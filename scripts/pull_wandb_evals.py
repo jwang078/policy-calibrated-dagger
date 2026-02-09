@@ -124,9 +124,15 @@ def create_eval_info_json(
 
     # Build per_group metrics
     per_group_metrics = {}
-    for wandb_key, json_key in metric_mapping.items():
-        if wandb_key in metrics:
+    for wandb_key in metrics:
+        if wandb_key in metric_mapping:
+            json_key = metric_mapping[wandb_key]
             per_group_metrics[json_key] = metrics[wandb_key]
+        else:
+            per_group_metrics[wandb_key] = metrics[wandb_key]
+    # for wandb_key, json_key in metric_mapping.items():
+    #     if wandb_key in metrics:
+    #         per_group_metrics[json_key] = metrics[wandb_key]
 
     # Add n_episodes if available
     n_episodes = int(metrics.get("episodes", metrics.get("n_episodes", 5)))
@@ -235,6 +241,9 @@ def main():
         "--no-videos", action="store_true", help="Skip downloading videos (faster, smaller output)"
     )
     parser.add_argument("--list", action="store_true", help="List matching runs without pulling")
+    parser.add_argument(
+        "--no-plots", action="store_true", help="Skip running summarize_evals.py to generate plots"
+    )
 
     args = parser.parse_args()
 
@@ -300,7 +309,7 @@ def main():
 
     # Run summarize_evals.py to generate charts
     summarize_script = Path(__file__).parent / "summarize_evals.py"
-    if summarize_script.exists() and all_created:
+    if summarize_script.exists() and all_created and not args.no_plots:
         print("\nGenerating summary charts...")
         result = subprocess.run(
             [sys.executable, str(summarize_script), str(output_base_dir)], capture_output=False

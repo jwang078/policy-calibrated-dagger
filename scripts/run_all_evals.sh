@@ -48,13 +48,12 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
     checkpoints_dir="$exp_dir/checkpoints"
     [ -d "$checkpoints_dir" ] || continue
 
-    # Count checkpoints (excluding last numerical which equals 'last')
-    last_numerical=$(ls -1 "$checkpoints_dir" | grep -E '^[0-9]+$' | sort -n | tail -1)
+    # Count checkpoints (excluding 'last' symlink which duplicates the last numerical)
     checkpoint_count=0
     for checkpoint_dir in "$checkpoints_dir"/*; do
         [ -d "$checkpoint_dir" ] || continue
         checkpoint_name=$(basename "$checkpoint_dir")
-        [ "$checkpoint_name" == "$last_numerical" ] && continue
+        [ "$checkpoint_name" == "last" ] && continue
         [ -d "$checkpoint_dir/pretrained_model" ] || continue
         ((checkpoint_count++))
     done
@@ -184,7 +183,7 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
     echo "Processing experiment: $exp_name"
     echo "Camera names: $camera_names"
     echo "Image resize mode: $image_resize_mode"
-    echo "Last numerical checkpoint (will skip): $last_numerical"
+    echo "Last numerical checkpoint: $last_numerical (will skip 'last' symlink)"
     echo "========================================"
 
     # Process each checkpoint
@@ -201,9 +200,9 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
 
         checkpoint_name=$(basename "$checkpoint_dir")
 
-        # Skip the last numerical checkpoint (it's the same as 'last')
-        if [ "$checkpoint_name" == "$last_numerical" ]; then
-            echo "Skipping $checkpoint_name (same as 'last')"
+        # Skip 'last' symlink (the last numerical checkpoint is the same)
+        if [ "$checkpoint_name" == "last" ]; then
+            echo "Skipping 'last' (same as $last_numerical)"
             continue
         fi
 
@@ -279,8 +278,10 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
         echo ""
 
         # Pause between evaluations to let the system rest
-        echo "Pausing for 15 seconds..."
-        sleep 15
+        if [ "$DRY_RUN" = false ]; then
+            echo "Pausing for 15 seconds..."
+            sleep 15
+        fi
     done
 done
 
@@ -291,4 +292,4 @@ echo "========================================"
 # Generate summary charts and tables
 echo ""
 echo "Generating evaluation summary..."
-python3 /home/jennyw2/code/lerobot/summarize_evals.py "$EVAL_OUTPUT_DIR"
+python3 /home/jennyw2/code/lerobot/my_scripts/summarize_evals.py "$EVAL_OUTPUT_DIR"

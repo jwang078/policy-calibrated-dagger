@@ -3,13 +3,15 @@
 # Script to run lerobot-eval on all policy checkpoints
 # Handles diffusion_approach_lever_* and pi05_training_approach_lever_* folders
 #
-# Usage: ./run_all_evals.sh [--dry-run] [--list]
-#   --dry-run: Show commands without executing them
-#   --list:    Only list experiments and checkpoints to evaluate, then exit
+# Usage: ./run_all_evals.sh [--dry-run] [--list] [--first-only]
+#   --dry-run:    Show commands without executing them
+#   --list:       Only list experiments and checkpoints to evaluate, then exit
+#   --first-only: Only evaluate the first checkpoint per experiment (for debugging)
 
 # Parse arguments
 DRY_RUN=false
 LIST_ONLY=false
+FIRST_ONLY=false
 for arg in "$@"; do
     case $arg in
         --dry-run)
@@ -18,6 +20,10 @@ for arg in "$@"; do
             ;;
         --list)
             LIST_ONLY=true
+            shift
+            ;;
+        --first-only)
+            FIRST_ONLY=true
             shift
             ;;
     esac
@@ -118,11 +124,10 @@ else:
     echo '["base_rgb"]'
 }
 
-# Function to get image resize mode from any checkpoint's train_config.json in the experiment
-get_image_resize_mode_from_experiment() {
+# Function to get image resize modes (as JSON list string) from any checkpoint's train_config.json
+get_image_resize_modes_from_experiment() {
     local checkpoints_dir="$1"
 
-    # Find the first checkpoint with a train_config.json
     for checkpoint_dir in "$checkpoints_dir"/*; do
         [ -d "$checkpoint_dir" ] || continue
         local config_file="$checkpoint_dir/pretrained_model/train_config.json"
@@ -133,20 +138,46 @@ import json
 
 config = json.load(open('$config_file'))
 
-env = config.get('env')
-if env and env.get('image_resize_mode'):
-    print(env['image_resize_mode'])
+env = config.get('env', {})
+# New field name (list)
+if env.get('image_resize_modes'):
+    print(json.dumps(env['image_resize_modes']))
+# Old field name (single string), wrap in list
+elif env.get('image_resize_mode'):
+    print(json.dumps([env['image_resize_mode']]))
 else:
-    # Default to letterbox if not specified
-    print('letterbox')
+    print('[\"letterbox\"]')
 " 2>/dev/null)
             echo "$result"
             return
         fi
     done
 
-    # Fallback if no config file found
-    echo 'letterbox'
+    echo '["letterbox"]'
+}
+
+# Function to get rename_map (as JSON string) from any checkpoint's train_config.json
+get_rename_map_from_experiment() {
+    local checkpoints_dir="$1"
+
+    for checkpoint_dir in "$checkpoints_dir"/*; do
+        [ -d "$checkpoint_dir" ] || continue
+        local config_file="$checkpoint_dir/pretrained_model/train_config.json"
+        if [ -f "$config_file" ]; then
+            local result
+            result=$(python3 -c "
+import json
+
+config = json.load(open('$config_file'))
+rename_map = config.get('rename_map', {})
+print(json.dumps(rename_map))
+" 2>/dev/null)
+            echo "$result"
+            return
+        fi
+    done
+
+    echo '{}'
 }
 
 # Find the last numerical checkpoint (to skip it since 'last' symlink points to it)
@@ -173,8 +204,9 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
     # Get camera names from the experiment's config file
     camera_names=$(get_camera_names_from_experiment "$checkpoints_dir")
 
-    # Get image resize mode from the experiment's config file
-    image_resize_mode=$(get_image_resize_mode_from_experiment "$checkpoints_dir")
+    # Get image resize modes and rename_map from the experiment's config file
+    image_resize_modes=$(get_image_resize_modes_from_experiment "$checkpoints_dir")
+    rename_map=$(get_rename_map_from_experiment "$checkpoints_dir")
 
     # Find the last numerical checkpoint to skip
     last_numerical=$(get_last_numerical_checkpoint "$checkpoints_dir")
@@ -182,27 +214,27 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
     echo "========================================"
     echo "Processing experiment: $exp_name"
     echo "Camera names: $camera_names"
-    echo "Image resize mode: $image_resize_mode"
+    echo "Image resize modes: $image_resize_modes"
+    echo "Rename map: $rename_map"
     echo "Last numerical checkpoint: $last_numerical (will skip 'last' symlink)"
     echo "========================================"
 
     # Process each checkpoint
-    index=0
+    first_done=false
     for checkpoint_dir in "$checkpoints_dir"/*; do
         [ -d "$checkpoint_dir" ] || continue
-
-        # Skip first checkpoint for debugging
-        if [ $index -eq 0 ]; then
-            ((index++))
-            continue
-        fi
-        ((index++))
 
         checkpoint_name=$(basename "$checkpoint_dir")
 
         # Skip 'last' symlink (the last numerical checkpoint is the same)
         if [ "$checkpoint_name" == "last" ]; then
             echo "Skipping 'last' (same as $last_numerical)"
+            continue
+        fi
+
+        # In --first-only mode, skip all but the first real checkpoint per experiment
+        if [ "$FIRST_ONLY" = true ] && [ "$first_done" = true ]; then
+            echo "Skipping $checkpoint_name (--first-only mode)"
             continue
         fi
 
@@ -234,13 +266,14 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
             --env.type=splatsim \\
             --env.task=upright_small_engine_new \\
             --env.camera_names='$camera_names' \\
-            --env.image_resize_mode=$image_resize_mode \\
+            --env.image_resize_modes='$image_resize_modes' \\
             --env.fps=30 \\
             --policy.path=$policy_path \\
             --eval.n_episodes=5 \\
             --output_dir=$eval_subdir \\
             --eval.batch_size=1 \\
-            --eval.use_async_envs=false"
+            --eval.use_async_envs=false \\
+            --rename_map='$rename_map'"
 
         if [ "$DRY_RUN" = true ]; then
             echo "Command:"
@@ -256,7 +289,8 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
                 echo "Checkpoint: $checkpoint_name"
                 echo "Policy path: $policy_path"
                 echo "Camera names: $camera_names"
-                echo "Image resize mode: $image_resize_mode"
+                echo "Image resize modes: $image_resize_modes"
+                echo "Rename map: $rename_map"
                 echo "Start time: $(date)"
                 echo "========================================"
                 echo ""
@@ -276,11 +310,17 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
 
         echo "Completed: $exp_name / $checkpoint_name"
         echo ""
+        first_done=true
 
         # Pause between evaluations to let the system rest
         if [ "$DRY_RUN" = false ]; then
+            echo "GPU memory usage after eval:"
+            nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader
+            # Kill any orphaned pybullet/python processes that might hold GPU memory
             echo "Pausing for 15 seconds..."
             sleep 15
+            echo "GPU memory usage after pause:"
+            nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader
         fi
     done
 done

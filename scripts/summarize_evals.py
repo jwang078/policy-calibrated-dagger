@@ -1073,8 +1073,8 @@ def print_best_checkpoints_summary(df: pd.DataFrame, output_dir: Path):
         # Best checkpoint row: exp_name filled in
         rows.append(best_row[display_cols].to_dict())
 
-        # Other checkpoints: exp_name blank
-        for _, other_row in group[~best_mask].iterrows():
+        # Other checkpoints: exp_name blank, sorted by avg_metric_rank descending
+        for _, other_row in group[~best_mask].sort_values("avg_metric_rank", ascending=False).iterrows():
             row = other_row[display_cols].to_dict()
             row["exp_name"] = ""
             rows.append(row)

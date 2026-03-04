@@ -52,21 +52,69 @@ class MetricConfig:
     label: str | None = None  # display label override (None → auto-generate from name)
     plot: bool = True  # whether to generate plots for this metric
     summary_display: bool = False  # whether to show in best_checkpoints summary table
+    per_task_key: str | None = None  # key in per_task metrics/info_metrics to get raw episode values
+    per_task_is_info: bool = False  # if True, look in info_metrics sub-dict
 
 
 METRICS: list[MetricConfig] = [
-    MetricConfig("avg_sum_reward", higher_is_better=True, required=True, summary_display=True),
-    MetricConfig("avg_max_reward", higher_is_better=True, required=True, plot=False),
-    MetricConfig("pc_success", higher_is_better=True, required=True, label="% Success", summary_display=True),
-    MetricConfig("avg_episode_length", higher_is_better=False, summary_display=True),
-    MetricConfig("avg_final_position_error_m", higher_is_better=False, summary_display=True),
-    MetricConfig("avg_final_orientation_error_deg", higher_is_better=False),
-    MetricConfig("avg_cam_looks_at_goal_score", higher_is_better=True, summary_display=True),
-    MetricConfig("avg_action_delta", higher_is_better=False),
-    MetricConfig("avg_action_accel", higher_is_better=False),
-    MetricConfig("avg_action_jerk", higher_is_better=False),
-    MetricConfig("avg_truncated", higher_is_better=False),
-    MetricConfig("avg_in_collision", higher_is_better=False),
+    MetricConfig(
+        "avg_sum_reward",
+        higher_is_better=True,
+        required=True,
+        summary_display=True,
+        per_task_key="sum_rewards",
+    ),
+    MetricConfig(
+        "avg_max_reward", higher_is_better=True, required=True, plot=False, per_task_key="max_rewards"
+    ),
+    MetricConfig(
+        "pc_success",
+        higher_is_better=True,
+        required=True,
+        label="% Success",
+        summary_display=True,
+        per_task_key="successes",
+    ),
+    MetricConfig(
+        "avg_episode_length",
+        higher_is_better=False,
+        summary_display=True,
+        per_task_key="episode_length",
+        per_task_is_info=True,
+    ),
+    MetricConfig(
+        "avg_final_position_error_m",
+        higher_is_better=False,
+        summary_display=True,
+        per_task_key="final_position_error_m",
+        per_task_is_info=True,
+    ),
+    MetricConfig(
+        "avg_final_orientation_error_deg",
+        higher_is_better=False,
+        per_task_key="final_orientation_error_deg",
+        per_task_is_info=True,
+    ),
+    MetricConfig(
+        "avg_cam_looks_at_goal_score",
+        higher_is_better=True,
+        summary_display=True,
+        per_task_key="cam_looks_at_goal_score",
+        per_task_is_info=True,
+    ),
+    MetricConfig(
+        "avg_action_delta", higher_is_better=False, per_task_key="action_delta", per_task_is_info=True
+    ),
+    MetricConfig(
+        "avg_action_accel", higher_is_better=False, per_task_key="action_accel", per_task_is_info=True
+    ),
+    MetricConfig(
+        "avg_action_jerk", higher_is_better=False, per_task_key="action_jerk", per_task_is_info=True
+    ),
+    MetricConfig("avg_truncated", higher_is_better=False, per_task_key="truncated", per_task_is_info=True),
+    MetricConfig(
+        "avg_in_collision", higher_is_better=False, per_task_key="in_collision", per_task_is_info=True
+    ),
     MetricConfig(
         "avg_episode_length_without_truncation",
         higher_is_better=False,
@@ -177,6 +225,21 @@ class EvalResult:
     avg_truncated: float | None
     avg_in_collision: float | None
     avg_episode_length_without_truncation: float | None
+
+    # Per-episode stds from per_task (None if < 2 samples or not available)
+    avg_sum_reward_std: float | None
+    avg_max_reward_std: float | None
+    pc_success_std: float | None
+    avg_episode_length_std: float | None
+    avg_final_position_error_m_std: float | None
+    avg_final_orientation_error_deg_std: float | None
+    avg_cam_looks_at_goal_score_std: float | None
+    avg_action_delta_std: float | None
+    avg_action_accel_std: float | None
+    avg_action_jerk_std: float | None
+    avg_truncated_std: float | None
+    avg_in_collision_std: float | None
+    avg_episode_length_without_truncation_std: float | None
 
 
 def parse_folder_name(folder_name: str) -> dict[str, Any]:
@@ -376,6 +439,51 @@ def get_dataset_from_training_folder(exp_name: str, training_base: Path) -> str 
     return None
 
 
+def _extract_per_task_episode_values(per_task: list[dict], metric_cfg: MetricConfig) -> list[float] | None:
+    """Extract all per-episode raw values for a metric from per_task entries.
+
+    Returns a flat list of all episode values across all task entries, or None if not available.
+    For 'successes', converts bool to float (1.0/0.0).
+    """
+    if metric_cfg.per_task_key is None:
+        return None
+    all_values: list[float] = []
+    for task_entry in per_task:
+        metrics = task_entry.get("metrics", {})
+        source = metrics.get("info_metrics", {}) if metric_cfg.per_task_is_info else metrics
+        values = source.get(metric_cfg.per_task_key)
+        if values is None:
+            continue
+        for v in values:
+            if isinstance(v, bool):
+                all_values.append(1.0 if v else 0.0)
+            else:
+                all_values.append(float(v))
+    return all_values if all_values else None
+
+
+def _compute_per_task_stats(
+    per_task: list[dict], metric_cfg: MetricConfig
+) -> tuple[float | None, float | None]:
+    """Compute mean and std for a metric from per_task raw episode values.
+
+    Returns (mean, std). std is None if fewer than 2 samples.
+    For pc_success, mean is returned as a percentage (0-100) to match overall format.
+    """
+    values = _extract_per_task_episode_values(per_task, metric_cfg)
+    if not values:
+        return None, None
+    arr = np.array(values, dtype=float)
+    mean_val = float(arr.mean())
+    std_val = float(arr.std(ddof=1)) if len(arr) >= 2 else None
+    # pc_success is stored as fraction in per_task (0/1), but overall uses 0-100
+    if metric_cfg.name == "pc_success":
+        mean_val = mean_val * 100.0
+        if std_val is not None:
+            std_val = std_val * 100.0
+    return mean_val, std_val
+
+
 def load_eval_results(eval_folder: Path, training_base: Path | None = None) -> list[EvalResult]:
     """Load all evaluation results from the folder."""
     results = []
@@ -413,12 +521,20 @@ def load_eval_results(eval_folder: Path, training_base: Path | None = None) -> l
 
         # Extract metrics from overall
         overall = data.get("overall", {})
+        per_task = data.get("per_task", [])
 
-        # Build metric kwargs from the registry
-        metric_values = {}
+        # Build metric kwargs: use per_task for means when available, else fall back to overall.
+        # Also compute stds from per_task raw episode values.
+        metric_values: dict[str, Any] = {}
+        metric_stds: dict[str, Any] = {}
         for m in METRICS:
             default = 0.0 if m.required else None
-            metric_values[m.name] = overall.get(m.name, default)
+            per_task_mean, per_task_std = _compute_per_task_stats(per_task, m)
+            if per_task_mean is not None:
+                metric_values[m.name] = per_task_mean
+            else:
+                metric_values[m.name] = overall.get(m.name, default)
+            metric_stds[f"{m.name}_std"] = per_task_std
 
         result = EvalResult(
             folder_name=subdir.name,
@@ -434,6 +550,7 @@ def load_eval_results(eval_folder: Path, training_base: Path | None = None) -> l
             exp_name=exp_name,
             n_episodes=int(overall.get("n_episodes", 0)),
             **metric_values,
+            **metric_stds,
         )
         results.append(result)
 
@@ -460,6 +577,7 @@ def create_dataframe(results: list[EvalResult]) -> pd.DataFrame:
         }
         for m in METRICS:
             row[m.name] = getattr(r, m.name)
+            row[f"{m.name}_std"] = getattr(r, f"{m.name}_std")
         data.append(row)
     return pd.DataFrame(data)
 
@@ -532,6 +650,76 @@ def compute_method_normalized_stats(
     return normalized_means, normalized_stds
 
 
+def _pooled_std_for_group(group_df: pd.DataFrame, metric: str) -> float | None:
+    """Compute pooled std for a group of rows using their per-episode mean, std, and n_episodes.
+
+    Uses the combined variance formula:
+        var_total = (1/N) * sum_i(n_i * (var_i + (mean_i - grand_mean)^2))
+
+    Returns None if fewer than 2 total episodes across the group.
+    """
+    std_col = f"{metric}_std"
+    if std_col not in group_df.columns:
+        return None
+    rows = group_df[[metric, std_col, "n_episodes"]].dropna(subset=[metric])
+    if rows.empty:
+        return None
+    total_n = rows["n_episodes"].sum()
+    if total_n < 2:
+        return None
+    grand_mean = (rows[metric] * rows["n_episodes"]).sum() / total_n
+    var_sum = 0.0
+    for _, row in rows.iterrows():
+        n_i = row["n_episodes"]
+        mean_i = row[metric]
+        std_i = row[std_col]
+        var_i = (
+            (std_i**2) if (std_i is not None and not (isinstance(std_i, float) and np.isnan(std_i))) else 0.0
+        )
+        var_sum += n_i * (var_i + (mean_i - grand_mean) ** 2)
+    return float(np.sqrt(var_sum / total_n))
+
+
+def _compute_grouped_errorbars(
+    df: pd.DataFrame, metric: str, groupby_col: str
+) -> tuple[pd.Series, pd.Series]:
+    """Compute mean and pooled per-episode std for each group, returning aligned Series."""
+    means = df.groupby(groupby_col)[metric].mean()
+    stds_dict = {}
+    for group_val, group_df in df.groupby(groupby_col):
+        stds_dict[group_val] = _pooled_std_for_group(group_df, metric)
+    stds = pd.Series(stds_dict).reindex(means.index)
+    return means, stds
+
+
+def _yerr_array(stds: pd.Series) -> np.ndarray | None:
+    """Convert a stds Series to a yerr array for ax.bar(), replacing NaN with 0 (no error bar shown)."""
+    arr = stds.to_numpy(dtype=float)
+    # If all NaN, return None to suppress error bars entirely
+    if np.all(np.isnan(arr)):
+        return None
+    arr = np.where(np.isnan(arr), 0.0, arr)
+    return arr
+
+
+def _add_bar_labels(ax: plt.Axes, bars, values: np.ndarray, fontsize: int = 20) -> None:
+    """Add value labels centered inside each bar in white."""
+    for bar, val in zip(bars, values, strict=True):
+        height = bar.get_height()
+        if height <= 0:
+            continue
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            height / 2,
+            f"{val:.2f}",
+            ha="center",
+            va="center",
+            fontsize=fontsize,
+            color="white",
+            fontweight="bold",
+        )
+
+
 def plot_metric_by_category(df: pd.DataFrame, metric: str, output_dir: Path, title_suffix: str = ""):
     """Create plots for a metric grouped by different categories."""
 
@@ -546,21 +734,19 @@ def plot_metric_by_category(df: pd.DataFrame, metric: str, output_dir: Path, tit
 
     # 1. Bar plot by method
     fig, ax = plt.subplots(figsize=(10, 6))
-    method_means = df_valid.groupby("method")[metric].mean()
-    method_stds = df_valid.groupby("method")[metric].std()
-    bars = ax.bar(method_means.index, method_means.values, yerr=method_stds.values, capsize=5)
+    method_means, method_stds = _compute_grouped_errorbars(df_valid, metric, "method")
+    yerr = _yerr_array(method_stds)
+    bars = ax.bar(
+        method_means.index,
+        method_means.to_numpy(),
+        yerr=yerr,
+        capsize=5,
+        error_kw={"ecolor": "#888888", "elinewidth": 1.5},
+    )
     ax.set_xlabel("Method")
     ax.set_ylabel(metric_label)
     ax.set_title(f"{metric_label} by Method{title_suffix}")
-    for bar, val in zip(bars, method_means.values, strict=True):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + method_stds.max() * 0.1,
-            f"{val:.2f}",
-            ha="center",
-            va="bottom",
-            fontsize=20,
-        )
+    _add_bar_labels(ax, bars, method_means.to_numpy())
     plt.tight_layout()
     plt.savefig(output_dir / f"{metric}_by_method.png", dpi=150)
     plt.close()
@@ -569,67 +755,68 @@ def plot_metric_by_category(df: pd.DataFrame, metric: str, output_dir: Path, tit
     df_with_dataset = df_valid[df_valid["dataset"].notna()]
     if not df_with_dataset.empty:
         _, ax = plt.subplots(figsize=(14, 8))
-        dataset_means, dataset_stds = compute_method_normalized_stats(df_with_dataset, metric, "dataset")
+        dataset_means, _ = compute_method_normalized_stats(df_with_dataset, metric, "dataset")
         if not dataset_means.empty:
+            # Use pooled per-episode stds for dataset grouping
+            _, dataset_ep_stds = _compute_grouped_errorbars(df_with_dataset, metric, "dataset")
+            dataset_ep_stds = dataset_ep_stds.reindex(dataset_means.index)
+            yerr = _yerr_array(dataset_ep_stds)
             bars = ax.bar(
-                range(len(dataset_means)), dataset_means.to_numpy(), yerr=dataset_stds.to_numpy(), capsize=5
+                range(len(dataset_means)),
+                dataset_means.to_numpy(),
+                yerr=yerr,
+                capsize=5,
+                error_kw={"ecolor": "#888888", "elinewidth": 1.5},
             )
             ax.set_xlabel("Dataset")
             ax.set_ylabel(metric_label)
             ax.set_title(f"{metric_label} by Dataset\n(method-normalized){title_suffix}")
             ax.set_xticks(range(len(dataset_means)))
             ax.set_xticklabels(dataset_means.index, rotation=10, ha="right", fontsize=16)
-            for bar, val in zip(bars, dataset_means.values, strict=True):
-                ax.text(
-                    bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + dataset_stds.max() * 0.1,
-                    f"{val:.2f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=16,
-                )
+            _add_bar_labels(ax, bars, dataset_means.to_numpy(), fontsize=16)
             plt.tight_layout()
             plt.savefig(output_dir / f"{metric}_by_dataset.png", dpi=150)
             plt.close()
 
     # 3. Bar plot by trajectory generation (method-normalized)
     _, ax = plt.subplots(figsize=(10, 6))
-    traj_means, traj_stds = compute_method_normalized_stats(df_valid, metric, "trajectory_gen")
-    bars = ax.bar(traj_means.index, traj_means.to_numpy(), yerr=traj_stds.to_numpy(), capsize=5)
+    traj_means, _ = compute_method_normalized_stats(df_valid, metric, "trajectory_gen")
+    _, traj_ep_stds = _compute_grouped_errorbars(df_valid, metric, "trajectory_gen")
+    traj_ep_stds = traj_ep_stds.reindex(traj_means.index)
+    yerr = _yerr_array(traj_ep_stds)
+    bars = ax.bar(
+        traj_means.index,
+        traj_means.to_numpy(),
+        yerr=yerr,
+        capsize=5,
+        error_kw={"ecolor": "#888888", "elinewidth": 1.5},
+    )
     ax.set_xlabel("Trajectory Generation")
     ax.set_ylabel(metric_label)
     ax.set_title(f"{metric_label} by Trajectory Generation\n(method-normalized){title_suffix}")
-    for bar, val in zip(bars, traj_means.values, strict=True):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + traj_stds.max() * 0.1,
-            f"{val:.2f}",
-            ha="center",
-            va="bottom",
-            fontsize=20,
-        )
+    _add_bar_labels(ax, bars, traj_means.to_numpy())
     plt.tight_layout()
     plt.savefig(output_dir / f"{metric}_by_trajectory_gen.png", dpi=150)
     plt.close()
 
     # 4. Bar plot by cameras (method-normalized)
     _, ax = plt.subplots(figsize=(10, 6))
-    cam_means, cam_stds = compute_method_normalized_stats(df_valid, metric, "cameras")
+    cam_means, _ = compute_method_normalized_stats(df_valid, metric, "cameras")
     cam_means = cam_means.reindex(CAMERA_ORDER)
-    cam_stds = cam_stds.reindex(CAMERA_ORDER)
-    bars = ax.bar(cam_means.index, cam_means.to_numpy(), yerr=cam_stds.to_numpy(), capsize=5)
+    _, cam_ep_stds = _compute_grouped_errorbars(df_valid, metric, "cameras")
+    cam_ep_stds = cam_ep_stds.reindex(CAMERA_ORDER)
+    yerr = _yerr_array(cam_ep_stds)
+    bars = ax.bar(
+        cam_means.index,
+        cam_means.to_numpy(),
+        yerr=yerr,
+        capsize=5,
+        error_kw={"ecolor": "#888888", "elinewidth": 1.5},
+    )
     ax.set_xlabel("Cameras")
     ax.set_ylabel(metric_label)
     ax.set_title(f"{metric_label} by Camera Config\n(method-normalized){title_suffix}")
-    for bar, val in zip(bars, cam_means.values, strict=True):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + cam_stds.max() * 0.1,
-            f"{val:.2f}",
-            ha="center",
-            va="bottom",
-            fontsize=20,
-        )
+    _add_bar_labels(ax, bars, cam_means.to_numpy())
     plt.tight_layout()
     plt.savefig(output_dir / f"{metric}_by_cameras.png", dpi=150)
     plt.close()
@@ -642,7 +829,23 @@ def plot_metric_by_category(df: pd.DataFrame, metric: str, output_dir: Path, tit
     for i, method in enumerate(pivot.columns):
         offset = (i - (len(pivot.columns) - 1) / 2) * width
         values = pivot[method].fillna(0).to_numpy()
-        ax.bar(x + offset, values, width, label=method)
+        # Compute per-cell pooled std (trajectory_gen x method)
+        yerr_vals = []
+        for traj in pivot.index:
+            cell_df = df_valid[(df_valid["trajectory_gen"] == traj) & (df_valid["method"] == method)]
+            yerr_vals.append(_pooled_std_for_group(cell_df, metric) or 0.0)
+        yerr_arr = np.array(yerr_vals)
+        has_errs = yerr_arr.any()
+        bars_group = ax.bar(
+            x + offset,
+            values,
+            width,
+            label=method,
+            yerr=yerr_arr if has_errs else None,
+            capsize=4,
+            error_kw={"ecolor": "#888888", "elinewidth": 1.5} if has_errs else {},
+        )
+        _add_bar_labels(ax, bars_group, values, fontsize=13)
         # Add N/A labels for missing data
         for j, val in enumerate(pivot[method]):
             if pd.isna(val):
@@ -675,7 +878,23 @@ def plot_metric_by_category(df: pd.DataFrame, metric: str, output_dir: Path, tit
     for i, method in enumerate(pivot.columns):
         offset = (i - (len(pivot.columns) - 1) / 2) * width
         values = pivot[method].fillna(0).to_numpy()
-        ax.bar(x + offset, values, width, label=method)
+        # Compute per-cell pooled std (cameras x method)
+        yerr_vals = []
+        for cam in pivot.index:
+            cell_df = df_valid[(df_valid["cameras"] == cam) & (df_valid["method"] == method)]
+            yerr_vals.append(_pooled_std_for_group(cell_df, metric) or 0.0)
+        yerr_arr = np.array(yerr_vals)
+        has_errs = yerr_arr.any()
+        cam_bars = ax.bar(
+            x + offset,
+            values,
+            width,
+            label=method,
+            yerr=yerr_arr if has_errs else None,
+            capsize=4,
+            error_kw={"ecolor": "#888888", "elinewidth": 1.5} if has_errs else {},
+        )
+        _add_bar_labels(ax, cam_bars, values, fontsize=13)
         # Add N/A labels for missing data
         for j, val in enumerate(pivot[method]):
             if pd.isna(val):
@@ -888,8 +1107,8 @@ def plot_metric_by_method(df: pd.DataFrame, metric: str, output_dir: Path):
     consistent_cameras = [c for c in CAMERA_ORDER if c in all_cameras]
     consistent_trajectories = [t for t in TRAJECTORY_ORDER if t in all_trajectories]
 
-    # Add some headroom for the value labels (15% padding)
-    y_limit = max_y_value * 1.15
+    # Add headroom for error bars (20% padding)
+    y_limit = max_y_value * 1.20
 
     # Second pass: create the plots with consistent y-axis and x-axis categories
     for method, grouped in grouped_data.items():
@@ -909,17 +1128,30 @@ def plot_metric_by_method(df: pd.DataFrame, metric: str, output_dir: Path):
             offset = (i - (n_traj - 1) / 2) * width
             # Replace NaN with 0 for plotting (will show as no bar)
             values = grouped[traj].fillna(0).to_numpy()
-            bars = ax.bar(x + offset, values, width, label=traj, color=colors[i % len(colors)])
-
-            # Add value labels on bars (only for non-zero values that were not NaN)
+            # Compute per-cell pooled std (camera x trajectory)
+            method_df = df_valid[df_valid["method"] == method]
+            yerr_vals = []
+            for cam in grouped.index:
+                cell_df = method_df[(method_df["cameras"] == cam) & (method_df["trajectory_gen"] == traj)]
+                yerr_vals.append(_pooled_std_for_group(cell_df, metric) or 0.0)
+            yerr_arr = np.array(yerr_vals)
+            has_errs = yerr_arr.any()
+            bars = ax.bar(
+                x + offset,
+                values,
+                width,
+                label=traj,
+                color=colors[i % len(colors)],
+                yerr=yerr_arr if has_errs else None,
+                capsize=4,
+                error_kw={"ecolor": "#888888", "elinewidth": 1.5} if has_errs else {},
+            )
+            _add_bar_labels(ax, bars, values, fontsize=13)
             # Add "N/A" for missing data
-            for j, bar in enumerate(bars):
-                height = bar.get_height()
-                original_value = grouped[traj].iloc[j]
+            for j, original_value in enumerate(grouped[traj]):
                 if pd.isna(original_value):
-                    # Show "N/A" at the baseline for missing data
                     ax.text(
-                        bar.get_x() + bar.get_width() / 2,
+                        x[j] + offset,
                         0,
                         "N/A",
                         ha="center",
@@ -927,15 +1159,6 @@ def plot_metric_by_method(df: pd.DataFrame, metric: str, output_dir: Path):
                         fontsize=14,
                         color="gray",
                         style="italic",
-                    )
-                elif height > 0:
-                    ax.text(
-                        bar.get_x() + bar.get_width() / 2,
-                        height,
-                        f"{height:.2f}",
-                        ha="center",
-                        va="bottom",
-                        fontsize=16,
                     )
 
         ax.set_xlabel("Camera Config")
@@ -951,6 +1174,79 @@ def plot_metric_by_method(df: pd.DataFrame, metric: str, output_dir: Path):
         safe_method = method.replace(".", "").replace(" ", "_")
         plt.savefig(output_dir / f"{metric}_by_camera_traj_{safe_method}.png", dpi=150)
         plt.close()
+
+
+def compile_best_checkpoint_videos(df: pd.DataFrame, eval_folder: Path, output_dir: Path) -> None:
+    """For each experiment's best checkpoint, concatenate all eval episode videos into one file.
+
+    Videos are saved to output_dir/videos/<folder_name>.mp4.
+    Episodes across all task groups are concatenated in order (task_group sorted, then episode index).
+    Requires ffmpeg on PATH.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    if shutil.which("ffmpeg") is None:
+        print("Warning: ffmpeg not found on PATH, skipping video compilation.")
+        return
+
+    df_best = select_overall_best_checkpoint_per_experiment(df)
+    videos_out = output_dir / "videos"
+    videos_out.mkdir(exist_ok=True)
+
+    for _, row in df_best.iterrows():
+        folder_name = row["folder_name"]
+        eval_run_dir = eval_folder / folder_name / "videos"
+        if not eval_run_dir.exists():
+            print(f"  Skipping {folder_name}: no videos folder found")
+            continue
+
+        # Collect all episode mp4s across task group subdirs, sorted by subdir then filename
+        episode_files: list[Path] = []
+        for task_dir in sorted(eval_run_dir.iterdir()):
+            if not task_dir.is_dir():
+                continue
+            episode_files.extend(sorted(task_dir.glob("eval_episode_*.mp4")))
+
+        if not episode_files:
+            print(f"  Skipping {folder_name}: no episode videos found")
+            continue
+
+        out_path = videos_out / f"{folder_name}.mp4"
+
+        # Write a concat list file and run ffmpeg
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            concat_file = Path(f.name)
+            for ep in episode_files:
+                f.write(f"file '{ep.resolve()}'\n")
+
+        try:
+            result = subprocess.run(  # nosec B607
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(concat_file),
+                    "-c",
+                    "copy",
+                    str(out_path),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                print(f"  Saved: {out_path.name} ({len(episode_files)} episodes)")
+            else:
+                print(
+                    f"  Error compiling {folder_name}: {result.stderr.splitlines()[-1] if result.stderr else 'unknown error'}"
+                )
+        finally:
+            concat_file.unlink(missing_ok=True)
 
 
 def _build_agg_dict(df: pd.DataFrame) -> dict:
@@ -1155,6 +1451,10 @@ def main():
     # Comprehensive success rate comparison (uses best checkpoint for pc_success)
     df_best_success = select_best_checkpoint_per_experiment(df, "pc_success")
     plot_success_rate_comparison(df_best_success, output_dir)
+
+    # Compile best-checkpoint episode videos into per-experiment concat videos
+    print("\nCompiling best-checkpoint eval videos...")
+    compile_best_checkpoint_videos(df, eval_folder, output_dir)
 
     print(f"\nPlots saved to: {output_dir}")
     print("Generated files:")

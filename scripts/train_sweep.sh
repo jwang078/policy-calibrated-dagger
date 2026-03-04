@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+
+DRY_RUN=false
+if [[ "${1:-}" == "--dry-run" ]]; then
+    DRY_RUN=true
+fi
+
+# ============================================================
+# USER CONFIG — edit this one line to change the experiment
+# ============================================================
+DATASET_SHORT="approach_lever_6_noteleport_5path"
+# ============================================================
+
+DATASET_REPO="JennyWWW/splatsim_${DATASET_SHORT}"
+
+# ── Validate names before doing anything ─────────────────────
+validate_names() {
+    local errors=0
+    local dataset_name="${DATASET_REPO#*/}"   # everything after the first /
+
+    # --- DATASET_SHORT rules ---
+    # Allowed characters: alphanumeric, _, -, .
+    if [[ "$DATASET_SHORT" =~ [^a-zA-Z0-9_.-] ]]; then
+        echo "ERROR: DATASET_SHORT contains invalid characters (only a-z, A-Z, 0-9, _, -, . allowed): '$DATASET_SHORT'" >&2
+        errors=1
+    fi
+    # Cannot start or end with - or .
+    if [[ "$DATASET_SHORT" =~ ^[.-] || "$DATASET_SHORT" =~ [.-]$ ]]; then
+        echo "ERROR: DATASET_SHORT cannot start or end with '-' or '.': '$DATASET_SHORT'" >&2
+        errors=1
+    fi
+    # Forbidden substrings
+    if [[ "$DATASET_SHORT" == *"--"* || "$DATASET_SHORT" == *".."* ]]; then
+        echo "ERROR: DATASET_SHORT cannot contain '--' or '..': '$DATASET_SHORT'" >&2
+        errors=1
+    fi
+
+    # --- dataset_name rules (the part after JennyWWW/) ---
+    # Allowed characters: alphanumeric, _, -, .
+    if [[ "$dataset_name" =~ [^a-zA-Z0-9_.-] ]]; then
+        echo "ERROR: dataset name contains invalid characters (only a-z, A-Z, 0-9, _, -, . allowed): '$dataset_name'" >&2
+        errors=1
+    fi
+    # Cannot start or end with - or .
+    if [[ "$dataset_name" =~ ^[.-] || "$dataset_name" =~ [.-]$ ]]; then
+        echo "ERROR: dataset name cannot start or end with '-' or '.': '$dataset_name'" >&2
+        errors=1
+    fi
+    # Forbidden substrings: -- and ..
+    if [[ "$dataset_name" == *"--"* || "$dataset_name" == *".."* ]]; then
+        echo "ERROR: dataset name cannot contain '--' or '..': '$dataset_name'" >&2
+        errors=1
+    fi
+    # Cannot end with .git or .ipynb
+    if [[ "$dataset_name" == *.git || "$dataset_name" == *.ipynb ]]; then
+        echo "ERROR: dataset name cannot end with '.git' or '.ipynb': '$dataset_name'" >&2
+        errors=1
+    fi
+    # Max length 96
+    if (( ${#dataset_name} > 96 )); then
+        echo "ERROR: dataset name exceeds 96 chars (${#dataset_name}): '$dataset_name'" >&2
+        errors=1
+    fi
+
+    if (( errors > 0 )); then
+        exit 1
+    fi
+
+    echo "Validation passed: DATASET_REPO='$DATASET_REPO' (dataset name: ${#dataset_name}/96 chars)"
+}
+validate_names
+
+TRAIN_SCRIPT="python /home/jennyw2/code/lerobot/src/lerobot/scripts/lerobot_train.py"
+
+# ── Shared env/eval args (same for every run) ────────────────
+SHARED_ARGS=(
+    --wandb.enable=true
+    --policy.device=cuda
+    --env.type=splatsim
+    --env.task=upright_small_engine_new
+    --env.fps=30
+    --eval.n_episodes=5
+    --eval.batch_size=1
+    --eval.use_async_envs=false
+)
+
+# ── Policy-specific args ─────────────────────────────────────
+
+DIFFUSION_ARGS=(
+    --policy.type=diffusion
+    --steps=75000
+    --batch_size=32
+    --eval_freq=25000
+    --save_freq=25000
+    --policy.vision_backbone=resnet18
+    --policy.pretrained_backbone_weights=null
+    --policy.use_group_norm=true
+    "--policy.crop_shape=[224, 224]"
+    --policy.crop_is_random=false
+    --policy.optimizer_lr=1e-5
+    --policy.use_separate_rgb_encoder_per_camera=true
+)
+DIFFUSION_RESIZE_MODE="stretch"
+
+PI05_ARGS=(
+    --policy.type=pi05
+    --steps=3000
+    --batch_size=16
+    --eval_freq=1000
+    --save_freq=1000
+    --policy.scheduler_decay_steps=3000
+    --policy.pretrained_path=lerobot/pi05_base
+    --policy.compile_model=false
+    --policy.gradient_checkpointing=true
+    --policy.dtype=bfloat16
+    --policy.train_expert_only=true
+    --policy.use_amp=true
+)
+PI05_RESIZE_MODE="letterbox"
+
+# ── Camera-specific args ─────────────────────────────────────
+# Sets CAMERA_ARGS array. Call as: set_camera_args <resize_mode> <camera_suffix>
+# camera_suffix: "basewrist" | "base" | "wrist"
+set_camera_args() {
+    local resize_mode=$1
+    local camera_suffix=$2
+
+    case "$camera_suffix" in
+        basewrist)
+            CAMERA_ARGS=(
+                "--env.camera_names=[\"base_rgb\", \"wrist_rgb\"]"
+                "--env.image_resize_modes=[\"${resize_mode}\"]"
+                "--policy.input_features={\"observation.images.base_rgb\": {\"type\": \"VISUAL\", \"shape\": [3, 224, 224]}, \"observation.images.wrist_rgb\": {\"type\": \"VISUAL\", \"shape\": [3, 224, 224]}, \"observation.state\": {\"type\": \"STATE\", \"shape\": [7]}}"
+                "--rename_map={\"observation.images.base_rgb_${resize_mode}\": \"observation.images.base_rgb\", \"observation.images.wrist_rgb_${resize_mode}\": \"observation.images.wrist_rgb\"}"
+            )
+            ;;
+        base)
+            CAMERA_ARGS=(
+                "--env.camera_names=[\"base_rgb\"]"
+                "--env.image_resize_modes=[\"${resize_mode}\"]"
+                "--policy.input_features={\"observation.images.base_rgb\": {\"type\": \"VISUAL\", \"shape\": [3, 224, 224]}, \"observation.state\": {\"type\": \"STATE\", \"shape\": [7]}}"
+                "--rename_map={\"observation.images.base_rgb_${resize_mode}\": \"observation.images.base_rgb\"}"
+            )
+            ;;
+        wrist)
+            CAMERA_ARGS=(
+                "--env.camera_names=[\"wrist_rgb\"]"
+                "--env.image_resize_modes=[\"${resize_mode}\"]"
+                "--policy.input_features={\"observation.images.wrist_rgb\": {\"type\": \"VISUAL\", \"shape\": [3, 224, 224]}, \"observation.state\": {\"type\": \"STATE\", \"shape\": [7]}}"
+                "--rename_map={\"observation.images.wrist_rgb_${resize_mode}\": \"observation.images.wrist_rgb\"}"
+            )
+            ;;
+    esac
+}
+
+# ── Helper to run one training job ───────────────────────────
+# run_job <policy_prefix> <camera_suffix> <policy_args_array_name> <resize_mode> [env_prefix]
+run_job() {
+    local policy_prefix=$1      # e.g. "diffusion" or "pi05"
+    local camera_suffix=$2      # e.g. "basewrist", "base", "wrist"
+    local -n policy_args=$3     # nameref to array
+    local resize_mode=$4
+    local env_prefix="${5:-}"   # optional env var prefix (e.g. PYTORCH_CUDA_ALLOC_CONF=...)
+
+    local run_name="${policy_prefix}_${DATASET_SHORT}_${camera_suffix}"
+
+    set_camera_args "$resize_mode" "$camera_suffix"
+
+    local full_cmd=(
+        $TRAIN_SCRIPT
+        --dataset.repo_id="$DATASET_REPO"
+        --output_dir="./outputs/training/${run_name}"
+        --job_name="${run_name}"
+        --policy.repo_id="${run_name}"
+        "${SHARED_ARGS[@]}"
+        "${policy_args[@]}"
+        "${CAMERA_ARGS[@]}"
+    )
+
+    echo "Running: ${env_prefix:+$env_prefix }${full_cmd[*]}"
+    if [[ "$DRY_RUN" == false ]]; then
+        ${env_prefix:+env $env_prefix} "${full_cmd[@]}"
+    fi
+    echo ""
+    echo "============================================================"
+}
+
+# ── Run all 6 jobs ────────────────────────────────────────────
+
+maybe_sleep() { [[ "$DRY_RUN" == false ]] && sleep 10; }
+
+run_job "diffusion" "basewrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE"
+maybe_sleep
+
+run_job "diffusion" "base"      DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE"
+maybe_sleep
+
+# run_job "diffusion" "wrist"     DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE"
+# maybe_sleep
+
+# pi0.5 + basewrist needs extra memory setting
+run_job "pi05" "basewrist" PI05_ARGS "$PI05_RESIZE_MODE" "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+maybe_sleep
+
+run_job "pi05" "base"      PI05_ARGS "$PI05_RESIZE_MODE"
+maybe_sleep
+
+# run_job "pi05" "wrist"     PI05_ARGS "$PI05_RESIZE_MODE"

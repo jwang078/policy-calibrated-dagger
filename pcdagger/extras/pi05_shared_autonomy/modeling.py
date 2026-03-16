@@ -24,10 +24,9 @@ Reference: https://arxiv.org/abs/2302.12244
 import logging
 from collections import deque
 
-import torch
 from torch import Tensor
 
-from lerobot.policies.pi05.configuration_shared_autonomy import SharedAutonomyConfig
+from lerobot.configs.shared_autonomy import SharedAutonomyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +56,7 @@ class SharedAutonomyProcessor:
             sa_config: Configuration for shared autonomy behavior.
         """
         self.sa_config = sa_config
-        self._human_action_buffer = deque(maxlen=sa_config.human_action_buffer_size)
+        self._human_action_buffer = deque(maxlen=sa_config.policy_guidance_action_buffer_size)
 
         # Debug tracking (similar to RTC)
         self.tracker = None
@@ -123,9 +122,7 @@ class SharedAutonomyProcessor:
             human_action = human_action.unsqueeze(1).expand_as(noise)
 
         if noise.shape != human_action.shape:
-            raise ValueError(
-                f"Shape mismatch: noise {noise.shape} vs human_action {human_action.shape}"
-            )
+            raise ValueError(f"Shape mismatch: noise {noise.shape} vs human_action {human_action.shape}")
 
         t_sw = self.sa_config.forward_flow_ratio
 
@@ -135,7 +132,7 @@ class SharedAutonomyProcessor:
         if self.sa_config.debug:
             logger.debug(
                 f"Applied partial forward flow with t_sw={t_sw:.3f}, "
-                f"noise_weight={t_sw:.3f}, action_weight={1-t_sw:.3f}"
+                f"noise_weight={t_sw:.3f}, action_weight={1 - t_sw:.3f}"
             )
 
         return x_tsw
@@ -170,8 +167,7 @@ class SharedAutonomyProcessor:
 
         if self.sa_config.debug:
             logger.debug(
-                f"Modified denoising: t_start={t_start:.3f}, dt={dt:.4f}, "
-                f"num_steps={num_inference_steps}"
+                f"Modified denoising: t_start={t_start:.3f}, dt={dt:.4f}, num_steps={num_inference_steps}"
             )
 
         return t_start, dt, num_inference_steps

@@ -8,7 +8,8 @@ fi
 # ============================================================
 # USER CONFIG — edit this one line to change the experiment
 # ============================================================
-DATASET_SHORT="approach_lever_6_noteleport_5path"
+DATASET_SHORT="approach_lever_7_lowres_5path"
+# DATASET_SHORT="approach_lever_6_noteleport_5path"
 # ============================================================
 
 DATASET_REPO="JennyWWW/splatsim_${DATASET_SHORT}"
@@ -82,6 +83,7 @@ SHARED_ARGS=(
     --eval.n_episodes=5
     --eval.batch_size=1
     --eval.use_async_envs=false
+    --dataset.image_transforms.enable=true
 )
 
 # ── Policy-specific args ─────────────────────────────────────
@@ -189,11 +191,11 @@ run_job() {
 
 maybe_sleep() { [[ "$DRY_RUN" == false ]] && sleep 10; }
 
-run_job "diffusion" "basewrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE"
-maybe_sleep
+# run_job "diffusion" "basewrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE"
+# maybe_sleep
 
-run_job "diffusion" "base"      DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE"
-maybe_sleep
+# run_job "diffusion" "base"      DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE"
+# maybe_sleep
 
 # run_job "diffusion" "wrist"     DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE"
 # maybe_sleep

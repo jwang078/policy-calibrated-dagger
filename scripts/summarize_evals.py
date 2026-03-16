@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib
+import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
 
@@ -54,6 +55,7 @@ class MetricConfig:
     summary_display: bool = False  # whether to show in best_checkpoints summary table
     per_task_key: str | None = None  # key in per_task metrics/info_metrics to get raw episode values
     per_task_is_info: bool = False  # if True, look in info_metrics sub-dict
+    use_boxplot: bool = False  # True = show distribution (box plot); False = bar chart (binary/0-1 metrics)
 
 
 METRICS: list[MetricConfig] = [
@@ -63,9 +65,15 @@ METRICS: list[MetricConfig] = [
         required=True,
         summary_display=True,
         per_task_key="sum_rewards",
+        use_boxplot=True,
     ),
     MetricConfig(
-        "avg_max_reward", higher_is_better=True, required=True, plot=False, per_task_key="max_rewards"
+        "avg_max_reward",
+        higher_is_better=True,
+        required=True,
+        plot=False,
+        per_task_key="max_rewards",
+        use_boxplot=True,
     ),
     MetricConfig(
         "pc_success",
@@ -74,6 +82,7 @@ METRICS: list[MetricConfig] = [
         label="% Success",
         summary_display=True,
         per_task_key="successes",
+        use_boxplot=False,  # binary 0/1
     ),
     MetricConfig(
         "avg_episode_length",
@@ -81,6 +90,7 @@ METRICS: list[MetricConfig] = [
         summary_display=True,
         per_task_key="episode_length",
         per_task_is_info=True,
+        use_boxplot=True,
     ),
     MetricConfig(
         "avg_final_position_error_m",
@@ -88,12 +98,14 @@ METRICS: list[MetricConfig] = [
         summary_display=True,
         per_task_key="final_position_error_m",
         per_task_is_info=True,
+        use_boxplot=True,
     ),
     MetricConfig(
         "avg_final_orientation_error_deg",
         higher_is_better=False,
         per_task_key="final_orientation_error_deg",
         per_task_is_info=True,
+        use_boxplot=True,
     ),
     MetricConfig(
         "avg_cam_looks_at_goal_score",
@@ -101,24 +113,50 @@ METRICS: list[MetricConfig] = [
         summary_display=True,
         per_task_key="cam_looks_at_goal_score",
         per_task_is_info=True,
+        use_boxplot=True,
     ),
     MetricConfig(
-        "avg_action_delta", higher_is_better=False, per_task_key="action_delta", per_task_is_info=True
+        "avg_action_delta",
+        higher_is_better=False,
+        per_task_key="action_delta",
+        per_task_is_info=True,
+        use_boxplot=True,
     ),
     MetricConfig(
-        "avg_action_accel", higher_is_better=False, per_task_key="action_accel", per_task_is_info=True
+        "avg_action_accel",
+        higher_is_better=False,
+        per_task_key="action_accel",
+        per_task_is_info=True,
+        use_boxplot=True,
     ),
     MetricConfig(
-        "avg_action_jerk", higher_is_better=False, per_task_key="action_jerk", per_task_is_info=True
+        "avg_action_jerk",
+        higher_is_better=False,
+        per_task_key="action_jerk",
+        per_task_is_info=True,
+        use_boxplot=True,
     ),
-    MetricConfig("avg_truncated", higher_is_better=False, per_task_key="truncated", per_task_is_info=True),
     MetricConfig(
-        "avg_in_collision", higher_is_better=False, per_task_key="in_collision", per_task_is_info=True
+        "avg_truncated",
+        higher_is_better=False,
+        per_task_key="truncated",
+        per_task_is_info=True,
+        use_boxplot=False,  # binary 0/1
+    ),
+    MetricConfig(
+        "avg_in_collision",
+        higher_is_better=False,
+        per_task_key="in_collision",
+        per_task_is_info=True,
+        use_boxplot=True,
     ),
     MetricConfig(
         "avg_episode_length_without_truncation",
         higher_is_better=False,
         label="Avg Episode Length W/O Truncation",
+        per_task_key="episode_length_without_truncation",
+        per_task_is_info=True,
+        use_boxplot=True,
     ),
 ]
 
@@ -131,6 +169,7 @@ OPTIONAL_METRICS: list[str] = [m.name for m in METRICS if not m.required]
 PLOT_METRICS: list[str] = [m.name for m in METRICS if m.plot and m.required]
 OPTIONAL_PLOT_METRICS: list[str] = [m.name for m in METRICS if m.plot and not m.required]
 SUMMARY_DISPLAY_METRICS: list[str] = [m.name for m in METRICS if m.summary_display]
+BOXPLOT_METRIC_NAMES: set[str] = {m.name for m in METRICS if m.use_boxplot}
 
 
 def select_best_checkpoint_per_experiment(df: pd.DataFrame, metric: str) -> pd.DataFrame:
@@ -240,6 +279,21 @@ class EvalResult:
     avg_truncated_std: float | None
     avg_in_collision_std: float | None
     avg_episode_length_without_truncation_std: float | None
+
+    # Raw per-episode values for boxplot metrics (None if not available)
+    avg_sum_reward_episodes: list[float] | None
+    avg_max_reward_episodes: list[float] | None
+    pc_success_episodes: list[float] | None
+    avg_episode_length_episodes: list[float] | None
+    avg_final_position_error_m_episodes: list[float] | None
+    avg_final_orientation_error_deg_episodes: list[float] | None
+    avg_cam_looks_at_goal_score_episodes: list[float] | None
+    avg_action_delta_episodes: list[float] | None
+    avg_action_accel_episodes: list[float] | None
+    avg_action_jerk_episodes: list[float] | None
+    avg_truncated_episodes: list[float] | None
+    avg_in_collision_episodes: list[float] | None
+    avg_episode_length_without_truncation_episodes: list[float] | None
 
 
 def parse_folder_name(folder_name: str) -> dict[str, Any]:
@@ -457,6 +511,8 @@ def _extract_per_task_episode_values(per_task: list[dict], metric_cfg: MetricCon
         for v in values:
             if isinstance(v, bool):
                 all_values.append(1.0 if v else 0.0)
+            elif v is None or (isinstance(v, float) and np.isnan(v)):
+                continue  # skip sentinel values (e.g. truncated episodes for episode_length_without_truncation)
             else:
                 all_values.append(float(v))
     return all_values if all_values else None
@@ -527,6 +583,7 @@ def load_eval_results(eval_folder: Path, training_base: Path | None = None) -> l
         # Also compute stds from per_task raw episode values.
         metric_values: dict[str, Any] = {}
         metric_stds: dict[str, Any] = {}
+        metric_episodes: dict[str, Any] = {}
         for m in METRICS:
             default = 0.0 if m.required else None
             per_task_mean, per_task_std = _compute_per_task_stats(per_task, m)
@@ -535,6 +592,7 @@ def load_eval_results(eval_folder: Path, training_base: Path | None = None) -> l
             else:
                 metric_values[m.name] = overall.get(m.name, default)
             metric_stds[f"{m.name}_std"] = per_task_std
+            metric_episodes[f"{m.name}_episodes"] = _extract_per_task_episode_values(per_task, m)
 
         result = EvalResult(
             folder_name=subdir.name,
@@ -551,6 +609,7 @@ def load_eval_results(eval_folder: Path, training_base: Path | None = None) -> l
             n_episodes=int(overall.get("n_episodes", 0)),
             **metric_values,
             **metric_stds,
+            **metric_episodes,
         )
         results.append(result)
 
@@ -578,11 +637,36 @@ def create_dataframe(results: list[EvalResult]) -> pd.DataFrame:
         for m in METRICS:
             row[m.name] = getattr(r, m.name)
             row[f"{m.name}_std"] = getattr(r, f"{m.name}_std")
+            row[f"{m.name}_episodes"] = getattr(r, f"{m.name}_episodes")
         data.append(row)
     return pd.DataFrame(data)
 
 
 CAMERA_ORDER = ["external", "wrist", "external+wrist"]
+
+# Fixed y-axis limits per metric for cross-run comparability.
+# (min, max) — None means use matplotlib auto-scaling for that metric.
+METRIC_YLIM: dict[str, tuple[float, float]] = {
+    "pc_success": (0, 100),
+    "avg_sum_reward": (0, 1),
+    "avg_max_reward": (0, 1),
+    "avg_episode_length": (0, 500),
+    "avg_episode_length_without_truncation": (0, 500),
+    "avg_truncated": (0, 1),
+    "avg_final_position_error_m": (0, 1.1),
+    "avg_position_error_m": (0, 1.1),
+    "avg_final_orientation_error_deg": (0, 200),
+    "avg_orientation_error_deg": (0, 200),
+    "avg_cam_looks_at_goal_score": (0, 150),
+    "avg_final_cam_looks_at_goal_score": (0, 150),
+    "avg_action_delta": (0, 1.0),
+    "avg_final_action_delta": (0, 1.0),
+    "avg_action_accel": (0, 0.5),
+    "avg_final_action_accel": (0, 0.5),
+    "avg_action_jerk": (0, 0.5),
+    "avg_final_action_jerk": (0, 0.5),
+    "avg_in_collision": (0, 500),
+}
 
 
 def get_metric_label(metric: str) -> str:
@@ -651,12 +735,10 @@ def compute_method_normalized_stats(
 
 
 def _pooled_std_for_group(group_df: pd.DataFrame, metric: str) -> float | None:
-    """Compute pooled std for a group of rows using their per-episode mean, std, and n_episodes.
+    """Compute pooled per-episode std for a group of rows (NOT divided by sqrt(N)).
 
-    Uses the combined variance formula:
-        var_total = (1/N) * sum_i(n_i * (var_i + (mean_i - grand_mean)^2))
-
-    Returns None if fewer than 2 total episodes across the group.
+    Use this if you want the spread of individual episodes rather than uncertainty of the mean.
+    For error bars on summary charts, prefer _pooled_sem_for_group instead.
     """
     std_col = f"{metric}_std"
     if std_col not in group_df.columns:
@@ -680,14 +762,70 @@ def _pooled_std_for_group(group_df: pd.DataFrame, metric: str) -> float | None:
     return float(np.sqrt(var_sum / total_n))
 
 
+def _wilson_ci_halfwidth(p_pct: float, n: int, z: float = 1.96) -> float:
+    """Wilson score interval half-width for a proportion, returned in percentage points.
+
+    p_pct: success rate in [0, 100]
+    n: number of episodes
+    z: z-score for desired confidence level (1.96 = 95%)
+    """
+    p = p_pct / 100.0
+    denom = 1 + z**2 / n
+    center = (p + z**2 / (2 * n)) / denom
+    half = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / denom
+    # Return symmetric half-width around the original mean (not the Wilson-adjusted center)
+    # so it can be used directly as yerr on the bar chart.
+    # We use the wider of the two asymmetric Wilson bounds as a conservative symmetric estimate.
+    lo = (center - half) * 100.0
+    hi = (center + half) * 100.0
+    return float(max(p_pct - lo, hi - p_pct))
+
+
+def _pooled_sem_for_group(group_df: pd.DataFrame, metric: str) -> float | None:
+    """Compute pooled SEM for a group of rows using their per-episode mean, std, and n_episodes.
+
+    For pc_success, uses Wilson score CI half-width instead of SEM (bounded, asymmetry-aware).
+    For other metrics, pools variance across runs then divides by sqrt(N) to get SEM.
+
+    Returns None if fewer than 2 total episodes across the group.
+    """
+    std_col = f"{metric}_std"
+    if std_col not in group_df.columns:
+        return None
+    rows = group_df[[metric, std_col, "n_episodes"]].dropna(subset=[metric])
+    if rows.empty:
+        return None
+    total_n = int(rows["n_episodes"].sum())
+    if total_n < 2:
+        return None
+
+    # For binary success metric, use Wilson CI half-width
+    if metric == "pc_success":
+        grand_mean = float((rows[metric] * rows["n_episodes"]).sum() / total_n)
+        return _wilson_ci_halfwidth(grand_mean, total_n)
+
+    grand_mean = (rows[metric] * rows["n_episodes"]).sum() / total_n
+    var_sum = 0.0
+    for _, row in rows.iterrows():
+        n_i = row["n_episodes"]
+        mean_i = row[metric]
+        std_i = row[std_col]
+        var_i = (
+            (std_i**2) if (std_i is not None and not (isinstance(std_i, float) and np.isnan(std_i))) else 0.0
+        )
+        var_sum += n_i * (var_i + (mean_i - grand_mean) ** 2)
+    pooled_std = np.sqrt(var_sum / total_n)
+    return float(pooled_std / np.sqrt(total_n))  # SEM
+
+
 def _compute_grouped_errorbars(
     df: pd.DataFrame, metric: str, groupby_col: str
 ) -> tuple[pd.Series, pd.Series]:
-    """Compute mean and pooled per-episode std for each group, returning aligned Series."""
+    """Compute mean and SEM (or Wilson CI for pc_success) for each group."""
     means = df.groupby(groupby_col)[metric].mean()
     stds_dict = {}
     for group_val, group_df in df.groupby(groupby_col):
-        stds_dict[group_val] = _pooled_std_for_group(group_df, metric)
+        stds_dict[group_val] = _pooled_sem_for_group(group_df, metric)
     stds = pd.Series(stds_dict).reindex(means.index)
     return means, stds
 
@@ -700,6 +838,18 @@ def _yerr_array(stds: pd.Series) -> np.ndarray | None:
         return None
     arr = np.where(np.isnan(arr), 0.0, arr)
     return arr
+
+
+_CI_NOTE = "Error bars: 95% Wilson CI"
+
+
+def _savefig(fig_or_path, path: Path, *, errorbars: bool = True, dpi: int = 150) -> None:
+    """Call tight_layout, optionally add CI note, save, and close the current figure."""
+    if errorbars:
+        plt.figtext(0.99, 0.01, _CI_NOTE, ha="right", va="bottom", fontsize=11, color="#666666")
+    plt.tight_layout()
+    plt.savefig(path, dpi=dpi)
+    plt.close()
 
 
 def _add_bar_labels(ax: plt.Axes, bars, values: np.ndarray, fontsize: int = 20) -> None:
@@ -747,9 +897,9 @@ def plot_metric_by_category(df: pd.DataFrame, metric: str, output_dir: Path, tit
     ax.set_ylabel(metric_label)
     ax.set_title(f"{metric_label} by Method{title_suffix}")
     _add_bar_labels(ax, bars, method_means.to_numpy())
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{metric}_by_method.png", dpi=150)
-    plt.close()
+    if metric in METRIC_YLIM:
+        ax.set_ylim(*METRIC_YLIM[metric])
+    _savefig(fig, output_dir / f"{metric}_by_method.png")
 
     # 2. Bar plot by dataset (method-normalized)
     df_with_dataset = df_valid[df_valid["dataset"].notna()]
@@ -774,9 +924,7 @@ def plot_metric_by_category(df: pd.DataFrame, metric: str, output_dir: Path, tit
             ax.set_xticks(range(len(dataset_means)))
             ax.set_xticklabels(dataset_means.index, rotation=10, ha="right", fontsize=16)
             _add_bar_labels(ax, bars, dataset_means.to_numpy(), fontsize=16)
-            plt.tight_layout()
-            plt.savefig(output_dir / f"{metric}_by_dataset.png", dpi=150)
-            plt.close()
+            _savefig(None, output_dir / f"{metric}_by_dataset.png")
 
     # 3. Bar plot by trajectory generation (method-normalized)
     _, ax = plt.subplots(figsize=(10, 6))
@@ -795,9 +943,9 @@ def plot_metric_by_category(df: pd.DataFrame, metric: str, output_dir: Path, tit
     ax.set_ylabel(metric_label)
     ax.set_title(f"{metric_label} by Trajectory Generation\n(method-normalized){title_suffix}")
     _add_bar_labels(ax, bars, traj_means.to_numpy())
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{metric}_by_trajectory_gen.png", dpi=150)
-    plt.close()
+    if metric in METRIC_YLIM:
+        ax.set_ylim(*METRIC_YLIM[metric])
+    _savefig(None, output_dir / f"{metric}_by_trajectory_gen.png")
 
     # 4. Bar plot by cameras (method-normalized)
     _, ax = plt.subplots(figsize=(10, 6))
@@ -817,9 +965,9 @@ def plot_metric_by_category(df: pd.DataFrame, metric: str, output_dir: Path, tit
     ax.set_ylabel(metric_label)
     ax.set_title(f"{metric_label} by Camera Config\n(method-normalized){title_suffix}")
     _add_bar_labels(ax, bars, cam_means.to_numpy())
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{metric}_by_cameras.png", dpi=150)
-    plt.close()
+    if metric in METRIC_YLIM:
+        ax.set_ylim(*METRIC_YLIM[metric])
+    _savefig(None, output_dir / f"{metric}_by_cameras.png")
 
     # 5. Grouped bar plot: method x trajectory_gen
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -833,7 +981,7 @@ def plot_metric_by_category(df: pd.DataFrame, metric: str, output_dir: Path, tit
         yerr_vals = []
         for traj in pivot.index:
             cell_df = df_valid[(df_valid["trajectory_gen"] == traj) & (df_valid["method"] == method)]
-            yerr_vals.append(_pooled_std_for_group(cell_df, metric) or 0.0)
+            yerr_vals.append(_pooled_sem_for_group(cell_df, metric) or 0.0)
         yerr_arr = np.array(yerr_vals)
         has_errs = yerr_arr.any()
         bars_group = ax.bar(
@@ -865,9 +1013,9 @@ def plot_metric_by_category(df: pd.DataFrame, metric: str, output_dir: Path, tit
     ax.set_xticks(x)
     ax.set_xticklabels(pivot.index, rotation=45)
     ax.legend(title="Method")
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{metric}_by_traj_and_method.png", dpi=150)
-    plt.close()
+    if metric in METRIC_YLIM:
+        ax.set_ylim(*METRIC_YLIM[metric])
+    _savefig(fig, output_dir / f"{metric}_by_traj_and_method.png")
 
     # 6. Grouped bar plot: method x cameras
     fig, ax = plt.subplots(figsize=(12, 6.6))
@@ -882,7 +1030,7 @@ def plot_metric_by_category(df: pd.DataFrame, metric: str, output_dir: Path, tit
         yerr_vals = []
         for cam in pivot.index:
             cell_df = df_valid[(df_valid["cameras"] == cam) & (df_valid["method"] == method)]
-            yerr_vals.append(_pooled_std_for_group(cell_df, metric) or 0.0)
+            yerr_vals.append(_pooled_sem_for_group(cell_df, metric) or 0.0)
         yerr_arr = np.array(yerr_vals)
         has_errs = yerr_arr.any()
         cam_bars = ax.bar(
@@ -914,9 +1062,240 @@ def plot_metric_by_category(df: pd.DataFrame, metric: str, output_dir: Path, tit
     ax.set_xticks(x)
     ax.set_xticklabels(pivot.index, rotation=45)
     ax.legend(title="Method")
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{metric}_by_cameras_and_method.png", dpi=150)
-    plt.close()
+    if metric in METRIC_YLIM:
+        ax.set_ylim(*METRIC_YLIM[metric])
+    _savefig(fig, output_dir / f"{metric}_by_cameras_and_method.png")
+
+
+def _collect_episodes_by_group(
+    df: pd.DataFrame, metric: str, groupby_col: str
+) -> tuple[list[str], list[list[float]]]:
+    """Return (group_labels, list_of_episode_arrays) grouped by groupby_col."""
+    eps_col = f"{metric}_episodes"
+    labels = []
+    episode_lists = []
+    for group_val, group_df in df.groupby(groupby_col):
+        episodes: list[float] = []
+        if eps_col in group_df.columns:
+            for val in group_df[eps_col]:
+                if val is not None:
+                    episodes.extend(val)
+        labels.append(str(group_val))
+        episode_lists.append(episodes)
+    return labels, episode_lists
+
+
+def _draw_boxplot(
+    ax,
+    labels: list[str],
+    episode_lists: list[list[float]],
+    metric_label: str,
+    xlabel: str,
+    title: str,
+    rotation: int = 0,
+    metric: str | None = None,
+) -> None:
+    """Draw a boxplot with overlaid jittered data points."""
+    # Filter out empty groups
+    pairs = [(lb, e) for lb, e in zip(labels, episode_lists, strict=False) if e]
+    if not pairs:
+        ax.set_title(title + "\n(no data)")
+        return
+    labels_clean, episode_lists_clean = zip(*pairs, strict=False)
+
+    ax.boxplot(
+        episode_lists_clean,
+        tick_labels=labels_clean,
+        patch_artist=True,
+        medianprops={"color": "black", "linewidth": 2},
+        boxprops={"facecolor": "#a8c8e8", "alpha": 0.7},
+        whiskerprops={"linewidth": 1.5},
+        capprops={"linewidth": 1.5},
+    )
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(metric_label)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3, axis="y")
+    if metric and metric in METRIC_YLIM:
+        ax.set_ylim(*METRIC_YLIM[metric])
+    if rotation:
+        ax.set_xticklabels(labels_clean, rotation=rotation, ha="right")
+
+
+def _plot_grouped_boxplot_by_category(
+    df: pd.DataFrame,
+    metric: str,
+    metric_label: str,
+    methods: list[str],
+    categories: list[str],
+    category_col: str,
+    *,
+    group_label: str,
+    title: str,
+    out_path: Path,
+) -> None:
+    """Single figure: groups = categories (traj or camera), boxes per group = methods.
+
+    Groups are spaced with a gap between them (no visible border). Shared y-axis.
+    """
+    eps_col = f"{metric}_episodes"
+    n_methods = len(methods)
+    n_cats = len(categories)
+    if n_cats == 0 or n_methods == 0:
+        return
+
+    method_colors = ["#3498db", "#e74c3c", "#2ecc71", "#9b59b6", "#f39c12"]
+
+    # Box width and intra-group spacing
+    width = 0.7 / max(n_methods, 1)
+    group_gap = 1.5  # gap between category groups (in position units)
+
+    # Assign x positions: each category group is centered, with group_gap between groups
+    group_centers = np.arange(n_cats) * (1.0 + group_gap)
+
+    all_positions: list[float] = []
+    all_data: list[list[float]] = []
+    all_colors: list[str] = []
+
+    for gi, cat in enumerate(categories):
+        cat_df = df[df[category_col] == cat]
+        for mi, method in enumerate(methods):
+            cell_df = cat_df[cat_df["method"] == method]
+            episodes: list[float] = []
+            for val in cell_df[eps_col]:
+                if val is not None:
+                    episodes.extend(v for v in val if not (isinstance(v, float) and np.isnan(v)))
+            offset = (mi - (n_methods - 1) / 2) * width
+            all_positions.append(float(group_centers[gi]) + offset)
+            all_data.append(episodes)
+            all_colors.append(method_colors[mi % len(method_colors)])
+
+    # Filter empty boxes
+    nonempty = [(p, d, c) for p, d, c in zip(all_positions, all_data, all_colors, strict=False) if d]
+    if not nonempty:
+        return
+    positions_clean, data_clean, colors_clean = zip(*nonempty, strict=False)
+
+    fig, ax = plt.subplots(figsize=(max(8, 2.5 * n_cats * n_methods), 6))
+    bp = ax.boxplot(
+        data_clean,
+        positions=positions_clean,
+        widths=width * 0.85,
+        patch_artist=True,
+        medianprops={"color": "black", "linewidth": 2},
+        whiskerprops={"linewidth": 1.5},
+        capprops={"linewidth": 1.5},
+        manage_ticks=False,
+    )
+    for patch, color in zip(bp["boxes"], colors_clean, strict=False):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.7)
+
+    ax.set_xticks(group_centers)
+    ax.set_xticklabels(categories)
+    ax.set_xlabel(group_label)
+    ax.set_ylabel(metric_label)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3, axis="y")
+    if metric in METRIC_YLIM:
+        ax.set_ylim(*METRIC_YLIM[metric])
+
+    legend_handles = [
+        mpatches.Patch(facecolor=method_colors[i % len(method_colors)], alpha=0.7, label=m)
+        for i, m in enumerate(methods)
+    ]
+    ax.legend(handles=legend_handles, title="Method")
+    _savefig(fig, out_path, errorbars=False)
+
+
+def plot_metric_boxplots_by_category(df: pd.DataFrame, metric: str, output_dir: Path, title_suffix: str = ""):
+    """Create box plots (with jittered points) for a metric grouped by different categories."""
+    df_valid = df[df[metric].notna()].copy()
+    if df_valid.empty:
+        return
+    eps_col = f"{metric}_episodes"
+    if eps_col not in df_valid.columns:
+        return
+    # Skip if no episode data at all
+    if not any(v is not None and len(v) > 0 for v in df_valid[eps_col]):
+        return
+
+    metric_label = get_metric_label(metric)
+
+    # 1. By method
+    fig, ax = plt.subplots(figsize=(10, 6))
+    labels, episode_lists = _collect_episodes_by_group(df_valid, metric, "method")
+    _draw_boxplot(
+        ax,
+        labels,
+        episode_lists,
+        metric_label,
+        "Method",
+        f"{metric_label} by Method{title_suffix}",
+        metric=metric,
+    )
+    _savefig(fig, output_dir / f"{metric}_by_method.png", errorbars=False)
+
+    # 2. By trajectory generation
+    fig, ax = plt.subplots(figsize=(10, 6))
+    labels, episode_lists = _collect_episodes_by_group(df_valid, metric, "trajectory_gen")
+    _draw_boxplot(
+        ax,
+        labels,
+        episode_lists,
+        metric_label,
+        "Trajectory Generation",
+        f"{metric_label} by Trajectory Generation{title_suffix}",
+        metric=metric,
+    )
+    _savefig(fig, output_dir / f"{metric}_by_trajectory_gen.png", errorbars=False)
+
+    # 3. By cameras
+    fig, ax = plt.subplots(figsize=(10, 6))
+    # Preserve CAMERA_ORDER
+    cam_groups = dict(zip(*_collect_episodes_by_group(df_valid, metric, "cameras"), strict=False))
+    cam_labels = [c for c in CAMERA_ORDER if c in cam_groups]
+    cam_episodes = [cam_groups[c] for c in cam_labels]
+    _draw_boxplot(
+        ax,
+        cam_labels,
+        cam_episodes,
+        metric_label,
+        "Cameras",
+        f"{metric_label} by Camera Config{title_suffix}",
+        metric=metric,
+    )
+    _savefig(fig, output_dir / f"{metric}_by_cameras.png", errorbars=False)
+
+    # 4. By method x trajectory_gen — grouped by traj, methods side-by-side, shared y-axis
+    methods = sorted(df_valid["method"].unique())
+    trajs = [t for t in TRAJECTORY_ORDER if t in df_valid["trajectory_gen"].unique()]
+    _plot_grouped_boxplot_by_category(
+        df_valid,
+        metric,
+        metric_label,
+        methods,
+        trajs,
+        "trajectory_gen",
+        group_label="Trajectory Generation",
+        title=f"{metric_label} by Method × Trajectory Gen{title_suffix}",
+        out_path=output_dir / f"{metric}_by_method_traj.png",
+    )
+
+    # 5. By method x cameras — grouped by camera, methods side-by-side, shared y-axis
+    cams = [c for c in CAMERA_ORDER if c in df_valid["cameras"].unique()]
+    _plot_grouped_boxplot_by_category(
+        df_valid,
+        metric,
+        metric_label,
+        methods,
+        cams,
+        "cameras",
+        group_label="Camera Config",
+        title=f"{metric_label} by Method × Camera Config{title_suffix}",
+        out_path=output_dir / f"{metric}_by_method_cameras.png",
+    )
 
 
 def plot_metric_over_checkpoints(df: pd.DataFrame, metric: str, output_dir: Path, title_suffix: str = ""):
@@ -946,10 +1325,8 @@ def plot_metric_over_checkpoints(df: pd.DataFrame, metric: str, output_dir: Path
         ax.set_title(f"{metric_label}\nover Checkpoints — {method}{title_suffix}")
         ax.legend(fontsize=8, loc="best")
         ax.set_xscale("log")
-        plt.tight_layout()
         method_slug = method.replace(".", "").replace(" ", "_").lower()
-        plt.savefig(output_dir / f"{metric}_over_checkpoints_{method_slug}.png", dpi=150)
-        plt.close()
+        _savefig(fig, output_dir / f"{metric}_over_checkpoints_{method_slug}.png", errorbars=False)
 
 
 def plot_heatmap(df: pd.DataFrame, metric: str, output_dir: Path):
@@ -1001,9 +1378,7 @@ def plot_heatmap(df: pd.DataFrame, metric: str, output_dir: Path):
                 )
 
     ax.set_title(f"{metric_label} Heatmap")
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{metric}_heatmap.png", dpi=150)
-    plt.close()
+    _savefig(fig, output_dir / f"{metric}_heatmap.png", errorbars=False)
 
 
 def plot_success_rate_comparison(df: pd.DataFrame, output_dir: Path):
@@ -1060,9 +1435,7 @@ def plot_success_rate_comparison(df: pd.DataFrame, output_dir: Path):
     ax.set_title("Top 15 Configurations by Success Rate")
     ax.invert_yaxis()
 
-    plt.tight_layout()
-    plt.savefig(output_dir / "success_rate_comparison.png", dpi=150)
-    plt.close()
+    _savefig(fig, output_dir / "success_rate_comparison.png", errorbars=False)
 
 
 TRAJECTORY_ORDER = ["1st RRT", "5th RRT"]
@@ -1110,70 +1483,128 @@ def plot_metric_by_method(df: pd.DataFrame, metric: str, output_dir: Path):
     # Add headroom for error bars (20% padding)
     y_limit = max_y_value * 1.20
 
+    use_boxplot = metric in BOXPLOT_METRIC_NAMES
+    eps_col = f"{metric}_episodes"
+
     # Second pass: create the plots with consistent y-axis and x-axis categories
     for method, grouped in grouped_data.items():
         # Reindex to have consistent categories (missing ones will be NaN)
         grouped = grouped.reindex(index=consistent_cameras, columns=consistent_trajectories)
+        method_df = df_valid[df_valid["method"] == method]
+        safe_method = method.replace(".", "").replace(" ", "_")
 
-        # Create the plot
         _, ax = plt.subplots(figsize=(10, 6))
-
-        x = np.arange(len(grouped.index))
-        width = 0.35
-        n_traj = len(grouped.columns)
-
         colors = ["#3498db", "#e74c3c"]  # Blue for 1st RRT, Red for 5th RRT
 
-        for i, traj in enumerate(grouped.columns):
-            offset = (i - (n_traj - 1) / 2) * width
-            # Replace NaN with 0 for plotting (will show as no bar)
-            values = grouped[traj].fillna(0).to_numpy()
-            # Compute per-cell pooled std (camera x trajectory)
-            method_df = df_valid[df_valid["method"] == method]
-            yerr_vals = []
-            for cam in grouped.index:
-                cell_df = method_df[(method_df["cameras"] == cam) & (method_df["trajectory_gen"] == traj)]
-                yerr_vals.append(_pooled_std_for_group(cell_df, metric) or 0.0)
-            yerr_arr = np.array(yerr_vals)
-            has_errs = yerr_arr.any()
-            bars = ax.bar(
-                x + offset,
-                values,
-                width,
-                label=traj,
-                color=colors[i % len(colors)],
-                yerr=yerr_arr if has_errs else None,
-                capsize=4,
-                error_kw={"ecolor": "#888888", "elinewidth": 1.5} if has_errs else {},
-            )
-            _add_bar_labels(ax, bars, values, fontsize=13)
-            # Add "N/A" for missing data
-            for j, original_value in enumerate(grouped[traj]):
-                if pd.isna(original_value):
-                    ax.text(
-                        x[j] + offset,
-                        0,
-                        "N/A",
-                        ha="center",
-                        va="bottom",
-                        fontsize=14,
-                        color="gray",
-                        style="italic",
-                    )
+        has_episode_data = (
+            eps_col in df_valid.columns
+            and df_valid[eps_col].apply(lambda v: v is not None and len(v) > 0).any()
+        )
+        if use_boxplot and has_episode_data:
+            # Grouped boxplot: one box per (camera, traj) cell, grouped by camera on x-axis
+            n_traj = len(consistent_trajectories)
+            width = 0.8 / max(n_traj, 1)
+            positions_map: dict[tuple[str, str], float] = {}
+            x = np.arange(len(consistent_cameras))
+            for i, traj in enumerate(consistent_trajectories):
+                offset = (i - (n_traj - 1) / 2) * width
+                for j, cam in enumerate(consistent_cameras):
+                    positions_map[(cam, traj)] = x[j] + offset
 
-        ax.set_xlabel("Camera Config")
-        ax.set_ylabel(metric_label)
-        ax.set_title(f"{metric_label} - {method}")
-        ax.set_xticks(x)
-        ax.set_xticklabels(grouped.index)
-        ax.set_ylim(0, y_limit)  # Set consistent y-axis range
-        ax.legend(title="Trajectory Gen")
-        ax.grid(True, alpha=0.3, axis="y")
+            # Collect episode data per cell and draw boxplots
+            all_positions = []
+            all_data = []
+            all_colors = []
+            for i, traj in enumerate(consistent_trajectories):
+                for _j, cam in enumerate(consistent_cameras):
+                    cell_df = method_df[(method_df["cameras"] == cam) & (method_df["trajectory_gen"] == traj)]
+                    episodes: list[float] = []
+                    for val in cell_df[eps_col]:
+                        if val is not None:
+                            episodes.extend(val)
+                    if episodes:
+                        all_positions.append(positions_map[(cam, traj)])
+                        all_data.append(episodes)
+                        all_colors.append(colors[i % len(colors)])
 
-        plt.tight_layout()
-        safe_method = method.replace(".", "").replace(" ", "_")
-        plt.savefig(output_dir / f"{metric}_by_camera_traj_{safe_method}.png", dpi=150)
-        plt.close()
+            if all_data:
+                bp = ax.boxplot(
+                    all_data,
+                    positions=all_positions,
+                    widths=width * 0.85,
+                    patch_artist=True,
+                    medianprops={"color": "black", "linewidth": 2},
+                    whiskerprops={"linewidth": 1.5},
+                    capprops={"linewidth": 1.5},
+                    manage_ticks=False,
+                )
+                for patch, color in zip(bp["boxes"], all_colors, strict=False):
+                    patch.set_facecolor(color)
+                    patch.set_alpha(0.7)
+
+            # Legend proxies
+            legend_handles = [
+                mpatches.Patch(facecolor=colors[i % len(colors)], alpha=0.7, label=traj)
+                for i, traj in enumerate(consistent_trajectories)
+            ]
+            ax.legend(handles=legend_handles, title="Trajectory Gen")
+            ax.set_xticks(x)
+            ax.set_xticklabels(consistent_cameras)
+            ax.grid(True, alpha=0.3, axis="y")
+            ax.set_xlabel("Camera Config")
+            ax.set_ylabel(metric_label)
+            ax.set_title(f"{metric_label} - {method}")
+            if metric in METRIC_YLIM:
+                ax.set_ylim(*METRIC_YLIM[metric])
+            _savefig(None, output_dir / f"{metric}_by_camera_traj_{safe_method}.png", errorbars=False)
+
+        else:
+            x = np.arange(len(grouped.index))
+            width = 0.35
+            n_traj = len(grouped.columns)
+
+            for i, traj in enumerate(grouped.columns):
+                offset = (i - (n_traj - 1) / 2) * width
+                values = grouped[traj].fillna(0).to_numpy()
+                yerr_vals = []
+                for cam in grouped.index:
+                    cell_df = method_df[(method_df["cameras"] == cam) & (method_df["trajectory_gen"] == traj)]
+                    yerr_vals.append(_pooled_sem_for_group(cell_df, metric) or 0.0)
+                yerr_arr = np.array(yerr_vals)
+                has_errs = yerr_arr.any()
+                bars = ax.bar(
+                    x + offset,
+                    values,
+                    width,
+                    label=traj,
+                    color=colors[i % len(colors)],
+                    yerr=yerr_arr if has_errs else None,
+                    capsize=4,
+                    error_kw={"ecolor": "#888888", "elinewidth": 1.5} if has_errs else {},
+                )
+                _add_bar_labels(ax, bars, values, fontsize=13)
+                for j, original_value in enumerate(grouped[traj]):
+                    if pd.isna(original_value):
+                        ax.text(
+                            x[j] + offset,
+                            0,
+                            "N/A",
+                            ha="center",
+                            va="bottom",
+                            fontsize=14,
+                            color="gray",
+                            style="italic",
+                        )
+
+            ax.set_xticks(x)
+            ax.set_xticklabels(grouped.index)
+            ax.set_ylim(*METRIC_YLIM[metric]) if metric in METRIC_YLIM else ax.set_ylim(0, y_limit)
+            ax.legend(title="Trajectory Gen")
+            ax.grid(True, alpha=0.3, axis="y")
+            ax.set_xlabel("Camera Config")
+            ax.set_ylabel(metric_label)
+            ax.set_title(f"{metric_label} - {method}")
+            _savefig(None, output_dir / f"{metric}_by_camera_traj_{safe_method}.png")
 
 
 def compile_best_checkpoint_videos(df: pd.DataFrame, eval_folder: Path, output_dir: Path) -> None:
@@ -1424,7 +1855,10 @@ def main():
 
     for metric in PLOT_METRICS:
         df_best = select_best_checkpoint_per_experiment(df, metric)
-        plot_metric_by_category(df_best, metric, output_dir)
+        if metric in BOXPLOT_METRIC_NAMES:
+            plot_metric_boxplots_by_category(df_best, metric, output_dir)
+        else:
+            plot_metric_by_category(df_best, metric, output_dir)
         plot_heatmap(df_best, metric, output_dir)
         plot_metric_by_method(df_best, metric, output_dir)
         # Line plot uses ALL checkpoints to show progression
@@ -1433,7 +1867,10 @@ def main():
     for metric in OPTIONAL_PLOT_METRICS:
         if df[metric].notna().any():
             df_best = select_best_checkpoint_per_experiment(df, metric)
-            plot_metric_by_category(df_best, metric, output_dir)
+            if metric in BOXPLOT_METRIC_NAMES:
+                plot_metric_boxplots_by_category(df_best, metric, output_dir)
+            else:
+                plot_metric_by_category(df_best, metric, output_dir)
             plot_heatmap(df_best, metric, output_dir)
             plot_metric_by_method(df_best, metric, output_dir)
             plot_metric_over_checkpoints(df, metric, output_dir)
@@ -1456,10 +1893,34 @@ def main():
     print("\nCompiling best-checkpoint eval videos...")
     compile_best_checkpoint_videos(df, eval_folder, output_dir)
 
+    # Warn if any metric's observed range falls outside its fixed ylim
+    ylim_warnings = []
+    for metric, (ymin, ymax) in METRIC_YLIM.items():
+        if metric not in df.columns:
+            continue
+        col = df[metric].dropna()
+        if col.empty:
+            continue
+        obs_min, obs_max = float(col.min()), float(col.max())
+        # Also check per-episode values (used in boxplots — can exceed the aggregated mean range)
+        eps_col = f"{metric}_episodes"
+        if eps_col in df.columns:
+            for val in df[eps_col]:
+                if val is not None:
+                    for v in val:
+                        if not (isinstance(v, float) and np.isnan(v)):
+                            obs_min = min(obs_min, float(v))
+                            obs_max = max(obs_max, float(v))
+        if obs_min < ymin or obs_max > ymax:
+            ylim_warnings.append(
+                f"  {metric}: data [{obs_min:.4g}, {obs_max:.4g}]  ylim [{ymin:.4g}, {ymax:.4g}]"
+            )
+    if ylim_warnings:
+        print("\nWARNING: metric values fall outside fixed ylim — update METRIC_YLIM:")
+        for w in ylim_warnings:
+            print(w)
+
     print(f"\nPlots saved to: {output_dir}")
-    print("Generated files:")
-    for f in sorted(output_dir.iterdir()):
-        print(f"  - {f.name}")
 
     return 0
 

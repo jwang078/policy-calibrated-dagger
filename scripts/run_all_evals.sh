@@ -12,8 +12,11 @@
 DRY_RUN=false
 LIST_ONLY=false
 FIRST_ONLY=false
-for arg in "$@"; do
-    case $arg in
+LAST_ONLY=false
+N_EPISODES=5  # Default value
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
         --dry-run)
             DRY_RUN=true
             shift
@@ -25,6 +28,17 @@ for arg in "$@"; do
         --first-only)
             FIRST_ONLY=true
             shift
+            ;;
+        --last-only)
+            LAST_ONLY=true
+            shift
+            ;;
+        --n-episodes)
+            N_EPISODES="$2"
+            shift 2
+            ;;
+        *)
+            shift # Ignore unknown arguments or handle as needed
             ;;
     esac
 done
@@ -65,6 +79,22 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
     done
 
     echo "  - $exp_name ($checkpoint_count checkpoints)"
+
+    # If last only, don't count all checkpoints, just 1
+    if [ "$LAST_ONLY" = true ]; then
+        checkpoint_count=1
+        echo "    (will evaluate only the last checkpoint due to --last-only flag)"
+    fi
+    # If first only, also just count 1
+    if [ "$FIRST_ONLY" = true ]; then
+        checkpoint_count=1
+        echo "    (will evaluate only the first checkpoint due to --first-only flag)"
+    fi
+    # If both first and last only, then throw an error because that can't be true
+    if [ "$FIRST_ONLY" = true ] && [ "$LAST_ONLY" = true ]; then
+        echo "Error: --first-only and --last-only flags cannot both be true"
+        exit 1
+    fi
     ((eval_count += checkpoint_count))
 done
 
@@ -238,6 +268,12 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
             continue
         fi
 
+        # In --last-only mode, skip all but the last real checkpoint per experiment
+        if [ "$LAST_ONLY" = true ] && [ "$checkpoint_name" != "$last_numerical" ]; then
+            echo "Skipping $checkpoint_name (--last-only mode)"
+            continue
+        fi
+
         policy_path="$checkpoint_dir/pretrained_model"
 
         # Check if pretrained_model exists
@@ -269,7 +305,7 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
             --env.image_resize_modes='$image_resize_modes' \\
             --env.fps=30 \\
             --policy.path=$policy_path \\
-            --eval.n_episodes=5 \\
+            --eval.n_episodes=$N_EPISODES \\
             --output_dir=$eval_subdir \\
             --eval.batch_size=1 \\
             --eval.use_async_envs=false \\
@@ -317,8 +353,8 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
             echo "GPU memory usage after eval:"
             nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader
             # Kill any orphaned pybullet/python processes that might hold GPU memory
-            echo "Pausing for 15 seconds..."
-            sleep 15
+            echo "Pausing for 5 seconds..."
+            sleep 5
             echo "GPU memory usage after pause:"
             nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader
         fi

@@ -29,7 +29,9 @@ def get_video_info(video_path):
     return width, height, fps, frame_count
 
 
-def concat_videos_horizontal(input_folder, output_folder=None, output_filename="combined.mp4"):
+def concat_videos_horizontal(
+    input_folder, output_folder=None, output_filename="combined.mp4", max_videos=None
+):
     """
     Concatenate all videos in input_folder horizontally.
 
@@ -48,6 +50,8 @@ def concat_videos_horizontal(input_folder, output_folder=None, output_filename="
 
     # Sort for consistent ordering
     video_files = sorted(video_files)
+    if max_videos is not None:
+        video_files = video_files[:max_videos]
 
     if not video_files:
         raise ValueError(f"No video files found in {input_folder}")
@@ -66,17 +70,13 @@ def concat_videos_horizontal(input_folder, output_folder=None, output_filename="
     # Use the fps from the first video (assume all are same)
     output_fps = video_infos[0]["fps"]
 
-    # Find max frame count and target height (use max height for quality)
+    # Each video is resized to target_width, preserving aspect ratio
+    target_width = 224
     max_frames = max(vi["frame_count"] for vi in video_infos)
-    target_height = max(vi["height"] for vi in video_infos)
+    scaled_heights = [int(vi["height"] * target_width / vi["width"]) for vi in video_infos]
+    target_height = max(scaled_heights)  # pad shorter videos vertically if aspect ratios differ
 
-    # Calculate scaled widths to maintain aspect ratio
-    scaled_widths = []
-    for vi in video_infos:
-        scale = target_height / vi["height"]
-        scaled_widths.append(int(vi["width"] * scale))
-
-    total_width = sum(scaled_widths)
+    total_width = target_width * len(video_infos)
 
     print(f"\nOutput: {total_width}x{target_height}, {output_fps} fps, {max_frames} frames")
 
@@ -102,23 +102,26 @@ def concat_videos_horizontal(input_folder, output_folder=None, output_filename="
 
         frames_row = []
 
-        for i, (cap, vi, scaled_w) in enumerate(zip(caps, video_infos, scaled_widths, strict=True)):
+        for i, (cap, vi, scaled_h) in enumerate(zip(caps, video_infos, scaled_heights, strict=True)):
             ret, frame = cap.read()
 
             if ret:
-                # Successfully read a frame
                 last_frames[i] = frame
             else:
-                # Video ended, use last frame (freeze frame)
                 frame = last_frames[i]
 
             if frame is None:
-                # Fallback: create black frame if no frame available
                 frame = np.zeros((vi["height"], vi["width"], 3), dtype=np.uint8)
                 last_frames[i] = frame
 
-            # Resize to target height while maintaining aspect ratio
-            resized = cv2.resize(frame, (scaled_w, target_height))
+            # Resize to target_width x scaled_h (preserves aspect ratio)
+            resized = cv2.resize(frame, (target_width, scaled_h))
+
+            # Pad vertically with black if this video is shorter than target_height
+            if scaled_h < target_height:
+                pad = np.zeros((target_height - scaled_h, target_width, 3), dtype=np.uint8)
+                resized = np.vstack([resized, pad])
+
             frames_row.append(resized)
 
         # Concatenate horizontally
@@ -150,10 +153,25 @@ def main():
     parser.add_argument(
         "-n", "--output-name", default="combined.mp4", help="Output filename (default: combined.mp4)"
     )
+    parser.add_argument(
+        "-m",
+        "--max-videos",
+        type=int,
+        default=None,
+        help="Maximum number of videos to include (default: all)",
+    )
 
     args = parser.parse_args()
 
-    concat_videos_horizontal(args.input_folder, args.output_folder, args.output_name)
+    # Default output name to the input folder's grandparent (the training run folder)
+    if args.output_name == "combined.mp4" and args.output_folder is None:
+        output_name = Path(args.input_folder).parent.parent.name + ".mp4"
+    elif args.output_name == "combined.mp4":
+        output_name = Path(args.output_folder).name + ".mp4"
+    else:
+        output_name = args.output_name
+
+    concat_videos_horizontal(args.input_folder, args.output_folder, output_name, args.max_videos)
 
 
 if __name__ == "__main__":

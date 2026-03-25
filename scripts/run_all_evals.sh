@@ -3,7 +3,7 @@
 # Script to run lerobot-eval on all policy checkpoints
 # Handles diffusion_approach_lever_* and pi05_training_approach_lever_* folders
 #
-# Usage: ./run_all_evals.sh [--dry-run] [--list] [--first-only]
+# Usage: ./run_all_evals.sh [--dry-run] [--list] [--first-only] [--n-episodes int]
 #   --dry-run:    Show commands without executing them
 #   --list:       Only list experiments and checkpoints to evaluate, then exit
 #   --first-only: Only evaluate the first checkpoint per experiment (for debugging)

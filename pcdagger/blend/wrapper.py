@@ -32,11 +32,13 @@ import numpy as np
 import pybullet as p
 import torch
 from scipy.spatial.transform import Rotation
+from splatsim.configs.env_config import SplatObjectConfig
+from splatsim.utils.paths import resolve_splatsim_path
 from torch import Tensor, nn
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.processor import PolicyProcessorPipeline
+from lerobot.processor import PolicyAction, PolicyProcessorPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +115,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         inner_policy: PreTrainedPolicy,
         inverse_postprocessor: PolicyProcessorPipeline,
         postprocessor: PolicyProcessorPipeline,
-        inverse_preprocessor: PolicyProcessorPipeline | None,
+        inverse_preprocessor: PolicyProcessorPipeline,
         forward_flow_ratio: float,
         show_slider: bool = True,
         robot_name: str = "robot_iphone_w_engine_new",
@@ -122,14 +124,14 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
     ):
         # Bypass PreTrainedPolicy.__init__ — we proxy the inner policy's config
         nn.Module.__init__(self)
-        self.config = inner_policy.config
+        self.config: PreTrainedConfig = inner_policy.config
         self.inner_policy = inner_policy
         self.inverse_postprocessor = inverse_postprocessor
         self.postprocessor = postprocessor  # normalized → raw joints
         self.inverse_preprocessor = inverse_preprocessor  # normalized obs.state → raw joints
         self.forward_flow_ratio = forward_flow_ratio
-        self._last_action: Tensor | None = None
         self._had_guidance_last_step: bool = False
+        self._desired_q: np.ndarray | None = None  # raw joint-space IK seed [num_dofs]
 
         # Wrapper-managed blended chunk buffer
         self._guided_chunk: Tensor | None = None  # [B, n_action_steps, action_dim]
@@ -141,9 +143,6 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         logger.info(f"SharedAutonomyPolicyWrapper: ratio={forward_flow_ratio}, robot={robot_name}")
 
         # Load pybullet DIRECT client for FK+IK (same pattern as KeyboardInterfaceAgent)
-        from splatsim.configs.env_config import SplatObjectConfig
-        from splatsim.utils.paths import resolve_splatsim_path
-
         robot_config = SplatObjectConfig(name="robot", splat_name=robot_name)
         urdf_path = resolve_splatsim_path(robot_config.urdf_path)
         ee_link_name = robot_config.wrist_camera_link_name
@@ -178,8 +177,11 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         )
         return np.array(state[4]), np.array(state[5])  # pos, quat (xyzw)
 
-    def _compute_next_joints(self, q: np.ndarray, delta_pos: np.ndarray, delta_rot: np.ndarray) -> np.ndarray:
+    def _compute_next_joints(self, q: np.ndarray, delta_pos: np.ndarray, delta_rot: np.ndarray) -> Tensor:
+        q = q[: self.num_dofs]  # crop out the gripper
+
         self._sync_joints(q)
+
         pos, quat = self._get_ee_pose()
         r_current = Rotation.from_quat(quat)
         target_pos = pos + r_current.apply(delta_pos)
@@ -202,9 +204,10 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             physicsClientId=self._pb_client,
         )
         q_ik = np.array(joint_poses[: self.num_dofs])
-        if np.max(np.abs(q_ik - q)) > 0.15:
-            return q  # reject singularity / far branch
-        delta_q = np.clip(q_ik - q, -self._max_joint_delta, self._max_joint_delta)
+        # if np.max(np.abs(q_ik - q)) > 0.15:
+        #     return q  # reject singularity / far branch
+        # delta_q = np.clip(q_ik - q, -self._max_joint_delta, self._max_joint_delta)
+        delta_q = q_ik - q
         return q + delta_q
 
     # ---- policy helpers ---------------------------------------------------- #
@@ -233,7 +236,8 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 f"Offending dims (indices): {bad_dims.tolist()}. "
                 f"Values: {normalized[out_of_range].tolist()}. Clamping to [-2, 2]."
             )
-            normalized = normalized.clamp(-2.0, 2.0)
+            print("TEMP not clamping")
+            # normalized = normalized.clamp(-2.0, 2.0)
         return normalized
 
     def _build_guidance_noise_from_chunk(
@@ -292,11 +296,15 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             t_sw = int(ratio * noise_scheduler.config.num_train_timesteps)
             t_tensor = torch.full((batch_size,), t_sw, dtype=torch.long, device=device)
             x_tsw = noise_scheduler.add_noise(full_guidance, full_noise, t_tensor)
-            return x_tsw, ratio
+            return x_tsw
 
         # --- Flow matching (PI0.5) path ---
         if getattr(self.config, "max_action_dim", None) is None:
-            return None  # policy doesn't expose needed config
+            # policy doesn't expose needed config
+            raise NotImplementedError(
+                "Inner policy does not support noise injection for guided execution. "
+                "Please use a compatible policy (e.g. diffusion with noise_scheduler, or flow model with max_action_dim) or set forward_flow_ratio=1.0 for pure policy control."
+            )
         # sample_actions expects (batch_size, chunk_size, max_action_dim). If n_action_steps < chunk_size,
         # pad guidance to chunk_size with repeated boundary values for a coherent sequence.
         chunk_size = self.config.chunk_size
@@ -311,13 +319,13 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             guidance_chunk = full_guidance
         noise = torch.randn_like(guidance_chunk)
         x_tsw = ratio * noise + (1.0 - ratio) * guidance_chunk
-        return x_tsw, ratio
+        return x_tsw
 
     def reset(self):
         self._guided_chunk = None
         self._chunk_step = 0
-        self._last_action = None
         self._had_guidance_last_step = False
+        self._desired_q = None
         return self.inner_policy.reset()
 
     @torch.no_grad()
@@ -325,140 +333,149 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         return self.inner_policy.predict_action_chunk(batch, **kwargs)
 
     @torch.no_grad()
+    def get_hold_action(self, inner_action: Tensor) -> Tensor:
+        assert self._desired_q is not None
+        return torch.stack([self.inverse_postprocessor(PolicyAction(q)) for q in self._desired_q])
+        # if self._desired_q is not None:
+        #     # Rebuild action from _desired_q so we hold the exact last commanded position
+        #     raw_action = torch.tensor(
+        #         np.concatenate([self._desired_q, [0.0]]),  # gripper from last action
+        #         dtype=inner_action.dtype, device=inner_action.device,
+        #     ).unsqueeze(0)
+        #     if self._last_action is not None:
+        #         raw_action[0, self.num_dofs] = self.postprocessor(self._last_action)[0, self.num_dofs]
+        #     return self._normalize_policy_guidance_action(raw_action)
+        # return self._last_action if self._last_action is not None else inner_action
+
+    @torch.no_grad()
+    def get_full_teleop_action(self, delta: Tensor):
+        """
+        Pure teleop mode: apply FK+IK from _desired_q (not obs, to avoid lag).
+
+        delta: [batch_size, 7] tensor [dx,dy,dz,droll,dpitch,dyaw,gripper]
+        inner_action: fallback action from inner policy (for dtype/device)
+
+        Returns normalized action tensor.
+        """
+        batch_size = delta.shape[0]
+        delta_np = delta.cpu().numpy()
+        device = delta.device
+
+        assert self._desired_q is not None, "_desired_q must be seeded before get_full_teleop_action"
+        actions = np.zeros((batch_size, self.num_dofs + 1), dtype=np.float64)
+        for b in range(batch_size):
+            d_pos, d_rot, d_gripper = delta_np[b][:3], delta_np[b][3:6], delta_np[b][6]
+            q_new = self._compute_next_joints(self._desired_q[b], d_pos, d_rot)
+            self._desired_q = q_new[: self.num_dofs].copy()
+            actions[b] = np.concatenate([q_new, [float(d_gripper)]])
+
+        raw_action = torch.tensor(actions, dtype=delta.dtype, device=device)
+        action = self._normalize_policy_guidance_action(raw_action)
+        return action
+
+    @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         # Extract delta guidance (7-d: [dx,dy,dz,droll,dpitch,dyaw,gripper]).
         # All-NaN means no key is held.
-        print("\n\n--- Shared Autonomy: select_action called ---")
-        policy_guidance_delta = batch.pop(OBS_HUMAN_ACTION, None)
-        print("curr observation.state", batch.get(OBS_STATE))
+        delta = batch.pop(OBS_HUMAN_ACTION, None)
+        obs_state = batch.get(OBS_STATE)
+        if obs_state is None:
+            raise RuntimeError("No obs.state available for shared autonomy wrapper")
+        # TODO this is really only designed to handle 1 teleoperator and 1 policy (batch size = 1)
+        assert delta.shape[0] == 1
+        assert obs_state.shape[0] == 1
 
         ratio = self.forward_flow_ratio
+        # TODO if this is a setting with multiple envs, prob need to have has_guidance have an entry per batch
+        has_guidance = delta is not None and not torch.isnan(delta).all()
 
-        has_guidance = policy_guidance_delta is not None and not torch.isnan(policy_guidance_delta).all()
+        delta_np = delta.cpu().numpy()  # [batch_size, 7]
 
         # We stay in "guided execution" mode until the current buffer is fully consumed,
         # even if the user releases the key mid-chunk.
-        n_action_steps = getattr(self.config, "n_action_steps", 1)
-        chunk_exhausted = self._chunk_step >= n_action_steps
+        chunk_exhausted = self._guided_chunk is None or self._chunk_step >= self.config.n_action_steps
         draining = self._guided_chunk is not None and not chunk_exhausted
         in_guidance_mode = has_guidance or draining
-
-        print(
-            "n_action_steps",
-            n_action_steps,
-            "chunk_step",
-            self._chunk_step,
-            "has_guidance",
-            has_guidance,
-            "in_guidance_mode",
-            in_guidance_mode,
-        )
 
         self._had_guidance_last_step = has_guidance
 
         # Reset inner policy exactly once when guidance session begins so its obs queue
         # starts accumulating from this point. By the time guidance ends (after n_action_steps),
         # the inner policy's obs queue is fresh and its action queue is empty — seamless handoff.
+        # But only do the reset if we are trying to blend (aka ratio in (0, 1) not inclusive)
         guidance_just_started = has_guidance and self._guided_chunk is None and self._chunk_step == 0
-        if guidance_just_started:
+        if guidance_just_started and ratio != 0 and ratio != 1:
             self.inner_policy.reset()
 
         # Always call inner_policy.select_action to keep obs queues updated (e.g. diffusion
         # maintains n_obs_steps history in _queues). Discard output when guidance overrides.
         inner_action = self.inner_policy.select_action(batch)
 
-        if ratio == 1.0 or not in_guidance_mode:
-            # Pure policy or no pending guidance: clear buffer and use inner policy output.
-            if self._guided_chunk is not None:
-                self._guided_chunk = None
-                self._chunk_step = 0
-            action = inner_action
-            if ratio == 0.0 and not has_guidance and self._last_action is not None:
-                action = self._last_action  # pure-human mode: hold last position
-                print("Holding last action (pure human mode), action", action)
+        # Seed _desired_q from inner_action on first call
+        if self._desired_q is None:
+            self._desired_q = self.postprocessor(inner_action).cpu().numpy()
+
+        print("\nhas guidance", has_guidance, "guidance", delta_np)
+
+        # --- Pure teleop (ratio=0): bypass policy chunk, do FK+IK from current state ---
+        if ratio == 0.0:
+            if has_guidance:
+                print("pure teleop")
+                action = self.get_full_teleop_action(delta)
             else:
-                print("Pure policy control (no guidance applied), action", action)
+                print("hold action")
+                action = self.get_hold_action(inner_action)
 
-            self._last_action = action
-            return action
-
-        print(" --- Shared Autonomy: applying guidance ---")
+        elif ratio == 1.0 or not in_guidance_mode:
+            # Pure policy or no pending guidance: clear buffer and use inner policy output.
+            # if self._guided_chunk is not None:
+            #     self._guided_chunk = None
+            #     self._chunk_step = 0
+            action = inner_action
 
         # --- Guided execution mode, ratio < 1.0 ---
 
         # Fast path: buffer draining with no new guidance delta — advance step and return.
-        if not has_guidance and self._guided_chunk is not None:
+        elif not has_guidance and self._guided_chunk is not None:
             action = self._guided_chunk[:, self._chunk_step, :]
             self._chunk_step += 1
-            self._last_action = action
-            print("Draining guided chunk buffer... (no new guidance), action", action)
-            return action
 
-        # max_action_dim: PI0.5 pads actions to this size; diffusion uses raw action_dim.
-        max_action_dim = getattr(self.config, "max_action_dim", None)
-        batch_size = policy_guidance_delta.shape[0]
-
-        # Determine anchor chunk for IK:
-        # - If chunk exhausted or no buffer yet: get a fresh policy chunk via predict_action_chunk.
-        #   Note: inner_policy.select_action was already called above (obs queues updated for diffusion),
-        #   so predict_action_chunk will read from up-to-date obs queues.
-        # - Otherwise: reuse _guided_chunk so guidance accumulates on top of itself.
-        if chunk_exhausted or self._guided_chunk is None:
-            anchor_chunk = self.inner_policy.predict_action_chunk(
-                batch
-            )  # [batch_size, chunk_size, action_dim]
-            print(
-                "New anchor chunk from policy (fresh), anchor_chunk shape",
-                anchor_chunk.shape,
-                "first action",
-                anchor_chunk[:, 0, :].cpu().numpy(),
-            )
-            self._chunk_step = 0
-            # To sync the reset time of the inner policy with this guidance policy, reset the observation queues of the
+        # Do the blend
         else:
-            anchor_chunk = self._guided_chunk  # [batch_size, n_action_steps, action_dim]
-            print(
-                "Using cached anchor chunk (accumulated)",
-                anchor_chunk.shape,
-                "first action",
-                anchor_chunk[:, 0, :].cpu().numpy(),
-            )
+            # max_action_dim: PI0.5 pads actions to this size; diffusion uses raw action_dim.
+            max_action_dim = getattr(self.config, "max_action_dim", None)
+            batch_size = delta_np.shape[0]
 
-        delta_np = policy_guidance_delta.cpu().numpy()  # [batch_size, 7]
-        device = anchor_chunk.device
-        t_start = self._chunk_step  # apply guidance to future steps only
-        anchor_len = anchor_chunk.shape[1]  # chunk_size or n_action_steps
-
-        # Clone anchor and apply IK delta in-place to steps [t_start, anchor_len).
-        # Zero-pad the last dim to max_action_dim if needed (required by PI0.5 model input).
-        guidance_chunk = anchor_chunk.clone()
-        action_dim = anchor_chunk.shape[2]
-        if max_action_dim is not None and action_dim < max_action_dim:
-            pad = torch.zeros(
-                batch_size,
-                anchor_len,
-                max_action_dim - action_dim,
-                dtype=guidance_chunk.dtype,
-                device=device,
-            )
-            guidance_chunk = torch.cat([guidance_chunk, pad], dim=2)
-        else:
-            max_action_dim = action_dim
-
-        # Apply IK at the last step of the chunk (full accumulated delta), then ramp up
-        # linearly from 0 at t_start to the full delta at the last step.
-        # This preserves curvature near the current step while steering the end of the
-        # chunk toward the human's desired EE direction.
-        raw_end = self.postprocessor(anchor_chunk[:, anchor_len - 1, :])  # [batch_size, num_dofs+1]
-        raw_end_np = raw_end.cpu().numpy()
-        step_end = np.zeros((batch_size, anchor_chunk.shape[2]), dtype=np.float64)
-        n_remaining = anchor_len - t_start
-        for b in range(batch_size):
-            d = delta_np[b]
-            if np.isnan(d).any():
-                step_end[b] = raw_end_np[b]
+            # Determine anchor chunk for IK:
+            # - If chunk exhausted or no buffer yet: get a fresh policy chunk via predict_action_chunk.
+            #   Note: inner_policy.select_action was already called above (obs queues updated for diffusion),
+            #   so predict_action_chunk will read from up-to-date obs queues.
+            # - Otherwise: reuse _guided_chunk so guidance accumulates on top of itself.
+            if chunk_exhausted or self._guided_chunk is None:
+                anchor_chunk = self.inner_policy.predict_action_chunk(
+                    batch
+                )  # [batch_size, chunk_size, action_dim]
+                self._chunk_step = 0
             else:
-                q = raw_end_np[b, : self.num_dofs].astype(float)
+                # The anchor is the previously blended chunk
+                anchor_chunk = self._guided_chunk  # [batch_size, n_action_steps, action_dim]
+
+            device = anchor_chunk.device
+            # apply guidance to future steps only
+            anchor_len = anchor_chunk.shape[1]  # chunk_size or n_action_steps
+            action_dim = anchor_chunk.shape[2]
+
+            # Apply IK at the last step of the chunk (full accumulated delta), then ramp up
+            # linearly from 0 at self._chunk_step to the full delta at the last step.
+            # This preserves curvature near the current step while steering the end of the
+            # chunk toward the human's desired EE direction.
+            raw_end = self.postprocessor(anchor_chunk[:, anchor_len - 1, :])  # [batch_size, num_dofs+1]
+            guidance_end = np.zeros((batch_size, anchor_chunk.shape[2]), dtype=np.float64)
+            n_remaining = anchor_len - self._chunk_step
+            for b in range(batch_size):
+                d = delta_np[b]
+                # Use _desired_q as IK seed if available, else fall back to chunk end
+                q = self._desired_q.copy() if self._desired_q is not None else raw_end[b, : self.num_dofs]
                 # Accumulate n_remaining steps of delta: position scales linearly,
                 # rotation composes n_remaining times (small-angle euler).
                 accumulated_pos = d[:3] * n_remaining
@@ -467,57 +484,64 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 for _ in range(n_remaining):
                     r_accumulated = r_accumulated * r_single
                 accumulated_rot = r_accumulated.as_euler("XYZ")
+
                 q_new = self._compute_next_joints(q, accumulated_pos, accumulated_rot)
-                step_end[b] = np.concatenate([q_new, [float(d[6])]])
+                guidance_end[b] = np.concatenate([q_new, [float(d[6])]])
 
-        g_end = torch.tensor(step_end, dtype=anchor_chunk.dtype, device=device)  # [B, action_dim]
-        norm_end = self._normalize_policy_guidance_action(g_end)  # [B, action_dim]
+            guidance_end = torch.tensor(
+                guidance_end, dtype=anchor_chunk.dtype, device=device
+            )  # [B, action_dim]
+            guidance_end_norm = self._normalize_policy_guidance_action(guidance_end)  # [B, action_dim]
 
-        # Joint-space delta at last step (normalized), padded to max_action_dim.
-        joint_delta = norm_end - anchor_chunk[:, anchor_len - 1, :]  # [B, action_dim]
-        if max_action_dim > action_dim:
-            joint_delta = torch.cat(
-                [
-                    joint_delta,
-                    torch.zeros(
-                        batch_size, max_action_dim - action_dim, dtype=joint_delta.dtype, device=device
-                    ),
-                ],
-                dim=1,
-            )
+            # Joint-space delta at last step (normalized), padded to max_action_dim.
+            joint_delta = guidance_end_norm - anchor_chunk[:, anchor_len - 1, :]  # [B, action_dim]
+            if max_action_dim > action_dim:
+                joint_delta = torch.cat(
+                    [
+                        joint_delta,
+                        torch.zeros(
+                            batch_size, max_action_dim - action_dim, dtype=joint_delta.dtype, device=device
+                        ),
+                    ],
+                    dim=1,
+                )
 
-        n_steps = anchor_len - t_start
-        for t in range(t_start, anchor_len):
-            alpha = (t - t_start) / max(n_steps - 1, 1)  # 0.0 at t_start, 1.0 at last step
-            guidance_chunk[:, t, :] = guidance_chunk[:, t, :] + alpha * joint_delta
+            # Clone anchor and apply IK delta in-place to steps [t_start, anchor_len).
+            # Zero-pad the last dim to max_action_dim if needed (required by PI0.5 model input).
+            guidance_chunk = anchor_chunk.clone()
+            if max_action_dim is not None and action_dim < max_action_dim:
+                pad = torch.zeros(
+                    batch_size,
+                    anchor_len,
+                    max_action_dim - action_dim,
+                    dtype=guidance_chunk.dtype,
+                    device=device,
+                )
+                guidance_chunk = torch.cat([guidance_chunk, pad], dim=2)
+            else:
+                max_action_dim = action_dim
 
-        # Apply noise scheduling and re-run guided denoising.
-        noise_result = self._build_guidance_noise_from_chunk(guidance_chunk, ratio)
-        if noise_result is None:
-            raise NotImplementedError(
-                "Inner policy does not support noise injection for guided execution. "
-                "Please use a compatible policy (e.g. diffusion with noise_scheduler, or flow model with max_action_dim) or set forward_flow_ratio=1.0 for pure policy control."
-            )
-        x_tsw, sa_ratio = noise_result
-        print("Built guidance noise with ratio", sa_ratio, "x_tsw shape", x_tsw.shape)
+            n_steps = anchor_len - self._chunk_step
+            for t in range(self._chunk_step, anchor_len):
+                alpha = (t - self._chunk_step) / max(n_steps - 1, 1)  # 0.0 at t_start, 1.0 at last step
+                guidance_chunk[:, t, :] = guidance_chunk[:, t, :] + alpha * joint_delta
 
-        blended = self.inner_policy.predict_action_chunk(
-            batch, noise=x_tsw, sa_noise_ratio=sa_ratio
-        )  # [B, n_action_steps, the dim of the action action (not necessarily action_dim, which is the max action size)]
-        self._guided_chunk = blended
-        print(
-            "Blended chunk from policy with guidance noise (normalized), blended shape",
-            blended.shape,
-            "first action",
-            blended[:, 0, :].cpu().numpy(),
-        )
-        # import pdb; pdb.set_trace()
+            # ratio=0 is handled by the early return above; this path is only for 0 < ratio < 1.
+            x_tsw = self._build_guidance_noise_from_chunk(guidance_chunk, ratio)
 
-        action = self._guided_chunk[:, self._chunk_step, :]
-        print("Returning chunk_step", self._chunk_step, "from blended chunk as next action, action", action)
-        self._chunk_step += 1
+            blended = self.inner_policy.predict_action_chunk(batch, noise=x_tsw, sa_noise_ratio=ratio)
+            self._guided_chunk = blended
 
-        self._last_action = action
+            action = self._guided_chunk[:, self._chunk_step, :]
+            self._chunk_step += 1
+
+        # self._last_action = action
+
+        # Update _desired_q from the action we're about to send, so all modes
+        # accumulate in raw joint space (like KeyboardInterfaceAgent._desired_q).
+        # get_full_teleop_action already updates _desired_q internally; skip it.
+        self._desired_q = self.postprocessor(action).cpu().numpy()
+
         return action
 
     def get_optim_params(self):

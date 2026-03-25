@@ -201,10 +201,10 @@ maybe_sleep() { [[ "$DRY_RUN" == false ]] && sleep 10; }
 # maybe_sleep
 
 # pi0.5 + basewrist needs extra memory setting
-run_job "pi05" "basewrist" PI05_ARGS "$PI05_RESIZE_MODE" "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
-maybe_sleep
+# run_job "pi05" "basewrist" PI05_ARGS "$PI05_RESIZE_MODE" "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+# maybe_sleep
 
-run_job "pi05" "base"      PI05_ARGS "$PI05_RESIZE_MODE"
-maybe_sleep
+# run_job "pi05" "base"      PI05_ARGS "$PI05_RESIZE_MODE"
+# maybe_sleep
 
-# run_job "pi05" "wrist"     PI05_ARGS "$PI05_RESIZE_MODE"
+run_job "pi05" "wrist"     PI05_ARGS "$PI05_RESIZE_MODE"

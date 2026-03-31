@@ -25,8 +25,11 @@ anchor. This means guidance is applied coherently across the entire action windo
 Works with any noise/flow-based policy (PI0.5, Diffusion) without modifying lerobot_eval.py.
 """
 
+from __future__ import annotations
+
 import logging
 import threading
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pybullet as p
@@ -40,53 +43,13 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
 
+if TYPE_CHECKING:
+    from lerobot.policies.teleop_recording import TeleopRecordingContext
+
 logger = logging.getLogger(__name__)
 
 OBS_HUMAN_ACTION = "observation.policy_guidance_action"
 OBS_STATE = "observation.state"
-
-
-def _launch_ratio_slider(wrapper: "SharedAutonomyPolicyWrapper") -> None:
-    """Launch a Tkinter slider in a background daemon thread to live-edit forward_flow_ratio."""
-    import tkinter as tk
-
-    def _run():
-        root = tk.Tk()
-        root.title("Shared Autonomy")
-        root.resizable(False, False)
-
-        tk.Label(root, text="forward_flow_ratio", font=("Helvetica", 12)).pack(padx=16, pady=(12, 0))
-
-        var = tk.DoubleVar(value=wrapper.forward_flow_ratio)
-        label = tk.Label(root, text=f"{wrapper.forward_flow_ratio:.2f}", font=("Courier", 14, "bold"))
-        label.pack(pady=(0, 4))
-
-        def on_change(val):
-            ratio = round(float(val), 2)
-            wrapper.forward_flow_ratio = ratio
-            label.config(text=f"{ratio:.2f}")
-
-        slider = tk.Scale(
-            root,
-            from_=0.0,
-            to=1.0,
-            resolution=0.01,
-            orient=tk.HORIZONTAL,
-            length=300,
-            variable=var,
-            command=on_change,
-            showvalue=False,
-        )
-        slider.pack(padx=16, pady=(0, 16))
-
-        tk.Label(root, text="0 = pure guidance    1 = pure policy", font=("Helvetica", 9), fg="gray").pack(
-            pady=(0, 12)
-        )
-
-        root.mainloop()
-
-    t = threading.Thread(target=_run, daemon=True, name="sa-ratio-slider")
-    t.start()
 
 
 class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
@@ -118,6 +81,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         inverse_preprocessor: PolicyProcessorPipeline,
         forward_flow_ratio: float,
         show_slider: bool = True,
+        start_paused: bool = False,
         robot_name: str = "robot_iphone_w_engine_new",
         max_joint_delta: float = 0.02,
         num_dofs: int = 6,
@@ -132,6 +96,11 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self.forward_flow_ratio = forward_flow_ratio
         self._had_guidance_last_step: bool = False
         self._desired_q: np.ndarray | None = None  # raw joint-space IK seed [num_dofs]
+        self._teleop_context: TeleopRecordingContext | None = None  # set by policy factory
+        self._start_paused = start_paused
+        self._run_event = threading.Event()
+        if not start_paused:
+            self._run_event.set()
 
         # Wrapper-managed blended chunk buffer
         self._guided_chunk: Tensor | None = None  # [B, n_action_steps, action_dim]
@@ -148,12 +117,19 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         ee_link_name = robot_config.wrist_camera_link_name
 
         self._pb_client = p.connect(p.DIRECT)
-        self._robot_id = p.loadURDF(urdf_path, useFixedBase=True, physicsClientId=self._pb_client)
+        # TODO(hardcoded): base_position from robot_iphone_w_engine_new config
+        self._robot_id = p.loadURDF(
+            urdf_path, useFixedBase=True, basePosition=[0, 0, -0.088], physicsClientId=self._pb_client
+        )
         self._ee_link = self._find_ee_link(ee_link_name)
         self._num_pb_joints = p.getNumJoints(self._robot_id, physicsClientId=self._pb_client)
+        self._obstacle_ids: list[int] = []
+        self._load_static_obstacles()
 
         if show_slider:
-            _launch_ratio_slider(self)
+            from lerobot.policies.shared_autonomy_gui import launch_ratio_slider
+
+            launch_ratio_slider(self)
 
     # ---- pybullet FK + IK -------------------------------------------------- #
 
@@ -209,6 +185,81 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # delta_q = np.clip(q_ik - q, -self._max_joint_delta, self._max_joint_delta)
         delta_q = q_ik - q
         return q + delta_q
+
+    def _load_static_obstacles(self) -> None:
+        """Load hardcoded static scene geometry into the IK pybullet client.
+
+        TODO(hardcoded): positions/sizes from UprightRobotSmallEngineNewPybulletRobotServer.
+        Update here if the scene layout changes.
+        """
+        # Table: size=(1.5, 1.0, 0.05), center at (0, 0.3, -0.025)
+        shape = p.createCollisionShape(
+            p.GEOM_BOX, halfExtents=[0.75, 0.5, 0.025], physicsClientId=self._pb_client
+        )
+        self._obstacle_ids.append(
+            p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=shape,
+                basePosition=[0, 0.3, -0.025],
+                physicsClientId=self._pb_client,
+            )
+        )
+        # Wall: size=(3.0, 0.05, 1.5), center at (0, -0.225, 0.75)
+        shape = p.createCollisionShape(
+            p.GEOM_BOX, halfExtents=[1.5, 0.025, 0.75], physicsClientId=self._pb_client
+        )
+        self._obstacle_ids.append(
+            p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=shape,
+                basePosition=[0, -0.225, 0.75],
+                physicsClientId=self._pb_client,
+            )
+        )
+
+    def _project_delta_for_collision(
+        self, q: np.ndarray, delta_pos: np.ndarray, delta_rot: np.ndarray
+    ) -> np.ndarray:
+        """Compute IK for delta, projecting delta_pos onto obstacle surfaces if needed.
+
+        1. Try full delta via IK.
+        2. If the result collides, project delta_pos to remove components pointing
+           into each obstacle (standard surface-projection / constraint stacking).
+        3. Retry IK with the projected delta.
+        4. If still colliding, hold in place (return q).
+        """
+        q_new = self._compute_next_joints(q, delta_pos, delta_rot)
+
+        # Check collision at proposed joint config
+        self._sync_joints(q_new[: self.num_dofs])
+        p.performCollisionDetection(physicsClientId=self._pb_client)
+
+        contacts = []
+        for obs_id in self._obstacle_ids:
+            contacts.extend(p.getContactPoints(self._robot_id, obs_id, physicsClientId=self._pb_client) or [])
+
+        if not contacts:
+            return q_new
+
+        # Project delta_pos: for each contact normal pointing away from the obstacle,
+        # remove the component of delta_pos that opposes it (i.e., moves into the obstacle).
+        projected_pos = delta_pos.copy()
+        for contact in contacts:
+            normal = np.array(contact[7])  # contactNormalOnB: from obstacle toward robot
+            dot = float(np.dot(projected_pos, normal))
+            if dot < 0:  # moving into the obstacle
+                projected_pos = projected_pos - dot * normal
+
+        q_projected = self._compute_next_joints(q, projected_pos, delta_rot)
+
+        # Safety check: if still colliding after projection, hold in place
+        self._sync_joints(q_projected[: self.num_dofs])
+        p.performCollisionDetection(physicsClientId=self._pb_client)
+        for obs_id in self._obstacle_ids:
+            if p.getContactPoints(self._robot_id, obs_id, physicsClientId=self._pb_client):
+                return q[: self.num_dofs]
+
+        return q_projected
 
     # ---- policy helpers ---------------------------------------------------- #
 
@@ -326,6 +377,8 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self._chunk_step = 0
         self._had_guidance_last_step = False
         self._desired_q = None
+        if self._start_paused:
+            self._run_event.clear()
         return self.inner_policy.reset()
 
     @torch.no_grad()
@@ -365,7 +418,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         actions = np.zeros((batch_size, self.num_dofs + 1), dtype=np.float64)
         for b in range(batch_size):
             d_pos, d_rot, d_gripper = delta_np[b][:3], delta_np[b][3:6], delta_np[b][6]
-            q_new = self._compute_next_joints(self._desired_q[b], d_pos, d_rot)
+            q_new = self._project_delta_for_collision(self._desired_q[b], d_pos, d_rot)
             self._desired_q = q_new[: self.num_dofs].copy()
             actions[b] = np.concatenate([q_new, [float(d_gripper)]])
 
@@ -375,6 +428,8 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+        self._run_event.wait()  # blocks while paused
+
         # Extract delta guidance (7-d: [dx,dy,dz,droll,dpitch,dyaw,gripper]).
         # All-NaN means no key is held.
         delta = batch.pop(OBS_HUMAN_ACTION, None)
@@ -388,6 +443,9 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         ratio = self.forward_flow_ratio
         # TODO if this is a setting with multiple envs, prob need to have has_guidance have an entry per batch
         has_guidance = delta is not None and not torch.isnan(delta).all()
+        if self._teleop_context is not None:
+            self._teleop_context.ratio = ratio
+            self._teleop_context.has_guidance = has_guidance
 
         delta_np = delta.cpu().numpy()  # [batch_size, 7]
 
@@ -415,15 +473,11 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         if self._desired_q is None:
             self._desired_q = self.postprocessor(inner_action).cpu().numpy()
 
-        print("\nhas guidance", has_guidance, "guidance", delta_np)
-
         # --- Pure teleop (ratio=0): bypass policy chunk, do FK+IK from current state ---
         if ratio == 0.0:
             if has_guidance:
-                print("pure teleop")
                 action = self.get_full_teleop_action(delta)
             else:
-                print("hold action")
                 action = self.get_hold_action(inner_action)
 
         elif ratio == 1.0 or not in_guidance_mode:
@@ -485,7 +539,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                     r_accumulated = r_accumulated * r_single
                 accumulated_rot = r_accumulated.as_euler("XYZ")
 
-                q_new = self._compute_next_joints(q, accumulated_pos, accumulated_rot)
+                q_new = self._project_delta_for_collision(q, accumulated_pos, accumulated_rot)
                 guidance_end[b] = np.concatenate([q_new, [float(d[6])]])
 
             guidance_end = torch.tensor(

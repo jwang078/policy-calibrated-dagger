@@ -8,7 +8,8 @@ fi
 # ============================================================
 # USER CONFIG — edit this one line to change the experiment
 # ============================================================
-DATASET_SHORT="approach_lever_7_lowres_5path"
+DATASET_SHORT="approach_lever_7_lowres_5path_10fails"
+# DATASET_SHORT="approach_lever_7_lowres_5path"
 # DATASET_SHORT="approach_lever_6_noteleport_5path"
 # ============================================================
 
@@ -57,9 +58,9 @@ validate_names() {
         echo "ERROR: dataset name cannot end with '.git' or '.ipynb': '$dataset_name'" >&2
         errors=1
     fi
-    # Max length 96
-    if (( ${#dataset_name} > 96 )); then
-        echo "ERROR: dataset name exceeds 96 chars (${#dataset_name}): '$dataset_name'" >&2
+    # Max length 56 (not including the dataset: prefix that sends it up to 64)
+    if (( ${#DATASET_REPO} > 56 )); then
+        echo "ERROR: dataset name exceeds 56 chars (${#DATASET_REPO}): '$DATASET_REPO'" >&2
         errors=1
     fi
 
@@ -67,7 +68,7 @@ validate_names() {
         exit 1
     fi
 
-    echo "Validation passed: DATASET_REPO='$DATASET_REPO' (dataset name: ${#dataset_name}/96 chars)"
+    echo "Validation passed: DATASET_REPO='$DATASET_REPO' (dataset name: ${#DATASET_REPO}/56 chars)"
 }
 validate_names
 
@@ -191,8 +192,8 @@ run_job() {
 
 maybe_sleep() { [[ "$DRY_RUN" == false ]] && sleep 10; }
 
-# run_job "diffusion" "basewrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE"
-# maybe_sleep
+run_job "diffusion" "basewrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE"
+maybe_sleep
 
 # run_job "diffusion" "base"      DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE"
 # maybe_sleep
@@ -201,10 +202,10 @@ maybe_sleep() { [[ "$DRY_RUN" == false ]] && sleep 10; }
 # maybe_sleep
 
 # pi0.5 + basewrist needs extra memory setting
-# run_job "pi05" "basewrist" PI05_ARGS "$PI05_RESIZE_MODE" "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
-# maybe_sleep
+run_job "pi05" "basewrist" PI05_ARGS "$PI05_RESIZE_MODE" "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+maybe_sleep
 
 # run_job "pi05" "base"      PI05_ARGS "$PI05_RESIZE_MODE"
 # maybe_sleep
 
-run_job "pi05" "wrist"     PI05_ARGS "$PI05_RESIZE_MODE"
+# run_job "pi05" "wrist"     PI05_ARGS "$PI05_RESIZE_MODE"

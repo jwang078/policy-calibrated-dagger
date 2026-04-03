@@ -83,7 +83,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         show_slider: bool = True,
         start_paused: bool = False,
         robot_name: str = "robot_iphone_w_engine_new",
-        max_joint_delta: float = 0.02,
+        max_joint_delta: float = 0.016,
         num_dofs: int = 6,
     ):
         # Bypass PreTrainedPolicy.__init__ — we proxy the inner policy's config
@@ -108,6 +108,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
 
         self.num_dofs = num_dofs
         self._max_joint_delta = max_joint_delta
+        self._prev_dq: np.ndarray | None = None  # previous joint velocity (raw, [num_dofs])
 
         logger.info(f"SharedAutonomyPolicyWrapper: ratio={forward_flow_ratio}, robot={robot_name}")
 
@@ -261,6 +262,61 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
 
         return q_projected
 
+    # ---- motion limits ----------------------------------------------------- #
+
+    def _apply_velocity_limit(
+        self, q_proposed: np.ndarray, q_prev: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Uniform velocity scaling: if any joint exceeds v_max, scale the whole delta vector
+        down proportionally. This preserves the EE direction (unlike per-joint clipping).
+
+        Only applied to the joint dims (first num_dofs); gripper passes through unchanged.
+
+        Returns (q_actual, dq_actual) where dq_actual should be stored as _prev_dq for the
+        next step (needed if you later add acceleration/jerk limits — see below).
+        """
+        n = self.num_dofs
+        v_max = self._max_joint_delta  # 0.5 / self._fps  # max position delta per step (rad)
+
+        dq = q_proposed[:n] - q_prev[:n]
+        v_mag = np.max(np.abs(dq))
+        if v_mag > v_max:
+            dq = dq * (v_max / v_mag)  # scale whole vector, not per-joint clip
+
+        # Use q_proposed as base so gripper (and any extra dims) are always present,
+        # regardless of whether q_prev was set with or without gripper.
+        q_actual = q_proposed.copy()
+        q_actual[:n] = q_prev[:n] + dq
+
+        # To also add acceleration and jerk limits, track dq_prev and ddq_prev across steps
+        # and apply constraints in reverse order (jerk → accel → vel) before the vel limit:
+        #
+        # a_max = 1.0 / self._fps
+        # j_max = 10.0 / self._fps
+        #
+        # d2q = dq - dq_prev                      # proposed acceleration
+        # d3q = d2q - ddq_prev                    # proposed jerk
+        #
+        # # 1) Jerk limit: scale jerk vector uniformly
+        # j_mag = np.max(np.abs(d3q))
+        # if j_mag > j_max:
+        #     d3q = d3q * (j_max / j_mag)
+        # d2q = ddq_prev + d3q                    # accel after jerk constraint
+        #
+        # # 2) Acceleration limit: scale (jerk-constrained) accel vector uniformly
+        # a_mag = np.max(np.abs(d2q))
+        # if a_mag > a_max:
+        #     d2q = d2q * (a_max / a_mag)
+        # dq = dq_prev + d2q                      # velocity after accel constraint
+        #
+        # # 3) Velocity limit (same as above, applied to the now-cascaded dq)
+        #
+        # Also update _prev_ddq = dq_actual - dq_prev alongside _prev_dq each step.
+
+        # The gripper passed through
+
+        return q_actual, dq
+
     # ---- policy helpers ---------------------------------------------------- #
 
     def _normalize_policy_guidance_action(self, policy_guidance_action: Tensor) -> Tensor:
@@ -377,6 +433,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self._chunk_step = 0
         self._had_guidance_last_step = False
         self._desired_q = None
+        self._prev_dq = None
         if self._start_paused:
             self._run_event.clear()
         return self.inner_policy.reset()
@@ -472,6 +529,11 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # Seed _desired_q from inner_action on first call
         if self._desired_q is None:
             self._desired_q = self.postprocessor(inner_action).cpu().numpy()
+
+        # Capture q_prev BEFORE any action computation so velocity limiting sees the true
+        # previous position. get_full_teleop_action pre-updates _desired_q internally,
+        # so reading it afterward would give dq=0 (a no-op).
+        q_prev_for_vel_limit = self._desired_q.reshape(-1).copy() if self._desired_q is not None else None
 
         # --- Pure teleop (ratio=0): bypass policy chunk, do FK+IK from current state ---
         if ratio == 0.0:
@@ -590,6 +652,19 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             self._chunk_step += 1
 
         # self._last_action = action
+
+        # Apply velocity limit when not in pure policy mode.
+        # Converts to raw joint space (where the limit is physically meaningful in radians),
+        # scales the whole joint delta vector uniformly (preserves EE direction), then
+        # converts back to normalized space.
+        if ratio != 1.0 and q_prev_for_vel_limit is not None:
+            q_proposed = self.postprocessor(action).cpu().numpy().reshape(-1)
+            q_prev = q_prev_for_vel_limit
+            q_actual, dq_actual = self._apply_velocity_limit(q_proposed, q_prev)
+            self._prev_dq = dq_actual
+            action = self._normalize_policy_guidance_action(
+                torch.tensor(q_actual, dtype=action.dtype, device=action.device).unsqueeze(0)
+            )
 
         # Update _desired_q from the action we're about to send, so all modes
         # accumulate in raw joint space (like KeyboardInterfaceAgent._desired_q).

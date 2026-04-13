@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from enum import Enum
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -41,7 +42,7 @@ from torch import Tensor, nn
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.processor import PolicyAction, PolicyProcessorPipeline
+from lerobot.processor import PolicyProcessorPipeline
 
 if TYPE_CHECKING:
     from lerobot.policies.teleop_recording import TeleopRecordingContext
@@ -49,7 +50,53 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 OBS_HUMAN_ACTION = "observation.policy_guidance_action"
+OBS_GUIDANCE_CHUNK = "observation.policy_guidance_chunk"
 OBS_STATE = "observation.state"
+
+
+class PolicyGuidanceRepresentation(Enum):
+    """How the guidance action passed in observation.policy_guidance_action is interpreted.
+
+    DELTA:        (default) 7-d EE delta [dx, dy, dz, droll, dpitch, dyaw, gripper].
+                  FK→IK is applied to convert to absolute joint positions.
+    ABSOLUTE_POS: 7-d absolute joint positions [j1, …, j6, gripper] (raw, unnormalized).
+                  FK→IK is skipped; the guidance is used directly as the target joints.
+    """
+
+    DELTA = "delta"
+    ABSOLUTE_POS = "absolute_pos"
+
+
+class BlendMode(Enum):
+    """How often guidance blending is applied within an action chunk.
+
+    EVERY_STEP:     (default) Re-blend every select_action call that has guidance.
+                    Each call runs a full denoising pass with fresh random noise.
+                    Allows continuous steering but sacrifices temporal coherence.
+    ONCE_PER_CHUNK: Blend only when a new anchor chunk is generated (chunk exhausted
+                    or first guidance call). Subsequent calls with guidance drain the
+                    blended chunk without re-blending. Produces temporally coherent
+                    action chunks from a single denoising pass.
+    """
+
+    EVERY_STEP = "every_step"
+    ONCE_PER_CHUNK = "once_per_chunk"
+
+
+class GuidanceBlendStrategy(Enum):
+    """How the guidance chunk is blended with the policy output.
+
+    DENOISE:     (default) Build partially-noised guidance, then run the model's
+                 denoising from t=ratio down to t=0. The model's visual conditioning
+                 can override guidance if it has a strong prior.
+    INTERPOLATE: Simple linear interpolation in clean action space:
+                 blended = ratio * policy_output + (1-ratio) * guidance.
+                 No denoising involved. Guarantees the guidance has proportional
+                 influence, but the result is not "on-manifold".
+    """
+
+    DENOISE = "denoise"
+    INTERPOLATE = "interpolate"
 
 
 class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
@@ -73,6 +120,11 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
     config_class = PreTrainedConfig
     name = "shared_autonomy_wrapper"
 
+    # Arm joint limits (matches SplatSim PybulletRobotServerBase).
+    # Override in subclass or set on instance for different robots.
+    lower_limits = [-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -np.pi]
+    upper_limits = [np.pi, 0, np.pi, np.pi, np.pi, np.pi]
+
     def __init__(
         self,
         inner_policy: PreTrainedPolicy,
@@ -85,6 +137,9 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         robot_name: str = "robot_iphone_w_engine_new",
         max_joint_delta: float = 0.016,
         num_dofs: int = 6,
+        policy_guidance_representation: PolicyGuidanceRepresentation = PolicyGuidanceRepresentation.DELTA,
+        blend_mode: BlendMode | str = BlendMode.EVERY_STEP,
+        guidance_blend_strategy: GuidanceBlendStrategy | str = GuidanceBlendStrategy.DENOISE,
     ):
         # Bypass PreTrainedPolicy.__init__ — we proxy the inner policy's config
         nn.Module.__init__(self)
@@ -94,6 +149,12 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self.postprocessor = postprocessor  # normalized → raw joints
         self.inverse_preprocessor = inverse_preprocessor  # normalized obs.state → raw joints
         self.forward_flow_ratio = forward_flow_ratio
+        self.blend_mode = BlendMode(blend_mode) if isinstance(blend_mode, str) else blend_mode
+        self.guidance_blend_strategy = (
+            GuidanceBlendStrategy(guidance_blend_strategy)
+            if isinstance(guidance_blend_strategy, str)
+            else guidance_blend_strategy
+        )
         self._had_guidance_last_step: bool = False
         self._desired_q: np.ndarray | None = None  # raw joint-space IK seed [num_dofs]
         self._teleop_context: TeleopRecordingContext | None = None  # set by policy factory
@@ -109,6 +170,8 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self.num_dofs = num_dofs
         self._max_joint_delta = max_joint_delta
         self._prev_dq: np.ndarray | None = None  # previous joint velocity (raw, [num_dofs])
+        self.skip_collision: bool = False  # set True for visualization (dataset guidance is known-safe)
+        self.policy_guidance_representation = policy_guidance_representation
 
         logger.info(f"SharedAutonomyPolicyWrapper: ratio={forward_flow_ratio}, robot={robot_name}")
 
@@ -124,6 +187,14 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         )
         self._ee_link = self._find_ee_link(ee_link_name)
         self._num_pb_joints = p.getNumJoints(self._robot_id, physicsClientId=self._pb_client)
+
+        # Count movable (non-fixed) joints for null-space IK arrays.
+        self._num_movable_joints = sum(
+            1
+            for i in range(self._num_pb_joints)
+            if p.getJointInfo(self._robot_id, i, physicsClientId=self._pb_client)[2] != p.JOINT_FIXED
+        )
+
         self._obstacle_ids: list[int] = []
         self._load_static_obstacles()
 
@@ -170,14 +241,28 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             if abs(q[i]) > 2.5:  # approaching ±π — bias IK away from singularity
                 rest[i] = 0.0
 
-        n = self._num_pb_joints
+        # Build null-space IK arrays. All must have length = num_movable_joints.
+        # Arm DOFs use class-level limits; remaining movable joints (gripper) get
+        # wide limits so they don't constrain the solution.
+        n_movable = self._num_movable_joints
+        n_extra = n_movable - self.num_dofs
+        ll = self.lower_limits + [-np.pi] * n_extra
+        ul = self.upper_limits + [np.pi] * n_extra
+        jr = [u - lo for lo, u in zip(ll, ul, strict=True)]
+        rp = rest + [0.0] * n_extra
+
         joint_poses = p.calculateInverseKinematics(
             self._robot_id,
             self._ee_link,
             target_pos,
             target_quat,
-            restPoses=rest + [0.0] * (n - self.num_dofs),
-            jointDamping=[0.1] * n,
+            lowerLimits=ll,
+            upperLimits=ul,
+            jointRanges=jr,
+            restPoses=rp,
+            jointDamping=[0.1] * n_movable,
+            maxNumIterations=1000,
+            residualThreshold=1e-6,
             physicsClientId=self._pb_client,
         )
         q_ik = np.array(joint_poses[: self.num_dofs])
@@ -219,7 +304,11 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         )
 
     def _project_delta_for_collision(
-        self, q: np.ndarray, delta_pos: np.ndarray, delta_rot: np.ndarray
+        self,
+        q: np.ndarray,
+        delta_pos: np.ndarray,
+        delta_rot: np.ndarray,
+        skip_collision: bool = False,
     ) -> np.ndarray:
         """Compute IK for delta, projecting delta_pos onto obstacle surfaces if needed.
 
@@ -230,6 +319,9 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         4. If still colliding, hold in place (return q).
         """
         q_new = self._compute_next_joints(q, delta_pos, delta_rot)
+
+        if skip_collision:
+            return q_new
 
         # Check collision at proposed joint config
         self._sync_joints(q_new[: self.num_dofs])
@@ -325,6 +417,33 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         Zero-fills NaN/Inf dimensions (e.g., gripper always closed in training data
         where normalization stats have zero variance).
         """
+        # TODO: remove gripper pre-clipping once the task uses the gripper.
+        # The training gripper is near-constant, so normalization has a huge scale factor
+        # and any guidance with gripper outside the training range explodes after normalization.
+        # Pre-clip the gripper dim to the training bounds so it maps to [-1, 1].
+        policy_guidance_action = policy_guidance_action.clone()
+        # for step in self.inverse_postprocessor.steps:
+        #     if not (hasattr(step, "_tensor_stats") and hasattr(step, "norm_map")):  # type: ignore[union-attr]
+        #         continue
+        #     stats = step._tensor_stats.get("action", {})  # type: ignore[union-attr]
+        #     norm_mode = step.norm_map.get(FeatureType.ACTION)  # type: ignore[union-attr]
+        #     dev, dt = policy_guidance_action.device, policy_guidance_action.dtype
+        #     lo, hi = None, None
+        #     if norm_mode == NormalizationMode.QUANTILES and "q01" in stats and "q99" in stats:
+        #         lo = stats["q01"][gripper_dim].to(device=dev, dtype=dt)
+        #         hi = stats["q99"][gripper_dim].to(device=dev, dtype=dt)
+        #     elif norm_mode == NormalizationMode.MIN_MAX and "min" in stats and "max" in stats:
+        #         lo = stats["min"][gripper_dim].to(device=dev, dtype=dt)
+        #         hi = stats["max"][gripper_dim].to(device=dev, dtype=dt)
+        #     elif norm_mode == NormalizationMode.MEAN_STD and "mean" in stats and "std" in stats:
+        #         mean_g = stats["mean"][gripper_dim].to(device=dev, dtype=dt)
+        #         std_g = stats["std"][gripper_dim].to(device=dev, dtype=dt)
+        #         lo = mean_g - 2 * std_g
+        #         hi = mean_g + 2 * std_g
+        #     if lo is not None and hi is not None:
+        #         policy_guidance_action[..., gripper_dim] = policy_guidance_action[..., gripper_dim].clamp(lo, hi)
+        #     break
+
         normalized = self.inverse_postprocessor(policy_guidance_action)
         bad = ~torch.isfinite(normalized)
         if bad.any():
@@ -334,21 +453,10 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 f"Check normalization stats for zero-variance dims."
             )
             normalized = normalized.masked_fill(bad, 0.0)
-        out_of_range = normalized.abs() > 2.0
-        if out_of_range.any():
-            bad_dims = out_of_range.nonzero(as_tuple=False)
-            logger.warning(
-                f"policy_guidance_action has {out_of_range.sum().item()} value(s) outside [-2, 2] "
-                f"after normalization (max abs: {normalized.abs().max().item():.2f}). "
-                f"Offending dims (indices): {bad_dims.tolist()}. "
-                f"Values: {normalized[out_of_range].tolist()}. Clamping to [-2, 2]."
-            )
-            print("TEMP not clamping")
-            # normalized = normalized.clamp(-2.0, 2.0)
         return normalized
 
     def _build_guidance_noise_from_chunk(
-        self, guidance_chunk: Tensor, ratio: float
+        self, guidance_chunk: Tensor, ratio: float, base_noise: Tensor | None = None
     ) -> tuple[Tensor, float] | None:
         """Build partially-noised guidance using the correct noise schedule.
 
@@ -381,9 +489,12 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             horizon = self.config.horizon
             n_obs_steps = self.config.n_obs_steps
             action_dim = guidance_chunk.shape[2]
-            full_noise = torch.randn(
-                batch_size, horizon, action_dim, dtype=guidance_chunk.dtype, device=device
-            )
+            if base_noise is not None:
+                full_noise = base_noise.clone()
+            else:
+                full_noise = torch.randn(
+                    batch_size, horizon, action_dim, dtype=guidance_chunk.dtype, device=device
+                )
             # guidance occupies [n_obs_steps-1, n_obs_steps-1+n_action_steps) in the horizon.
             # Fill non-guidance positions with plausible values (not pure noise) so the UNet
             # sees a coherent full-horizon sequence during denoising.
@@ -400,7 +511,17 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             # Future positions [end:horizon]: repeat last guidance step
             for t in range(end, horizon):
                 full_guidance[:, t, :] = guidance_chunk[:, -1, :]
-            t_sw = int(ratio * noise_scheduler.config.num_train_timesteps)
+            # Sync to the exact discrete inference timesteps so the injected
+            # noise variance matches what the UNet expects on its first step.
+            # Using raw `int(ratio * num_train_timesteps)` can land between
+            # inference steps, causing SNR mismatch and jagged outputs.
+            if not hasattr(noise_scheduler, "timesteps") or noise_scheduler.timesteps is None:
+                num_inf_steps = getattr(diffusion_model, "num_inference_steps", 100)
+                noise_scheduler.set_timesteps(num_inf_steps, device=device)
+            timesteps = noise_scheduler.timesteps  # e.g. [999, 899, ..., 0]
+            start_step_idx = int((1.0 - ratio) * len(timesteps))
+            start_step_idx = max(0, min(start_step_idx, len(timesteps) - 1))
+            t_sw = timesteps[start_step_idx]
             t_tensor = torch.full((batch_size,), t_sw, dtype=torch.long, device=device)
             x_tsw = noise_scheduler.add_noise(full_guidance, full_noise, t_tensor)
             return x_tsw
@@ -424,7 +545,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             for t in range(n_action_steps, chunk_size):
                 full_guidance[:, t, :] = guidance_chunk[:, -1, :]
             guidance_chunk = full_guidance
-        noise = torch.randn_like(guidance_chunk)
+        noise = base_noise.clone() if base_noise is not None else torch.randn_like(guidance_chunk)
         x_tsw = ratio * noise + (1.0 - ratio) * guidance_chunk
         return x_tsw
 
@@ -445,7 +566,10 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
     @torch.no_grad()
     def get_hold_action(self, inner_action: Tensor) -> Tensor:
         assert self._desired_q is not None
-        return torch.stack([self.inverse_postprocessor(PolicyAction(q)) for q in self._desired_q])
+        raw = torch.tensor(
+            self._desired_q.reshape(-1), dtype=inner_action.dtype, device=inner_action.device
+        ).unsqueeze(0)  # [1, num_dofs+1]
+        return self._normalize_policy_guidance_action(raw)
         # if self._desired_q is not None:
         #     # Rebuild action from _desired_q so we hold the exact last commanded position
         #     raw_action = torch.tensor(
@@ -473,28 +597,34 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
 
         assert self._desired_q is not None, "_desired_q must be seeded before get_full_teleop_action"
         actions = np.zeros((batch_size, self.num_dofs + 1), dtype=np.float64)
+        q_seed = self._desired_q.reshape(-1).copy()
         for b in range(batch_size):
             d_pos, d_rot, d_gripper = delta_np[b][:3], delta_np[b][3:6], delta_np[b][6]
-            q_new = self._project_delta_for_collision(self._desired_q[b], d_pos, d_rot)
-            self._desired_q = q_new[: self.num_dofs].copy()
+            q_new = self._project_delta_for_collision(
+                q_seed, d_pos, d_rot, skip_collision=self.skip_collision
+            )
+            q_seed = q_new[: self.num_dofs].copy()
             actions[b] = np.concatenate([q_new, [float(d_gripper)]])
 
+        self._last_raw_action = actions[-1]  # [num_dofs+1] float64, for _desired_q update
         raw_action = torch.tensor(actions, dtype=delta.dtype, device=device)
         action = self._normalize_policy_guidance_action(raw_action)
         return action
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
+    def select_action(self, batch: dict[str, Tensor], base_noise: Tensor | None = None) -> Tensor:
         self._run_event.wait()  # blocks while paused
+        self._last_raw_action = None  # reset; set by get_full_teleop_action if called
 
         # Extract delta guidance (7-d: [dx,dy,dz,droll,dpitch,dyaw,gripper]).
         # All-NaN means no key is held.
         delta = batch.pop(OBS_HUMAN_ACTION, None)
+        guidance_chunk_raw = batch.pop(OBS_GUIDANCE_CHUNK, None)  # [B, n_remaining, action_dim] or None
         obs_state = batch.get(OBS_STATE)
         if obs_state is None:
             raise RuntimeError("No obs.state available for shared autonomy wrapper")
         # TODO this is really only designed to handle 1 teleoperator and 1 policy (batch size = 1)
-        assert delta.shape[0] == 1
+        assert delta is None or delta.shape[0] == 1
         assert obs_state.shape[0] == 1
 
         ratio = self.forward_flow_ratio
@@ -504,7 +634,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             self._teleop_context.ratio = ratio
             self._teleop_context.has_guidance = has_guidance
 
-        delta_np = delta.cpu().numpy()  # [batch_size, 7]
+        delta_np = delta.cpu().numpy() if delta is not None else None  # [batch_size, 7]
 
         # We stay in "guided execution" mode until the current buffer is fully consumed,
         # even if the user releases the key mid-chunk.
@@ -514,13 +644,9 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
 
         self._had_guidance_last_step = has_guidance
 
-        # Reset inner policy exactly once when guidance session begins so its obs queue
-        # starts accumulating from this point. By the time guidance ends (after n_action_steps),
-        # the inner policy's obs queue is fresh and its action queue is empty — seamless handoff.
-        # But only do the reset if we are trying to blend (aka ratio in (0, 1) not inclusive)
-        guidance_just_started = has_guidance and self._guided_chunk is None and self._chunk_step == 0
-        if guidance_just_started and ratio != 0 and ratio != 1:
-            self.inner_policy.reset()
+        # No inner policy reset needed here — the obs queue is always updated by
+        # inner_policy.select_action (called unconditionally below), so it stays
+        # current regardless of whether we're blending or not.
 
         # Always call inner_policy.select_action to keep obs queues updated (e.g. diffusion
         # maintains n_obs_steps history in _queues). Discard output when guidance overrides.
@@ -528,22 +654,25 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
 
         # Seed _desired_q from inner_action on first call
         if self._desired_q is None:
-            self._desired_q = self.postprocessor(inner_action).cpu().numpy()
+            self._desired_q = self.postprocessor(inner_action).cpu().numpy().reshape(-1)
 
         # Capture q_prev BEFORE any action computation so velocity limiting sees the true
         # previous position. get_full_teleop_action pre-updates _desired_q internally,
         # so reading it afterward would give dq=0 (a no-op).
-        q_prev_for_vel_limit = self._desired_q.reshape(-1).copy() if self._desired_q is not None else None
+        # q_prev_for_vel_limit = self._desired_q.reshape(-1).copy() if self._desired_q is not None else None
 
         # --- Pure teleop (ratio=0): bypass policy chunk, do FK+IK from current state ---
         if ratio == 0.0:
             if has_guidance:
-                action = self.get_full_teleop_action(delta)
+                if self.policy_guidance_representation == PolicyGuidanceRepresentation.ABSOLUTE_POS:
+                    action = self._normalize_policy_guidance_action(delta)
+                else:
+                    action = self.get_full_teleop_action(delta)
             else:
                 action = self.get_hold_action(inner_action)
 
-        elif ratio == 1.0 or not in_guidance_mode:
-            # Pure policy or no pending guidance: clear buffer and use inner policy output.
+        elif not in_guidance_mode:
+            # No pending guidance: clear buffer and use inner policy output.
             # if self._guided_chunk is not None:
             #     self._guided_chunk = None
             #     self._chunk_step = 0
@@ -551,16 +680,30 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
 
         # --- Guided execution mode, ratio < 1.0 ---
 
-        # Fast path: buffer draining with no new guidance delta — advance step and return.
-        elif not has_guidance and self._guided_chunk is not None:
+        # Drain path: return the next action from an existing blended chunk without
+        # re-blending. Taken when:
+        #   - No new guidance delta (user released key), OR
+        #   - ONCE_PER_CHUNK mode and the current blended chunk is still valid.
+        elif (
+            self._guided_chunk is not None
+            and not chunk_exhausted
+            and (not has_guidance or self.blend_mode == BlendMode.ONCE_PER_CHUNK)
+        ):
             action = self._guided_chunk[:, self._chunk_step, :]
             self._chunk_step += 1
+            print("draining blended chunk, step", self._chunk_step)
 
         # Do the blend
         else:
+            print("starting blended execution with new guidance, ratio", ratio)
             # max_action_dim: PI0.5 pads actions to this size; diffusion uses raw action_dim.
             max_action_dim = getattr(self.config, "max_action_dim", None)
-            batch_size = delta_np.shape[0]
+            if delta_np is not None:
+                batch_size = delta_np.shape[0]
+            elif guidance_chunk_raw is not None:
+                batch_size = guidance_chunk_raw.shape[0]
+            else:
+                batch_size = obs_state.shape[0]
 
             # Determine anchor chunk for IK:
             # - If chunk exhausted or no buffer yet: get a fresh policy chunk via predict_action_chunk.
@@ -568,62 +711,24 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             #   so predict_action_chunk will read from up-to-date obs queues.
             # - Otherwise: reuse _guided_chunk so guidance accumulates on top of itself.
             if chunk_exhausted or self._guided_chunk is None:
+                noise_kwargs = {"noise": base_noise} if base_noise is not None else {}
                 anchor_chunk = self.inner_policy.predict_action_chunk(
-                    batch
+                    batch, **noise_kwargs
                 )  # [batch_size, chunk_size, action_dim]
                 self._chunk_step = 0
+                print("predicting new chunk from policy for guidance, chunk_step reset to 0")
             else:
                 # The anchor is the previously blended chunk
                 anchor_chunk = self._guided_chunk  # [batch_size, n_action_steps, action_dim]
+                print("reusing previous blended chunk as anchor for new guidance")
 
             device = anchor_chunk.device
             # apply guidance to future steps only
             anchor_len = anchor_chunk.shape[1]  # chunk_size or n_action_steps
             action_dim = anchor_chunk.shape[2]
 
-            # Apply IK at the last step of the chunk (full accumulated delta), then ramp up
-            # linearly from 0 at self._chunk_step to the full delta at the last step.
-            # This preserves curvature near the current step while steering the end of the
-            # chunk toward the human's desired EE direction.
-            raw_end = self.postprocessor(anchor_chunk[:, anchor_len - 1, :])  # [batch_size, num_dofs+1]
-            guidance_end = np.zeros((batch_size, anchor_chunk.shape[2]), dtype=np.float64)
-            n_remaining = anchor_len - self._chunk_step
-            for b in range(batch_size):
-                d = delta_np[b]
-                # Use _desired_q as IK seed if available, else fall back to chunk end
-                q = self._desired_q.copy() if self._desired_q is not None else raw_end[b, : self.num_dofs]
-                # Accumulate n_remaining steps of delta: position scales linearly,
-                # rotation composes n_remaining times (small-angle euler).
-                accumulated_pos = d[:3] * n_remaining
-                r_single = Rotation.from_euler("XYZ", d[3:6])
-                r_accumulated = Rotation.identity()
-                for _ in range(n_remaining):
-                    r_accumulated = r_accumulated * r_single
-                accumulated_rot = r_accumulated.as_euler("XYZ")
-
-                q_new = self._project_delta_for_collision(q, accumulated_pos, accumulated_rot)
-                guidance_end[b] = np.concatenate([q_new, [float(d[6])]])
-
-            guidance_end = torch.tensor(
-                guidance_end, dtype=anchor_chunk.dtype, device=device
-            )  # [B, action_dim]
-            guidance_end_norm = self._normalize_policy_guidance_action(guidance_end)  # [B, action_dim]
-
-            # Joint-space delta at last step (normalized), padded to max_action_dim.
-            joint_delta = guidance_end_norm - anchor_chunk[:, anchor_len - 1, :]  # [B, action_dim]
-            if max_action_dim > action_dim:
-                joint_delta = torch.cat(
-                    [
-                        joint_delta,
-                        torch.zeros(
-                            batch_size, max_action_dim - action_dim, dtype=joint_delta.dtype, device=device
-                        ),
-                    ],
-                    dim=1,
-                )
-
-            # Clone anchor and apply IK delta in-place to steps [t_start, anchor_len).
-            # Zero-pad the last dim to max_action_dim if needed (required by PI0.5 model input).
+            # Build the normalized guidance chunk to use as noise anchor.
+            # Clone anchor and zero-pad to max_action_dim if needed (required by PI0.5).
             guidance_chunk = anchor_chunk.clone()
             if max_action_dim is not None and action_dim < max_action_dim:
                 pad = torch.zeros(
@@ -637,16 +742,149 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             else:
                 max_action_dim = action_dim
 
-            n_steps = anchor_len - self._chunk_step
-            for t in range(self._chunk_step, anchor_len):
-                alpha = (t - self._chunk_step) / max(n_steps - 1, 1)  # 0.0 at t_start, 1.0 at last step
-                guidance_chunk[:, t, :] = guidance_chunk[:, t, :] + alpha * joint_delta
+            if (
+                self.policy_guidance_representation == PolicyGuidanceRepresentation.ABSOLUTE_POS
+                and guidance_chunk_raw is not None
+            ):
+                # Full per-step guidance chunk provided: normalize each step and overwrite
+                # the corresponding positions in the anchor. This avoids the single-point
+                # ramp-to-endpoint approximation that dilutes guidance on early steps.
+                # guidance_chunk_raw: [B, n_remaining, action_dim] covering [chunk_step, anchor_len)
+                n_provided = guidance_chunk_raw.shape[1]
+                n_remaining = anchor_len - self._chunk_step
+                n_fill = min(n_provided, n_remaining)
+                for t_rel in range(n_fill):
+                    step_raw = guidance_chunk_raw[:, t_rel, :]  # [B, action_dim]
+                    step_norm = self._normalize_policy_guidance_action(step_raw)
+                    t_abs = self._chunk_step + t_rel
+                    guidance_chunk[:, t_abs, :action_dim] = step_norm
+                # If guidance is shorter than remaining chunk, repeat last step
+                print(
+                    f"Applied {n_fill} steps of provided guidance chunk to absolute positions. {n_remaining - n_fill} steps remain; repeating last provided step for those."
+                    if n_fill < n_remaining
+                    else f"Applied full provided guidance chunk of {n_provided} steps to absolute positions."
+                )
+                if n_fill < n_remaining:
+                    last_norm = guidance_chunk[:, self._chunk_step + n_fill - 1, :action_dim]
+                    for t_abs in range(self._chunk_step + n_fill, anchor_len):
+                        guidance_chunk[:, t_abs, :action_dim] = last_norm
+                print(
+                    "first 10 guidance chunk after applying provided absolute positions:",
+                    guidance_chunk[:, :10, :action_dim],
+                )
+
+            elif self.policy_guidance_representation == PolicyGuidanceRepresentation.ABSOLUTE_POS:
+                # Single-point guidance: normalize and overwrite all remaining steps uniformly.
+                guidance_end_norm = self._normalize_policy_guidance_action(delta)  # [B, action_dim]
+                for t_abs in range(self._chunk_step, anchor_len):
+                    guidance_chunk[:, t_abs, :action_dim] = guidance_end_norm
+                print(
+                    "applied single-point guidance to all future steps in chunk from step", self._chunk_step
+                )
+
+            elif (
+                self.policy_guidance_representation == PolicyGuidanceRepresentation.DELTA
+                and guidance_chunk_raw is not None
+            ):
+                # Per-step DELTA chunk: apply each delta sequentially via FK+IK,
+                # building the guidance trajectory step-by-step from _desired_q.
+                # guidance_chunk_raw: [B, n_provided, 7] — each step is an EE delta
+                # [dx, dy, dz, droll, dpitch, dyaw, gripper].
+                guidance_chunk_np = guidance_chunk_raw.cpu().numpy()
+                n_provided = guidance_chunk_np.shape[1]
+                n_remaining = anchor_len - self._chunk_step
+                for b in range(batch_size):
+                    raw_end = self.postprocessor(anchor_chunk[:, self._chunk_step, :])
+                    q_seed = (
+                        self._desired_q.copy()
+                        if self._desired_q is not None
+                        else raw_end[b, : self.num_dofs].cpu().numpy()
+                    )
+                    # Apply provided deltas step-by-step
+                    last_delta = guidance_chunk_np[b, min(n_provided - 1, 0)]  # fallback for padding
+                    for t_rel in range(n_remaining):
+                        if t_rel < n_provided:
+                            d = guidance_chunk_np[b, t_rel]
+                            last_delta = d
+                        else:
+                            d = last_delta  # keep applying the last delta
+                        d_pos, d_rot, d_gripper = d[:3], d[3:6], d[6]
+                        q_new = self._project_delta_for_collision(
+                            q_seed, d_pos, d_rot, skip_collision=self.skip_collision
+                        )
+                        raw_step = np.concatenate([q_new, [float(d_gripper)]])
+                        step_t = torch.tensor(raw_step, dtype=anchor_chunk.dtype, device=device).unsqueeze(0)
+                        step_norm = self._normalize_policy_guidance_action(step_t)
+                        t_abs = self._chunk_step + t_rel
+                        guidance_chunk[:, t_abs, :action_dim] = step_norm
+                        q_seed = q_new[: self.num_dofs].copy()
+
+            elif self.policy_guidance_representation == PolicyGuidanceRepresentation.DELTA:
+                # Single-step DELTA: apply IK at the end of the chunk (full accumulated
+                # delta), ramp linearly from anchor at chunk_step to guidance at last step.
+                assert delta_np is not None, "DELTA mode requires a guidance delta in the batch"
+                raw_end = self.postprocessor(anchor_chunk[:, anchor_len - 1, :])  # [B, num_dofs+1]
+                guidance_end = np.zeros((batch_size, action_dim), dtype=np.float64)
+                n_remaining = anchor_len - self._chunk_step
+                for b in range(batch_size):
+                    d = delta_np[b]
+                    q = self._desired_q.copy() if self._desired_q is not None else raw_end[b, : self.num_dofs]
+                    accumulated_pos = d[:3] * n_remaining
+                    r_single = Rotation.from_euler("XYZ", d[3:6])
+                    r_accumulated = Rotation.identity()
+                    for _ in range(n_remaining):
+                        r_accumulated = r_accumulated * r_single
+                    accumulated_rot = r_accumulated.as_euler("XYZ")
+                    q_new = self._project_delta_for_collision(q, accumulated_pos, accumulated_rot)
+                    guidance_end[b] = np.concatenate([q_new, [float(d[6])]])
+
+                guidance_end_t = torch.tensor(guidance_end, dtype=anchor_chunk.dtype, device=device)
+                guidance_end_norm = self._normalize_policy_guidance_action(guidance_end_t)
+                joint_delta = guidance_end_norm - anchor_chunk[:, anchor_len - 1, :]
+                if max_action_dim > action_dim:
+                    joint_delta = torch.cat(
+                        [
+                            joint_delta,
+                            torch.zeros(
+                                batch_size,
+                                max_action_dim - action_dim,
+                                dtype=joint_delta.dtype,
+                                device=device,
+                            ),
+                        ],
+                        dim=1,
+                    )
+                n_steps = anchor_len - self._chunk_step
+                for t_abs in range(self._chunk_step, anchor_len):
+                    alpha = (t_abs - self._chunk_step) / max(n_steps - 1, 1)
+                    guidance_chunk[:, t_abs, :] = guidance_chunk[:, t_abs, :] + alpha * joint_delta
+
+            else:
+                raise NotImplementedError(
+                    f"Unsupported policy_guidance_representation: {self.policy_guidance_representation}"
+                )
 
             # ratio=0 is handled by the early return above; this path is only for 0 < ratio < 1.
-            x_tsw = self._build_guidance_noise_from_chunk(guidance_chunk, ratio)
 
-            blended = self.inner_policy.predict_action_chunk(batch, noise=x_tsw, sa_noise_ratio=ratio)
-            self._guided_chunk = blended
+            # build the guidance noise regardless of blend strategy to consume the rng seed
+            # It's ok to do this duplicate work for interpolate because that is a debug mode, anyways
+            x_tsw = self._build_guidance_noise_from_chunk(guidance_chunk, ratio, base_noise=base_noise)
+            if self.guidance_blend_strategy == GuidanceBlendStrategy.INTERPOLATE:
+                # Simple linear interpolation in clean action space — no denoising.
+                # guidance_chunk[:, :, :action_dim] is the normalized guidance.
+                # anchor_chunk is the pure policy output (normalized).
+                # blended = ratio * anchor + (1-ratio) * guidance
+                blended = anchor_chunk.clone()
+                g = guidance_chunk[:, :, :action_dim]
+                blended[:, :, :action_dim] = ratio * anchor_chunk + (1.0 - ratio) * g
+                self._guided_chunk = blended
+            elif self.guidance_blend_strategy == GuidanceBlendStrategy.DENOISE:
+                blended = self.inner_policy.predict_action_chunk(batch, noise=x_tsw, sa_noise_ratio=ratio)
+                self._guided_chunk = blended
+            else:
+                raise NotImplementedError(
+                    f"Unsupported guidance_blend_strategy: {self.guidance_blend_strategy}"
+                )
 
             action = self._guided_chunk[:, self._chunk_step, :]
             self._chunk_step += 1
@@ -657,19 +895,28 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # Converts to raw joint space (where the limit is physically meaningful in radians),
         # scales the whole joint delta vector uniformly (preserves EE direction), then
         # converts back to normalized space.
-        if ratio != 1.0 and q_prev_for_vel_limit is not None:
-            q_proposed = self.postprocessor(action).cpu().numpy().reshape(-1)
-            q_prev = q_prev_for_vel_limit
-            q_actual, dq_actual = self._apply_velocity_limit(q_proposed, q_prev)
-            self._prev_dq = dq_actual
-            action = self._normalize_policy_guidance_action(
-                torch.tensor(q_actual, dtype=action.dtype, device=action.device).unsqueeze(0)
-            )
+        # TODO put this velocity limit back for all ratios after bugs are ironed out
+        # if ratio != 0.0 and ratio != 1.0 and q_prev_for_vel_limit is not None:
+        #     """
+        #     TODO after other bugs are ironed out:
+        #     _desired_q seeded from policy output, not obs state: line 548 seeds it from self.postprocessor(inner_action). So the very first velocity limit step (line 688) computes dq = q_proposed - inner_action_raw, not dq = q_proposed - actual_robot_state. This can produce an artificially large delta on the first step and trigger velocity limiting incorrectly.
+        #     """
+        #     q_proposed = self.postprocessor(action).cpu().numpy().reshape(-1)
+        #     q_prev = q_prev_for_vel_limit
+        #     q_actual, dq_actual = self._apply_velocity_limit(q_proposed, q_prev)
+        #     self._prev_dq = dq_actual
+        #     action = self._normalize_policy_guidance_action(
+        #         torch.tensor(q_actual, dtype=action.dtype, device=action.device).unsqueeze(0)
+        #     )
 
         # Update _desired_q from the action we're about to send, so all modes
         # accumulate in raw joint space (like KeyboardInterfaceAgent._desired_q).
-        # get_full_teleop_action already updates _desired_q internally; skip it.
-        self._desired_q = self.postprocessor(action).cpu().numpy()
+        # When get_full_teleop_action was called, use its raw float64 IK result
+        # to avoid precision loss from the normalize→denormalize roundtrip.
+        if self._last_raw_action is not None:
+            self._desired_q = self._last_raw_action.reshape(-1).copy()
+        else:
+            self._desired_q = self.postprocessor(action).cpu().numpy().reshape(-1)
 
         return action
 

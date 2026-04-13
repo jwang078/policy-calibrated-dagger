@@ -192,8 +192,8 @@ run_job() {
 
 maybe_sleep() { [[ "$DRY_RUN" == false ]] && sleep 10; }
 
-run_job "diffusion" "basewrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE"
-maybe_sleep
+# run_job "diffusion" "basewrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE"
+# maybe_sleep
 
 # run_job "diffusion" "base"      DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE"
 # maybe_sleep

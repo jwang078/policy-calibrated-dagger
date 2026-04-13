@@ -874,6 +874,15 @@ def parse_args():
             "equivalent results given the same dataset guidance."
         ),
     )
+    parser.add_argument(
+        "--n_anchor_steps",
+        type=int,
+        default=0,
+        help=(
+            "Number of action steps at the start of each chunk to anchor exactly to guidance "
+            "via inpainting inside the denoising loop. 0 = full-chunk blending only (default)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -912,6 +921,7 @@ def main():
     )
     wrapper.guidance_blend_strategy = GuidanceBlendStrategy(args.blend_strategy)
     wrapper.policy_guidance_representation = PolicyGuidanceRepresentation(args.guidance_repr)
+    wrapper.n_anchor_steps = args.n_anchor_steps
     wrapper.skip_collision = True  # dataset guidance is known-safe; collision detection adds IK drift
     n_obs_steps = wrapper.config.n_obs_steps
     n_action_steps = wrapper.config.n_action_steps
@@ -1049,8 +1059,9 @@ def main():
             policy_tag = json.load(f)["policy"]["type"]
         repr_tag = "delta" if args.guidance_repr == "delta" else "abspos"
         drain_tag = "onestep" if args.drain_chunk else "everystep"
+        anchor_tag = f"anchor{args.n_anchor_steps}" if args.n_anchor_steps > 0 else "noanchor"
         parent = f"shared_autonomy_ep{episode_index}_frame{frame_index}"
-        name = f"{policy_tag}_{args.blend_strategy}_{repr_tag}_{drain_tag}"
+        name = f"{policy_tag}_{args.blend_strategy}_{repr_tag}_{drain_tag}_{anchor_tag}"
         output_dir = Path("outputs/viz") / parent / name
     else:
         output_dir = Path(args.output_dir)

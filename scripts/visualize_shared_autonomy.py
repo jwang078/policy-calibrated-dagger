@@ -255,9 +255,9 @@ def get_action_chunk_for_ratio(
             task_description=task_description,
         )
         preprocessed = obs_preprocessor(raw_obs)
-        if guidance_action is not None:
-            guidance_t = torch.tensor(guidance_action, dtype=torch.float32, device=device).unsqueeze(0)
-            preprocessed["observation.policy_guidance_action"] = guidance_t
+        # if guidance_action is not None:
+        #     guidance_t = torch.tensor(guidance_action, dtype=torch.float32, device=device).unsqueeze(0)
+        #     preprocessed["observation.policy_guidance_action"] = guidance_t
         if guidance_chunk is not None:
             chunk_t = torch.tensor(guidance_chunk, dtype=torch.float32, device=device).unsqueeze(0)
             preprocessed["observation.policy_guidance_chunk"] = chunk_t

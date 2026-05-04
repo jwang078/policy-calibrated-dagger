@@ -3,10 +3,12 @@
 # Script to run lerobot-eval on all policy checkpoints
 # Handles diffusion_approach_lever_* and pi05_training_approach_lever_* folders
 #
-# Usage: ./run_all_evals.sh [--dry-run] [--list] [--first-only] [--n-episodes int]
-#   --dry-run:    Show commands without executing them
-#   --list:       Only list experiments and checkpoints to evaluate, then exit
-#   --first-only: Only evaluate the first checkpoint per experiment (for debugging)
+# Usage: ./run_all_evals.sh [--dry-run] [--list] [--first-only] [--n-episodes int] [--episode-length int]
+#   --dry-run:        Show commands without executing them
+#   --list:           Only list experiments and checkpoints to evaluate, then exit
+#   --first-only:     Only evaluate the first checkpoint per experiment (for debugging)
+#   --n-episodes:     Number of evaluation episodes (default 5)
+#   --episode-length: Max steps per episode (default: use env default)
 
 # Parse arguments
 DRY_RUN=false
@@ -14,6 +16,7 @@ LIST_ONLY=false
 FIRST_ONLY=false
 LAST_ONLY=false
 N_EPISODES=5  # Default value
+EPISODE_LENGTH=""  # Default: unset (use env default)
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -35,6 +38,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --n-episodes)
             N_EPISODES="$2"
+            shift 2
+            ;;
+        --episode-length)
+            EPISODE_LENGTH="$2"
             shift 2
             ;;
         *)
@@ -310,6 +317,11 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
             --eval.batch_size=1 \\
             --eval.use_async_envs=false \\
             --rename_map='$rename_map'"
+
+        if [ -n "$EPISODE_LENGTH" ]; then
+            eval_cmd="$eval_cmd \\
+            --env.episode_length=$EPISODE_LENGTH"
+        fi
 
         if [ "$DRY_RUN" = true ]; then
             echo "Command:"

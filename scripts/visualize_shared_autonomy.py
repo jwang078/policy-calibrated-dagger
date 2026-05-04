@@ -36,7 +36,11 @@ from scipy.spatial.transform import Rotation
 
 # ── lerobot imports ──────────────────────────────────────────────────────────
 from lerobot.configs.shared_autonomy import SharedAutonomyConfig
-from lerobot.policies.factory import _wrap_with_shared_autonomy, get_policy_class
+from lerobot.policies.factory import (
+    _reconnect_relative_absolute_steps,
+    _wrap_with_shared_autonomy,
+    get_policy_class,
+)
 from lerobot.policies.shared_autonomy_wrapper import (
     BlendMode,
     GuidanceBlendStrategy,
@@ -44,6 +48,7 @@ from lerobot.policies.shared_autonomy_wrapper import (
 )
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import POLICY_PREPROCESSOR_DEFAULT_NAME
+from lerobot.utils.lerobot_dataset_utils import make_default_rename_map, resolve_dataset_dir
 
 # ── policy loading ────────────────────────────────────────────────────────────
 
@@ -98,6 +103,7 @@ def load_wrapped_policy(
         pretrained_model_name_or_path=str(policy_path),
         config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
     )
+    _reconnect_relative_absolute_steps(obs_preprocessor, wrapper.postprocessor, policy=wrapper)
 
     return wrapper, obs_preprocessor
 
@@ -231,8 +237,21 @@ def get_action_chunk_for_ratio(
     task_description: str | None = None,
     drain_chunk: bool = True,
     base_noise: torch.Tensor | None = None,
-) -> np.ndarray:
-    """Compute a single predicted action chunk (raw joint space) for a given forward_flow_ratio."""
+    total_steps: int | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Compute a predicted action trajectory (raw joint space) for a given forward_flow_ratio.
+
+    The real-phase loop runs for ``total_steps`` iterations (defaults to the policy's
+    full chunk length — chunk_size for flow matching, horizon for diffusion). Inside
+    that window the policy re-predicts and re-blends every ``wrapper.config.n_action_steps``
+    steps, so smaller n_action_steps means more frequent regeneration over the same time
+    window.
+
+    Returns (all_raw_actions [total_steps, action_dim],
+             decoded_guidance_chunk [total_steps, joint_dim] | None).
+    decoded_guidance_chunk is stitched from each blend's first n_action_steps of decoded
+    guidance, so it lines up with the executed trajectory.
+    """
 
     def _build_batch(
         row: pd.Series,
@@ -265,8 +284,9 @@ def get_action_chunk_for_ratio(
 
     # Use the first guidance action for all obs-filling steps (constant context).
     first_guidance = guidance_actions_raw[0]
-    n_obs_steps = wrapper.config.n_obs_steps
-    n_action_steps = wrapper.config.n_action_steps
+    n_obs_steps: int = wrapper.config.n_obs_steps
+    n_action_steps: int = wrapper.config.n_action_steps
+    n_steps: int = total_steps if total_steps is not None else n_action_steps
 
     wrapper.reset()
     wrapper.forward_flow_ratio = ratio
@@ -313,20 +333,24 @@ def get_action_chunk_for_ratio(
     # Real phase: action queue is now empty, obs queue has correct history.
     # The first call triggers predict_action_chunk with the right obs window.
     #
-    # drain_chunk mode: provide guidance only on t=0 to trigger one clean blend,
-    # then let the wrapper drain the blended chunk (no re-blending, temporally
-    # coherent). Without drain_chunk, guidance is provided every step.
+    # drain_chunk mode: provide guidance at every chunk boundary (t % n_action_steps == 0)
+    # to trigger a fresh blend, then let the wrapper drain the blended chunk between
+    # boundaries. Without drain_chunk, guidance is provided every step (re-blends each
+    # step with fresh noise).
     last_row = obs_frames.iloc[-1]
-    for t in range(n_action_steps):
-        if drain_chunk and t > 0 and ratio not in (0.0, 1.0):
+    decoded_guidance_full: np.ndarray | None = None
+    for t in range(n_steps):
+        at_chunk_boundary = t % n_action_steps == 0
+        suppress_guidance = drain_chunk and not at_chunk_boundary and ratio not in (0.0, 1.0)
+        if suppress_guidance:
             # No guidance → wrapper takes drain path, returns from same chunk.
-            # Only suppress guidance for intermediate ratios — ratio=0.0 needs
-            # guidance every step (otherwise get_hold_action returns same point).
+            # Only suppress for intermediate ratios — ratio=0.0 needs guidance every step
+            # (otherwise get_hold_action returns the same point).
             batch = _build_batch(last_row)
         else:
             guidance = guidance_actions_raw[t]
             # Pass the full remaining chunk so the wrapper can use per-step guidance
-            # instead of ramp-to-endpoint approximation (ABSOLUTE_POS mode only).
+            # instead of the ramp-to-endpoint approximation (ABSOLUTE_POS mode only).
             remaining_chunk = guidance_actions_raw[t:]  # [n_remaining, action_dim]
             batch = _build_batch(last_row, guidance_action=guidance, guidance_chunk=remaining_chunk)
         # use base_noise to make the plots plot the same noise across ratios
@@ -334,9 +358,19 @@ def get_action_chunk_for_ratio(
         raw = wrapper.postprocessor(action_norm).detach().cpu().numpy().reshape(-1)
         raw_actions.append(raw)
 
+        # Stitch the decoded guidance per blend so the overlay lines up with the
+        # executed trajectory. Each blend overwrites _last_decoded_guidance_chunk;
+        # only its first n_action_steps actually get drained before the next blend.
+        if at_chunk_boundary and wrapper._last_decoded_guidance_chunk is not None:
+            chunk_decode = wrapper._last_decoded_guidance_chunk[0]  # [anchor_len, joint_dim]
+            if decoded_guidance_full is None:
+                decoded_guidance_full = np.zeros((n_steps, chunk_decode.shape[1]), dtype=chunk_decode.dtype)
+            end_t = min(t + n_action_steps, n_steps)
+            decoded_guidance_full[t:end_t] = chunk_decode[: end_t - t]
+
     all_raw_actions = np.stack(raw_actions)
 
-    return all_raw_actions
+    return all_raw_actions, decoded_guidance_full
 
 
 @torch.no_grad()
@@ -352,7 +386,8 @@ def get_action_chunks_for_ratios(
     device: str,
     task_description: str | None = None,
     drain_chunk: bool = False,
-) -> dict[float, np.ndarray]:
+    total_steps: int | None = None,
+) -> tuple[dict[float, np.ndarray], dict[float, np.ndarray]]:
     """Compute predicted action chunks (raw joint space) for each forward_flow_ratio.
 
     Uses wrapper.select_action() directly so that changes to select_action (velocity
@@ -390,9 +425,10 @@ def get_action_chunks_for_ratios(
     base_noise = torch.randn(noise_shape, device=device)
 
     results: dict[float, np.ndarray] = {}
+    decoded_guidance_by_ratio: dict[float, np.ndarray] = {}
 
     for ratio in ratios:
-        all_raw_actions = get_action_chunk_for_ratio(
+        all_raw_actions, decoded_guidance = get_action_chunk_for_ratio(
             wrapper,
             obs_preprocessor,
             obs_frames,
@@ -405,11 +441,14 @@ def get_action_chunks_for_ratios(
             task_description,
             drain_chunk,
             base_noise=base_noise,
+            total_steps=total_steps,
         )
 
         results[ratio] = all_raw_actions
+        if decoded_guidance is not None:
+            decoded_guidance_by_ratio[ratio] = decoded_guidance
 
-    return results
+    return results, decoded_guidance_by_ratio
 
 
 # ── FK-based EE trajectory ────────────────────────────────────────────────────
@@ -524,6 +563,7 @@ def plot_joint_angles(
     frame_index: int,
     obs_states_raw: np.ndarray | None = None,
     guidance_actions_raw: np.ndarray | None = None,
+    decoded_guidance_raw: np.ndarray | None = None,
     output_path: Path | None = None,
     no_show: bool = False,
 ):
@@ -596,6 +636,23 @@ def plot_joint_angles(
                 zorder=3,
             )
 
+        # Decoded guidance_chunk (orange dashed): the raw-joint decode of what the
+        # wrapper actually fed into the blend. If this overlaps the green guidance,
+        # the blend's input is correct and any deviation is the blend math's fault.
+        if decoded_guidance_raw is not None and decoded_guidance_raw.shape[0] > 0:
+            dg_ts = np.arange(decoded_guidance_raw.shape[0])
+            ax.plot(
+                dg_ts,
+                decoded_guidance_raw[:, dim_idx],
+                color="orange",
+                linewidth=1.8,
+                linestyle="--",
+                marker="s",
+                markersize=4,
+                label="decoded guidance_chunk" if dim_idx == 0 else "_nolegend_",
+                zorder=3,
+            )
+
         for ratio, color in zip(ratios, colors, strict=True):
             chunk = action_chunks_by_ratio[ratio]
             timesteps = np.arange(chunk.shape[0])
@@ -644,6 +701,7 @@ def plot_ee_trajectories_3d(
     frame_index: int,
     obs_ee_positions: np.ndarray | None = None,
     guidance_ee_positions: np.ndarray | None = None,
+    decoded_guidance_ee_positions: np.ndarray | None = None,
     output_path: Path | None = None,
     no_show: bool = False,
 ):
@@ -718,6 +776,24 @@ def plot_ee_trajectories_3d(
             )
         )
 
+    # Decoded guidance_chunk (orange dashed): raw-joint decode of what the wrapper fed
+    # into the blend. Overlap with the green trajectory ⇒ blend input is correct.
+    if decoded_guidance_ee_positions is not None and len(decoded_guidance_ee_positions) > 0:
+        n_dg = len(decoded_guidance_ee_positions)
+        sizes_dg = [12] + [5] * (n_dg - 2) + [8]
+        symbols_dg = ["diamond"] + ["circle"] * (n_dg - 2) + ["x"]
+        fig.add_trace(
+            go.Scatter3d(
+                x=decoded_guidance_ee_positions[:, 0],
+                y=decoded_guidance_ee_positions[:, 1],
+                z=decoded_guidance_ee_positions[:, 2],
+                mode="lines+markers",
+                name="decoded guidance_chunk",
+                line={"color": "orange", "width": 3, "dash": "dash"},
+                marker={"color": "orange", "size": sizes_dg, "symbol": symbols_dg, "opacity": 0.9},
+            )
+        )
+
     for i, ratio in enumerate(ratios):
         traj = ee_trajectories_by_ratio[ratio]  # [n_action_steps+1, 3]
         color = to_hex(cmap(i / max(len(ratios) - 1, 1)))
@@ -782,7 +858,8 @@ def parse_args():
         default=None,
         help=(
             "Local directory containing parquet files. "
-            "Defaults to ~/.cache/huggingface/lerobot/{repo_id}/data."
+            "Defaults to auto-resolved from --dataset_repo_id (flat layout under "
+            "$HF_LEROBOT_HOME or snapshot cache under $HF_LEROBOT_HUB_CACHE)."
         ),
     )
     parser.add_argument(
@@ -833,6 +910,17 @@ def parse_args():
     )
     parser.add_argument("--num_dofs", type=int, default=6)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--n_action_steps",
+        type=int,
+        default=None,
+        help=(
+            "Override the policy's n_action_steps (how many actions are executed "
+            "before re-predicting). Smaller values cause the policy to regenerate "
+            "and re-blend more frequently within the same visualization window. "
+            "Default: use the policy's config value."
+        ),
+    )
     parser.add_argument(
         "--output_dir",
         default=None,
@@ -890,10 +978,7 @@ def main():
     args = parse_args()
 
     # Resolve dataset directory.
-    if args.dataset_dir is not None:
-        dataset_dir = Path(args.dataset_dir)
-    else:
-        dataset_dir = Path.home() / ".cache" / "huggingface" / "lerobot" / args.dataset_repo_id / "data"
+    dataset_dir = resolve_dataset_dir(args.dataset_repo_id, args.dataset_dir)
     print(f"Dataset dir: {dataset_dir}")
 
     # Load task description mapping (needed by PI0.5 preprocessor).
@@ -902,10 +987,7 @@ def main():
 
     # Build default rename_map if not provided.
     if args.rename_map is None:
-        rename_map = {
-            f"observation.images.{cam}_{args.image_resize_mode}": f"observation.images.{cam}"
-            for cam in args.camera_names
-        }
+        rename_map = make_default_rename_map(args.camera_names, args.image_resize_mode)
     else:
         rename_map = args.rename_map
     print(f"Rename map: {rename_map}")
@@ -923,9 +1005,21 @@ def main():
     wrapper.policy_guidance_representation = PolicyGuidanceRepresentation(args.guidance_repr)
     wrapper.n_anchor_steps = args.n_anchor_steps
     wrapper.skip_collision = True  # dataset guidance is known-safe; collision detection adds IK drift
+    if args.n_action_steps is not None:
+        prev_n_action_steps = wrapper.config.n_action_steps
+        wrapper.config.n_action_steps = args.n_action_steps
+        print(f"Overrode n_action_steps: {prev_n_action_steps} → {args.n_action_steps}")
     n_obs_steps = wrapper.config.n_obs_steps
     n_action_steps = wrapper.config.n_action_steps
-    print(f"Policy type: {wrapper.config.type}, n_obs_steps={n_obs_steps}, n_action_steps={n_action_steps}")
+    # Total visualization length: the full chunk the model produces per predict call.
+    # Flow matching (PI0.5) exposes chunk_size; diffusion exposes horizon.
+    total_steps = getattr(wrapper.config, "chunk_size", None) or getattr(wrapper.config, "horizon", None)
+    if total_steps is None:
+        raise ValueError("Could not determine policy chunk length (chunk_size/horizon).")
+    print(
+        f"Policy type: {wrapper.config.type}, n_obs_steps={n_obs_steps}, "
+        f"n_action_steps={n_action_steps}, total_steps={total_steps}"
+    )
     print(
         f"Blend strategy: {wrapper.guidance_blend_strategy.value}, guidance repr: {wrapper.policy_guidance_representation.value}"
     )
@@ -945,7 +1039,7 @@ def main():
         print(f"Using episode: {episode_index}")
 
     # Load episode to determine length, then pick frame.
-    n_needed = n_obs_steps + n_action_steps
+    n_needed = n_obs_steps + total_steps
     # Load full episode quickly to find frame count.
     parquet_files = find_parquet_files(dataset_dir)
     ep_df_list = []
@@ -978,10 +1072,10 @@ def main():
     frames_df = load_episode_frames(dataset_dir, episode_index, frame_index, n_needed)
 
     obs_frames = frames_df.iloc[:n_obs_steps]
-    guidance_frames = frames_df.iloc[n_obs_steps : n_obs_steps + n_action_steps]
+    guidance_frames = frames_df.iloc[n_obs_steps : n_obs_steps + total_steps]
     guidance_actions_raw = np.stack(
         [np.array(row["action"], dtype=np.float32) for _, row in guidance_frames.iterrows()]
-    )  # [n_action_steps, action_dim]
+    )  # [total_steps, action_dim]
     print(
         f"Loaded {len(obs_frames)} obs frames + {len(guidance_frames)} guidance frames. "
         f"Action dim: {guidance_actions_raw.shape[1]}"
@@ -1012,7 +1106,7 @@ def main():
 
     # Compute action chunks for each ratio.
     print(f"Computing action chunks for ratios: {args.forward_flow_ratios} …")
-    action_chunks = get_action_chunks_for_ratios(
+    action_chunks, decoded_guidance_by_ratio = get_action_chunks_for_ratios(
         wrapper=wrapper,
         obs_preprocessor=obs_preprocessor,
         obs_frames=obs_frames,
@@ -1024,8 +1118,23 @@ def main():
         device=args.device,
         task_description=task_description,
         drain_chunk=args.drain_chunk,
+        total_steps=total_steps,
     )
     print("Done computing action chunks.")
+
+    # Pick a single decoded guidance_chunk to overlay on the plots. With deterministic
+    # base_noise the anchor is identical across ratios, so all decoded chunks should match;
+    # we just take the first available one (skipping degenerate ratios that bypass blend).
+    decoded_guidance: np.ndarray | None = None
+    if decoded_guidance_by_ratio:
+        sample_ratio = next(iter(decoded_guidance_by_ratio.keys()))
+        decoded_guidance = decoded_guidance_by_ratio[sample_ratio]
+        print(
+            f"Captured decoded guidance_chunk for diagnostic from ratio={sample_ratio} "
+            f"(shape {decoded_guidance.shape})."
+        )
+    else:
+        print("No decoded guidance_chunk captured (all ratios bypassed the blend branch).")
 
     # Compute EE trajectories.
     print("Computing EE trajectories via pybullet FK …")
@@ -1043,6 +1152,9 @@ def main():
     guidance_ee_positions = compute_ee_from_states(
         wrapper, guidance_actions_raw_for_plot
     )  # [n_action_steps, 3]
+    decoded_guidance_ee_positions = (
+        compute_ee_from_states(wrapper, decoded_guidance) if decoded_guidance is not None else None
+    )
     print("Done computing EE trajectories.")
 
     # Build joint names.
@@ -1060,8 +1172,9 @@ def main():
         repr_tag = "delta" if args.guidance_repr == "delta" else "abspos"
         drain_tag = "onestep" if args.drain_chunk else "everystep"
         anchor_tag = f"anchor{args.n_anchor_steps}" if args.n_anchor_steps > 0 else "noanchor"
+        nas_tag = f"nas{n_action_steps}"
         parent = f"shared_autonomy_ep{episode_index}_frame{frame_index}"
-        name = f"{policy_tag}_{args.blend_strategy}_{repr_tag}_{drain_tag}_{anchor_tag}"
+        name = f"{policy_tag}_{args.blend_strategy}_{repr_tag}_{drain_tag}_{anchor_tag}_{nas_tag}"
         output_dir = Path("outputs/viz") / parent / name
     else:
         output_dir = Path(args.output_dir)
@@ -1079,6 +1192,7 @@ def main():
         frame_index=frame_index,
         obs_states_raw=obs_states_raw,
         guidance_actions_raw=guidance_actions_raw_for_plot,
+        decoded_guidance_raw=decoded_guidance,
         output_path=joint_angles_path,
         no_show=args.no_show,
     )
@@ -1091,6 +1205,7 @@ def main():
         frame_index=frame_index,
         obs_ee_positions=obs_ee_positions,
         guidance_ee_positions=guidance_ee_positions,
+        decoded_guidance_ee_positions=decoded_guidance_ee_positions,
         output_path=ee_traj_path,
         no_show=args.no_show,
     )

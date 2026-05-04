@@ -144,6 +144,36 @@ def launch_ratio_slider(wrapper: SharedAutonomyPolicyWrapper) -> None:
 
         _update_pause_text()
 
+        # --- RRT to Goal toggle ---
+        # Single button: first click plans + executes; click again while busy cancels.
+        from lerobot.policies.rrt_to_goal import RRTMode
+
+        rrt_btn = tk.Button(
+            root,
+            text="RRT to Goal",
+            font=("Helvetica", 11, "bold"),
+            width=24,
+            command=lambda: wrapper.trigger_rrt_to_goal(),
+        )
+        rrt_btn.pack(padx=16, pady=(0, 4))
+
+        rrt_status = tk.Label(root, text="RRT: idle", font=("Helvetica", 9), fg="gray")
+        rrt_status.pack(padx=16, pady=(0, 12))
+
+        rrt_colors = {
+            RRTMode.IDLE: "gray",
+            RRTMode.PLANNING: "orange",
+            RRTMode.EXECUTING: "green",
+        }
+
+        def _poll_rrt():
+            mode = wrapper._rrt.mode
+            rrt_status.config(text=f"RRT: {mode.value}", fg=rrt_colors[mode])
+            rrt_btn.config(text=("Cancel RRT" if mode != RRTMode.IDLE else "RRT to Goal"))
+            root.after(150, _poll_rrt)
+
+        _poll_rrt()
+
         # --- Teleop recording status ---
         from lerobot.policies.teleop_recording import TeleopRecordingContext
 

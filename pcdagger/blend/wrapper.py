@@ -27,6 +27,7 @@ Works with any noise/flow-based policy (PI0.5, Diffusion) without modifying lero
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 from enum import Enum
@@ -42,7 +43,15 @@ from torch import Tensor, nn
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.processor import PolicyProcessorPipeline
+from lerobot.policies.rrt_to_goal import (
+    RRTMode,
+    RRTPlanningError,
+    RRTRuntimeState,
+    RRTToGoalPlanner,
+    extract_task_goal,
+)
+from lerobot.policies.teleop_recording import FrameSource
+from lerobot.processor import AbsoluteActionsProcessorStep, PolicyProcessorPipeline, to_relative_actions
 
 if TYPE_CHECKING:
     from lerobot.policies.teleop_recording import TeleopRecordingContext
@@ -140,6 +149,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         blend_mode: BlendMode | str = BlendMode.EVERY_STEP,
         guidance_blend_strategy: GuidanceBlendStrategy | str = GuidanceBlendStrategy.DENOISE,
         n_anchor_steps: int = 0,
+        fps: int = 30,
     ):
         # Bypass PreTrainedPolicy.__init__ — we proxy the inner policy's config
         nn.Module.__init__(self)
@@ -166,6 +176,10 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # Wrapper-managed blended chunk buffer
         self._guided_chunk: Tensor | None = None  # [B, n_action_steps, action_dim]
         self._chunk_step: int = 99999999999  # how many steps have been returned from _guided_chunk
+        # Diagnostic: raw-joint decode of the most-recently-built guidance_chunk
+        # ([B, anchor_len, joint_dim]). Lets callers compare what the wrapper
+        # actually feeds into the blend against the demo trajectory.
+        self._last_decoded_guidance_chunk: np.ndarray | None = None
 
         self.num_dofs = num_dofs
         self._max_joint_delta = max_joint_delta
@@ -173,6 +187,16 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self.skip_collision: bool = False  # set True for visualization (dataset guidance is known-safe)
         self.policy_guidance_representation = policy_guidance_representation
         self.n_anchor_steps = n_anchor_steps
+        self._fps = fps
+
+        # All RRT-mode state lives in a single dataclass; keeps the wrapper tidy.
+        self._rrt: RRTRuntimeState = RRTRuntimeState()
+
+        # When True (default) RRT auto-pauses the wrapper on natural goal-reach
+        # so the user can decide what to do next from the GUI. Automated callers
+        # (e.g. the intervention-recording script) flip this off so the loop
+        # keeps running after the chunk exhausts.
+        self.auto_pause_on_rrt_finish: bool = True
 
         logger.info(f"SharedAutonomyPolicyWrapper: ratio={forward_flow_ratio}, robot={robot_name}")
 
@@ -181,13 +205,40 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         urdf_path = resolve_splatsim_path(robot_config.urdf_path)
         ee_link_name = robot_config.wrist_camera_link_name
 
-        self._pb_client = p.connect(p.DIRECT)
+        self._pb_client = p.connect(p.GUI)
         # TODO(hardcoded): base_position from robot_iphone_w_engine_new config
+        # Match SplatSim's load_urdf flags for articulated objects so the
+        # planner's collision shapes are byte-identical to the simulator's:
+        #   - URDF_USE_IMPLICIT_CYLINDER: use analytical cylinders for any
+        #     <geometry><cylinder/></geometry>. Without this pybullet falls
+        #     back to a convex mesh approximation (a few mm smaller in
+        #     radius), which is enough for the planner to declare a tight
+        #     path collision-free that the simulator then registers as a graze.
+        #   - URDF_USE_SELF_COLLISION: enables robot-vs-self getClosestPoints
+        #     reports, which the planner's self-collision checks rely on.
+        #   - URDF_USE_SELF_COLLISION_EXCLUDE_PARENT: ignore parent↔child
+        #     joint pairs in those reports (otherwise every adjacent link
+        #     would always look "in collision" because they touch at the
+        #     joint).
+        urdf_flags = (
+            p.URDF_USE_IMPLICIT_CYLINDER
+            | p.URDF_USE_SELF_COLLISION
+            | p.URDF_USE_SELF_COLLISION_EXCLUDE_PARENT
+        )
         self._robot_id = p.loadURDF(
-            urdf_path, useFixedBase=True, basePosition=[0, 0, -0.088], physicsClientId=self._pb_client
+            urdf_path,
+            useFixedBase=True,
+            basePosition=[0, 0, -0.088],
+            flags=urdf_flags,
+            physicsClientId=self._pb_client,
         )
         self._ee_link = self._find_ee_link(ee_link_name)
         self._num_pb_joints = p.getNumJoints(self._robot_id, physicsClientId=self._pb_client)
+        # One-time AABB log per robot link at the rest pose. Matches the
+        # diagnostic we use for obstacles in load_obstacles, so you can
+        # eyeball that all gripper / arm links have non-degenerate
+        # collision geometry after the URDF flag change.
+        self._log_robot_link_aabbs()
 
         # Count movable (non-fixed) joints for null-space IK arrays.
         self._num_movable_joints = sum(
@@ -216,6 +267,32 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
     def _sync_joints(self, q: np.ndarray):
         for i in range(self.num_dofs):
             p.resetJointState(self._robot_id, i + 1, q[i], physicsClientId=self._pb_client)
+
+    def _log_robot_link_aabbs(self) -> None:
+        """Log every robot link's name and AABB at the rest pose.
+
+        Mirrors the diagnostic we emit for obstacles. A degenerate AABB
+        (zero-volume) on an arm or gripper link means that link has no
+        collision geometry in the URDF and would be silently skipped by
+        the planner's collision check — useful to eyeball after URDF
+        changes.
+        """
+        try:
+            n = p.getNumJoints(self._robot_id, physicsClientId=self._pb_client)
+            base_aabb = p.getAABB(self._robot_id, linkIndex=-1, physicsClientId=self._pb_client)
+            entries: list[str] = [f"base(-1): aabb={base_aabb}"]
+            for link_i in range(n):
+                info = p.getJointInfo(self._robot_id, link_i, physicsClientId=self._pb_client)
+                link_name = info[12].decode("utf-8")
+                aabb = p.getAABB(self._robot_id, linkIndex=link_i, physicsClientId=self._pb_client)
+                entries.append(f"{link_name}({link_i}): aabb={aabb}")
+            logger.info(
+                "Robot link AABBs at rest pose (n_links=%d):\n  %s",
+                n + 1,
+                "\n  ".join(entries),
+            )
+        except p.error as e:
+            logger.warning("Failed to log robot link AABBs: %s", e)
 
     def _get_ee_pose(self) -> tuple[np.ndarray, np.ndarray]:
         state = p.getLinkState(
@@ -303,6 +380,189 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 physicsClientId=self._pb_client,
             )
         )
+
+    # ---- RRT-to-Goal mode ------------------------------------------------- #
+
+    def _ensure_rrt_planner(self) -> RRTToGoalPlanner:
+        """Lazy-init the planner (so the import / setup happens only when used)."""
+        if self._rrt.planner is None:
+            self._rrt.planner = RRTToGoalPlanner(
+                pb_client=self._pb_client,
+                robot_id=self._robot_id,
+                joint_indices=list(range(1, 1 + self.num_dofs)),
+                ee_link_index=self._ee_link,
+                num_dofs=self.num_dofs,
+                fps=self._fps,
+                lower_limits=np.asarray(self.lower_limits, dtype=np.float64),
+                upper_limits=np.asarray(self.upper_limits, dtype=np.float64),
+                num_ik_candidates=16,
+            )
+        return self._rrt.planner
+
+    def _maybe_update_oracle_obstacles(self, oracle_cfg: dict) -> None:
+        """Cache the oracle env config and (re)load obstacles when its hash changes.
+
+        Loads obstacles into the wrapper's pybullet client and adopts them as
+        the authoritative obstacle set for IK collision projection too. The
+        hardcoded fallback bodies (loaded by ``_load_static_obstacles`` for
+        no-oracle environments) are torn down on the first oracle load so the
+        planner doesn't trip over duplicate table/wall geometry.
+        """
+        if oracle_cfg is None:
+            return
+        self._rrt.oracle_env_config = oracle_cfg
+        try:
+            planner = self._ensure_rrt_planner()
+            oracle_ids = planner.load_obstacles(oracle_cfg)
+        except Exception:
+            logger.exception("Failed to load oracle obstacles into pybullet client")
+            return
+        # Replace the hardcoded fallback obstacles with the oracle set.
+        # Idempotent — only runs once, the first time oracle info arrives.
+        if not getattr(self, "_oracle_replaced_static_obstacles", False):
+            for body_id in self._obstacle_ids:
+                with contextlib.suppress(p.error):
+                    p.removeBody(body_id, physicsClientId=self._pb_client)
+            self._oracle_replaced_static_obstacles = True
+        self._obstacle_ids = list(oracle_ids)
+
+    def trigger_rrt_to_goal(self) -> None:
+        """Toggle: start RRT-to-goal if idle, cancel if planning/executing.
+
+        Safe to call from a GUI thread. Planning runs on a daemon worker thread
+        so this method returns immediately.
+        """
+        rrt = self._rrt
+        with rrt.lock:
+            if rrt.mode in (RRTMode.PLANNING, RRTMode.EXECUTING):
+                rrt.cancel_requested = True
+                logger.info("RRT cancellation requested (state=%s)", rrt.mode.value)
+                return
+            rrt.mode = RRTMode.PLANNING
+            rrt.cancel_requested = False
+        threading.Thread(target=self._do_rrt_plan, daemon=True, name="rrt-plan").start()
+
+    def _do_rrt_plan(self) -> None:
+        """Worker entry: plan a trajectory, then transition to EXECUTING."""
+        rrt = self._rrt
+        try:
+            if rrt.oracle_env_config is None:
+                logger.warning(
+                    "RRT triggered but no oracle_env_config available. "
+                    "Set env.include_oracle_info=true to enable."
+                )
+                rrt.mode = RRTMode.IDLE
+                return
+            goal = extract_task_goal(rrt.oracle_env_config)
+            if goal is None:
+                logger.warning(
+                    "RRT triggered but oracle_env_config has no task.target_ee_pos / target_ee_quat"
+                )
+                rrt.mode = RRTMode.IDLE
+                return
+            target_ee_pos, target_ee_quat, q_goal_bias = goal
+            if self._desired_q is None:
+                logger.warning("RRT triggered before _desired_q seeded; aborting")
+                rrt.mode = RRTMode.IDLE
+                return
+
+            planner = self._ensure_rrt_planner()
+            planner.load_obstacles(rrt.oracle_env_config)
+            q_start = self._desired_q.reshape(-1)[: self.num_dofs].copy()
+            chunk = planner.plan(q_start, target_ee_pos, target_ee_quat, q_goal_bias)
+        except RRTPlanningError as e:
+            logger.warning("RRT planning failed: %s", e)
+            rrt.mode = RRTMode.IDLE
+            return
+        except Exception:
+            logger.exception("Unexpected error during RRT planning")
+            rrt.mode = RRTMode.IDLE
+            return
+
+        with rrt.lock:
+            if rrt.cancel_requested:
+                logger.info("RRT plan ready but cancellation was requested; discarding")
+                rrt.mode = RRTMode.IDLE
+                rrt.cancel_requested = False
+                return
+            rrt.chunk = chunk
+            rrt.step = 0
+            rrt.mode = RRTMode.EXECUTING
+            # Note: forward_flow_ratio is intentionally left untouched. The RRT
+            # execution branch in select_action wins on its own (early-returns
+            # before the ratio-based branches), so there's no need to park the
+            # ratio at 1.0 — and not parking means slider edits made during RRT
+            # execution stay in effect when the user cancels or RRT finishes.
+            # Display the planned-cancel point alongside the total chunk length
+            # if the caller advertised one (controller's randomized stop). When
+            # target is None or >= chunk length, just show the total.
+            n_total = len(chunk)
+            target = rrt.target_steps
+            exec_str = f"{target}/{n_total}" if target is not None and target < n_total else f"{n_total}"
+            logger.info("RRT executing %s waypoints (current ratio=%.2f)", exec_str, self.forward_flow_ratio)
+
+    def _flush_inner_action_queue(self) -> None:
+        """Drop the inner policy's cached actions without resetting its obs queue.
+
+        Both PI0.5 and Diffusion buffer a chunk's worth of actions and pop one
+        per select_action call. After RRT execution that buffer is stale (the
+        robot has been driven by the planner). Clearing only the action queue
+        forces predict_action_chunk to fire again on the next call — but the
+        observation history (n_obs_steps) is preserved, which matters for
+        policies whose obs window is longer than 1 step.
+        """
+        cleared_queue = False
+        inner = self.inner_policy
+        # PI0.5
+        action_q = getattr(inner, "_action_queue", None)
+        if action_q is not None and hasattr(action_q, "clear"):
+            action_q.clear()
+            cleared_queue = True
+        # Diffusion (and any other policy following the shared `_queues[ACTION]` pattern)
+        queues = getattr(inner, "_queues", None)
+        if isinstance(queues, dict):
+            from lerobot.utils.constants import ACTION
+
+            q = queues.get(ACTION)
+            if q is not None and hasattr(q, "clear"):
+                q.clear()
+                cleared_queue = True
+
+        if not cleared_queue:
+            raise RuntimeError(
+                "Failed to flush inner policy's action queue: no known queue attribute found. "
+            )
+
+    def _cancel_rrt(self) -> None:
+        rrt = self._rrt
+        rrt.chunk = None
+        rrt.step = 0
+        rrt.mode = RRTMode.IDLE
+        rrt.cancel_requested = False
+        # Clear the controller's advertised cancel hint so a later trigger
+        # without one doesn't print a stale "X/Y" in the executing log.
+        rrt.target_steps = None
+        # forward_flow_ratio was never parked (see _do_rrt_plan), so there's
+        # nothing to restore — whatever the user has the slider at right now
+        # is the ratio used post-cancel.
+        # The robot has been driven by the RRT planner since these were last
+        # populated, so the cached actions are stale (the policy's obs queue,
+        # however, has been getting fresh observations every step — keep it).
+        # Drop the inner policy's action chunk and the wrapper's blended chunk
+        # so the next call generates fresh actions from the post-RRT pose.
+        self._flush_inner_action_queue()
+        self._guided_chunk = None
+        self._chunk_step = 99_999_999_999  # forces chunk_exhausted on next call
+        self._had_guidance_last_step = False
+
+    def _finish_rrt(self) -> None:
+        """Goal reached: restore prior ratio, then auto-pause unless disabled."""
+        self._cancel_rrt()
+        if self.auto_pause_on_rrt_finish:
+            self._run_event.clear()
+            logger.info("RRT goal reached; auto-paused. Resume to continue.")
+        else:
+            logger.info("RRT goal reached; auto-pause disabled (running headless).")
 
     def _project_delta_for_collision(
         self,
@@ -417,10 +677,26 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
 
         Zero-fills NaN/Inf dimensions (e.g., gripper always closed in training data
         where normalization stats have zero variance).
+
+        When the policy uses relative actions, the postprocessor's AbsoluteActionsProcessorStep
+        will add the current state to produce absolute joint positions. To make the round-trip
+        correct (normalize → postprocess → absolute guidance), the raw absolute guidance must
+        first be converted to relative (guidance - state) before normalizing, matching how
+        training actions were preprocessed.
         """
-        # The training gripper is near-constant, so normalization has a huge scale factor
-        # and any guidance with gripper outside the training range explodes after normalization.
         policy_guidance_action = policy_guidance_action.clone()
+
+        # If relative actions are enabled, convert absolute guidance → relative so that
+        # (a) normalization uses the correct relative-action stats, and
+        # (b) the postprocessor's AbsoluteActionsProcessorStep adds state back cleanly.
+        for _step in self.postprocessor.steps:
+            if isinstance(_step, AbsoluteActionsProcessorStep):
+                if _step.enabled and _step.relative_step is not None:
+                    state = _step.relative_step._last_state
+                    if state is not None:
+                        mask = _step.relative_step._build_mask(policy_guidance_action.shape[-1])
+                        policy_guidance_action = to_relative_actions(policy_guidance_action, state, mask)
+                break
 
         normalized = self.inverse_postprocessor(policy_guidance_action)
         bad = ~torch.isfinite(normalized)
@@ -533,6 +809,14 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self._had_guidance_last_step = False
         self._desired_q = None
         self._prev_dq = None
+        self._last_decoded_guidance_chunk = None
+        # Clear RRT chunk state on episode boundary; keep the planner instance
+        # so its obstacle cache survives if the env config hash matches next episode.
+        self._rrt.chunk = None
+        self._rrt.step = 0
+        self._rrt.mode = RRTMode.IDLE
+        self._rrt.cancel_requested = False
+        self._rrt.target_steps = None
         if self._start_paused:
             self._run_event.clear()
         return self.inner_policy.reset()
@@ -584,14 +868,17 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self._run_event.wait()  # blocks while paused
         self._last_raw_action = None  # reset; set by get_full_teleop_action if called
 
+        # Cache the oracle env config (obstacle geometry + task goal) sent by the
+        # SplatSim server when env.include_oracle_info=true. Loading obstacles here
+        # benefits both the IK collision projection and the RRT-to-goal mode.
+        oracle_cfg = batch.pop("oracle_env_config", None)
+        if oracle_cfg is not None:
+            self._maybe_update_oracle_obstacles(oracle_cfg)
+
         # Extract delta guidance (7-d: [dx,dy,dz,droll,dpitch,dyaw,gripper]).
         # All-NaN means no key is held.
         guidance_chunk_raw = batch.pop(OBS_GUIDANCE_CHUNK, None)  # [B, n_remaining, action_dim] or None
         obs_state = batch.get(OBS_STATE)
-
-        print("batch keys:", batch.keys())
-
-        print("guidance_chunk_raw:", guidance_chunk_raw)
 
         if obs_state is None:
             raise RuntimeError("No obs.state available for shared autonomy wrapper")
@@ -601,9 +888,23 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         ratio = self.forward_flow_ratio
         # TODO if this is a setting with multiple envs, prob need to have has_guidance have an entry per batch
         has_guidance = guidance_chunk_raw is not None and not torch.isnan(guidance_chunk_raw).all()
+        rrt_active = self._rrt.mode == RRTMode.EXECUTING and self._rrt.chunk is not None
+        # print("rrt active:", rrt_active)
         if self._teleop_context is not None:
             self._teleop_context.ratio = ratio
-            self._teleop_context.has_guidance = has_guidance
+            # Treat user guidance OR RRT execution as "real" frames so the recorder
+            # keeps them after trim and counts them toward min_episode_length.
+            self._teleop_context.has_guidance = has_guidance or rrt_active
+            # Tag the frame source for the recorder. RRT execution always tags
+            # RRT; otherwise we mirror the legacy "ratio==0 means teleop" rule
+            # so the recorder only records pure-teleop segments. Anything else
+            # (pure policy, blend) is POLICY and not recorded.
+            if rrt_active:
+                self._teleop_context.frame_source = FrameSource.RRT
+            elif ratio == 0.0:
+                self._teleop_context.frame_source = FrameSource.TELEOP
+            else:
+                self._teleop_context.frame_source = FrameSource.POLICY
 
         # We stay in "guided execution" mode until the current buffer is fully consumed,
         # even if the user releases the key mid-chunk.
@@ -617,27 +918,138 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # inner_policy.select_action (called unconditionally below), so it stays
         # current regardless of whether we're blending or not.
 
+        # If RRT is about to be cancelled this step, pre-flush the inner policy's
+        # cached action chunk so the next inner_policy.select_action call hits an
+        # empty queue and triggers predict_action_chunk against the up-to-date
+        # obs queue. Without this, inner_action would be drained from the chunk
+        # predicted at/before RRT start — telling the robot to move toward a
+        # pre-RRT pose for one frame after cancel, which shows up as a stutter.
+        # The matching _cancel_rrt below also flushes (idempotent) so the cancel
+        # state stays consistent if the order is ever rearranged.
+        rrt_will_cancel = (
+            self._rrt.mode == RRTMode.EXECUTING
+            and self._rrt.chunk is not None
+            and (has_guidance or self._rrt.cancel_requested)
+        )
+        if rrt_will_cancel:
+            self._flush_inner_action_queue()
+            self._guided_chunk = None
+            self._chunk_step = 99_999_999_999
+
         # Always call inner_policy.select_action to keep obs queues updated (e.g. diffusion
         # maintains n_obs_steps history in _queues). Discard output when guidance overrides.
         inner_action = self.inner_policy.select_action(batch)
 
-        # Seed _desired_q from inner_action on first call
-        if self._desired_q is None:
+        # Sync _desired_q from the ACTUAL observed joint state (not the cumulative
+        # commanded value). The wrapper's pybullet client uses resetJointState
+        # which is a teleport — no physics, so a previously-commanded pose may
+        # have phased through an obstacle in our private client even though the
+        # env's physics-enabled simulator stopped the real robot at the surface.
+        # Re-syncing from obs every step keeps our private client matched to
+        # reality, which fixes RRT plans starting from inside-an-obstacle, IK
+        # seeded at a phantom pose, and teleop deltas accumulating from a place
+        # the robot isn't actually at.
+        #
+        # obs.state was normalized by the policy preprocessor — so the right
+        # inverse is the preprocessor's UnnormalizerProcessorStep, NOT the
+        # action postprocessor. The action postprocessor includes an
+        # AbsoluteActionsProcessorStep that adds the cached state to convert
+        # relative deltas back to absolute joints — applying it to obs.state
+        # double-adds and causes a constant offset.
+        #
+        # ``self.inverse_preprocessor`` carries the right UnnormalizerProcessor
+        # (configured with the preprocessor's stats), but its top-level
+        # ``to_transition`` puts the input in the ACTION slot, while the
+        # unnormalize step expects obs in the OBSERVATION slot. Bypass the
+        # bogus to_transition by building the transition manually with
+        # obs_state as the observation, then run the steps directly.
+        actual_q_t = None
+        try:
+            from lerobot.processor.converters import create_transition
+            from lerobot.processor.normalize_processor import UnnormalizerProcessorStep
+            from lerobot.types import TransitionKey
+
+            transition = create_transition(observation={OBS_STATE: obs_state})
+            for _step in self.inverse_preprocessor.steps:
+                if isinstance(_step, UnnormalizerProcessorStep):
+                    transition = _step(transition)
+                    break
+            obs_dict = transition.get(TransitionKey.OBSERVATION)
+            if isinstance(obs_dict, dict) and OBS_STATE in obs_dict:
+                actual_q_t = obs_dict[OBS_STATE]
+        except Exception:
+            actual_q_t = None
+
+        if actual_q_t is not None:
+            actual_q = actual_q_t[0].detach().cpu().numpy().astype(np.float64)
+            # observation.state is [num_dofs joints + gripper] = num_dofs+1 entries.
+            self._desired_q = actual_q.reshape(-1)[: self.num_dofs + 1]
+        elif self._desired_q is None:
+            # Last-resort initial seed from the policy's postprocessed action.
             self._desired_q = self.postprocessor(inner_action).cpu().numpy().reshape(-1)
+        assert self._desired_q is not None  # narrowed for the type checker
+
+        # Reflect the (just-synced) actual joint state into the wrapper's
+        # pybullet client so RRT planning, IK, and collision projection all
+        # see a pose matching the env's real robot.
+        self._sync_joints(self._desired_q[: self.num_dofs])
 
         # Capture q_prev BEFORE any action computation so velocity limiting sees the true
         # previous position. get_full_teleop_action pre-updates _desired_q internally,
         # so reading it afterward would give dq=0 (a no-op).
         # q_prev_for_vel_limit = self._desired_q.reshape(-1).copy() if self._desired_q is not None else None
 
+        # --- RRT-to-Goal mode: highest priority among non-paused branches. ---
+        # Cancellation: user takes over (has_guidance) or explicit cancel button.
+        rrt = self._rrt
+        if rrt.mode == RRTMode.EXECUTING and rrt.chunk is not None:
+            if has_guidance or rrt.cancel_requested:
+                # print("cancel rrt")
+                self._cancel_rrt()
+                # _cancel_rrt restored forward_flow_ratio and dropped stale
+                # cached actions (obs queue is left intact). Refresh the locals
+                # derived from wrapper state so the branches below see the
+                # post-cancel world rather than the parked-during-RRT state.
+                ratio = self.forward_flow_ratio
+                chunk_exhausted = True
+                draining = False
+                in_guidance_mode = has_guidance
+                # Get a simple action just for this timestep
+                action = self.get_hold_action(inner_action)
+                return action
+                # fall through to the existing blend/teleop branches below
+            elif rrt.step >= len(rrt.chunk):
+                # print('finish rrt: chunk exhausted (step %d >= chunk length %d)' % (rrt.step, len(rrt.chunk)))
+                # Goal reached: restore prior ratio, auto-pause for the next step.
+                self._finish_rrt()
+                action = self.get_hold_action(inner_action)
+                # Skip the existing branches below; jump to _desired_q update.
+                assert self._desired_q is not None  # seeded above
+                self._last_raw_action = self._desired_q.reshape(-1).copy()
+                return action
+            else:
+                # print("rrt executing: step %d / %d" % (rrt.step, len(rrt.chunk)))
+                wp = rrt.chunk[rrt.step][: self.num_dofs]
+                rrt.step += 1
+                gripper = float(self._desired_q[-1]) if self._desired_q is not None else 0.0
+                raw7 = np.concatenate([wp, [gripper]]).astype(np.float64)
+                self._last_raw_action = raw7  # picked up by the post-block _desired_q update
+                raw_t = torch.tensor(raw7, dtype=inner_action.dtype, device=inner_action.device).unsqueeze(0)
+                action = self._normalize_policy_guidance_action(raw_t)
+                # _desired_q is updated in the post-block via _last_raw_action.
+                self._desired_q = raw7.copy()
+                return action
+
         # --- Pure teleop (ratio=0): bypass policy chunk, do FK+IK from current state ---
         if ratio == 0.0:
             if has_guidance:
+                # print("applying user guidance in teleop mode")
                 if self.policy_guidance_representation == PolicyGuidanceRepresentation.ABSOLUTE_POS:
                     action = self._normalize_policy_guidance_action(guidance_chunk_raw[:, 0, :])
                 else:
                     action = self.get_full_teleop_action(guidance_chunk_raw[:, 0, :])
             else:
+                # print("hold action")
                 action = self.get_hold_action(inner_action)
 
         elif not in_guidance_mode:
@@ -645,6 +1057,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             # if self._guided_chunk is not None:
             #     self._guided_chunk = None
             #     self._chunk_step = 0
+            # print("not in guidance mode. using policy")
             action = inner_action
 
         # --- Guided execution mode, ratio < 1.0 ---
@@ -741,43 +1154,121 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 self.policy_guidance_representation == PolicyGuidanceRepresentation.DELTA
                 and guidance_chunk_raw is not None
             ):
-                # Per-step DELTA chunk: apply each delta sequentially via FK+IK,
-                # building the guidance trajectory step-by-step from _desired_q.
-                # guidance_chunk_raw: [B, n_provided, 7] — each step is an EE delta
-                # [dx, dy, dz, droll, dpitch, dyaw, gripper].
+                # Hardcoded toggle. Default (False) = step-by-step integration seeded from
+                # _desired_q, matching what ratio=0.0 / get_full_teleop_action does. The
+                # legacy path (True) is anchor-seeded with an R_0-frame cumulative offset;
+                # easy to flip back if the new path turns out to be wrong for some case.
+                use_legacy_anchor_seeded_delta = False
+
                 guidance_chunk_np = guidance_chunk_raw.cpu().numpy()
                 n_provided = guidance_chunk_np.shape[1]
                 n_remaining = anchor_len - self._chunk_step
-                for b in range(batch_size):
-                    raw_end = self.postprocessor(anchor_chunk[:, self._chunk_step, :])
-                    q_seed = (
-                        self._desired_q.copy()
-                        if self._desired_q is not None
-                        else raw_end[b, : self.num_dofs].cpu().numpy()
-                    )
-                    # Apply provided deltas step-by-step
-                    last_delta = guidance_chunk_np[b, min(n_provided - 1, 0)]  # fallback for padding
-                    for t_rel in range(n_remaining):
-                        if t_rel < n_provided:
-                            d = guidance_chunk_np[b, t_rel]
-                            last_delta = d
-                        else:
-                            d = last_delta  # keep applying the last delta
-                        d_pos, d_rot, d_gripper = d[:3], d[3:6], d[6]
-                        q_new = self._project_delta_for_collision(
-                            q_seed, d_pos, d_rot, skip_collision=self.skip_collision
-                        )
-                        raw_step = np.concatenate([q_new, [float(d_gripper)]])
-                        step_t = torch.tensor(raw_step, dtype=anchor_chunk.dtype, device=device).unsqueeze(0)
-                        step_norm = self._normalize_policy_guidance_action(step_t)
-                        t_abs = self._chunk_step + t_rel
-                        guidance_chunk[:, t_abs, :action_dim] = step_norm
-                        q_seed = q_new[: self.num_dofs].copy()
+
+                if not use_legacy_anchor_seeded_delta:
+                    # Step-by-step DELTA integration. Seed from _desired_q and apply each
+                    # delta in its own native local EE frame. Produces an absolute-joint
+                    # trace of the user's intended trajectory, so the blend pulls the
+                    # policy toward the demo rather than toward an anchor-offset that
+                    # drifts whenever the policy disagrees with the demo.
+                    assert self._desired_q is not None, "_desired_q must be seeded before DELTA blend"
+                    for b in range(batch_size):
+                        q_seed = self._desired_q.reshape(-1).copy()[: self.num_dofs]
+                        last_delta = guidance_chunk_np[b, 0]  # fallback if guidance shorter than chunk
+                        for t_rel in range(n_remaining):
+                            d = guidance_chunk_np[b, t_rel] if t_rel < n_provided else last_delta
+                            if t_rel < n_provided:
+                                last_delta = d
+                            d_pos, d_rot, d_gripper = d[:3], d[3:6], d[6]
+
+                            q_new = self._project_delta_for_collision(
+                                q_seed,
+                                d_pos,
+                                d_rot,
+                                skip_collision=self.skip_collision,
+                            )
+                            q_seed = q_new[: self.num_dofs].copy()
+
+                            t_abs = self._chunk_step + t_rel
+                            raw_step = np.concatenate([q_new, [float(d_gripper)]])
+                            step_t = torch.tensor(
+                                raw_step, dtype=anchor_chunk.dtype, device=device
+                            ).unsqueeze(0)
+                            step_norm = self._normalize_policy_guidance_action(step_t)
+                            guidance_chunk[:, t_abs, :action_dim] = step_norm
+                else:
+                    # Legacy anchor-seeded DELTA: for each step t, take the anchor joint
+                    # position at t and shift it by the EE delta accumulated from
+                    # chunk_step to t, expressed in anchor[chunk_step]'s EE frame (R_0).
+                    # Designed to keep guidance[t] close to anchor[t] for live keyboard
+                    # teleop; produces wrong absolute trajectories when fed a full
+                    # pre-recorded chunk of demo deltas.
+                    assert self._desired_q is not None, "_desired_q must be seeded before DELTA blend"
+
+                    for b in range(batch_size):
+                        # Get anchor joints at the first step of the remaining chunk.
+                        # anchor_q0_raw = self.postprocessor(anchor_chunk[[b], self._chunk_step, :])
+                        # q_seed = anchor_q0_raw[0, : self.num_dofs].cpu().numpy()
+
+                        q_seed = self._desired_q.reshape(-1).copy()[: self.num_dofs]
+
+                        # Compute R_0: EE orientation at anchor[chunk_step].
+                        # All subsequent accumulated deltas are expressed in this frame.
+                        self._sync_joints(q_seed)
+                        _, quat_0 = self._get_ee_pose()
+                        rot_0 = Rotation.from_quat(quat_0)
+
+                        # Accumulate translation and rotation in the rot_0 frame.
+                        accumulated_pos = np.zeros(3)
+                        accumulated_rot = Rotation.identity()
+                        last_delta = guidance_chunk_np[b, 0]  # fallback for padding
+                        for t_rel in range(n_remaining):
+                            d = guidance_chunk_np[b, t_rel] if t_rel < n_provided else last_delta
+                            if t_rel < n_provided:
+                                last_delta = d
+                            accumulated_pos = accumulated_pos + d[:3]
+                            accumulated_rot = accumulated_rot * Rotation.from_euler("XYZ", d[3:6])
+                            d_gripper = d[6]
+
+                            # Get anchor joint config at this step as the IK seed.
+                            t_abs = self._chunk_step + t_rel
+                            anchor_qt_raw = self.postprocessor(anchor_chunk[[b], t_abs, :])
+                            anchor_qt = anchor_qt_raw[0, : self.num_dofs].cpu().numpy()
+
+                            # Transform accumulated_pos from rot_0's frame to anchor[t]'s EE
+                            # frame so that _compute_next_joints (which applies delta in the
+                            # current EE frame) produces the intended world-frame displacement.
+                            self._sync_joints(anchor_qt)
+                            _, quat_t = self._get_ee_pose()
+                            rot_t = Rotation.from_quat(quat_t)
+                            delta_pos_in_t_frame = rot_t.inv().apply(rot_0.apply(accumulated_pos))
+                            delta_rot_in_t_frame = accumulated_rot.as_euler("XYZ")
+
+                            q_new = self._project_delta_for_collision(
+                                anchor_qt,
+                                delta_pos_in_t_frame,
+                                delta_rot_in_t_frame,
+                                skip_collision=self.skip_collision,
+                            )
+                            raw_step = np.concatenate([q_new, [float(d_gripper)]])
+                            step_t = torch.tensor(
+                                raw_step, dtype=anchor_chunk.dtype, device=device
+                            ).unsqueeze(0)
+                            step_norm = self._normalize_policy_guidance_action(step_t)
+                            guidance_chunk[:, t_abs, :action_dim] = step_norm
 
             else:
                 raise NotImplementedError(
                     f"Unsupported policy_guidance_representation: {self.policy_guidance_representation}"
                 )
+
+            # Diagnostic: decode the constructed guidance_chunk back to raw joints so callers
+            # can compare what is being fed into the blend against the demo trajectory. If
+            # this matches the demo, any deviation in the blended output is the blend math's
+            # fault; if it doesn't match, the reconstruction (accumulation/anchor-seeding) is.
+            decoded_steps = [
+                self.postprocessor(guidance_chunk[:, t_abs, :action_dim]) for t_abs in range(anchor_len)
+            ]
+            self._last_decoded_guidance_chunk = torch.stack(decoded_steps, dim=1).detach().cpu().numpy()
 
             # ratio=0 is handled by the early return above; this path is only for 0 < ratio < 1.
 

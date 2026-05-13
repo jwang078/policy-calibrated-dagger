@@ -33,6 +33,7 @@ import plotly.graph_objects as go
 import torch
 from PIL import Image
 from scipy.spatial.transform import Rotation
+from tqdm import tqdm
 
 # ── lerobot imports ──────────────────────────────────────────────────────────
 from lerobot.configs.shared_autonomy import SharedAutonomyConfig
@@ -370,6 +371,31 @@ def get_action_chunk_for_ratio(
 
     all_raw_actions = np.stack(raw_actions)
 
+    # Diagnostic — verify the postprocessor really is converting relative→absolute.
+    # If absolute conversion fires, all_raw_actions[0] should be near obs.state values
+    # (~[1,-1,1,...] range, not [-0.1,0.1] relative range). Print only for one ratio.
+    if abs(ratio - 1.0) < 1e-6:
+        last_state = None
+        for _step in wrapper.postprocessor.steps:
+            if hasattr(_step, "relative_step") and _step.relative_step is not None:
+                last_state = _step.relative_step._last_state
+                break
+        if last_state is not None:
+            ls = last_state.detach().cpu().numpy().reshape(-1).tolist()
+            print(f"[diag ratio={ratio}] _last_state = {[f'{v:.3f}' for v in ls]}")
+        else:
+            print(f"[diag ratio={ratio}] _last_state IS None — absolute conversion is a no-op!")
+        print(
+            f"[diag ratio={ratio}] all_raw_actions[0] = {[f'{v:.3f}' for v in all_raw_actions[0].tolist()]}"
+        )
+        print(
+            f"[diag ratio={ratio}] all_raw_actions[1] = {[f'{v:.3f}' for v in all_raw_actions[1].tolist()]}"
+        )
+        if decoded_guidance_full is not None:
+            print(
+                f"[diag ratio={ratio}] decoded_guidance[0] = {[f'{v:.3f}' for v in decoded_guidance_full[0].tolist()]}"
+            )
+
     return all_raw_actions, decoded_guidance_full
 
 
@@ -427,7 +453,14 @@ def get_action_chunks_for_ratios(
     results: dict[float, np.ndarray] = {}
     decoded_guidance_by_ratio: dict[float, np.ndarray] = {}
 
-    for ratio in ratios:
+    progress = tqdm(
+        ratios,
+        desc="Computing action chunks",
+        unit="ratio",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+    )
+    for ratio in progress:
+        progress.set_postfix_str(f"ratio={ratio:.2f}")
         all_raw_actions, decoded_guidance = get_action_chunk_for_ratio(
             wrapper,
             obs_preprocessor,
@@ -850,8 +883,24 @@ def parse_args():
     )
     parser.add_argument(
         "--dataset_repo_id",
-        default="JennyWWW/splatsim_approach_lever_7_lowres_5path_10fails",
-        help="HuggingFace dataset repo ID.",
+        default=None,
+        help=(
+            "HuggingFace dataset repo ID. If omitted, auto-resolved from the "
+            "checkpoint's train_config.json (dataset.repo_id) so visualization "
+            "uses the dataset the policy was trained on. Pass explicitly to "
+            "override."
+        ),
+    )
+    parser.add_argument(
+        "--task_description",
+        default=None,
+        help=(
+            "Task description string to inject for PI0.5 preprocessing. "
+            "If omitted, resolved from the dataset's meta/tasks.parquet "
+            "(per-episode lookup), falling back to the checkpoint's "
+            "train_config.json env.task. Pass explicitly if the dataset has "
+            "an empty/missing task description string."
+        ),
     )
     parser.add_argument(
         "--dataset_dir",
@@ -977,8 +1026,32 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Auto-resolve dataset from the checkpoint's train_config.json if not passed.
+    # Prevents the silent dataset-mismatch bug (running a dataset-11 checkpoint
+    # against dataset-7 frames, etc.). Also captures env.task as a fallback for
+    # task description when the dataset's tasks.parquet has an empty string.
+    dataset_repo_id = args.dataset_repo_id
+    train_cfg_env_task: str | None = None
+    train_cfg_path = Path(args.policy_path) / "train_config.json"
+    if train_cfg_path.is_file():
+        try:
+            _cfg = json.loads(train_cfg_path.read_text())
+            if dataset_repo_id is None:
+                dataset_repo_id = _cfg.get("dataset", {}).get("repo_id")
+            env_section = _cfg.get("env") or {}
+            train_cfg_env_task = env_section.get("task") or env_section.get("task_description")
+        except (json.JSONDecodeError, OSError):
+            pass
+    if dataset_repo_id is None:
+        raise SystemExit(
+            f"Could not auto-resolve --dataset_repo_id from "
+            f"{train_cfg_path}. Pass --dataset_repo_id explicitly."
+        )
+    if args.dataset_repo_id is None:
+        print(f"Auto-resolved --dataset_repo_id from checkpoint: {dataset_repo_id}")
+
     # Resolve dataset directory.
-    dataset_dir = resolve_dataset_dir(args.dataset_repo_id, args.dataset_dir)
+    dataset_dir = resolve_dataset_dir(dataset_repo_id, args.dataset_dir)
     print(f"Dataset dir: {dataset_dir}")
 
     # Load task description mapping (needed by PI0.5 preprocessor).
@@ -1081,13 +1154,45 @@ def main():
         f"Action dim: {guidance_actions_raw.shape[1]}"
     )
 
-    # Resolve task description for this episode (used by PI0.5 preprocessor).
+    # Resolve task description for this episode (used by PI0.5 preprocessor,
+    # which strictly requires a non-None task). Resolution chain, in order:
+    #   1. --task_description CLI override (most explicit).
+    #   2. Per-episode task_index lookup in the dataset's task_map.
+    #   3. Sole entry in task_map (single-task dataset where index doesn't line up).
+    #   4. env.task from the checkpoint's train_config.json (handles datasets
+    #      whose tasks.parquet has an empty description string — common for
+    #      lerobot-recorded sims that didn't carry a task name).
+    # If all four fail, we print a clear error; PI0.5 will then raise
+    # "No task found in complementary data" downstream.
     task_idx = int(frames_df.iloc[0].get("task_index", 1))
-    task_description = task_map.get(task_idx)
-    if task_description is not None:
-        print(f"Task: '{task_description}' (task_index={task_idx})")
+    task_description: str | None
+    if args.task_description is not None:
+        task_description = args.task_description
+        print(f"Task: '{task_description}' (from --task_description override)")
     else:
-        print(f"No task description found for task_index={task_idx} — skipping task injection.")
+        task_description = task_map.get(task_idx)
+        if task_description is not None:
+            print(f"Task: '{task_description}' (task_index={task_idx})")
+        elif task_map:
+            fallback_idx, fallback_desc = next(iter(task_map.items()))
+            task_description = fallback_desc
+            print(
+                f"No task description for task_index={task_idx}; falling back to "
+                f"task_index={fallback_idx} → '{task_description}' (the only entry in the map)."
+            )
+        elif train_cfg_env_task:
+            task_description = train_cfg_env_task
+            print(
+                f"Dataset's task_map is empty (tasks.parquet has empty description "
+                f"strings). Falling back to env.task from train_config.json: "
+                f"'{task_description}'."
+            )
+        else:
+            print(
+                f"No task description found for task_index={task_idx}: task_map "
+                f"is empty AND train_config.json has no env.task. PI0.5 will "
+                f"fail at preprocessing — pass --task_description explicitly."
+            )
 
     # For DELTA mode: convert absolute joint positions to EE-space deltas.
     # The wrapper's DELTA path expects [dx,dy,dz,droll,dpitch,dyaw,gripper] per step.

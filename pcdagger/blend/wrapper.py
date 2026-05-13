@@ -205,7 +205,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         urdf_path = resolve_splatsim_path(robot_config.urdf_path)
         ee_link_name = robot_config.wrist_camera_link_name
 
-        self._pb_client = p.connect(p.GUI)
+        self._pb_client = p.connect(p.GUI if show_slider else p.DIRECT)
         # TODO(hardcoded): base_position from robot_iphone_w_engine_new config
         # Match SplatSim's load_urdf flags for articulated objects so the
         # planner's collision shapes are byte-identical to the simulator's:
@@ -1073,11 +1073,9 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         ):
             action = self._guided_chunk[:, self._chunk_step, :]
             self._chunk_step += 1
-            print("draining blended chunk, step", self._chunk_step)
 
         # Do the blend
         else:
-            print("starting blended execution with new guidance, ratio", ratio)
             # max_action_dim: PI0.5 pads actions to this size; diffusion uses raw action_dim.
             max_action_dim = getattr(self.config, "max_action_dim", None)
             batch_size = guidance_chunk_raw.shape[0] if guidance_chunk_raw is not None else obs_state.shape[0]
@@ -1093,11 +1091,9 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                     batch, **noise_kwargs
                 )  # [batch_size, chunk_size, action_dim]
                 self._chunk_step = 0
-                print("predicting new chunk from policy for guidance, chunk_step reset to 0")
             else:
                 # The anchor is the previously blended chunk
                 anchor_chunk = self._guided_chunk  # [batch_size, n_action_steps, action_dim]
-                print("reusing previous blended chunk as anchor for new guidance")
 
             device = anchor_chunk.device
             # apply guidance to future steps only
@@ -1136,19 +1132,10 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                     t_abs = self._chunk_step + t_rel
                     guidance_chunk[:, t_abs, :action_dim] = step_norm
                 # If guidance is shorter than remaining chunk, repeat last step
-                print(
-                    f"Applied {n_fill} steps of provided guidance chunk to absolute positions. {n_remaining - n_fill} steps remain; repeating last provided step for those."
-                    if n_fill < n_remaining
-                    else f"Applied full provided guidance chunk of {n_provided} steps to absolute positions."
-                )
                 if n_fill < n_remaining:
                     last_norm = guidance_chunk[:, self._chunk_step + n_fill - 1, :action_dim]
                     for t_abs in range(self._chunk_step + n_fill, anchor_len):
                         guidance_chunk[:, t_abs, :action_dim] = last_norm
-                print(
-                    "first 10 guidance chunk after applying provided absolute positions:",
-                    guidance_chunk[:, :10, :action_dim],
-                )
 
             elif (
                 self.policy_guidance_representation == PolicyGuidanceRepresentation.DELTA

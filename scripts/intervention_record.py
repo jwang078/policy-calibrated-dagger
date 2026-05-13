@@ -338,16 +338,21 @@ def _process_observation(
     env: gym.vector.VectorEnv,
     env_preprocessor,
     preprocessor,
+    fallback_task: str = "",
 ) -> dict[str, Any]:
     """Mirror lerobot_eval's per-step observation pipeline."""
     observation = preprocess_observation(observation)
     try:
-        observation["task"] = list(env.call("task_description"))
+        tasks = list(env.call("task_description"))
+        # Replace empty strings with the fallback so the dataset always has a
+        # meaningful task string (PI0.5 requires one for conditioning).
+        observation["task"] = [t if t else fallback_task for t in tasks]
     except (AttributeError, NotImplementedError):
         try:
-            observation["task"] = list(env.call("task"))
+            tasks = list(env.call("task"))
+            observation["task"] = [t if t else fallback_task for t in tasks]
         except (AttributeError, NotImplementedError):
-            observation["task"] = [""] * env.num_envs
+            observation["task"] = [fallback_task] * env.num_envs
 
     observation = env_preprocessor(observation)
     observation = preprocessor(observation)
@@ -405,6 +410,7 @@ def run_intervention_rollout(
     n_scenarios: int,
     intervention_cfg: InterventionConfig,
     csv_path: Path | None = None,
+    fallback_task: str = "",
 ) -> list[ScenarioResult]:
     """Run the intervention loop over ``n_scenarios`` env scenarios."""
     assert env.num_envs == 1, (
@@ -449,6 +455,28 @@ def run_intervention_rollout(
             policy.reset()
             ctrl.reset_for_new_scenario()
             teleop_ctx.source_scenario_idx = scenario_idx
+
+            # Pull splatsim scene metadata from the env so it's saved with each
+            # recorded episode. get_env_config() is already exposed over ZMQ and
+            # is invalidated on reset, so this always reflects the current scenario.
+            try:
+                env_cfgs = env.call("get_env_config")
+                env_cfg = env_cfgs[0] if env_cfgs else None
+                if env_cfg is not None:
+                    teleop_ctx.splatsim_robot_config = env_cfg.get("splatsim_robot_config")
+                    teleop_ctx.splatsim_object_configs = env_cfg.get("splatsim_object_configs")
+                    teleop_ctx.splatsim_background_config = env_cfg.get("splatsim_background_config")
+                else:
+                    teleop_ctx.splatsim_robot_config = None
+                    teleop_ctx.splatsim_object_configs = None
+                    teleop_ctx.splatsim_background_config = None
+            except Exception:
+                logger.warning(
+                    "Could not fetch splatsim metadata from env; episode metadata will be incomplete."
+                )
+                teleop_ctx.splatsim_robot_config = None
+                teleop_ctx.splatsim_object_configs = None
+                teleop_ctx.splatsim_background_config = None
             success = False
             step = 0
 
@@ -460,7 +488,9 @@ def run_intervention_rollout(
             )
             try:
                 while step < max_steps_per_scenario:
-                    obs_b = _process_observation(observation, env, env_preprocessor, preprocessor)
+                    obs_b = _process_observation(
+                        observation, env, env_preprocessor, preprocessor, fallback_task=fallback_task
+                    )
 
                     with (
                         torch.inference_mode(),
@@ -564,6 +594,9 @@ def run_intervention_rollout(
         except Exception:
             logger.exception("Failed to discard pending episodes during shutdown.")
         teleop_ctx.source_scenario_idx = None
+        teleop_ctx.splatsim_robot_config = None
+        teleop_ctx.splatsim_object_configs = None
+        teleop_ctx.splatsim_background_config = None
         teleop_ctx.defer_episode_saves = False
         if csv_file is not None:
             csv_file.close()
@@ -667,6 +700,7 @@ def intervention_main(cfg: EvalPipelineConfig):
             n_scenarios=cfg.eval.n_episodes,
             intervention_cfg=intervention_cfg,
             csv_path=csv_path,
+            fallback_task=cfg.env.task,
         )
 
     n_success = sum(1 for r in results if r.success)

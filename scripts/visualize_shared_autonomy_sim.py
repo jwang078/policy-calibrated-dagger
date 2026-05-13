@@ -1,26 +1,59 @@
 #!/usr/bin/env python
 """Sim-in-the-loop variant of visualize_shared_autonomy.py.
 
-The parquet-driven script (`visualize_shared_autonomy.py`) feeds the same dataset
-frame's observation to the policy every step. With small `--n_action_steps`, the
-wrapper re-predicts mid-rollout but the observations are stale → zigzag artifacts
-at chunk boundaries. This script drives a real splatsim env so observations stay
-in sync with the actually-executed actions.
+The parquet-driven script (``visualize_shared_autonomy.py``) feeds the same frozen
+dataset frame to the policy every step, so observations go stale as soon as the policy
+diverges from the demo. This script drives a real splatsim env each step so
+observations stay in sync with the actually-executed actions.
 
-Imports plotting / IO helpers from `visualize_shared_autonomy.py` (sibling file).
+**Required setup** — splatsim must run out-of-process (the wrapper already holds a
+pybullet GUI client in this process and a second in-process pybullet client would
+crash). Launch the simulator once:
 
-Example:
+    cd ~/code/SplatSim && \\
+        python scripts/launch_nodes.py \\
+            --robot sim_ur_pybullet_small_engine_new_interactive \\
+            --robot_port 6001 \\
+            --robot_name robot_iphone_w_engine_new \\
+            --eval_benchmark_repo_id <benchmark_dataset_repo_id>
+
+Then point this script at it:
+
     python my_scripts/visualize_shared_autonomy_sim.py \\
         --policy_path .../pretrained_model \\
         --dataset_repo_id JennyWWW/splatsim_approach_lever_7_lowres_5path_10fails \\
-        --episode_index 305 --frame_index 8 \\
+        --episode_index 305 \\
         --forward_flow_ratios 0.0 0.05 0.2 0.4 0.8 1.0 \\
         --blend_strategy denoise --guidance_repr delta --drain_chunk \\
-        --n_action_steps 5 \\
         --env_task upright_small_engine_new \\
-        --env_camera_names base_rgb wrist_rgb \\
-        --env_image_resize_modes letterbox --image_resize_mode letterbox \\
-        --env_fps 30 --env_episode_length 400
+        --env_external_port 6001
+
+For example:
+# 1. Launch splatsim out-of-process (once, stays up)
+cd ~/code/SplatSim && python scripts/launch_nodes.py \
+    --robot sim_ur_pybullet_small_engine_new_interactive \
+    --robot_port 6001 \
+    --robot_name robot_iphone_w_engine_new \
+    --eval_benchmark_repo_id JennyWWW/eval_splatsim_approach_lever_benchmark_1000
+
+# 2. Run visualize (in another terminal)
+python my_scripts/visualize_shared_autonomy_sim.py \
+    --policy_path outputs/training/pi05_approach_lever_11_biasend_5path_delta_basewrist/checkpoints/006000/pretrained_model \
+    --dataset_repo_id JennyWWW/splatsim_approach_lever_7_lowres_5path_10fails \
+    --episode_index 305 \
+    --forward_flow_ratios 0.0 0.05 0.2 0.4 0.8 1.0 \
+    --blend_strategy denoise --guidance_repr delta --drain_chunk \
+    --env_task upright_small_engine_new --env_external_port 6001
+
+The ``--episode_index`` selects which benchmark scenario to load on the server via
+``vec_env.reset(seed=[episode_index])``. ``--frame_index`` is used only to slice the
+guidance (demo) actions from the dataset; the robot always starts from the episode's
+initial pose as seeded by the server.
+
+Imports plotting / IO helpers from the sibling parquet script
+(``visualize_shared_autonomy.py``) and batch-building helpers from
+``visualize_shared_autonomy_sim.py`` itself (which ``augment_dataset_with_blending.py``
+also imports).
 """
 
 from __future__ import annotations
@@ -29,7 +62,6 @@ import argparse
 import json
 import random
 import sys
-from math import ceil  # noqa: F401  (parity with sibling script)
 from pathlib import Path
 from typing import Any
 
@@ -45,24 +77,12 @@ matplotlib.use("Agg")
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import torch  # noqa: E402
+from tqdm import tqdm  # noqa: E402
 
 # Allow importing the sibling parquet-driven script directly.
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
-
-from visualize_shared_autonomy import (  # type: ignore[import-not-found]  # noqa: E402
-    absolute_positions_to_ee_deltas,
-    compute_ee_from_states,
-    compute_ee_trajectories,
-    find_parquet_files,
-    get_available_episodes,
-    load_episode_frames,
-    load_task_description,
-    load_wrapped_policy,
-    plot_ee_trajectories_3d,
-    plot_joint_angles,
-)
 
 from lerobot.envs import close_envs  # noqa: E402
 from lerobot.envs.factory import make_env, make_env_config, make_env_pre_post_processors  # noqa: E402
@@ -74,6 +94,18 @@ from lerobot.policies.shared_autonomy_wrapper import (  # noqa: E402
 )
 from lerobot.utils.lerobot_dataset_utils import make_default_rename_map, resolve_dataset_dir  # noqa: E402
 from lerobot.utils.sim_seeding import seed_splatsim_env_to_state  # noqa: E402
+from my_scripts.visualize_shared_autonomy_DEPRECATED import (  # type: ignore[import-not-found]  # noqa: E402
+    absolute_positions_to_ee_deltas,
+    compute_ee_from_states,
+    compute_ee_trajectories,
+    find_parquet_files,
+    get_available_episodes,
+    load_episode_frames,
+    load_task_description,
+    load_wrapped_policy,
+    plot_ee_trajectories_3d,
+    plot_joint_angles,
+)
 
 # ── env construction ──────────────────────────────────────────────────────────
 
@@ -87,11 +119,16 @@ def build_splatsim_env(
     fps: int,
     episode_length: int,
     external_port: int | None,
-    eval_benchmark_repo_id: str,
-    eval_benchmark_subset: list[int],
+    external_host: str = "127.0.0.1",
+    eval_benchmark_repo_id: str | None = None,
+    eval_benchmark_subset: list[int] | None = None,
     policy_cfg: Any,
 ):
     """Build a splatsim vec env (n_envs=1) plus the env-specific pre/post processors.
+
+    When ``external_port`` is set the env connects to an already-running splatsim
+    server via ZMQ; ``eval_benchmark_repo_id`` and ``eval_benchmark_subset`` are
+    configured on the server side and are ignored here.
 
     Returns (vec_env, env_cfg, env_preprocessor, env_postprocessor).
     """
@@ -104,6 +141,7 @@ def build_splatsim_env(
         fps=fps,
         episode_length=episode_length,
         external_port=external_port,
+        external_host=external_host,
         eval_benchmark_repo_id=eval_benchmark_repo_id,
         eval_benchmark_subset=eval_benchmark_subset,
     )
@@ -117,13 +155,10 @@ def build_splatsim_env(
 
 
 def _apply_rename_map(obs: dict[str, torch.Tensor], rename_map: dict[str, str]) -> dict[str, torch.Tensor]:
-    """Rename observation keys in-place per ``rename_map``. Keys not present pass through."""
+    """Rename observation keys per ``rename_map``. Keys not present pass through."""
     if not rename_map:
         return obs
-    out: dict[str, torch.Tensor] = {}
-    for k, v in obs.items():
-        out[rename_map.get(k, k)] = v
-    return out
+    return {rename_map.get(k, k): v for k, v in obs.items()}
 
 
 def _build_sim_batch(
@@ -138,27 +173,75 @@ def _build_sim_batch(
 ) -> dict[str, torch.Tensor]:
     """env_obs (gym vec env format) → policy-ready preprocessed batch.
 
-    Mirrors the sequence in lerobot_eval.py: preprocess_observation → env_preprocessor →
-    rename_map → obs_preprocessor. Optionally injects ``task`` and the guidance chunk.
+    Mirrors the lerobot_eval.py sequence:
+    preprocess_observation → env_preprocessor → rename_map → obs_preprocessor.
+    Optionally injects ``task`` and the guidance chunk.
+
+    Also imported by ``augment_dataset_with_blending.py``.
     """
-    obs = preprocess_observation(env_obs)  # numpy → torch with OBS_STATE / OBS_IMAGES.* keys
+    obs = preprocess_observation(env_obs)
     obs = env_preprocessor(obs) if env_preprocessor is not None else obs
     obs = _apply_rename_map(obs, rename_map)
-
-    # Move tensors to device before the policy preprocessor sees them, matching the parquet path.
     obs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in obs.items()}
-
-    # Task must be present *before* the policy preprocessor (PI0.5 tokenizes it there).
+    # Task must be injected *before* the policy preprocessor (PI0.5 tokenizes it there).
     if task_description is not None:
         obs["task"] = [task_description]
-
     obs = obs_preprocessor(obs)
-
     if guidance_chunk is not None:
         chunk_t = torch.tensor(guidance_chunk, dtype=torch.float32, device=device).unsqueeze(0)
         obs["observation.policy_guidance_chunk"] = chunk_t
-
     return obs
+
+
+# ── shared sim-loop helpers ───────────────────────────────────────────────────
+
+
+def _run_filler_phase(
+    wrapper,
+    obs_preprocessor,
+    env_preprocessor,
+    env_obs: dict,
+    *,
+    guidance_chunk: np.ndarray,
+    rename_map: dict[str, str],
+    device: str,
+    task_description: str | None,
+    seed_joint_state: np.ndarray,
+) -> None:
+    """Drain the inner policy's first throwaway chunk so the obs queue has the
+    right history before the real phase begins. Does NOT step the env.
+
+    Also snaps ``wrapper._desired_q`` to ``seed_joint_state`` after filler so the
+    wrapper's IK anchor isn't polluted by the throwaway chunk's actions.
+
+    Imported by ``augment_dataset_with_blending.py``.
+    """
+    n_obs_steps: int = wrapper.config.n_obs_steps
+    n_action_steps: int = wrapper.config.n_action_steps
+    n_filler_drain = n_action_steps - (n_obs_steps - 1)
+    for _ in range(n_filler_drain):
+        batch = _build_sim_batch(
+            env_obs,
+            env_preprocessor=env_preprocessor,
+            obs_preprocessor=obs_preprocessor,
+            rename_map=rename_map,
+            device=device,
+            task_description=task_description,
+            guidance_chunk=guidance_chunk,
+        )
+        wrapper.select_action(batch)
+    for _ in range(n_obs_steps - 1):
+        batch = _build_sim_batch(
+            env_obs,
+            env_preprocessor=env_preprocessor,
+            obs_preprocessor=obs_preprocessor,
+            rename_map=rename_map,
+            device=device,
+            task_description=task_description,
+            guidance_chunk=guidance_chunk,
+        )
+        wrapper.select_action(batch)
+    wrapper._desired_q = np.asarray(seed_joint_state, dtype=np.float32)[: wrapper.num_dofs].copy()
 
 
 # ── action chunk collection ───────────────────────────────────────────────────
@@ -173,6 +256,7 @@ def get_sim_action_chunk_for_ratio(
     env_postprocessor,
     *,
     seed_joint_state: np.ndarray,
+    episode_index_for_seed: int,
     guidance_actions_raw: np.ndarray,
     ratio: float,
     drain_chunk: bool,
@@ -182,71 +266,59 @@ def get_sim_action_chunk_for_ratio(
     device: str,
     task_description: str | None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
-    """Sim-in-the-loop variant: seed env, run filler with seeded obs, then loop
-    ``env.step`` ↔ ``wrapper.select_action`` for ``total_steps`` iterations."""
-    n_obs_steps: int = wrapper.config.n_obs_steps
+    """Sim-in-the-loop variant: seed env, run filler, then loop
+    ``env.step`` ↔ ``wrapper.select_action`` for ``total_steps`` iterations.
+
+    ``episode_index_for_seed`` is forwarded to ``vec_env.reset(seed=[...])`` so the
+    server loads the matching benchmark scenario. For local in-process envs the robot
+    is also teleported to ``seed_joint_state``; for ZMQ envs it starts at the
+    episode-initial pose.
+    """
     n_action_steps: int = wrapper.config.n_action_steps
     if total_steps <= 0:
         raise ValueError(f"total_steps must be positive, got {total_steps}")
 
-    print(f"[ratio={ratio}] wrapper.reset() …", flush=True)
     wrapper.reset()
     wrapper.forward_flow_ratio = ratio
     wrapper.blend_mode = BlendMode.ONCE_PER_CHUNK if drain_chunk else BlendMode.EVERY_STEP
 
-    # Seed sim to (episode-start objects, frame_index robot pose).
-    print(f"[ratio={ratio}] seeding env to state {seed_joint_state.tolist()} …", flush=True)
-    env_obs = seed_splatsim_env_to_state(vec_env, joint_state=seed_joint_state, num_dofs=wrapper.num_dofs)
-    print(f"[ratio={ratio}] seed done; env_obs keys: {list(env_obs.keys())}", flush=True)
-
-    first_guidance_chunk = guidance_actions_raw  # full chunk; wrapper truncates as needed
+    env_obs = seed_splatsim_env_to_state(
+        vec_env,
+        joint_state=seed_joint_state,
+        num_dofs=wrapper.num_dofs,
+        seed=[episode_index_for_seed],
+    )
 
     # ─── Filler phase ────────────────────────────────────────────────────────
-    # Drain the inner policy's first throwaway chunk while feeding the seeded env_obs
-    # repeatedly. This populates the inner policy's obs queue with the right history
-    # before the real phase begins. We do NOT step the env during filler.
-    n_filler_drain = n_action_steps - (n_obs_steps - 1)
-    print(
-        f"[ratio={ratio}] filler phase: draining {n_filler_drain} + {n_obs_steps - 1} actions …", flush=True
+    _run_filler_phase(
+        wrapper,
+        obs_preprocessor,
+        env_preprocessor,
+        env_obs,
+        guidance_chunk=guidance_actions_raw,
+        rename_map=rename_map,
+        device=device,
+        task_description=task_description,
+        seed_joint_state=seed_joint_state,
     )
-    for i in range(n_filler_drain):
-        batch = _build_sim_batch(
-            env_obs,
-            env_preprocessor=env_preprocessor,
-            obs_preprocessor=obs_preprocessor,
-            rename_map=rename_map,
-            device=device,
-            task_description=task_description,
-            guidance_chunk=first_guidance_chunk,
-        )
-        if i == 0:
-            print(f"[ratio={ratio}] first wrapper.select_action call …", flush=True)
-        wrapper.select_action(batch)  # discard
-        if i == 0:
-            print(f"[ratio={ratio}] first wrapper.select_action returned", flush=True)
-    for _ in range(n_obs_steps - 1):
-        batch = _build_sim_batch(
-            env_obs,
-            env_preprocessor=env_preprocessor,
-            obs_preprocessor=obs_preprocessor,
-            rename_map=rename_map,
-            device=device,
-            task_description=task_description,
-            guidance_chunk=first_guidance_chunk,
-        )
-        wrapper.select_action(batch)  # discard
-
-    # Filler corrupts the IK anchor; snap _desired_q to the seeded joints.
-    wrapper._desired_q = np.asarray(seed_joint_state, dtype=np.float32)[: wrapper.num_dofs].copy()
-    print(f"[ratio={ratio}] filler done; entering real phase …", flush=True)
 
     # ─── Real phase ──────────────────────────────────────────────────────────
     raw_actions: list[np.ndarray] = []
     decoded_guidance_full: np.ndarray | None = None
+    success = False
+    hold_action: np.ndarray | None = None
+
     for t in range(total_steps):
+        # ── Hold mode: episode succeeded, don't step env again ────────────────
+        # Stepping after termination triggers AutoresetMode.NEXT_STEP and would
+        # bring in the next scene's images, causing a sharp visual transition.
+        if success:
+            assert hold_action is not None
+            raw_actions.append(hold_action)
+            continue
+
         at_chunk_boundary = t % n_action_steps == 0
         suppress_guidance = drain_chunk and not at_chunk_boundary and ratio not in (0.0, 1.0)
-
         guidance_chunk = None if suppress_guidance else guidance_actions_raw[t:]
 
         batch = _build_sim_batch(
@@ -260,40 +332,43 @@ def get_sim_action_chunk_for_ratio(
         )
 
         action_norm = wrapper.select_action(batch, base_noise=base_noise)
-        raw_action = wrapper.postprocessor(action_norm)  # (1, action_dim) tensor
+        raw_action = wrapper.postprocessor(action_norm)
 
-        # Mirror lerobot_eval: env_postprocessor on action transition (no-op for splatsim).
         if env_postprocessor is not None:
             from lerobot.utils.constants import ACTION
 
-            transition = env_postprocessor({ACTION: raw_action})
-            raw_action = transition[ACTION]
+            _post_out = env_postprocessor({ACTION: raw_action})
+            if _post_out is not None:
+                raw_action = _post_out[ACTION]
 
-        action_numpy = raw_action.detach().to("cpu").numpy()  # (1, action_dim)
-        # Splatsim action_space is (7,); env.step on a SyncVectorEnv expects (n_envs, 7).
-        # action_numpy already has the right shape (batch=1, action_dim=7).
-        if t < 2:
-            print(
-                f"[ratio={ratio}, t={t}] action_numpy shape={action_numpy.shape} "
-                f"first={action_numpy.reshape(-1).tolist()[:3]}; calling vec_env.step …",
-                flush=True,
-            )
+        action_numpy = raw_action.detach().to("cpu").numpy()
         env_obs, _reward, _term, _trunc, _info = vec_env.step(action_numpy)
-        if t < 2:
-            print(f"[ratio={ratio}, t={t}] vec_env.step returned", flush=True)
-
         raw_actions.append(action_numpy.reshape(-1))
 
-        # Stitch decoded guidance per blend boundary so the orange overlay tracks the
-        # executed trajectory across multiple regenerations.
         if at_chunk_boundary and wrapper._last_decoded_guidance_chunk is not None:
-            chunk_decode = wrapper._last_decoded_guidance_chunk[0]  # [anchor_len, joint_dim]
+            chunk_decode = wrapper._last_decoded_guidance_chunk[0]
             if decoded_guidance_full is None:
                 decoded_guidance_full = np.zeros(
                     (total_steps, chunk_decode.shape[1]), dtype=chunk_decode.dtype
                 )
             end_t = min(t + n_action_steps, total_steps)
             decoded_guidance_full[t:end_t] = chunk_decode[: end_t - t]
+
+        # Check for success / termination.
+        terminated = bool(_term[0]) if hasattr(_term, "__len__") else bool(_term)
+        if terminated and not success:
+            success = True
+            agent_pos = env_obs.get("agent_pos")
+            hold_action = (
+                np.asarray(agent_pos[0], dtype=np.float32)
+                if agent_pos is not None
+                else action_numpy.reshape(-1)
+            )
+            print(
+                f"[ratio={ratio}] Episode succeeded at t={t + 1}/{total_steps}. "
+                f"Holding for {total_steps - t - 1} remaining steps.",
+                flush=True,
+            )
 
     return np.stack(raw_actions), decoded_guidance_full
 
@@ -307,6 +382,7 @@ def get_sim_action_chunks_for_ratios(
     env_postprocessor,
     *,
     seed_joint_state: np.ndarray,
+    episode_index_for_seed: int,
     guidance_actions_raw: np.ndarray,
     ratios: list[float],
     rename_map: dict[str, str],
@@ -316,7 +392,6 @@ def get_sim_action_chunks_for_ratios(
     total_steps: int,
 ) -> tuple[dict[float, np.ndarray], dict[float, np.ndarray]]:
     """Run :func:`get_sim_action_chunk_for_ratio` for each ratio with a shared base_noise."""
-    # Match the parquet path's deterministic noise — same shape detection logic.
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
@@ -330,7 +405,14 @@ def get_sim_action_chunks_for_ratios(
     results: dict[float, np.ndarray] = {}
     decoded_guidance_by_ratio: dict[float, np.ndarray] = {}
 
-    for ratio in ratios:
+    progress = tqdm(
+        ratios,
+        desc="Computing sim action chunks",
+        unit="ratio",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+    )
+    for ratio in progress:
+        progress.set_postfix_str(f"ratio={ratio:.2f}")
         actions, decoded = get_sim_action_chunk_for_ratio(
             wrapper,
             obs_preprocessor,
@@ -338,6 +420,7 @@ def get_sim_action_chunks_for_ratios(
             env_preprocessor,
             env_postprocessor,
             seed_joint_state=seed_joint_state,
+            episode_index_for_seed=episode_index_for_seed,
             guidance_actions_raw=guidance_actions_raw,
             ratio=ratio,
             drain_chunk=drain_chunk,
@@ -361,56 +444,53 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Sim-in-the-loop visualization of SharedAutonomyPolicyWrapper predictions. "
-            "Drives a real splatsim env each step so observations stay in sync with the "
-            "executed rollout (unlike visualize_shared_autonomy.py, which feeds the same "
-            "dataset frame every step)."
+            "Requires an external splatsim ZMQ server (see script docstring)."
         )
     )
-    # ── Identical to visualize_shared_autonomy.py ────────────────────────────
-    parser.add_argument("--policy_path", required=True, help="Path to pretrained model directory.")
+    parser.add_argument("--policy_path", required=True)
     parser.add_argument(
         "--dataset_repo_id",
-        default="JennyWWW/splatsim_approach_lever_7_lowres_5path_10fails",
-        help="HuggingFace dataset repo ID.",
-    )
-    parser.add_argument(
-        "--dataset_dir",
         default=None,
-        help="Local directory containing parquet files (auto-resolved if not set).",
+        help=(
+            "HuggingFace dataset repo ID. If omitted, auto-resolved from the "
+            "checkpoint's train_config.json (dataset.repo_id)."
+        ),
+    )
+    parser.add_argument("--dataset_dir", default=None)
+    parser.add_argument(
+        "--task_description",
+        default=None,
+        help=(
+            "Task description string for PI0.5 preprocessing. If omitted, "
+            "resolved from the dataset's tasks.parquet, falling back to "
+            "--env_task."
+        ),
     )
     parser.add_argument("--episode_index", type=int, default=None)
-    parser.add_argument("--frame_index", type=int, default=None)
     parser.add_argument(
-        "--forward_flow_ratios",
-        nargs="+",
-        type=float,
-        default=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        "--frame_index",
+        type=int,
+        default=None,
+        help=(
+            "Starting frame within episode for guidance slice. For ZMQ envs the robot "
+            "always starts at the episode-initial pose regardless of this value."
+        ),
+    )
+    parser.add_argument(
+        "--forward_flow_ratios", nargs="+", type=float, default=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
     )
     parser.add_argument(
         "--image_resize_mode",
         default="letterbox",
         choices=["stretch", "letterbox"],
-        help="Image resize mode used for parquet column lookup AND the rename_map default.",
+        help="Parquet column lookup and rename_map default.",
     )
     parser.add_argument("--camera_names", nargs="+", default=["base_rgb", "wrist_rgb"])
-    parser.add_argument(
-        "--rename_map",
-        type=json.loads,
-        default=None,
-        help="JSON rename map; defaults to {cam}_{mode} → {cam} per camera.",
-    )
+    parser.add_argument("--rename_map", type=json.loads, default=None)
     parser.add_argument("--robot_name", default="robot_iphone_w_engine_new")
     parser.add_argument("--num_dofs", type=int, default=6)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "--n_action_steps",
-        type=int,
-        default=None,
-        help=(
-            "Override the policy's n_action_steps. Smaller values cause the policy "
-            "to regenerate and re-blend more frequently within the same window."
-        ),
-    )
+    parser.add_argument("--n_action_steps", type=int, default=None)
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--no_show", action="store_true")
     parser.add_argument("--drain_chunk", action="store_true")
@@ -418,61 +498,63 @@ def parse_args():
     parser.add_argument("--guidance_repr", default="absolute_pos", choices=["absolute_pos", "delta"])
     parser.add_argument("--n_anchor_steps", type=int, default=0)
 
-    # ── Sim-in-the-loop env config ───────────────────────────────────────────
+    # ── Env / simulator config ────────────────────────────────────────────────
     parser.add_argument("--env_task", default="upright_small_engine_new")
-    parser.add_argument(
-        "--env_robot_name",
-        default=None,
-        help="Defaults to --robot_name (used both for FK and the splatsim env).",
-    )
+    parser.add_argument("--env_robot_name", default=None, help="Defaults to --robot_name.")
     parser.add_argument("--env_camera_names", nargs="+", default=None, help="Defaults to --camera_names.")
     parser.add_argument(
-        "--env_image_resize_modes",
-        nargs="+",
-        default=None,
-        help="Defaults to [--image_resize_mode]. The env produces obs keys per mode.",
+        "--env_image_resize_modes", nargs="+", default=None, help="Defaults to [--image_resize_mode]."
     )
     parser.add_argument("--env_fps", type=int, default=30)
-    parser.add_argument("--env_episode_length", type=int, default=400)
+    parser.add_argument("--env_episode_length", type=int, default=1_000_000)
     parser.add_argument(
         "--env_external_port",
         type=int,
-        default=None,
-        help="Connect to an already-running splatsim server (ZMQ). State seeding is "
-        "NOT supported in this mode — only --env_external_port=None is supported.",
+        default=6001,
+        help=(
+            "ZMQ port of the already-running splatsim server. The server must be "
+            "launched separately (see script docstring). Default: 6001."
+        ),
     )
+    parser.add_argument("--env_external_host", default="127.0.0.1")
 
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    if args.env_external_port is not None:
-        raise NotImplementedError(
-            "Connecting to an external splatsim server (ZMQ) is not supported by "
-            "the sim-seeding helper. Run with --env_external_port omitted so this "
-            "script launches its own splatsim env."
-        )
 
-    # Default the env_* fields to their non-env counterparts where applicable.
     env_robot_name = args.env_robot_name or args.robot_name
     env_camera_names = args.env_camera_names or list(args.camera_names)
     env_image_resize_modes = args.env_image_resize_modes or [args.image_resize_mode]
 
-    # Resolve dataset / task map.
-    dataset_dir = resolve_dataset_dir(args.dataset_repo_id, args.dataset_dir)
+    # Auto-resolve dataset_repo_id from the checkpoint if not passed. Prevents
+    # the silent dataset-mismatch bug (e.g. dataset-11 checkpoint visualized
+    # against dataset-7 frames).
+    dataset_repo_id = args.dataset_repo_id
+    if dataset_repo_id is None:
+        train_cfg_path = Path(args.policy_path) / "train_config.json"
+        if train_cfg_path.is_file():
+            try:
+                _cfg = json.loads(train_cfg_path.read_text())
+                dataset_repo_id = _cfg.get("dataset", {}).get("repo_id")
+            except (json.JSONDecodeError, OSError):
+                dataset_repo_id = None
+        if dataset_repo_id is None:
+            raise SystemExit(
+                f"Could not auto-resolve --dataset_repo_id from "
+                f"{train_cfg_path}. Pass --dataset_repo_id explicitly."
+            )
+        print(f"Auto-resolved --dataset_repo_id from checkpoint: {dataset_repo_id}")
+
+    dataset_dir = resolve_dataset_dir(dataset_repo_id, args.dataset_dir)
     print(f"Dataset dir: {dataset_dir}")
     task_map = load_task_description(dataset_dir)
     print(f"Task map: {task_map}")
 
-    # Rename map (parity with parquet script).
-    if args.rename_map is None:
-        rename_map = make_default_rename_map(args.camera_names, args.image_resize_mode)
-    else:
-        rename_map = args.rename_map
+    rename_map = args.rename_map or make_default_rename_map(args.camera_names, args.image_resize_mode)
     print(f"Rename map: {rename_map}")
 
-    # Load policy.
     print(f"Loading policy from {args.policy_path} …")
     wrapper, obs_preprocessor = load_wrapped_policy(
         policy_path=args.policy_path,
@@ -486,28 +568,24 @@ def main():
     wrapper.n_anchor_steps = args.n_anchor_steps
     wrapper.skip_collision = True
     if args.n_action_steps is not None:
-        prev_n_action_steps = wrapper.config.n_action_steps
+        prev = wrapper.config.n_action_steps
         wrapper.config.n_action_steps = args.n_action_steps
-        print(f"Overrode n_action_steps: {prev_n_action_steps} → {args.n_action_steps}")
+        print(f"Overrode n_action_steps: {prev} → {args.n_action_steps}")
     n_obs_steps = wrapper.config.n_obs_steps
     n_action_steps = wrapper.config.n_action_steps
     total_steps = getattr(wrapper.config, "chunk_size", None) or getattr(wrapper.config, "horizon", None)
     if total_steps is None:
         raise ValueError("Could not determine policy chunk length (chunk_size/horizon).")
     print(
-        f"Policy type: {wrapper.config.type}, n_obs_steps={n_obs_steps}, "
+        f"Policy: {wrapper.config.type}, n_obs_steps={n_obs_steps}, "
         f"n_action_steps={n_action_steps}, total_steps={total_steps}"
-    )
-    print(
-        f"Blend strategy: {wrapper.guidance_blend_strategy.value}, "
-        f"guidance repr: {wrapper.policy_guidance_representation.value}"
     )
 
     # Pick episode + frame.
     if args.episode_index is None:
-        available = get_available_episodes(dataset_dir, min_episode_index=301)
+        available = get_available_episodes(dataset_dir, min_episode_index=0)
         if not available:
-            raise RuntimeError(f"No episodes >= 301 in {dataset_dir}.")
+            raise RuntimeError(f"No episodes found in {dataset_dir}.")
         episode_index = random.choice(available)
         print(f"Selected random episode: {episode_index}")
     else:
@@ -516,13 +594,13 @@ def main():
 
     n_needed = n_obs_steps + total_steps
     parquet_files = find_parquet_files(dataset_dir)
-    ep_df_list = []
-    for f in parquet_files:
-        df_ep = pd.read_parquet(
+    ep_df_list = [
+        pd.read_parquet(
             f, columns=["episode_index", "frame_index"], filters=[("episode_index", "==", episode_index)]
         )
-        if len(df_ep) > 0:
-            ep_df_list.append(df_ep)
+        for f in parquet_files
+    ]
+    ep_df_list = [d for d in ep_df_list if len(d) > 0]
     if not ep_df_list:
         raise ValueError(f"Episode {episode_index} not found.")
     ep_info = pd.concat(ep_df_list).sort_values("frame_index").reset_index(drop=True)
@@ -539,7 +617,6 @@ def main():
         frame_index = args.frame_index
         print(f"Using frame_index: {frame_index}")
 
-    # Load demo frames for guidance.
     frames_df = load_episode_frames(dataset_dir, episode_index, frame_index, n_needed)
     obs_frames = frames_df.iloc[:n_obs_steps]
     guidance_frames = frames_df.iloc[n_obs_steps : n_obs_steps + total_steps]
@@ -547,20 +624,26 @@ def main():
         [np.array(row["action"], dtype=np.float32) for _, row in guidance_frames.iterrows()]
     )
     print(
-        f"Loaded {len(obs_frames)} obs + {len(guidance_frames)} guidance frames "
-        f"(action_dim={guidance_actions_raw.shape[1]})."
+        f"Loaded {len(obs_frames)} obs + {len(guidance_frames)} guidance frames (action_dim={guidance_actions_raw.shape[1]})."
     )
 
-    # Task description for PI0.5.
+    # Task resolution chain: --task_description override → per-episode lookup
+    # in task_map → --env_task fallback. PI0.5 requires a non-empty task; the
+    # final fallback ensures the script can't reach the preprocessor with None.
     task_idx = int(frames_df.iloc[0].get("task_index", 1))
-    task_description = task_map.get(task_idx)
-    if task_description is not None:
-        print(f"Task: '{task_description}' (task_index={task_idx})")
+    if args.task_description is not None:
+        task_description = args.task_description
+        print(f"Task: '{task_description}' (from --task_description override)")
+    else:
+        task_description = task_map.get(task_idx)
+        if task_description:
+            print(f"Task: '{task_description}' (task_index={task_idx})")
+        else:
+            task_description = args.env_task
+            print(f"No task in dataset for task_index={task_idx}; using --env_task='{task_description}'")
 
-    # Seed state = the recorded action at frame_index (matches parquet path's _desired_q).
     seed_joint_state = np.array(obs_frames.iloc[-1]["action"], dtype=np.float32)
 
-    # DELTA-mode guidance prep — freeze the conversion using the seeded init_state.
     guidance_actions_raw_for_plot = guidance_actions_raw
     if args.guidance_repr == "delta":
         print("Converting absolute positions to EE deltas for DELTA mode …")
@@ -568,11 +651,13 @@ def main():
             wrapper, seed_joint_state, guidance_actions_raw
         )
 
-    # Build env. The eval_benchmark_subset is a single-episode list so each reset()
-    # restores object poses for *this* episode. The robot is then teleported to the
-    # seed_joint_state (mid-episode) inside seed_splatsim_env_to_state.
-    print(f"Building splatsim env (task={args.env_task}, episode_subset=[{episode_index}]) …")
-    vec_env, env_cfg, env_pre, env_post = build_splatsim_env(
+    # Connect to the external simulator. The server is already running in
+    # EVAL_BENCHMARK mode; we select scenarios via reset(seed=[episode_index]).
+    print(
+        f"Connecting to splatsim at {args.env_external_host}:{args.env_external_port} "
+        f"(task={args.env_task}) …"
+    )
+    vec_env, _env_cfg, env_pre, env_post = build_splatsim_env(
         task=args.env_task,
         robot_name=env_robot_name,
         camera_names=env_camera_names,
@@ -580,13 +665,13 @@ def main():
         fps=args.env_fps,
         episode_length=args.env_episode_length,
         external_port=args.env_external_port,
-        eval_benchmark_repo_id=args.dataset_repo_id,
-        eval_benchmark_subset=[episode_index],
+        external_host=args.env_external_host,
+        eval_benchmark_repo_id=None,  # configured on the server side
+        eval_benchmark_subset=None,
         policy_cfg=wrapper.config,
     )
 
     try:
-        # Run all ratios.
         print(f"Computing sim rollouts for ratios: {args.forward_flow_ratios} …")
         action_chunks, decoded_guidance_by_ratio = get_sim_action_chunks_for_ratios(
             wrapper,
@@ -595,6 +680,7 @@ def main():
             env_pre,
             env_post,
             seed_joint_state=seed_joint_state,
+            episode_index_for_seed=episode_index,
             guidance_actions_raw=guidance_actions_raw,
             ratios=args.forward_flow_ratios,
             rename_map=rename_map,
@@ -607,21 +693,17 @@ def main():
     finally:
         close_envs({"splatsim": {0: vec_env}})
 
-    # Pick a representative decoded guidance overlay (any ratio that hit the blend).
     decoded_guidance: np.ndarray | None = None
     if decoded_guidance_by_ratio:
         sample_ratio = next(iter(decoded_guidance_by_ratio.keys()))
         decoded_guidance = decoded_guidance_by_ratio[sample_ratio]
         print(f"Captured decoded guidance overlay from ratio={sample_ratio}.")
 
-    # EE trajectories.
     print("Computing EE trajectories via pybullet FK …")
     obs_states_raw = np.stack([np.array(row["action"], dtype=np.float32) for _, row in obs_frames.iterrows()])
     init_obs_state_raw = obs_states_raw[-1]
     ee_trajectories = compute_ee_trajectories(
-        wrapper=wrapper,
-        init_obs_state_raw=init_obs_state_raw,
-        action_chunks_by_ratio=action_chunks,
+        wrapper=wrapper, init_obs_state_raw=init_obs_state_raw, action_chunks_by_ratio=action_chunks
     )
     obs_ee_positions = compute_ee_from_states(wrapper, obs_states_raw)
     guidance_ee_positions = compute_ee_from_states(wrapper, guidance_actions_raw_for_plot)
@@ -629,17 +711,20 @@ def main():
         compute_ee_from_states(wrapper, decoded_guidance) if decoded_guidance is not None else None
     )
 
-    # Joint names for plots.
     action_dim = next(iter(action_chunks.values())).shape[1]
     joint_names = [f"joint_{i + 1}" for i in range(min(args.num_dofs, action_dim))]
     if action_dim > args.num_dofs:
         joint_names.append("gripper")
 
-    # Output dir naming — mirror the parquet path with a `_sim` suffix.
     if args.output_dir is None:
-        train_config_path = Path(args.policy_path) / "train_config.json"
-        with open(train_config_path) as f:
-            policy_tag = json.load(f)["policy"]["type"]
+        import json as _json
+
+        train_cfg = args.policy_path.rstrip("/") + "/train_config.json"
+        try:
+            with open(train_cfg) as f:
+                policy_tag = _json.load(f)["policy"]["type"]
+        except Exception:
+            policy_tag = "policy"
         repr_tag = "delta" if args.guidance_repr == "delta" else "abspos"
         drain_tag = "onestep" if args.drain_chunk else "everystep"
         anchor_tag = f"anchor{args.n_anchor_steps}" if args.n_anchor_steps > 0 else "noanchor"

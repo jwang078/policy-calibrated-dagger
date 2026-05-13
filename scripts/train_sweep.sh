@@ -1,25 +1,47 @@
 #!/usr/bin/env bash
+set -euo pipefail
+# train_sweep.sh
+#
+# Runs one or more lerobot-train jobs against a dataset.  Optionally loops
+# over cumulative augmented-ratio subsets (RATIO_SWEEP) created by
+# augment_ratios_sweep.sh.
+#
+# Usage:
+#   bash my_scripts/train_sweep.sh [OPTIONS]
+#
+# All options have defaults (see USER CONFIG below).
+#
+# Options:
+#   --dataset_short=STR     Short dataset name (without the "splatsim_" prefix)
+#   --ratio_sweep           Enable the augmented-ratio sweep
+#   --ratios="N N N"        Space-separated ratio list (used when --ratio_sweep)
+#   --no_relative           Disable relative-action training (default: enabled)
+#   --dry-run               Print commands without executing
+#
+# Example:
+#   bash my_scripts/train_sweep.sh \
+#       --dataset_short=approach_lever_11_50failsrrtpi05 \
+#       --ratio_sweep \
+#       --ratios="0.2 0.4 0.6 0.8 1.0"
 
-DRY_RUN=false
-if [[ "${1:-}" == "--dry-run" ]]; then
-    DRY_RUN=true
-fi
-
-# ============================================================
-# USER CONFIG — edit this section to change the experiment
-# ============================================================
+# ── USER CONFIG (defaults) ────────────────────────────────────────────────────
 DATASET_SHORT="approach_lever_11_50failsrrtpi05"
-# DATASET_SHORT="approach_lever_11_biasend_5path"
-# DATASET_SHORT="approach_lever_10_rectify_5path"
-# DATASET_SHORT="approach_lever_9_rectify_5path"
-# DATASET_SHORT="approach_lever_7_lowres_5path_10fails"
-# DATASET_SHORT="approach_lever_7_lowres_5path"
-# DATASET_SHORT="approach_lever_6_noteleport_5path"
-
-# Set to true to train with relative actions. Requires running
-# compute_relative_stats.sh first to generate the stats files.
 USE_RELATIVE_ACTIONS=true
-# ============================================================
+RATIO_SWEEP=false
+RATIOS=(0.2 0.4 0.6 0.8 1.0)
+DRY_RUN=false
+# ─────────────────────────────────────────────────────────────────────────────
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run)          DRY_RUN=true ;;
+        --ratio_sweep)      RATIO_SWEEP=true ;;
+        --no_relative)      USE_RELATIVE_ACTIONS=false ;;
+        --dataset_short=*)  DATASET_SHORT="${arg#*=}" ;;
+        --ratios=*)         IFS=' ' read -ra RATIOS <<< "${arg#*=}" ;;
+        *) echo "Unknown argument: $arg" >&2; exit 1 ;;
+    esac
+done
 
 DATASET_REPO="JennyWWW/splatsim_${DATASET_SHORT}"
 
@@ -105,6 +127,7 @@ SHARED_ARGS=(
     --env.type=splatsim
     --env.task=upright_small_engine_new
     --env.fps=30
+    --env.eval_benchmark_repo_id=JennyWWW/eval_splatsim_approach_lever_benchmark_1000
     --eval.n_episodes=5
     --eval.batch_size=1
     --eval.use_async_envs=false
@@ -148,6 +171,30 @@ PI05_ARGS=(
     --policy.use_amp=true
 )
 PI05_RESIZE_MODE="letterbox"
+
+# ACT: trains from scratch on top of a pretrained ResNet18 backbone, with
+# absolute actions + temporal ensembling (the canonical ACT setup, designed
+# to handle chunk-boundary smoothing without needing relative actions).
+# n_action_steps=1 is required when temporal_ensemble_coeff is set: the
+# policy is queried every step and ensembled predictions are averaged.
+ACT_ARGS=(
+    --policy.type=act
+    --steps=50000
+    --batch_size=8
+    --eval_freq=10000
+    --save_freq=10000
+    --policy.vision_backbone=resnet18
+    --policy.chunk_size=50
+    --policy.n_action_steps=1
+    --policy.temporal_ensemble_coeff=0.01
+    --policy.optimizer_lr=1e-5
+    --policy.optimizer_lr_backbone=1e-5
+    # kl_weight default in lerobot is 10, which causes the CVAE to mode-collapse
+    # on small/simple datasets (policy outputs the dataset mean for everything).
+    # Lowering to 1.0 lets the L1 reconstruction signal dominate.
+    --policy.kl_weight=1.0
+)
+ACT_RESIZE_MODE="letterbox"
 
 # ── Camera-specific args ─────────────────────────────────────
 # Sets CAMERA_ARGS array. Call as: set_camera_args <resize_mode> <camera_suffix>
@@ -211,9 +258,10 @@ run_job() {
         "${CAMERA_ARGS[@]}"
     )
 
-    # Append relative-action flags if enabled, using the per-policy stats file
+    # Append relative-action flags if enabled, using the per-policy stats file.
     if [[ "$USE_RELATIVE_ACTIONS" == true ]]; then
         full_cmd+=(--policy.use_relative_actions=true)
+        full_cmd+=(--policy.relative_exclude_joints='["gripper"]')
         case "$policy_prefix" in
             diffusion*) full_cmd+=(--dataset.stats_path="$DIFFUSION_STATS_PATH") ;;
             pi05*|pi0*) full_cmd+=(--dataset.stats_path="$PI05_STATS_PATH") ;;
@@ -252,31 +300,114 @@ PI05_BASEWRIST_ENV="PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 PI05_BASEWRIST_EXTRA=(--batch_size=8)
 
 PI05_BASE_ENV=""
-PI05_BASE_EXTRA=()
+PI05_BASE_EXTRA=(--batch_size=8)
 
 PI05_WRIST_ENV=""
-PI05_WRIST_EXTRA=()
+PI05_WRIST_EXTRA=(--batch_size=8)
+
+ACT_BASEWRIST_ENV=""
+ACT_BASEWRIST_EXTRA=()
+
+ACT_BASE_ENV=""
+ACT_BASE_EXTRA=()
+
+ACT_WRIST_ENV=""
+ACT_WRIST_EXTRA=()
 
 # ── Run jobs ──────────────────────────────────────────────────
 
 maybe_sleep() { [[ "$DRY_RUN" == false ]] && sleep 10; }
 
-run_job "pi05" "basewrist" PI05_ARGS "$PI05_RESIZE_MODE" "$PI05_BASEWRIST_ENV" PI05_BASEWRIST_EXTRA
-maybe_sleep
+# All training jobs live here.  Wrapped in a function so the ratio sweep loop
+# can call it once per merged dataset, then clean up before the next iteration.
+_run_all_jobs() {
+    run_job "pi05" "basewrist" PI05_ARGS "$PI05_RESIZE_MODE" "$PI05_BASEWRIST_ENV" PI05_BASEWRIST_EXTRA
+    maybe_sleep
 
-run_job "diffusion" "basewrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$DIFFUSION_BASEWRIST_ENV" DIFFUSION_BASEWRIST_EXTRA
-maybe_sleep
+    # run_job "act" "basewrist" ACT_ARGS "$ACT_RESIZE_MODE" "$ACT_BASEWRIST_ENV" ACT_BASEWRIST_EXTRA
+    # maybe_sleep
 
+    # run_job "diffusion" "basewrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$DIFFUSION_BASEWRIST_ENV" DIFFUSION_BASEWRIST_EXTRA
+    # maybe_sleep
 
-# run_job "pi05" "base"  PI05_ARGS "$PI05_RESIZE_MODE" "$PI05_BASE_ENV"  PI05_BASE_EXTRA
-# maybe_sleep
+    # run_job "pi05" "base"  PI05_ARGS "$PI05_RESIZE_MODE" "$PI05_BASE_ENV"  PI05_BASE_EXTRA
+    # maybe_sleep
 
-# run_job "pi05" "wrist" PI05_ARGS "$PI05_RESIZE_MODE" "$PI05_WRIST_ENV" PI05_WRIST_EXTRA
+    # run_job "pi05" "wrist" PI05_ARGS "$PI05_RESIZE_MODE" "$PI05_WRIST_ENV" PI05_WRIST_EXTRA
 
+    # run_job "diffusion" "base"  DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$DIFFUSION_BASE_ENV"  DIFFUSION_BASE_EXTRA
+    # maybe_sleep
 
+    # run_job "diffusion" "wrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$DIFFUSION_WRIST_ENV" DIFFUSION_WRIST_EXTRA
+    # maybe_sleep
+}
 
-# run_job "diffusion" "base"  DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$DIFFUSION_BASE_ENV"  DIFFUSION_BASE_EXTRA
-# maybe_sleep
+# ── Plain run or ratio sweep ───────────────────────────────────
 
-# run_job "diffusion" "wrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$DIFFUSION_WRIST_ENV" DIFFUSION_WRIST_EXTRA
-# maybe_sleep
+if [[ "$RATIO_SWEEP" == false ]]; then
+    _run_all_jobs
+else
+    # Snapshot base dataset vars so each sweep iteration can restore stats paths.
+    _BASE_DATASET_REPO="$DATASET_REPO"
+    _BASE_DATASET_SHORT="$DATASET_SHORT"
+    _BASE_PI05_STATS="$PI05_STATS_PATH"
+    _BASE_DIFFUSION_STATS="$DIFFUSION_STATS_PATH"
+    _HF_LEROBOT_HOME="$(python3 -c "
+import os; from pathlib import Path
+print(Path(os.environ.get('HF_LEROBOT_HOME', Path.home()/'.cache/huggingface/lerobot')))")"
+
+    _ratio_to_tag() { python3 -c "import sys; r=float(sys.argv[1]); print(f'{int(round(r*10)):02d}')" "$1"; }
+
+    _CUMULATIVE_RATIOS=()
+
+    for _RATIO in "${RATIOS[@]}"; do
+        _CUMULATIVE_RATIOS+=("$_RATIO")
+
+        # Build merged dataset name from all cumulative tags joined by _
+        _ALL_TAGS=""
+        for _r in "${_CUMULATIVE_RATIOS[@]}"; do
+            _t=$(_ratio_to_tag "$_r")
+            _ALL_TAGS="${_ALL_TAGS:+${_ALL_TAGS}_}${_t}"
+        done
+        _MERGED_NAME="${_BASE_DATASET_SHORT}_base_piabsden${_ALL_TAGS}"
+        _MERGED_REPO="JennyWWW/splatsim_${_MERGED_NAME}"
+        _MERGED_ROOT="${_HF_LEROBOT_HOME}/JennyWWW/${_MERGED_NAME#splatsim_}"
+
+        echo "============================================================"
+        echo "RATIO SWEEP: cumulative ratios up to ${_RATIO} → ${_MERGED_REPO}"
+        echo "============================================================"
+
+        # Step 1: create the merged dataset
+        if [[ "$DRY_RUN" == false ]]; then
+            python my_scripts/merge_augmented_datasets_for_training.py \
+                --base "$_BASE_DATASET_REPO" \
+                --ratios "${_CUMULATIVE_RATIOS[@]}"
+        else
+            echo "[DRY-RUN] python my_scripts/merge_augmented_datasets_for_training.py \\"
+            echo "    --base $_BASE_DATASET_REPO --ratios ${_CUMULATIVE_RATIOS[*]}"
+        fi
+
+        # Step 2: point training at merged dataset; reuse base stats
+        DATASET_REPO="$_MERGED_REPO"
+        DATASET_SHORT="$_MERGED_NAME"
+        PI05_STATS_PATH="$_BASE_PI05_STATS"
+        DIFFUSION_STATS_PATH="$_BASE_DIFFUSION_STATS"
+
+        _run_all_jobs
+
+        # Step 3: delete merged dataset to reclaim disk before next iteration
+        if [[ "$DRY_RUN" == false && -d "$_MERGED_ROOT" ]]; then
+            echo "Removing merged dataset to free disk: $_MERGED_ROOT"
+            rm -rf "$_MERGED_ROOT"
+        else
+            echo "[DRY-RUN] rm -rf $_MERGED_ROOT"
+        fi
+        echo ""
+    done
+
+    # Restore base vars
+    DATASET_REPO="$_BASE_DATASET_REPO"
+    DATASET_SHORT="$_BASE_DATASET_SHORT"
+    PI05_STATS_PATH="$_BASE_PI05_STATS"
+    DIFFUSION_STATS_PATH="$_BASE_DIFFUSION_STATS"
+fi

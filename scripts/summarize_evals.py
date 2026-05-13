@@ -101,9 +101,24 @@ METRICS: list[MetricConfig] = [
         use_boxplot=True,
     ),
     MetricConfig(
+        "avg_min_position_error_m",
+        higher_is_better=False,
+        summary_display=True,
+        per_task_key="min_position_error_m",
+        per_task_is_info=True,
+        use_boxplot=True,
+    ),
+    MetricConfig(
         "avg_final_orientation_error_deg",
         higher_is_better=False,
         per_task_key="final_orientation_error_deg",
+        per_task_is_info=True,
+        use_boxplot=True,
+    ),
+    MetricConfig(
+        "avg_min_orientation_error_deg",
+        higher_is_better=False,
+        per_task_key="min_orientation_error_deg",
         per_task_is_info=True,
         use_boxplot=True,
     ),
@@ -256,7 +271,9 @@ class EvalResult:
     pc_success: float
     avg_episode_length: float | None
     avg_final_position_error_m: float | None
+    avg_min_position_error_m: float | None
     avg_final_orientation_error_deg: float | None
+    avg_min_orientation_error_deg: float | None
     avg_cam_looks_at_goal_score: float | None
     avg_action_delta: float | None
     avg_action_accel: float | None
@@ -271,7 +288,9 @@ class EvalResult:
     pc_success_std: float | None
     avg_episode_length_std: float | None
     avg_final_position_error_m_std: float | None
+    avg_min_position_error_m_std: float | None
     avg_final_orientation_error_deg_std: float | None
+    avg_min_orientation_error_deg_std: float | None
     avg_cam_looks_at_goal_score_std: float | None
     avg_action_delta_std: float | None
     avg_action_accel_std: float | None
@@ -286,7 +305,9 @@ class EvalResult:
     pc_success_episodes: list[float] | None
     avg_episode_length_episodes: list[float] | None
     avg_final_position_error_m_episodes: list[float] | None
+    avg_min_position_error_m_episodes: list[float] | None
     avg_final_orientation_error_deg_episodes: list[float] | None
+    avg_min_orientation_error_deg_episodes: list[float] | None
     avg_cam_looks_at_goal_score_episodes: list[float] | None
     avg_action_delta_episodes: list[float] | None
     avg_action_accel_episodes: list[float] | None
@@ -654,8 +675,10 @@ METRIC_YLIM: dict[str, tuple[float, float]] = {
     "avg_episode_length_without_truncation": (0, 500),
     "avg_truncated": (0, 1),
     "avg_final_position_error_m": (0, 1.1),
+    "avg_min_position_error_m": (0, 1.1),
     "avg_position_error_m": (0, 1.1),
     "avg_final_orientation_error_deg": (0, 200),
+    "avg_min_orientation_error_deg": (0, 200),
     "avg_orientation_error_deg": (0, 200),
     "avg_cam_looks_at_goal_score": (0, 150),
     "avg_final_cam_looks_at_goal_score": (0, 150),
@@ -970,101 +993,131 @@ def plot_metric_by_category(df: pd.DataFrame, metric: str, output_dir: Path, tit
     _savefig(None, output_dir / f"{metric}_by_cameras.png")
 
     # 5. Grouped bar plot: method x trajectory_gen
-    fig, ax = plt.subplots(figsize=(12, 6))
     pivot = df_valid.pivot_table(values=metric, index="trajectory_gen", columns="method", aggfunc="mean")
-    x = np.arange(len(pivot.index))
-    width = 0.8 / len(pivot.columns)
-    for i, method in enumerate(pivot.columns):
-        offset = (i - (len(pivot.columns) - 1) / 2) * width
-        values = pivot[method].fillna(0).to_numpy()
-        # Compute per-cell pooled std (trajectory_gen x method)
-        yerr_vals = []
-        for traj in pivot.index:
-            cell_df = df_valid[(df_valid["trajectory_gen"] == traj) & (df_valid["method"] == method)]
-            yerr_vals.append(_pooled_sem_for_group(cell_df, metric) or 0.0)
-        yerr_arr = np.array(yerr_vals)
-        has_errs = yerr_arr.any()
-        bars_group = ax.bar(
-            x + offset,
-            values,
-            width,
-            label=method,
-            yerr=yerr_arr if has_errs else None,
-            capsize=4,
-            error_kw={"ecolor": "#888888", "elinewidth": 1.5} if has_errs else {},
-        )
-        _add_bar_labels(ax, bars_group, values, fontsize=13)
-        # Add N/A labels for missing data
-        for j, val in enumerate(pivot[method]):
-            if pd.isna(val):
-                ax.text(
-                    x[j] + offset,
-                    0,
-                    "N/A",
-                    ha="center",
-                    va="bottom",
-                    fontsize=14,
-                    color="gray",
-                    style="italic",
-                )
-    ax.set_xlabel("Trajectory Generation")
-    ax.set_ylabel(metric_label)
-    ax.set_title(f"{metric_label}\nby Trajectory Generation and Method{title_suffix}")
-    ax.set_xticks(x)
-    ax.set_xticklabels(pivot.index, rotation=45)
-    ax.legend(title="Method")
-    if metric in METRIC_YLIM:
-        ax.set_ylim(*METRIC_YLIM[metric])
-    _savefig(fig, output_dir / f"{metric}_by_traj_and_method.png")
+    if not pivot.empty and len(pivot.columns) > 0:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        x = np.arange(len(pivot.index))
+        width = 0.8 / len(pivot.columns)
+        for i, method in enumerate(pivot.columns):
+            offset = (i - (len(pivot.columns) - 1) / 2) * width
+            values = pivot[method].fillna(0).to_numpy()
+            # Compute per-cell pooled std (trajectory_gen x method)
+            yerr_vals = []
+            for traj in pivot.index:
+                cell_df = df_valid[(df_valid["trajectory_gen"] == traj) & (df_valid["method"] == method)]
+                yerr_vals.append(_pooled_sem_for_group(cell_df, metric) or 0.0)
+            yerr_arr = np.array(yerr_vals)
+            has_errs = yerr_arr.any()
+            bars_group = ax.bar(
+                x + offset,
+                values,
+                width,
+                label=method,
+                yerr=yerr_arr if has_errs else None,
+                capsize=4,
+                error_kw={"ecolor": "#888888", "elinewidth": 1.5} if has_errs else {},
+            )
+            _add_bar_labels(ax, bars_group, values, fontsize=13)
+            # Add N/A labels for missing data
+            for j, val in enumerate(pivot[method]):
+                if pd.isna(val):
+                    ax.text(
+                        x[j] + offset,
+                        0,
+                        "N/A",
+                        ha="center",
+                        va="bottom",
+                        fontsize=14,
+                        color="gray",
+                        style="italic",
+                    )
+        ax.set_xlabel("Trajectory Generation")
+        ax.set_ylabel(metric_label)
+        ax.set_title(f"{metric_label}\nby Trajectory Generation and Method{title_suffix}")
+        ax.set_xticks(x)
+        ax.set_xticklabels(pivot.index, rotation=45)
+        ax.legend(title="Method")
+        if metric in METRIC_YLIM:
+            ax.set_ylim(*METRIC_YLIM[metric])
+        _savefig(fig, output_dir / f"{metric}_by_traj_and_method.png")
 
     # 6. Grouped bar plot: method x cameras
-    fig, ax = plt.subplots(figsize=(12, 6.6))
     pivot = df_valid.pivot_table(values=metric, index="cameras", columns="method", aggfunc="mean")
     pivot = pivot.reindex(CAMERA_ORDER)
-    x = np.arange(len(pivot.index))
-    width = 0.8 / len(pivot.columns)
-    for i, method in enumerate(pivot.columns):
-        offset = (i - (len(pivot.columns) - 1) / 2) * width
-        values = pivot[method].fillna(0).to_numpy()
-        # Compute per-cell pooled std (cameras x method)
-        yerr_vals = []
-        for cam in pivot.index:
-            cell_df = df_valid[(df_valid["cameras"] == cam) & (df_valid["method"] == method)]
-            yerr_vals.append(_pooled_sem_for_group(cell_df, metric) or 0.0)
-        yerr_arr = np.array(yerr_vals)
-        has_errs = yerr_arr.any()
-        cam_bars = ax.bar(
-            x + offset,
-            values,
-            width,
-            label=method,
-            yerr=yerr_arr if has_errs else None,
-            capsize=4,
-            error_kw={"ecolor": "#888888", "elinewidth": 1.5} if has_errs else {},
-        )
-        _add_bar_labels(ax, cam_bars, values, fontsize=13)
-        # Add N/A labels for missing data
-        for j, val in enumerate(pivot[method]):
-            if pd.isna(val):
-                ax.text(
-                    x[j] + offset,
-                    0,
-                    "N/A",
-                    ha="center",
-                    va="bottom",
-                    fontsize=14,
-                    color="gray",
-                    style="italic",
-                )
-    ax.set_xlabel("Cameras")
-    ax.set_ylabel(metric_label)
-    ax.set_title(f"{metric_label} by Camera Config and Method{title_suffix}")
-    ax.set_xticks(x)
-    ax.set_xticklabels(pivot.index, rotation=45)
-    ax.legend(title="Method")
-    if metric in METRIC_YLIM:
-        ax.set_ylim(*METRIC_YLIM[metric])
-    _savefig(fig, output_dir / f"{metric}_by_cameras_and_method.png")
+    if not pivot.empty and len(pivot.columns) > 0:
+        fig, ax = plt.subplots(figsize=(12, 6.6))
+        x = np.arange(len(pivot.index))
+        width = 0.8 / len(pivot.columns)
+        for i, method in enumerate(pivot.columns):
+            offset = (i - (len(pivot.columns) - 1) / 2) * width
+            values = pivot[method].fillna(0).to_numpy()
+            # Compute per-cell pooled std (cameras x method)
+            yerr_vals = []
+            for cam in pivot.index:
+                cell_df = df_valid[(df_valid["cameras"] == cam) & (df_valid["method"] == method)]
+                yerr_vals.append(_pooled_sem_for_group(cell_df, metric) or 0.0)
+            yerr_arr = np.array(yerr_vals)
+            has_errs = yerr_arr.any()
+            cam_bars = ax.bar(
+                x + offset,
+                values,
+                width,
+                label=method,
+                yerr=yerr_arr if has_errs else None,
+                capsize=4,
+                error_kw={"ecolor": "#888888", "elinewidth": 1.5} if has_errs else {},
+            )
+            _add_bar_labels(ax, cam_bars, values, fontsize=13)
+            # Add N/A labels for missing data
+            for j, val in enumerate(pivot[method]):
+                if pd.isna(val):
+                    ax.text(
+                        x[j] + offset,
+                        0,
+                        "N/A",
+                        ha="center",
+                        va="bottom",
+                        fontsize=14,
+                        color="gray",
+                        style="italic",
+                    )
+        ax.set_xlabel("Cameras")
+        ax.set_ylabel(metric_label)
+        ax.set_title(f"{metric_label} by Camera Config and Method{title_suffix}")
+        ax.set_xticks(x)
+        ax.set_xticklabels(pivot.index, rotation=45)
+        ax.legend(title="Method")
+        if metric in METRIC_YLIM:
+            ax.set_ylim(*METRIC_YLIM[metric])
+        _savefig(fig, output_dir / f"{metric}_by_cameras_and_method.png")
+
+
+def _wrap_underscore_label(label: str, max_chars: int = 24) -> str:
+    """Wrap an underscore-separated label across multiple lines at ``_`` boundaries.
+
+    Greedy line-fill: append tokens to the current line until adding the next one
+    would exceed ``max_chars``, then start a new line. Never splits a token.
+    Used for x-tick labels on plots where dataset/experiment names are long and
+    overflow each other at small rotation angles.
+
+    Example: ``_wrap_underscore_label("splatsim_approach_lever_11_50failsrrtpi05")``
+    →
+    ``"splatsim_approach_lever\\n11_50failsrrtpi05"``
+    """
+    parts = label.split("_")
+    if not parts:
+        return label
+    lines: list[str] = []
+    current = parts[0]
+    for part in parts[1:]:
+        candidate = f"{current}_{part}"
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            lines.append(current)
+            current = part
+    lines.append(current)
+    return "\n".join(lines)
 
 
 def _collect_episodes_by_group(
@@ -1134,6 +1187,8 @@ def _plot_grouped_boxplot_by_category(
     group_label: str,
     title: str,
     out_path: Path,
+    xtick_rotation: int = 0,
+    display_labels: list[str] | None = None,
 ) -> None:
     """Single figure: groups = categories (traj or camera), boxes per group = methods.
 
@@ -1193,7 +1248,11 @@ def _plot_grouped_boxplot_by_category(
         patch.set_alpha(0.7)
 
     ax.set_xticks(group_centers)
-    ax.set_xticklabels(categories)
+    xtick_text = display_labels if display_labels is not None else categories
+    if xtick_rotation:
+        ax.set_xticklabels(xtick_text, rotation=xtick_rotation, ha="right")
+    else:
+        ax.set_xticklabels(xtick_text)
     ax.set_xlabel(group_label)
     ax.set_ylabel(metric_label)
     ax.set_title(title)
@@ -1296,6 +1355,55 @@ def plot_metric_boxplots_by_category(df: pd.DataFrame, metric: str, output_dir: 
         title=f"{metric_label} by Method × Camera Config{title_suffix}",
         out_path=output_dir / f"{metric}_by_method_cameras.png",
     )
+
+    # 6. By dataset — one box per training dataset (all methods/checkpoints pooled).
+    #    Useful for "does dataset X teach a better policy than dataset Y" when you
+    #    don't want to factor method/camera variation out yet. Dataset names are
+    #    long; wrap them across 2-3 lines at underscore boundaries so labels fit
+    #    without rotation.
+    datasets_present = [d for d in df_valid["dataset"].dropna().unique() if d]
+    if datasets_present:
+        # Stable ordering: sort by name *length* (shortest left, longest right).
+        # Matches the "datasets nest" pattern where longer names typically add
+        # suffixes onto a shorter base (e.g. _piabsden02 augmenting an existing
+        # dataset), so length-order also tends to be "base → variants → most-
+        # augmented" left-to-right. Falls back to alphabetic for ties.
+        datasets_sorted = sorted(datasets_present, key=lambda d: (len(d), d))
+        wrapped_datasets = [_wrap_underscore_label(d) for d in datasets_sorted]
+        fig, ax = plt.subplots(figsize=(max(10, 3.5 * len(datasets_sorted)), 6.5))
+        labels, episode_lists = _collect_episodes_by_group(df_valid, metric, "dataset")
+        # Re-order to match `datasets_sorted` and substitute the wrapped labels
+        # for display.
+        label_to_episodes = dict(zip(labels, episode_lists, strict=False))
+        ordered_episodes = [label_to_episodes[d] for d in datasets_sorted if d in label_to_episodes]
+        ordered_wrapped = [
+            w for d, w in zip(datasets_sorted, wrapped_datasets, strict=False) if d in label_to_episodes
+        ]
+        _draw_boxplot(
+            ax,
+            ordered_wrapped,
+            ordered_episodes,
+            metric_label,
+            "Dataset",
+            f"{metric_label} by Dataset{title_suffix}",
+            metric=metric,
+        )
+        _savefig(fig, output_dir / f"{metric}_by_dataset.png", errorbars=False)
+
+        # 7. By method × dataset — grouped by dataset, methods side-by-side.
+        #    Wrapped labels for display; un-wrapped names still drive the filter.
+        _plot_grouped_boxplot_by_category(
+            df_valid,
+            metric,
+            metric_label,
+            methods,
+            datasets_sorted,
+            "dataset",
+            group_label="Dataset",
+            title=f"{metric_label} by Method × Dataset{title_suffix}",
+            out_path=output_dir / f"{metric}_by_method_dataset.png",
+            display_labels=wrapped_datasets,
+        )
 
 
 def plot_metric_over_checkpoints(df: pd.DataFrame, metric: str, output_dir: Path, title_suffix: str = ""):

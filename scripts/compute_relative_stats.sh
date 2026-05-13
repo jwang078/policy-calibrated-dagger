@@ -5,26 +5,29 @@
 # --dataset.stats_path without needing to store the dataset twice.
 #
 # Run this once per dataset before training with USE_RELATIVE_ACTIONS=true in train_sweep.sh.
-# Usage: ./compute_relative_stats.sh [--dry-run]
-
-DRY_RUN=false
-if [[ "${1:-}" == "--dry-run" ]]; then
-    DRY_RUN=true
-fi
+#
+# Usage:
+#   bash my_scripts/compute_relative_stats.sh [OPTIONS]
+#
+# Options:
+#   --dataset_short=STR    Short dataset name (without the "splatsim_" prefix)
+#   --dry-run              Print commands without executing
 
 # ============================================================
-# USER CONFIG — keep in sync with train_sweep.sh
+# USER CONFIG (defaults — override via --dataset_short=...)
 # ============================================================
 DATASET_SHORT="approach_lever_11_50failsrrtpi05"
-# DATASET_SHORT="approach_lever_11_biasend_5path"
-# DATASET_SHORT="approach_lever_10_rectify_5path"
-# DATASET_SHORT="approach_lever_9_rectify_5path"
-# DATASET_SHORT="approach_lever_8_fisheye_trim_5path"
-# DATASET_SHORT="approach_lever_7_lowres_5path_10fails"
-# DATASET_SHORT="approach_lever_7_lowres_5path"
-# DATASET_SHORT="approach_lever_6_noteleport_5path"
 EXCLUDE_JOINTS="['gripper']"
 # ============================================================
+
+DRY_RUN=false
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run)          DRY_RUN=true ;;
+        --dataset_short=*)  DATASET_SHORT="${arg#*=}" ;;
+        *) echo "Unknown argument: $arg" >&2; exit 1 ;;
+    esac
+done
 
 DATASET_REPO="JennyWWW/splatsim_${DATASET_SHORT}"
 DATASET_CACHE=~/.cache/huggingface/lerobot/${DATASET_REPO}

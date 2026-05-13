@@ -2,20 +2,28 @@
 """Debug a policy checkpoint by comparing its predictions to dataset ground truth.
 
 Loads a few consecutive frames from the dataset, runs the policy through the same
-preprocessor → select_action → postprocessor pipeline as eval, then plots:
+preprocessor → select_action → postprocessor pipeline as eval, then plots three
+rows per joint:
 
-  1. Relative action deltas  — raw policy output before absolute conversion
-     (should be small ~0 offsets, not huge jumps)
-  2. Predicted absolute actions vs GT actions  — per joint + gripper
-  3. State used for relative→absolute conversion  — shows if the state is correct
+  1. Predicted absolute actions vs GT actions  — per joint + gripper
+  2. Delta view  — for relative-action policies, this is the raw policy output
+     before absolute conversion (should look like small offsets, not huge jumps).
+     For absolute-action policies, this is ``pred_action - current_state``: how
+     far the policy wants to move from the current state. Still useful for
+     sanity-checking direction and magnitude.
+  3. Absolute prediction error  — pred minus GT
+
+Auto-resolves ``--dataset_repo_id`` from the checkpoint's ``train_config.json``
+when not provided, so the visualization always uses the same dataset the policy
+was trained on (pass ``--dataset_repo_id`` to override).
 
 This tests the full eval pipeline without an env, isolating model/pipeline issues
-from env issues.
+from env issues. Works on both absolute- and relative-action policies; labels and
+sanity-check heuristics adapt to which one the checkpoint was trained as.
 
 Example:
     python my_scripts/visualize_policy_predictions.py \\
         --checkpoint outputs/training/pi05_approach_lever_7_lowres_5path_delta_basewrist/checkpoints/001000/pretrained_model \\
-        --dataset_dir ~/.cache/huggingface/lerobot/JennyWWW/splatsim_approach_lever_7_lowres_5path \\
         --episode 5 --start_frame 0 --n_frames 5 \\
         --camera_names base_rgb wrist_rgb \\
         --image_resize_mode letterbox \\
@@ -43,6 +51,26 @@ from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PR
 from lerobot.utils.lerobot_dataset_utils import resolve_dataset_dir
 
 JOINT_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"]
+
+
+def is_relative_action_policy(preprocessor: PolicyProcessorPipeline) -> bool:
+    """True if the preprocessor contains the relative-action step (i.e. the policy was trained
+    to output deltas that get converted to absolute actions in the postprocessor)."""
+    from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
+
+    return any(isinstance(s, RelativeActionsProcessorStep) for s in preprocessor.steps)
+
+
+def dataset_repo_id_from_checkpoint(checkpoint: Path) -> str | None:
+    """Read ``dataset.repo_id`` from the checkpoint's ``train_config.json``. None if missing."""
+    cfg_path = checkpoint / "train_config.json"
+    if not cfg_path.is_file():
+        return None
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    return cfg.get("dataset", {}).get("repo_id")
 
 
 # ── data helpers ──────────────────────────────────────────────────────────────
@@ -198,18 +226,35 @@ def run_policy_on_frames(
 # ── plotting ──────────────────────────────────────────────────────────────────
 
 
-def plot_results(results: dict, episode: int, start_frame: int, save_path: Path | None = None):
+def plot_results(
+    results: dict,
+    episode: int,
+    start_frame: int,
+    is_relative: bool,
+    save_path: Path | None = None,
+):
     pred_abs = results["pred_absolute"]  # (N, 7)
-    pred_rel = results["pred_relative"]  # (N, 7)
+    pred_rel = results["pred_relative"]  # (N, 7) — see below for meaning
     gt = results["gt_actions"]  # (N, 7)
     states = results["states"]  # (N, 7)
     n_frames, action_dim = pred_abs.shape
     joint_names = JOINT_NAMES[:action_dim]
     xs = np.arange(n_frames) + start_frame
 
+    # Row-1 semantics depend on policy mode:
+    #   relative-action policy → row 1 = policy's actual delta output (recovered
+    #     from absolute by subtracting state). Compared to GT_action - GT_state.
+    #   absolute-action policy → row 1 = pred - state ("how far the policy wants
+    #     to move"). Same y-data, different interpretation.
+    mode_tag = "relative-action" if is_relative else "absolute-action"
+    delta_ylabel = "raw delta output" if is_relative else "pred − state (commanded move)"
+    pred_delta_label = "Pred delta (raw)" if is_relative else "Pred − state"
+    gt_delta_label = "GT delta" if is_relative else "GT − state"
+
     fig, axes = plt.subplots(3, action_dim, figsize=(4 * action_dim, 9))
     fig.suptitle(
-        f"Policy predictions — episode {episode}, frames {start_frame}–{start_frame + n_frames - 1}",
+        f"Policy predictions [{mode_tag}] — episode {episode}, "
+        f"frames {start_frame}–{start_frame + n_frames - 1}",
         fontsize=13,
     )
 
@@ -226,14 +271,14 @@ def plot_results(results: dict, episode: int, start_frame: int, save_path: Path 
         ax.tick_params(labelsize=7)
         ax.grid(True, alpha=0.3)
 
-        # Row 1: relative delta predicted vs GT relative delta
+        # Row 1: delta view (interpretation depends on policy mode — see above)
         gt_delta = gt[:, j] - states[:, j]
         ax = axes[1, j]
         ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
-        ax.plot(xs, gt_delta, "k-o", markersize=4, label="GT delta")
-        ax.plot(xs, pred_rel[:, j], "r--s", markersize=4, label="Pred delta")
+        ax.plot(xs, gt_delta, "k-o", markersize=4, label=gt_delta_label)
+        ax.plot(xs, pred_rel[:, j], "r--s", markersize=4, label=pred_delta_label)
         if j == 0:
-            ax.set_ylabel("relative delta", fontsize=8)
+            ax.set_ylabel(delta_ylabel, fontsize=8)
             ax.legend(fontsize=7)
         ax.tick_params(labelsize=7)
         ax.grid(True, alpha=0.3)
@@ -249,9 +294,12 @@ def plot_results(results: dict, episode: int, start_frame: int, save_path: Path 
         ax.grid(True, alpha=0.3)
 
     # Print diagnostics
-    print("\n── Diagnostics ──────────────────────────────────────────────────")
+    print(f"\n── Diagnostics ({mode_tag}) ────────────────────────────────────")
+    delta_header = "GT delta" if is_relative else "GT−state"
+    pred_header = "Pred delta" if is_relative else "Pred−state"
     print(
-        f"{'Joint':<12} {'GT delta mean':>14} {'GT delta std':>13} {'Pred delta mean':>16} {'Pred delta std':>14} {'Pred-GT abs err':>16}"
+        f"{'Joint':<12} {delta_header + ' mean':>14} {delta_header + ' std':>13} "
+        f"{pred_header + ' mean':>16} {pred_header + ' std':>14} {'Pred-GT abs err':>16}"
     )
     for j, name in enumerate(joint_names):
         gt_delta = gt[:, j] - states[:, j]
@@ -263,17 +311,38 @@ def plot_results(results: dict, episode: int, start_frame: int, save_path: Path 
         )
     print()
 
-    # Sanity check: large relative deltas are a red flag
-    max_pred_delta = np.abs(pred_rel[:, :-1]).max()  # exclude gripper
-    max_gt_delta = np.abs(gt[:, :-1] - states[:, :-1]).max()
-    print(f"Max |predicted relative delta| (joints 1-6): {max_pred_delta:.4f}")
-    print(f"Max |GT relative delta|        (joints 1-6): {max_gt_delta:.4f}")
-    if max_pred_delta > 5 * max_gt_delta + 0.1:
-        print("⚠️  Predicted deltas are MUCH larger than GT — policy may be predicting in wrong space")
-    elif max_pred_delta < 0.001:
-        print("⚠️  Predicted deltas are near zero — policy may not have learned yet (undertrained)")
+    # Sanity check. For relative-action policies the magnitude check catches
+    # space-mismatch bugs ("policy is producing absolute-sized values where
+    # deltas are expected"). For absolute-action policies this check doesn't
+    # apply; report absolute prediction RMSE instead (the directly useful
+    # number for absolute policies).
+    if is_relative:
+        max_pred_delta = np.abs(pred_rel[:, :-1]).max()  # exclude gripper
+        max_gt_delta = np.abs(gt[:, :-1] - states[:, :-1]).max()
+        print(f"Max |predicted raw delta| (joints 1-6): {max_pred_delta:.4f}")
+        print(f"Max |GT delta|            (joints 1-6): {max_gt_delta:.4f}")
+        if max_pred_delta > 5 * max_gt_delta + 0.1:
+            print("⚠️  Predicted deltas are MUCH larger than GT — policy may be predicting in wrong space")
+        elif max_pred_delta < 0.001:
+            print("⚠️  Predicted deltas are near zero — policy may not have learned yet (undertrained)")
+        else:
+            print("✓  Predicted delta magnitude looks comparable to GT")
     else:
-        print("✓  Predicted delta magnitude looks comparable to GT")
+        rmse_joints = float(np.sqrt(np.mean((pred_abs[:, :-1] - gt[:, :-1]) ** 2)))
+        rmse_gripper = float(np.sqrt(np.mean((pred_abs[:, -1] - gt[:, -1]) ** 2)))
+        max_err_joints = float(np.abs(pred_abs[:, :-1] - gt[:, :-1]).max())
+        print(f"Absolute prediction RMSE (joints 1-6): {rmse_joints:.4f} rad")
+        print(f"Absolute prediction RMSE (gripper)   : {rmse_gripper:.4f}")
+        print(f"Max |pred - GT|          (joints 1-6): {max_err_joints:.4f} rad")
+        # Heuristic: an undertrained absolute policy often predicts something
+        # close to the current state (i.e. ~zero net motion) rather than the GT.
+        mean_pred_move = float(np.abs(pred_abs[:, :-1] - states[:, :-1]).mean())
+        mean_gt_move = float(np.abs(gt[:, :-1] - states[:, :-1]).mean())
+        if mean_gt_move > 1e-4 and mean_pred_move < 0.1 * mean_gt_move:
+            print(
+                "⚠️  Pred actions are ~equal to current state (mean |pred-state| << mean |GT-state|) — "
+                "policy may be undertrained, anchoring on state, or seeing wrong inputs"
+            )
 
     plt.tight_layout()
     if save_path:
@@ -293,8 +362,12 @@ def main():
     parser.add_argument("--checkpoint", required=True, help="Path to pretrained_model dir")
     parser.add_argument(
         "--dataset_repo_id",
-        default="JennyWWW/splatsim_approach_lever_7_lowres_5path_10fails",
-        help="HuggingFace dataset repo ID. Used to auto-resolve --dataset_dir if not given.",
+        default=None,
+        help=(
+            "HuggingFace dataset repo ID. If omitted, auto-resolved from the "
+            "checkpoint's train_config.json (dataset.repo_id) so visualization "
+            "uses the same dataset the policy was trained on."
+        ),
     )
     parser.add_argument(
         "--dataset_dir",
@@ -318,7 +391,16 @@ def main():
     args = parser.parse_args()
 
     checkpoint = Path(args.checkpoint)
-    data_dir = resolve_dataset_dir(args.dataset_repo_id, args.dataset_dir)
+    dataset_repo_id = args.dataset_repo_id
+    if dataset_repo_id is None:
+        dataset_repo_id = dataset_repo_id_from_checkpoint(checkpoint)
+        if dataset_repo_id is None:
+            parser.error(
+                "Could not auto-resolve --dataset_repo_id from "
+                f"{checkpoint}/train_config.json. Pass --dataset_repo_id explicitly."
+            )
+        print(f"Auto-resolved --dataset_repo_id from checkpoint: {dataset_repo_id}")
+    data_dir = resolve_dataset_dir(dataset_repo_id, args.dataset_dir)
     print(f"Dataset data dir: {data_dir}")
 
     # ── load policy ──────────────────────────────────────────────────────────
@@ -343,7 +425,11 @@ def main():
 
     # Wire absolute↔relative steps and attach the policy so the relative step only
     # refreshes its anchor state on chunk boundaries (matches lerobot-eval behavior).
+    # No-op for absolute-action policies (preprocessor has no RelativeActionsProcessorStep).
     _reconnect_relative_absolute_steps(preprocessor, postprocessor, policy=policy)
+
+    is_relative = is_relative_action_policy(preprocessor)
+    print(f"Policy action mode: {'relative' if is_relative else 'absolute'}")
 
     # ── load data ────────────────────────────────────────────────────────────
     print(f"\nLoading {args.n_frames} frames from episode {args.episode}, frame {args.start_frame}")
@@ -365,7 +451,7 @@ def main():
 
     # ── plot ─────────────────────────────────────────────────────────────────
     save_path = Path(args.save) if args.save else None
-    plot_results(results, args.episode, args.start_frame, save_path)
+    plot_results(results, args.episode, args.start_frame, is_relative, save_path)
 
 
 if __name__ == "__main__":

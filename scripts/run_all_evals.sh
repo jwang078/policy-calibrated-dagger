@@ -1,14 +1,67 @@
 #!/bin/bash
 
-# Script to run lerobot-eval on all policy checkpoints
-# Handles diffusion_approach_lever_* and pi05_training_approach_lever_* folders
+# Script to run lerobot-eval on all policy checkpoints, in eval-benchmark
+# mode against a fixed pre-recorded scenario set so different runs and
+# checkpoints are directly comparable.
 #
-# Usage: ./run_all_evals.sh [--dry-run] [--list] [--first-only] [--n-episodes int] [--episode-length int]
-#   --dry-run:        Show commands without executing them
-#   --list:           Only list experiments and checkpoints to evaluate, then exit
-#   --first-only:     Only evaluate the first checkpoint per experiment (for debugging)
-#   --n-episodes:     Number of evaluation episodes (default 5)
-#   --episode-length: Max steps per episode (default: use env default)
+# Each lerobot-eval invocation launches its own splatsim process in
+# EVAL_BENCHMARK mode bound to $EVAL_BENCHMARK_REPO_ID, with --seed=0 so
+# the seed-pinned reset path picks scenario 0, 1, 2, ... in order. Setting
+# --n-episodes=N therefore evaluates the FIRST N scenarios from the
+# benchmark dataset.
+#
+# Handles diffusion_approach_lever_*, pi05_approach_lever_*, and act_approach_lever_* folders.
+#
+# Usage: ./run_all_evals.sh [--dry-run] [--list] [--first-only] [--n-episodes int] [--episode-length int] [--temporal-ensemble] [--temporal-ensemble-coeff float] [--temporal-ensemble-n-action-steps int]
+#   --dry-run:                          Show commands without executing them
+#   --list:                             Only list experiments and checkpoints to evaluate, then exit
+#   --first-only:                       Only evaluate the first checkpoint per experiment (for debugging)
+#   --n-episodes:                       Number of first-N benchmark scenarios to evaluate (default 5)
+#   --episode-length:                   Max steps per episode (default: use env default)
+#   --temporal-ensemble:                Enable TemporalEnsemblePolicyWrapper at eval time. Adds
+#                                       --policy.temporal_ensemble_config.* flags and sets n_action_steps
+#                                       (default 1 = max smoothing; override via --temporal-ensemble-n-action-steps).
+#                                       When enabled, the output dir is tagged with _te_K{N}_c{COEFF} so
+#                                       results don't collide with the un-ensembled baseline.
+#                                       ACT checkpoints with legacy temporal_ensemble_coeff stay on their
+#                                       inline path (the wrapper is skipped via lerobot's deprecation
+#                                       check), so this is safe to enable across mixed checkpoint sets.
+#   --temporal-ensemble-coeff:          Temporal-ensemble coefficient (default 0.01). Larger positive
+#                                       values weight older predictions more heavily.
+#   --temporal-ensemble-n-action-steps: Cadence at which the model is queried under temporal ensembling
+#                                       (default 1 = max smoothing). K must be < chunk_size or the factory
+#                                       raises (no-op smoothing). K=chunk_size-1 (e.g. 49 for pi05) gives
+#                                       the minimum-smoothing setting that still mitigates chunk-boundary
+#                                       jerk — good for multimodal tasks.
+#   --force-act-to-wrapper-mode:        ACT-only opt-in. By default, ACT checkpoints trained with the
+#                                       legacy temporal_ensemble_coeff use their inline ensembler and
+#                                       skip the new wrapper. Pass this flag to force the wrapper path
+#                                       on ACT — useful for A/B-testing wrapper equivalence vs the
+#                                       inline ensembler. No effect on pi05/diffusion. Output dir is
+#                                       additionally tagged with _forcenoactte when set.
+#   --last-mile-debug:                  DEBUG/diagnostic. Wraps the policy with LastMileDebugWrapper which,
+#                                       when the robot's end-effector is within --last-mile-debug-threshold
+#                                       (meters, L2 position) of oracle_env_config.task.target_ee_pos, blends
+#                                       the commanded joint targets toward q_goal_bias by
+#                                       --last-mile-debug-alpha (1.0 = full override). Trigger metric matches
+#                                       the simulator's success criterion (EE-space distance) — robust to
+#                                       the kinematic-redundancy issue where the policy reaches a similar EE
+#                                       pose via a totally different joint config than q_goal_bias. Requires
+#                                       splatsim to expose current_ee_pos in get_env_config (recently added).
+#                                       Output dir tagged _lastmile{threshold}a{alpha}.
+#   --last-mile-debug-threshold:        EE position distance threshold (meters) below which the override fires.
+#                                       Default 0.05 (5cm). The simulator's typical success tolerance is ~3cm
+#                                       so 5cm fires shortly before the success region.
+#   --last-mile-debug-alpha:            Blend weight 0..1. 0=pure policy (sanity check), 1=full goal override.
+#                                       Default 1.0.
+#   --temporal-ensemble-pin-noise:      Stochastic-policy diagnostic. pi05 (and diffusion) sample fresh
+#                                       Gaussian noise every predict_action_chunk; without pinning,
+#                                       each chunk fed to the ensembler is an independent draw from
+#                                       p(actions|obs) and on multimodal tasks the average collapses
+#                                       across modes (slow / wrong-direction progress). With this flag,
+#                                       the wrapper samples noise once per episode and reuses it so
+#                                       successive chunks differ only by observation conditioning.
+#                                       No effect on deterministic ACT. Output dir tagged _pinnoise.
 
 # Parse arguments
 DRY_RUN=false
@@ -17,6 +70,14 @@ FIRST_ONLY=false
 LAST_ONLY=false
 N_EPISODES=5  # Default value
 EPISODE_LENGTH=""  # Default: unset (use env default)
+TEMPORAL_ENSEMBLE=false
+TEMPORAL_ENSEMBLE_COEFF=0.01
+TEMPORAL_ENSEMBLE_N_ACTION_STEPS=1
+FORCE_ACT_TO_WRAPPER_MODE=false
+TEMPORAL_ENSEMBLE_PIN_NOISE=false
+LAST_MILE_DEBUG=false
+LAST_MILE_DEBUG_THRESHOLD=0.05
+LAST_MILE_DEBUG_ALPHA=1.0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -44,8 +105,42 @@ while [[ $# -gt 0 ]]; do
             EPISODE_LENGTH="$2"
             shift 2
             ;;
+        --temporal-ensemble)
+            TEMPORAL_ENSEMBLE=true
+            shift
+            ;;
+        --temporal-ensemble-coeff)
+            TEMPORAL_ENSEMBLE_COEFF="$2"
+            shift 2
+            ;;
+        --temporal-ensemble-n-action-steps)
+            TEMPORAL_ENSEMBLE_N_ACTION_STEPS="$2"
+            shift 2
+            ;;
+        --force-act-to-wrapper-mode)
+            FORCE_ACT_TO_WRAPPER_MODE=true
+            shift
+            ;;
+        --temporal-ensemble-pin-noise)
+            TEMPORAL_ENSEMBLE_PIN_NOISE=true
+            shift
+            ;;
+        --last-mile-debug)
+            LAST_MILE_DEBUG=true
+            shift
+            ;;
+        --last-mile-debug-threshold)
+            LAST_MILE_DEBUG_THRESHOLD="$2"
+            shift 2
+            ;;
+        --last-mile-debug-alpha)
+            LAST_MILE_DEBUG_ALPHA="$2"
+            shift 2
+            ;;
         *)
-            shift # Ignore unknown arguments or handle as needed
+            echo "Unknown argument: $1" >&2
+            echo "See the header comment for the supported flags." >&2
+            exit 1
             ;;
     esac
 done
@@ -58,7 +153,11 @@ fi
 OUTPUTS_DIR="/home/jennyw2/code/lerobot/outputs"
 TIMESTAMP=$(date +"%Y-%m-%d-%H%M%S")
 EVAL_OUTPUT_DIR="$OUTPUTS_DIR/eval_output/$TIMESTAMP"
-EXP_PATTERNS=("$OUTPUTS_DIR"/training/diffusion_approach_lever_* "$OUTPUTS_DIR"/training/pi05_approach_lever_*)
+EXP_PATTERNS=("$OUTPUTS_DIR"/training/diffusion_approach_lever_* "$OUTPUTS_DIR"/training/pi05_approach_lever_* "$OUTPUTS_DIR"/training/act_approach_lever_*)
+# Fixed benchmark dataset that splatsim's EVAL_BENCHMARK mode replays. With
+# --seed=0 in lerobot-eval, the seed-pinned reset path picks scenarios
+# 0..n_episodes-1 in order, so all checkpoints see the same scenarios.
+EVAL_BENCHMARK_REPO_ID="JennyWWW/eval_splatsim_approach_lever_benchmark_1000"
 
 # Collect all experiment folders that will be processed
 echo "========================================"
@@ -289,8 +388,29 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
             continue
         fi
 
-        # Create unique output directory for this evaluation
+        # Create unique output directory for this evaluation. Tag the dir with
+        # the TE config when enabled so a TE sweep doesn't overwrite the
+        # un-ensembled baseline. Naming: `_te{coeff}` always; `_numactsteps{K}`
+        # only when n_action_steps != 1 (the default max-smoothing case);
+        # `_forcenoactte` when ACT's inline ensembler is being overridden by
+        # the wrapper (i.e. ACT's built-in temporal ensembling is disabled in
+        # favor of the policy-agnostic wrapper).
         eval_subdir="$EVAL_OUTPUT_DIR/${exp_name}_${checkpoint_name}"
+        if [ "$TEMPORAL_ENSEMBLE" = true ]; then
+            eval_subdir="${eval_subdir}_te${TEMPORAL_ENSEMBLE_COEFF}"
+            if [ "$TEMPORAL_ENSEMBLE_N_ACTION_STEPS" != "1" ]; then
+                eval_subdir="${eval_subdir}_numactsteps${TEMPORAL_ENSEMBLE_N_ACTION_STEPS}"
+            fi
+            if [ "$FORCE_ACT_TO_WRAPPER_MODE" = true ]; then
+                eval_subdir="${eval_subdir}_forcenoactte"
+            fi
+            if [ "$TEMPORAL_ENSEMBLE_PIN_NOISE" = true ]; then
+                eval_subdir="${eval_subdir}_pinnoise"
+            fi
+        fi
+        if [ "$LAST_MILE_DEBUG" = true ]; then
+            eval_subdir="${eval_subdir}_lastmile${LAST_MILE_DEBUG_THRESHOLD}a${LAST_MILE_DEBUG_ALPHA}"
+        fi
         if [ "$DRY_RUN" = false ]; then
             mkdir -p "$eval_subdir"
         fi
@@ -311,16 +431,60 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
             --env.camera_names='$camera_names' \\
             --env.image_resize_modes='$image_resize_modes' \\
             --env.fps=30 \\
+            --env.eval_benchmark_repo_id=$EVAL_BENCHMARK_REPO_ID \\
             --policy.path=$policy_path \\
             --eval.n_episodes=$N_EPISODES \\
             --output_dir=$eval_subdir \\
             --eval.batch_size=1 \\
             --eval.use_async_envs=false \\
+            --seed=0 \\
             --rename_map='$rename_map'"
 
         if [ -n "$EPISODE_LENGTH" ]; then
             eval_cmd="$eval_cmd \\
             --env.episode_length=$EPISODE_LENGTH"
+        fi
+
+        # Dataset #7 (approach_lever_7_lowres_5path) was generated before the
+        # fisheye wrist-camera change, so eval must also render the wrist cam
+        # as pinhole to match training distribution.
+        if [[ "$exp_name" == *"approach_lever_7_lowres_5path"* ]]; then
+            eval_cmd="$eval_cmd \\
+            --env.use_fisheye_wrist_camera=false"
+        fi
+
+        # Temporal ensembling: applies the TemporalEnsemblePolicyWrapper at eval
+        # time for smoother chunk boundaries. Default n_action_steps=1 (model
+        # queried every step, maximum smoothing); override via
+        # --temporal-ensemble-n-action-steps for a lighter touch (e.g. K=49 on
+        # pi05's chunk_size=50 smooths only the boundary). For ACT checkpoints
+        # whose train config already set the legacy temporal_ensemble_coeff,
+        # the inline path takes priority and the wrapper is skipped (see
+        # ACTConfig.__post_init__).
+        if [ "$TEMPORAL_ENSEMBLE" = true ]; then
+            eval_cmd="$eval_cmd \\
+            --policy.n_action_steps=$TEMPORAL_ENSEMBLE_N_ACTION_STEPS \\
+            --policy.temporal_ensemble_config.enabled=true \\
+            --policy.temporal_ensemble_config.coeff=$TEMPORAL_ENSEMBLE_COEFF"
+            if [ "$FORCE_ACT_TO_WRAPPER_MODE" = true ]; then
+                eval_cmd="$eval_cmd \\
+            --policy.temporal_ensemble_config.force_act_to_wrapper_mode=true"
+            fi
+            if [ "$TEMPORAL_ENSEMBLE_PIN_NOISE" = true ]; then
+                eval_cmd="$eval_cmd \\
+            --policy.temporal_ensemble_config.pin_noise=true"
+            fi
+        fi
+
+        # DEBUG: oracle last-mile override. Pulls commanded joint targets
+        # toward oracle's q_goal_bias when within threshold. Diagnostic only;
+        # the wrapper, factory call, and these CLI flags can all be removed
+        # together once the precision hypothesis test is done.
+        if [ "$LAST_MILE_DEBUG" = true ]; then
+            eval_cmd="$eval_cmd \\
+            --policy.last_mile_debug_config.enabled=true \\
+            --policy.last_mile_debug_config.ee_distance_threshold=$LAST_MILE_DEBUG_THRESHOLD \\
+            --policy.last_mile_debug_config.blend_alpha=$LAST_MILE_DEBUG_ALPHA"
         fi
 
         if [ "$DRY_RUN" = true ]; then
@@ -378,6 +542,8 @@ echo "All evaluations complete!"
 echo "========================================"
 
 # Generate summary charts and tables
-echo ""
-echo "Generating evaluation summary..."
-python3 /home/jennyw2/code/lerobot/my_scripts/summarize_evals.py "$EVAL_OUTPUT_DIR"
+if [ "$DRY_RUN" = false ]; then
+    echo ""
+    echo "Generating evaluation summary..."
+    python3 /home/jennyw2/code/lerobot/my_scripts/summarize_evals.py "$EVAL_OUTPUT_DIR"
+fi

@@ -26,13 +26,45 @@ from enum import Enum
 import numpy as np
 import pybullet as p
 
+from lerobot.policies.guidance.base import GuidanceMode
+
+
+class PathSelectionStrategy(Enum):
+    """How `RRTToGoalPlanner.plan()` picks among IK-goal-candidate paths.
+
+    All strategies score each successful candidate path and pick the minimum;
+    they differ only in what they minimize:
+
+    * ``EE_ARC_LENGTH`` (default) — Euclidean distance traversed by the EE
+      link in cartesian space. Penalizes wide swings that hurt DAgger data
+      quality even when the joint-space length is small.
+    * ``JOINT_ARC_LENGTH`` — sum of joint-space L2 distances between
+      consecutive waypoints. Legacy behavior; tends to prefer paths that
+      happen to land near `q_start` in configuration space even if the EE
+      swings wide.
+    * ``JOINT_VELOCITY_MATCH`` — L2 distance between the candidate's
+      initial joint velocity (averaged over the first few path samples)
+      and the robot's recent joint velocity (averaged over the last few
+      samples before the trigger). Picks the path that maintains the
+      current motion direction the most, minimizing the velocity
+      discontinuity at the trigger moment. Requires `recent_joint_velocity`
+      to be passed to `plan()`; raises `RRTPlanningError` if not.
+    """
+
+    EE_ARC_LENGTH = "ee_arc_length"
+    JOINT_ARC_LENGTH = "joint_arc_length"
+    JOINT_VELOCITY_MATCH = "joint_velocity_match"
+
+
 logger = logging.getLogger(__name__)
 
 
-class RRTMode(Enum):
-    IDLE = "idle"
-    PLANNING = "planning"
-    EXECUTING = "executing"
+# `RRTMode` is aliased to the unified `GuidanceMode` so external callers like
+# `InterventionController` (which imports `RRTMode` and compares against
+# `RRTMode.IDLE/PLANNING/EXECUTING`) keep working unchanged after the SA-wrapper
+# guidance-source refactor. The two enums have byte-identical members and string
+# values; the alias is transparent.
+RRTMode = GuidanceMode
 
 
 @dataclass
@@ -64,10 +96,50 @@ class RRTPlanningError(RuntimeError):
     in collision, no path found within iteration budget, etc.)."""
 
 
+def _canonical_for_hash(value) -> str:
+    """Render value to a canonical string so functionally-identical configs
+    hash to the same key.
+
+    Specifically:
+      * Sort dict keys (Python preserves insertion order, but the env can
+        emit the same dict with different key orderings across calls).
+      * Round floats to 6 decimal places — the env's quaternion conversion
+        sometimes flips -0.0 vs 0.0 and emits sub-nanometer position
+        jitter; without rounding, repr() of those differs and invalidates
+        the cache for the same physical scene.
+    """
+    if isinstance(value, dict):
+        items = sorted(value.items(), key=lambda kv: str(kv[0]))
+        return "{" + ",".join(f"{_canonical_for_hash(k)}:{_canonical_for_hash(v)}" for k, v in items) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_canonical_for_hash(v) for v in value) + "]"
+    if isinstance(value, float):
+        rounded = round(value, 6)
+        # Normalize -0.0 → 0.0 so the sign bit doesn't break the cache.
+        if rounded == 0:
+            rounded = 0.0
+        return repr(rounded)
+    return repr(value)
+
+
 def _hash_config(cfg: dict) -> str:
-    # Hash is for cache invalidation only, not security. usedforsecurity=False
-    # silences bandit's B324 warning about SHA1.
-    return hashlib.sha1(repr(cfg).encode("utf-8"), usedforsecurity=False).hexdigest()
+    """Hash JUST the obstacle-relevant portion of the oracle env config.
+
+    The full ``env_config`` dict includes transient per-step fields like
+    ``current_ee_pos`` that change every tick — hashing the whole dict
+    invalidates the cache every step and forces a full obstacle reload.
+    ``load_obstacles`` only reads ``cfg["objects"]``, so that's the only
+    thing the cache key needs to track.
+
+    Uses a canonical-rendering helper that sorts dict keys and rounds floats
+    so a static scene produces a stable hash across env ticks, even when
+    the env emits ``-0.0`` vs ``0.0`` or sub-µm float jitter.
+
+    Hash is for cache invalidation only, not security. usedforsecurity=False
+    silences bandit's B324 warning about SHA1.
+    """
+    objs = cfg.get("objects", []) if isinstance(cfg, dict) else []
+    return hashlib.sha1(_canonical_for_hash(objs).encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
 class RRTToGoalPlanner:
@@ -92,6 +164,8 @@ class RRTToGoalPlanner:
         max_joint_vel: float = 0.5,
         max_joint_acc: float = 1.0,
         max_joint_jerk: float = 10.0,
+        path_selection: PathSelectionStrategy = PathSelectionStrategy.EE_ARC_LENGTH,
+        velocity_match_window: int = 3,
     ) -> None:
         self._pb_client = pb_client
         self._robot_id = robot_id
@@ -113,6 +187,12 @@ class RRTToGoalPlanner:
         self._max_joint_vel = max_joint_vel
         self._max_joint_acc = max_joint_acc
         self._max_joint_jerk = max_joint_jerk
+        self._path_selection = path_selection
+        # Window over which to average velocities for the JOINT_VELOCITY_MATCH
+        # strategy. Applied to BOTH the candidate path's leading edge and the
+        # robot's trailing velocity history. 3 samples ≈ 100 ms at 30 Hz —
+        # enough to smooth jitter, short enough that "recent" still means recent.
+        self._velocity_match_window = int(velocity_match_window)
         self._loaded_obstacle_ids: list[int] = []  # only oracle-loaded bodies
         self._obstacle_names: dict[int, str] = {}
         self._skip_pairs: set[tuple[int, int]] = set()
@@ -344,6 +424,7 @@ class RRTToGoalPlanner:
         target_ee_pos: np.ndarray,
         target_ee_quat: np.ndarray,
         q_goal_bias: np.ndarray | None = None,
+        recent_joint_velocity: np.ndarray | None = None,
     ) -> np.ndarray:
         """Plan a joint-space trajectory to an end-effector pose.
 
@@ -422,14 +503,30 @@ class RRTToGoalPlanner:
                 raise RRTPlanningError("No collision-free IK solution found for target EE pose")
             logger.info("Resolved EE goal to %d collision-free IK candidate(s)", len(candidates))
 
-            # Try RRT against EVERY candidate, score each by joint-space arc
-            # length, keep the shortest. Compared to "stop at first success",
-            # this is more expensive (we plan all candidates) but produces
-            # noticeably tidier corrections — DAgger data quality matters more
-            # than per-cycle latency for our use case.
+            # Try RRT against EVERY candidate, score each by the active
+            # `path_selection` strategy, keep the minimum-score winner. See
+            # `PathSelectionStrategy` for the three options. Score-name +
+            # units depend on the strategy (different log labels below).
+            if self._path_selection == PathSelectionStrategy.JOINT_VELOCITY_MATCH:
+                if recent_joint_velocity is None:
+                    raise RRTPlanningError(
+                        "PathSelectionStrategy.JOINT_VELOCITY_MATCH requires `recent_joint_velocity` "
+                        "to be passed to plan(); none provided. Either supply a velocity history or "
+                        "switch to EE_ARC_LENGTH / JOINT_ARC_LENGTH."
+                    )
+                recent_vel = np.asarray(recent_joint_velocity, dtype=np.float64).reshape(-1)[: self._num_dofs]
+            else:
+                recent_vel = None
+
+            score_label, score_units = {
+                PathSelectionStrategy.EE_ARC_LENGTH: ("EE arc-length", "m"),
+                PathSelectionStrategy.JOINT_ARC_LENGTH: ("joint arc-length", "rad"),
+                PathSelectionStrategy.JOINT_VELOCITY_MATCH: ("joint-velocity deviation", "rad/step"),
+            }[self._path_selection]
+
             path = None
             chosen_q_goal = None
-            best_length = float("inf")
+            best_score = float("inf")
             for i, q_goal in enumerate(candidates):
                 logger.info("Trying RRT against IK candidate %d/%d", i + 1, len(candidates))
                 attempt = get_path(
@@ -449,27 +546,28 @@ class RRTToGoalPlanner:
                 if attempt is None:
                     continue
                 attempt_arr = np.asarray(attempt, dtype=np.float64)
-                if attempt_arr.shape[0] < 2:
-                    length = 0.0
-                else:
-                    length = float(np.sum(np.linalg.norm(np.diff(attempt_arr, axis=0), axis=1)))
+                score = self._score_candidate(attempt_arr, recent_vel)
                 logger.info(
-                    "Candidate %d/%d produced a path with joint-space length=%.3f",
+                    "Candidate %d/%d produced a path with %s=%.3f %s",
                     i + 1,
                     len(candidates),
-                    length,
+                    score_label,
+                    score,
+                    score_units,
                 )
-                if length < best_length:
-                    best_length = length
+                if score < best_score:
+                    best_score = score
                     path = attempt
                     chosen_q_goal = q_goal
 
             if path is None or chosen_q_goal is None:
                 raise RRTPlanningError(f"RRT failed for all {len(candidates)} IK goal candidate(s)")
             logger.info(
-                "Picked shortest path among %d candidate(s): joint-space length=%.3f",
+                "Picked best path among %d candidate(s) by %s=%.3f %s",
                 len(candidates),
-                best_length,
+                score_label,
+                best_score,
+                score_units,
             )
 
             # Snap endpoints to the exact start/goal so smoothing doesn't drift.
@@ -520,6 +618,87 @@ class RRTToGoalPlanner:
                     1,
                     physicsClientId=self._pb_client,
                 )
+
+    def _score_candidate(
+        self,
+        path: np.ndarray,
+        recent_joint_velocity: np.ndarray | None,
+    ) -> float:
+        """Dispatch to the active path-selection strategy. Lower = better.
+
+        `recent_joint_velocity` is consulted only when the strategy is
+        JOINT_VELOCITY_MATCH; for other strategies it is ignored.
+        """
+        strategy = self._path_selection
+        if strategy == PathSelectionStrategy.EE_ARC_LENGTH:
+            return self._path_ee_arc_length(path)
+        if strategy == PathSelectionStrategy.JOINT_ARC_LENGTH:
+            return self._path_joint_arc_length(path)
+        if strategy == PathSelectionStrategy.JOINT_VELOCITY_MATCH:
+            assert recent_joint_velocity is not None  # caller guarantees, see plan()
+            return self._path_velocity_deviation(path, recent_joint_velocity)
+        raise ValueError(f"Unknown PathSelectionStrategy: {strategy!r}")
+
+    def _path_joint_arc_length(self, path: np.ndarray) -> float:
+        """Sum of joint-space L2 distances between consecutive waypoints.
+
+        Cheap: no pybullet calls. Tends to favor candidates that land close
+        to `q_start` in configuration space even if the EE swings wide;
+        use EE_ARC_LENGTH if you care more about cartesian path tidiness.
+        """
+        if path.shape[0] < 2:
+            return 0.0
+        deltas = np.diff(path, axis=0)
+        return float(np.sum(np.linalg.norm(deltas, axis=1)))
+
+    def _path_velocity_deviation(
+        self,
+        path: np.ndarray,
+        recent_joint_velocity: np.ndarray,
+    ) -> float:
+        """L2 norm of (candidate initial velocity − robot recent velocity).
+
+        Both velocities are computed as the mean per-step joint delta
+        averaged over `velocity_match_window` samples — the candidate path's
+        leading samples (`path[1] - path[0]`, `path[2] - path[1]`, ...) on
+        the candidate side, and the caller-provided `recent_joint_velocity`
+        (already averaged) on the robot side. Lower deviation = the
+        candidate's first few steps continue the robot's current motion the
+        most, minimizing the velocity discontinuity at the trigger moment.
+        """
+        if path.shape[0] < 2:
+            # Degenerate path — no motion to compare against. Return a large
+            # penalty so any candidate with real motion wins over this one.
+            return float("inf")
+        window = max(1, min(self._velocity_match_window, path.shape[0] - 1))
+        leading_deltas = np.diff(path[: window + 1], axis=0)  # [window, num_dofs]
+        candidate_vel = leading_deltas.mean(axis=0)
+        recent_vel = recent_joint_velocity.reshape(-1)[: self._num_dofs]
+        return float(np.linalg.norm(candidate_vel - recent_vel))
+
+    def _path_ee_arc_length(self, path: np.ndarray) -> float:
+        """Sum of Euclidean distances between consecutive end-effector world
+        positions along a joint-space ``path`` of shape ``[N, num_dofs]``.
+
+        Uses fast FK: resetJointState (no physics step) on the arm joints,
+        then ``getLinkState(..., computeForwardKinematics=True)``. This leaves
+        the robot at the path's terminal config — callers in ``plan()`` are
+        responsible for restoring joint state from the snapshot taken on entry.
+        """
+        if path.shape[0] < 2:
+            return 0.0
+        ee_positions = np.empty((path.shape[0], 3), dtype=np.float64)
+        for k in range(path.shape[0]):
+            for j_idx, qi in zip(self._joint_indices, path[k].tolist(), strict=True):
+                p.resetJointState(self._robot_id, j_idx, float(qi), physicsClientId=self._pb_client)
+            link_state = p.getLinkState(
+                self._robot_id,
+                self._ee_link_index,
+                computeForwardKinematics=True,
+                physicsClientId=self._pb_client,
+            )
+            ee_positions[k] = link_state[0]  # worldLinkFramePosition
+        return float(np.sum(np.linalg.norm(np.diff(ee_positions, axis=0), axis=1)))
 
     def _ik_null_space_kwargs(self, seed_q: np.ndarray) -> dict:
         """Build the null-space kwargs for calculateInverseKinematics, padded

@@ -27,7 +27,7 @@ Works with any noise/flow-based policy (PI0.5, Diffusion) without modifying lero
 
 from __future__ import annotations
 
-import contextlib
+import collections
 import logging
 import threading
 from enum import Enum
@@ -42,14 +42,13 @@ from splatsim.utils.paths import resolve_splatsim_path
 from torch import Tensor, nn
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.guidance import GuidanceCallCtx
+from lerobot.policies.guidance.observation_teleop_source import ObservationTeleopGuidanceSource
+from lerobot.policies.guidance.oracle_goal_source import OracleGoalGuidanceSource
+from lerobot.policies.guidance.rrt_source import RRTGuidanceSource
+from lerobot.policies.guidance.views import _RRTBackCompatView
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.rrt_to_goal import (
-    RRTMode,
-    RRTPlanningError,
-    RRTRuntimeState,
-    RRTToGoalPlanner,
-    extract_task_goal,
-)
+from lerobot.policies.rrt_to_goal import RRTMode
 from lerobot.policies.teleop_recording import FrameSource
 from lerobot.processor import AbsoluteActionsProcessorStep, PolicyProcessorPipeline, to_relative_actions
 
@@ -150,6 +149,10 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         guidance_blend_strategy: GuidanceBlendStrategy | str = GuidanceBlendStrategy.DENOISE,
         n_anchor_steps: int = 0,
         fps: int = 30,
+        rrt_pre_jump_lookback_steps: int = 5,
+        rrt_teleport_to_q_start: bool = True,
+        rrt_blocking_plan: bool = True,
+        rrt_path_selection: str | None = None,
     ):
         # Bypass PreTrainedPolicy.__init__ — we proxy the inner policy's config
         nn.Module.__init__(self)
@@ -165,21 +168,44 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             if isinstance(guidance_blend_strategy, str)
             else guidance_blend_strategy
         )
-        self._had_guidance_last_step: bool = False
         self._desired_q: np.ndarray | None = None  # raw joint-space IK seed [num_dofs]
+        # Most recent ACTUAL joint state, unnormalized from the latest observation.
+        # Used as q_start for RRT planning so the plan starts where the robot is,
+        # not where it was commanded to be (which can diverge when the policy
+        # commands the robot into an obstacle — the env physics stops the real
+        # robot at the surface while _desired_q keeps accumulating commanded poses,
+        # producing demos that begin with a jarring "teleport to commanded pose"
+        # before the recovery trajectory).
+        self._latest_actual_q: np.ndarray | None = None
+        # Ring buffer of the most recent ~N actual joint observations. When RRT
+        # is triggered, q_start is taken from the oldest entry — that's the pose
+        # the robot was at BEFORE the policy's current (presumably bad) action
+        # chunk started commanding the robot toward a collision. Combined with
+        # _maybe_teleport_to_q_start below, this makes the recorded RRT segment
+        # begin at a clean pre-jump pose with no sim catch-up frames.
+        # `_actual_q_history` is wrapper-owned (written every step from obs decode,
+        # read by the RRT source via the wrapper back-ref to derive q_start). Sized
+        # from rrt_pre_jump_lookback_steps so the OLDEST entry is approximately N
+        # steps before the most recent push.
+        self._actual_q_history: collections.deque[np.ndarray] = collections.deque(
+            maxlen=max(1, int(rrt_pre_jump_lookback_steps) + 1)
+        )
         self._teleop_context: TeleopRecordingContext | None = None  # set by policy factory
         self._start_paused = start_paused
         self._run_event = threading.Event()
         if not start_paused:
             self._run_event.set()
 
-        # Wrapper-managed blended chunk buffer
-        self._guided_chunk: Tensor | None = None  # [B, n_action_steps, action_dim]
-        self._chunk_step: int = 99999999999  # how many steps have been returned from _guided_chunk
-        # Diagnostic: raw-joint decode of the most-recently-built guidance_chunk
-        # ([B, anchor_len, joint_dim]). Lets callers compare what the wrapper
-        # actually feeds into the blend against the demo trajectory.
-        self._last_decoded_guidance_chunk: np.ndarray | None = None
+        # The observation-driven path (pure teleop + DENOISE/INTERPOLATE blend)
+        # is owned by ObservationTeleopGuidanceSource. The wrapper accesses
+        # its state — `_guided_chunk`, `_chunk_step`, `_had_guidance_last_step`,
+        # `_last_decoded_guidance_chunk` — via property shims further down.
+        self._obs_teleop_source = ObservationTeleopGuidanceSource(self)
+        # Method-triggered oracle-goal source for DAgger interventions. Builds
+        # a linear-interpolation chunk from current q_start to the oracle's
+        # q_goal_bias and plays it back verbatim. Triggered by external code
+        # (lerobot-eval --intervention) via `self._oracle_goal_source.trigger()`.
+        self._oracle_goal_source = OracleGoalGuidanceSource(self)
 
         self.num_dofs = num_dofs
         self._max_joint_delta = max_joint_delta
@@ -189,14 +215,20 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self.n_anchor_steps = n_anchor_steps
         self._fps = fps
 
-        # All RRT-mode state lives in a single dataclass; keeps the wrapper tidy.
-        self._rrt: RRTRuntimeState = RRTRuntimeState()
-
-        # When True (default) RRT auto-pauses the wrapper on natural goal-reach
-        # so the user can decide what to do next from the GUI. Automated callers
-        # (e.g. the intervention-recording script) flip this off so the loop
-        # keeps running after the chunk exhausts.
-        self.auto_pause_on_rrt_finish: bool = True
+        # All RRT-mode state — planning lifecycle, chunk playback, plan thread —
+        # is owned by the RRTGuidanceSource. The wrapper accesses RRT state via
+        # this source; external callers (lerobot-eval --intervention, the GUI,
+        # last_mile/helpers.py) access it via the back-compat `_rrt` property.
+        # `auto_pause_on_rrt_finish` lives on the source; the wrapper exposes
+        # it as a property shim further down.
+        self._rrt_source = RRTGuidanceSource(
+            self,
+            pre_jump_lookback_steps=int(rrt_pre_jump_lookback_steps),
+            teleport_to_q_start=bool(rrt_teleport_to_q_start),
+            blocking_plan=bool(rrt_blocking_plan),
+            auto_pause_on_finish=True,
+            path_selection=rrt_path_selection,
+        )
 
         logger.info(f"SharedAutonomyPolicyWrapper: ratio={forward_flow_ratio}, robot={robot_name}")
 
@@ -383,123 +415,127 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
 
     # ---- RRT-to-Goal mode ------------------------------------------------- #
 
-    def _ensure_rrt_planner(self) -> RRTToGoalPlanner:
-        """Lazy-init the planner (so the import / setup happens only when used)."""
-        if self._rrt.planner is None:
-            self._rrt.planner = RRTToGoalPlanner(
-                pb_client=self._pb_client,
-                robot_id=self._robot_id,
-                joint_indices=list(range(1, 1 + self.num_dofs)),
-                ee_link_index=self._ee_link,
-                num_dofs=self.num_dofs,
-                fps=self._fps,
-                lower_limits=np.asarray(self.lower_limits, dtype=np.float64),
-                upper_limits=np.asarray(self.upper_limits, dtype=np.float64),
-                num_ik_candidates=16,
-            )
-        return self._rrt.planner
+    # ── RRT lifecycle: thin shims over `self._rrt_source` ──────────────── #
+    # All RRT planning/execution machinery lives on the RRTGuidanceSource.
+    # These methods exist for back-compat with external callers that learned
+    # the wrapper-level API before the source extraction (lerobot-eval --intervention,
+    # last_mile/helpers.py, shared_autonomy_gui.py). New callers should prefer
+    # `self._rrt_source.<...>` directly.
 
-    def _maybe_update_oracle_obstacles(self, oracle_cfg: dict) -> None:
-        """Cache the oracle env config and (re)load obstacles when its hash changes.
+    @property
+    def _rrt(self):
+        """Back-compat view of the RRT source's runtime state.
 
-        Loads obstacles into the wrapper's pybullet client and adopts them as
-        the authoritative obstacle set for IK collision projection too. The
-        hardcoded fallback bodies (loaded by ``_load_static_obstacles`` for
-        no-oracle environments) are torn down on the first oracle load so the
-        planner doesn't trip over duplicate table/wall geometry.
+        Returns a thin proxy so `wrapper._rrt.mode`, `wrapper._rrt.target_steps`,
+        `wrapper._rrt.planner`, etc. all read/write the underlying
+        `RRTGuidanceSource.state` (which is the same `RRTRuntimeState` dataclass
+        that used to live directly on the wrapper). See
+        `lerobot.policies.guidance.views._RRTBackCompatView` for the proxy
+        implementation.
         """
-        if oracle_cfg is None:
-            return
-        self._rrt.oracle_env_config = oracle_cfg
-        try:
-            planner = self._ensure_rrt_planner()
-            oracle_ids = planner.load_obstacles(oracle_cfg)
-        except Exception:
-            logger.exception("Failed to load oracle obstacles into pybullet client")
-            return
-        # Replace the hardcoded fallback obstacles with the oracle set.
-        # Idempotent — only runs once, the first time oracle info arrives.
-        if not getattr(self, "_oracle_replaced_static_obstacles", False):
-            for body_id in self._obstacle_ids:
-                with contextlib.suppress(p.error):
-                    p.removeBody(body_id, physicsClientId=self._pb_client)
-            self._oracle_replaced_static_obstacles = True
-        self._obstacle_ids = list(oracle_ids)
+        return _RRTBackCompatView(self._rrt_source)
+
+    @property
+    def auto_pause_on_rrt_finish(self) -> bool:
+        """Whether to pause the wrapper when RRT reaches its goal naturally.
+
+        Mirrored on the source. External code (lerobot-eval --intervention,
+        last_mile/helpers.py) sets this on the wrapper; the property
+        forwards the write to the source.
+        """
+        return self._rrt_source.auto_pause_on_finish
+
+    @auto_pause_on_rrt_finish.setter
+    def auto_pause_on_rrt_finish(self, value: bool) -> None:
+        self._rrt_source.auto_pause_on_finish = bool(value)
+
+    def set_env_for_teleport(self, env: object) -> None:
+        """Register the gym env handle used to teleport the sim's joint state
+        before RRT execution begins. Should be the un-vectorized,
+        un-wrapped env (or a single-env sub-handle) that exposes
+        ``robot_server.teleport_joint_state(splatsim_robot, joint_state)``.
+
+        Called once by the intervention recorder right after env creation.
+        """
+        self._rrt_source.set_env_for_teleport(env)
+
+    # ── Obs-driven source: back-compat property shims for migrated state ─ #
+    # External callers don't read these directly (audit), but inline wrapper
+    # code (e.g. `select_action`'s pre-flush block, `_cancel_rrt`) still
+    # touches them. Properties forward to the source so the existing code
+    # keeps working transparently.
+
+    @property
+    def _guided_chunk(self):
+        return self._obs_teleop_source._guided_chunk
+
+    @_guided_chunk.setter
+    def _guided_chunk(self, value) -> None:
+        self._obs_teleop_source._guided_chunk = value
+
+    @property
+    def _chunk_step(self) -> int:
+        return self._obs_teleop_source._chunk_step
+
+    @_chunk_step.setter
+    def _chunk_step(self, value: int) -> None:
+        self._obs_teleop_source._chunk_step = value
+
+    @property
+    def _had_guidance_last_step(self) -> bool:
+        return self._obs_teleop_source._had_guidance_last_step
+
+    @_had_guidance_last_step.setter
+    def _had_guidance_last_step(self, value: bool) -> None:
+        self._obs_teleop_source._had_guidance_last_step = bool(value)
+
+    @property
+    def _last_decoded_guidance_chunk(self):
+        return self._obs_teleop_source._last_decoded_guidance_chunk
+
+    @_last_decoded_guidance_chunk.setter
+    def _last_decoded_guidance_chunk(self, value) -> None:
+        self._obs_teleop_source._last_decoded_guidance_chunk = value
+
+    def is_rrt_active(self) -> bool:
+        """True while RRT is planning or executing."""
+        return self._rrt_source.is_active()
+
+    def disable_recording(self) -> None:
+        """Turn off all recording-related behavior.
+
+        Clears two pieces of state:
+          * ``_teleop_context``: detaches the singleton
+            ``TeleopRecordingContext``, so per-step ``select_action``
+            bookkeeping (frame_source, has_guidance, etc.) becomes a no-op.
+          * the RRT source's teleport-to-q_start flag: disables the
+            "teleport the sim robot to the RRT plan's q_start before
+            execution" optimization. That feature exists to make the
+            recorded RRT trajectory start pristine (no catch-up frames
+            from physics interpolation). When we're not recording, the
+            catch-up frames don't matter; and the teleport requires a
+            separately-set env handle which the non-recording eval path
+            doesn't supply, so leaving the flag on just produces a
+            misleading "Skipping teleport — recorded intervention will
+            start with catch-up frames" warning.
+
+        ``_wrap_with_shared_autonomy`` always attaches a
+        ``TeleopRecordingContext`` and leaves the teleport flag at its
+        default ``True``, because the primary caller is
+        ``lerobot-eval --intervention``. External callers using SA for help
+        rather than data collection (e.g. the last-mile RRT helper) should
+        call this method after wrapping.
+        """
+        self._teleop_context = None
+        self._rrt_source.set_teleport_enabled(False)
 
     def trigger_rrt_to_goal(self) -> None:
         """Toggle: start RRT-to-goal if idle, cancel if planning/executing.
 
-        Safe to call from a GUI thread. Planning runs on a daemon worker thread
-        so this method returns immediately.
+        Blocks when the source's `blocking_plan` is True (the default and the
+        eval/recording path). See `RRTGuidanceSource.trigger` for details.
         """
-        rrt = self._rrt
-        with rrt.lock:
-            if rrt.mode in (RRTMode.PLANNING, RRTMode.EXECUTING):
-                rrt.cancel_requested = True
-                logger.info("RRT cancellation requested (state=%s)", rrt.mode.value)
-                return
-            rrt.mode = RRTMode.PLANNING
-            rrt.cancel_requested = False
-        threading.Thread(target=self._do_rrt_plan, daemon=True, name="rrt-plan").start()
-
-    def _do_rrt_plan(self) -> None:
-        """Worker entry: plan a trajectory, then transition to EXECUTING."""
-        rrt = self._rrt
-        try:
-            if rrt.oracle_env_config is None:
-                logger.warning(
-                    "RRT triggered but no oracle_env_config available. "
-                    "Set env.include_oracle_info=true to enable."
-                )
-                rrt.mode = RRTMode.IDLE
-                return
-            goal = extract_task_goal(rrt.oracle_env_config)
-            if goal is None:
-                logger.warning(
-                    "RRT triggered but oracle_env_config has no task.target_ee_pos / target_ee_quat"
-                )
-                rrt.mode = RRTMode.IDLE
-                return
-            target_ee_pos, target_ee_quat, q_goal_bias = goal
-            if self._desired_q is None:
-                logger.warning("RRT triggered before _desired_q seeded; aborting")
-                rrt.mode = RRTMode.IDLE
-                return
-
-            planner = self._ensure_rrt_planner()
-            planner.load_obstacles(rrt.oracle_env_config)
-            q_start = self._desired_q.reshape(-1)[: self.num_dofs].copy()
-            chunk = planner.plan(q_start, target_ee_pos, target_ee_quat, q_goal_bias)
-        except RRTPlanningError as e:
-            logger.warning("RRT planning failed: %s", e)
-            rrt.mode = RRTMode.IDLE
-            return
-        except Exception:
-            logger.exception("Unexpected error during RRT planning")
-            rrt.mode = RRTMode.IDLE
-            return
-
-        with rrt.lock:
-            if rrt.cancel_requested:
-                logger.info("RRT plan ready but cancellation was requested; discarding")
-                rrt.mode = RRTMode.IDLE
-                rrt.cancel_requested = False
-                return
-            rrt.chunk = chunk
-            rrt.step = 0
-            rrt.mode = RRTMode.EXECUTING
-            # Note: forward_flow_ratio is intentionally left untouched. The RRT
-            # execution branch in select_action wins on its own (early-returns
-            # before the ratio-based branches), so there's no need to park the
-            # ratio at 1.0 — and not parking means slider edits made during RRT
-            # execution stay in effect when the user cancels or RRT finishes.
-            # Display the planned-cancel point alongside the total chunk length
-            # if the caller advertised one (controller's randomized stop). When
-            # target is None or >= chunk length, just show the total.
-            n_total = len(chunk)
-            target = rrt.target_steps
-            exec_str = f"{target}/{n_total}" if target is not None and target < n_total else f"{n_total}"
-            logger.info("RRT executing %s waypoints (current ratio=%.2f)", exec_str, self.forward_flow_ratio)
+        self._rrt_source.trigger()
 
     def _flush_inner_action_queue(self) -> None:
         """Drop the inner policy's cached actions without resetting its obs queue.
@@ -534,29 +570,31 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             )
 
     def _cancel_rrt(self) -> None:
-        rrt = self._rrt
-        rrt.chunk = None
-        rrt.step = 0
-        rrt.mode = RRTMode.IDLE
-        rrt.cancel_requested = False
-        # Clear the controller's advertised cancel hint so a later trigger
-        # without one doesn't print a stale "X/Y" in the executing log.
-        rrt.target_steps = None
-        # forward_flow_ratio was never parked (see _do_rrt_plan), so there's
-        # nothing to restore — whatever the user has the slider at right now
-        # is the ratio used post-cancel.
-        # The robot has been driven by the RRT planner since these were last
-        # populated, so the cached actions are stale (the policy's obs queue,
-        # however, has been getting fresh observations every step — keep it).
-        # Drop the inner policy's action chunk and the wrapper's blended chunk
-        # so the next call generates fresh actions from the post-RRT pose.
+        """Cancel RRT and clear obs-driven cached state. See `_cancel_intervention`."""
+        self._cancel_intervention(self._rrt_source)
+
+    def _cancel_oracle_goal(self) -> None:
+        """Cancel the OracleGoal sequence and clear obs-driven cached state.
+
+        Same cleanup as `_cancel_rrt` — the differences between the two sources
+        are in chunk construction (planner vs interpolator), not in cancellation.
+        """
+        self._cancel_intervention(self._oracle_goal_source)
+
+    def _cancel_intervention(self, source) -> None:
+        """Source-agnostic cancel: clear the source's chunk, flush stale inner
+        policy actions, and reset the obs-teleop blend buffer so the next call
+        generates fresh actions from the post-cancel pose.
+
+        forward_flow_ratio is intentionally not parked (no source's execution
+        branch reads it), so there's nothing to restore.
+        """
+        source.cancel()
         self._flush_inner_action_queue()
-        self._guided_chunk = None
-        self._chunk_step = 99_999_999_999  # forces chunk_exhausted on next call
-        self._had_guidance_last_step = False
+        self._obs_teleop_source.cancel()
 
     def _finish_rrt(self) -> None:
-        """Goal reached: restore prior ratio, then auto-pause unless disabled."""
+        """Goal reached: cancel + clean caches, then auto-pause unless disabled."""
         self._cancel_rrt()
         if self.auto_pause_on_rrt_finish:
             self._run_event.clear()
@@ -804,19 +842,15 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         return x_tsw
 
     def reset(self):
-        self._guided_chunk = None
-        self._chunk_step = 0
-        self._had_guidance_last_step = False
+        self._obs_teleop_source.reset()
         self._desired_q = None
+        self._latest_actual_q = None
+        self._actual_q_history.clear()
         self._prev_dq = None
-        self._last_decoded_guidance_chunk = None
         # Clear RRT chunk state on episode boundary; keep the planner instance
         # so its obstacle cache survives if the env config hash matches next episode.
-        self._rrt.chunk = None
-        self._rrt.step = 0
-        self._rrt.mode = RRTMode.IDLE
-        self._rrt.cancel_requested = False
-        self._rrt.target_steps = None
+        self._rrt_source.reset()
+        self._oracle_goal_source.reset()
         if self._start_paused:
             self._run_event.clear()
         return self.inner_policy.reset()
@@ -871,13 +905,19 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # Cache the oracle env config (obstacle geometry + task goal) sent by the
         # SplatSim server when env.include_oracle_info=true. Loading obstacles here
         # benefits both the IK collision projection and the RRT-to-goal mode.
+        # The RRT source owns the obstacle adoption logic now — it also tears
+        # down the wrapper's hardcoded fallback obstacles on first oracle load.
         oracle_cfg = batch.pop("oracle_env_config", None)
         if oracle_cfg is not None:
-            self._maybe_update_oracle_obstacles(oracle_cfg)
+            self._rrt_source.update_oracle_config(oracle_cfg)
+            self._oracle_goal_source.update_oracle_config(oracle_cfg)
 
-        # Extract delta guidance (7-d: [dx,dy,dz,droll,dpitch,dyaw,gripper]).
-        # All-NaN means no key is held.
-        guidance_chunk_raw = batch.pop(OBS_GUIDANCE_CHUNK, None)  # [B, n_remaining, action_dim] or None
+        # The obs-driven source pops OBS_GUIDANCE_CHUNK from the batch and computes
+        # has_guidance for this tick. Done BEFORE inner_policy.select_action so the
+        # inner policy doesn't see the (consumed) guidance key in its obs batch.
+        self._obs_teleop_source.update(GuidanceCallCtx(batch=batch))
+        has_guidance = self._obs_teleop_source.has_guidance
+
         obs_state = batch.get(OBS_STATE)
 
         if obs_state is None:
@@ -886,10 +926,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         assert obs_state.shape[0] == 1
 
         ratio = self.forward_flow_ratio
-        # TODO if this is a setting with multiple envs, prob need to have has_guidance have an entry per batch
-        has_guidance = guidance_chunk_raw is not None and not torch.isnan(guidance_chunk_raw).all()
         rrt_active = self._rrt.mode == RRTMode.EXECUTING and self._rrt.chunk is not None
-        # print("rrt active:", rrt_active)
         if self._teleop_context is not None:
             self._teleop_context.ratio = ratio
             # Treat user guidance OR RRT execution as "real" frames so the recorder
@@ -905,14 +942,6 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 self._teleop_context.frame_source = FrameSource.TELEOP
             else:
                 self._teleop_context.frame_source = FrameSource.POLICY
-
-        # We stay in "guided execution" mode until the current buffer is fully consumed,
-        # even if the user releases the key mid-chunk.
-        chunk_exhausted = self._guided_chunk is None or self._chunk_step >= self.config.n_action_steps
-        draining = self._guided_chunk is not None and not chunk_exhausted
-        in_guidance_mode = has_guidance or draining
-
-        self._had_guidance_last_step = has_guidance
 
         # No inner policy reset needed here — the obs queue is always updated by
         # inner_policy.select_action (called unconditionally below), so it stays
@@ -933,8 +962,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         )
         if rrt_will_cancel:
             self._flush_inner_action_queue()
-            self._guided_chunk = None
-            self._chunk_step = 99_999_999_999
+            self._obs_teleop_source.cancel()
 
         # Always call inner_policy.select_action to keep obs queues updated (e.g. diffusion
         # maintains n_obs_steps history in _queues). Discard output when guidance overrides.
@@ -984,6 +1012,16 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             actual_q = actual_q_t[0].detach().cpu().numpy().astype(np.float64)
             # observation.state is [num_dofs joints + gripper] = num_dofs+1 entries.
             self._desired_q = actual_q.reshape(-1)[: self.num_dofs + 1]
+            # Preserve a copy of the actual observation for RRT's q_start —
+            # _desired_q gets overwritten with the commanded action at the end
+            # of select_action, so by the time the planner thread reads it the
+            # value reflects "where we want the robot to go next", not "where
+            # the robot is right now". When commanded ≠ actual (collision,
+            # mid-chunk replay, etc.) the latter is what RRT needs.
+            self._latest_actual_q = actual_q.reshape(-1)[: self.num_dofs + 1].copy()
+            # Also push into the rolling history so RRT can pull q_start from
+            # N steps ago (pre-jump pose), not just the current actual_q.
+            self._actual_q_history.append(self._latest_actual_q.copy())
         elif self._desired_q is None:
             # Last-resort initial seed from the policy's postprocessed action.
             self._desired_q = self.postprocessor(inner_action).cpu().numpy().reshape(-1)
@@ -1006,18 +1044,10 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             if has_guidance or rrt.cancel_requested:
                 # print("cancel rrt")
                 self._cancel_rrt()
-                # _cancel_rrt restored forward_flow_ratio and dropped stale
-                # cached actions (obs queue is left intact). Refresh the locals
-                # derived from wrapper state so the branches below see the
-                # post-cancel world rather than the parked-during-RRT state.
-                ratio = self.forward_flow_ratio
-                chunk_exhausted = True
-                draining = False
-                in_guidance_mode = has_guidance
-                # Get a simple action just for this timestep
-                action = self.get_hold_action(inner_action)
-                return action
-                # fall through to the existing blend/teleop branches below
+                # _cancel_rrt cleared stale inner-policy + obs-blend caches.
+                # Return a hold action for this tick; next tick falls through
+                # to the obs-driven source naturally.
+                return self.get_hold_action(inner_action)
             elif rrt.step >= len(rrt.chunk):
                 # print('finish rrt: chunk exhausted (step %d >= chunk length %d)' % (rrt.step, len(rrt.chunk)))
                 # Goal reached: restore prior ratio, auto-pause for the next step.
@@ -1040,263 +1070,61 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 self._desired_q = raw7.copy()
                 return action
 
-        # --- Pure teleop (ratio=0): bypass policy chunk, do FK+IK from current state ---
-        if ratio == 0.0:
+        # --- Oracle-goal source: method-triggered (like RRT), VERBATIM playback. ---
+        # Active iff an external caller (e.g. lerobot-eval --intervention with
+        # method=oracle_goal) called `self._oracle_goal_source.trigger()`. The
+        # chunk is a linear-interpolation from q_start to q_goal_bias; emit one
+        # waypoint per step, tagged FrameSource.BLEND_INTERVENTION_100.
+        if self._oracle_goal_source.is_active():
             if has_guidance:
-                # print("applying user guidance in teleop mode")
-                if self.policy_guidance_representation == PolicyGuidanceRepresentation.ABSOLUTE_POS:
-                    action = self._normalize_policy_guidance_action(guidance_chunk_raw[:, 0, :])
-                else:
-                    action = self.get_full_teleop_action(guidance_chunk_raw[:, 0, :])
-            else:
-                # print("hold action")
-                action = self.get_hold_action(inner_action)
+                # User guidance arrived: cancel the oracle-goal sequence and
+                # let the obs-teleop source take over on this and future ticks.
+                self._oracle_goal_source.state.cancel_requested = True
+            og_result = self._oracle_goal_source.next_action(
+                GuidanceCallCtx(
+                    batch=batch,
+                    desired_q=self._desired_q,
+                    actual_q_history=self._actual_q_history,
+                    latest_actual_q=self._latest_actual_q,
+                    inner_action=inner_action,
+                    inner_dtype=inner_action.dtype,
+                    inner_device=inner_action.device,
+                    oracle_env_config=oracle_cfg,
+                )
+            )
+            if og_result.flush_inner_queue_after:
+                self._flush_inner_action_queue()
+                self._obs_teleop_source.cancel()
+            if self._teleop_context is not None and og_result.frame_source is not None:
+                # Override the upfront frame_source tagging (which guessed POLICY
+                # / TELEOP / RRT). OracleGoal emits BLEND_INTERVENTION_<XXX>.
+                self._teleop_context.frame_source = og_result.frame_source
+                self._teleop_context.has_guidance = True
+            if og_result.raw7 is not None:
+                self._desired_q = og_result.raw7.reshape(-1).copy()
+            return og_result.action
 
-        elif not in_guidance_mode:
-            # No pending guidance: clear buffer and use inner policy output.
-            # if self._guided_chunk is not None:
-            #     self._guided_chunk = None
-            #     self._chunk_step = 0
-            # print("not in guidance mode. using policy")
-            action = inner_action
-
-        # --- Guided execution mode, ratio < 1.0 ---
-
-        # Drain path: return the next action from an existing blended chunk without
-        # re-blending. Taken when:
-        #   - No new guidance delta (user released key), OR
-        #   - ONCE_PER_CHUNK mode and the current blended chunk is still valid.
-        elif (
-            self._guided_chunk is not None
-            and not chunk_exhausted
-            and (not has_guidance or self.blend_mode == BlendMode.ONCE_PER_CHUNK)
-        ):
-            action = self._guided_chunk[:, self._chunk_step, :]
-            self._chunk_step += 1
-
-        # Do the blend
+        # --- Obs-driven path (pure teleop / blend): delegated to ObservationTeleopGuidanceSource. ---
+        # Source already saw OBS_GUIDANCE_CHUNK during its update() above; it picks the
+        # right sub-case (pure teleop at ratio=0, drain, or blend rebuild) internally.
+        # When the source isn't active (ratio>0, no guidance, nothing draining), the
+        # wrapper just returns the inner policy's output directly.
+        if self._obs_teleop_source.is_active():
+            action = self._obs_teleop_source.next_action(
+                GuidanceCallCtx(
+                    batch=batch,
+                    desired_q=self._desired_q,
+                    actual_q_history=self._actual_q_history,
+                    latest_actual_q=self._latest_actual_q,
+                    inner_action=inner_action,
+                    inner_dtype=inner_action.dtype,
+                    inner_device=inner_action.device,
+                    oracle_env_config=oracle_cfg,
+                ),
+                base_noise=base_noise,
+            ).action
         else:
-            # max_action_dim: PI0.5 pads actions to this size; diffusion uses raw action_dim.
-            max_action_dim = getattr(self.config, "max_action_dim", None)
-            batch_size = guidance_chunk_raw.shape[0] if guidance_chunk_raw is not None else obs_state.shape[0]
-
-            # Determine anchor chunk for IK:
-            # - If chunk exhausted or no buffer yet: get a fresh policy chunk via predict_action_chunk.
-            #   Note: inner_policy.select_action was already called above (obs queues updated for diffusion),
-            #   so predict_action_chunk will read from up-to-date obs queues.
-            # - Otherwise: reuse _guided_chunk so guidance accumulates on top of itself.
-            if chunk_exhausted or self._guided_chunk is None:
-                noise_kwargs = {"noise": base_noise} if base_noise is not None else {}
-                anchor_chunk = self.inner_policy.predict_action_chunk(
-                    batch, **noise_kwargs
-                )  # [batch_size, chunk_size, action_dim]
-                self._chunk_step = 0
-            else:
-                # The anchor is the previously blended chunk
-                anchor_chunk = self._guided_chunk  # [batch_size, n_action_steps, action_dim]
-
-            device = anchor_chunk.device
-            # apply guidance to future steps only
-            anchor_len = anchor_chunk.shape[1]  # chunk_size or n_action_steps
-            action_dim = anchor_chunk.shape[2]
-
-            # Build the normalized guidance chunk to use as noise anchor.
-            # Clone anchor and zero-pad to max_action_dim if needed (required by PI0.5).
-            guidance_chunk = anchor_chunk.clone()
-            if max_action_dim is not None and action_dim < max_action_dim:
-                pad = torch.zeros(
-                    batch_size,
-                    anchor_len,
-                    max_action_dim - action_dim,
-                    dtype=guidance_chunk.dtype,
-                    device=device,
-                )
-                guidance_chunk = torch.cat([guidance_chunk, pad], dim=2)
-            else:
-                max_action_dim = action_dim
-
-            if (
-                self.policy_guidance_representation == PolicyGuidanceRepresentation.ABSOLUTE_POS
-                and guidance_chunk_raw is not None
-            ):
-                # Full per-step guidance chunk provided: normalize each step and overwrite
-                # the corresponding positions in the anchor. This avoids the single-point
-                # ramp-to-endpoint approximation that dilutes guidance on early steps.
-                # guidance_chunk_raw: [B, n_remaining, action_dim] covering [chunk_step, anchor_len)
-                n_provided = guidance_chunk_raw.shape[1]
-                n_remaining = anchor_len - self._chunk_step
-                n_fill = min(n_provided, n_remaining)
-                for t_rel in range(n_fill):
-                    step_raw = guidance_chunk_raw[:, t_rel, :]  # [B, action_dim]
-                    step_norm = self._normalize_policy_guidance_action(step_raw)
-                    t_abs = self._chunk_step + t_rel
-                    guidance_chunk[:, t_abs, :action_dim] = step_norm
-                # If guidance is shorter than remaining chunk, repeat last step
-                if n_fill < n_remaining:
-                    last_norm = guidance_chunk[:, self._chunk_step + n_fill - 1, :action_dim]
-                    for t_abs in range(self._chunk_step + n_fill, anchor_len):
-                        guidance_chunk[:, t_abs, :action_dim] = last_norm
-
-            elif (
-                self.policy_guidance_representation == PolicyGuidanceRepresentation.DELTA
-                and guidance_chunk_raw is not None
-            ):
-                # Hardcoded toggle. Default (False) = step-by-step integration seeded from
-                # _desired_q, matching what ratio=0.0 / get_full_teleop_action does. The
-                # legacy path (True) is anchor-seeded with an R_0-frame cumulative offset;
-                # easy to flip back if the new path turns out to be wrong for some case.
-                use_legacy_anchor_seeded_delta = False
-
-                guidance_chunk_np = guidance_chunk_raw.cpu().numpy()
-                n_provided = guidance_chunk_np.shape[1]
-                n_remaining = anchor_len - self._chunk_step
-
-                if not use_legacy_anchor_seeded_delta:
-                    # Step-by-step DELTA integration. Seed from _desired_q and apply each
-                    # delta in its own native local EE frame. Produces an absolute-joint
-                    # trace of the user's intended trajectory, so the blend pulls the
-                    # policy toward the demo rather than toward an anchor-offset that
-                    # drifts whenever the policy disagrees with the demo.
-                    assert self._desired_q is not None, "_desired_q must be seeded before DELTA blend"
-                    for b in range(batch_size):
-                        q_seed = self._desired_q.reshape(-1).copy()[: self.num_dofs]
-                        last_delta = guidance_chunk_np[b, 0]  # fallback if guidance shorter than chunk
-                        for t_rel in range(n_remaining):
-                            d = guidance_chunk_np[b, t_rel] if t_rel < n_provided else last_delta
-                            if t_rel < n_provided:
-                                last_delta = d
-                            d_pos, d_rot, d_gripper = d[:3], d[3:6], d[6]
-
-                            q_new = self._project_delta_for_collision(
-                                q_seed,
-                                d_pos,
-                                d_rot,
-                                skip_collision=self.skip_collision,
-                            )
-                            q_seed = q_new[: self.num_dofs].copy()
-
-                            t_abs = self._chunk_step + t_rel
-                            raw_step = np.concatenate([q_new, [float(d_gripper)]])
-                            step_t = torch.tensor(
-                                raw_step, dtype=anchor_chunk.dtype, device=device
-                            ).unsqueeze(0)
-                            step_norm = self._normalize_policy_guidance_action(step_t)
-                            guidance_chunk[:, t_abs, :action_dim] = step_norm
-                else:
-                    # Legacy anchor-seeded DELTA: for each step t, take the anchor joint
-                    # position at t and shift it by the EE delta accumulated from
-                    # chunk_step to t, expressed in anchor[chunk_step]'s EE frame (R_0).
-                    # Designed to keep guidance[t] close to anchor[t] for live keyboard
-                    # teleop; produces wrong absolute trajectories when fed a full
-                    # pre-recorded chunk of demo deltas.
-                    assert self._desired_q is not None, "_desired_q must be seeded before DELTA blend"
-
-                    for b in range(batch_size):
-                        # Get anchor joints at the first step of the remaining chunk.
-                        # anchor_q0_raw = self.postprocessor(anchor_chunk[[b], self._chunk_step, :])
-                        # q_seed = anchor_q0_raw[0, : self.num_dofs].cpu().numpy()
-
-                        q_seed = self._desired_q.reshape(-1).copy()[: self.num_dofs]
-
-                        # Compute R_0: EE orientation at anchor[chunk_step].
-                        # All subsequent accumulated deltas are expressed in this frame.
-                        self._sync_joints(q_seed)
-                        _, quat_0 = self._get_ee_pose()
-                        rot_0 = Rotation.from_quat(quat_0)
-
-                        # Accumulate translation and rotation in the rot_0 frame.
-                        accumulated_pos = np.zeros(3)
-                        accumulated_rot = Rotation.identity()
-                        last_delta = guidance_chunk_np[b, 0]  # fallback for padding
-                        for t_rel in range(n_remaining):
-                            d = guidance_chunk_np[b, t_rel] if t_rel < n_provided else last_delta
-                            if t_rel < n_provided:
-                                last_delta = d
-                            accumulated_pos = accumulated_pos + d[:3]
-                            accumulated_rot = accumulated_rot * Rotation.from_euler("XYZ", d[3:6])
-                            d_gripper = d[6]
-
-                            # Get anchor joint config at this step as the IK seed.
-                            t_abs = self._chunk_step + t_rel
-                            anchor_qt_raw = self.postprocessor(anchor_chunk[[b], t_abs, :])
-                            anchor_qt = anchor_qt_raw[0, : self.num_dofs].cpu().numpy()
-
-                            # Transform accumulated_pos from rot_0's frame to anchor[t]'s EE
-                            # frame so that _compute_next_joints (which applies delta in the
-                            # current EE frame) produces the intended world-frame displacement.
-                            self._sync_joints(anchor_qt)
-                            _, quat_t = self._get_ee_pose()
-                            rot_t = Rotation.from_quat(quat_t)
-                            delta_pos_in_t_frame = rot_t.inv().apply(rot_0.apply(accumulated_pos))
-                            delta_rot_in_t_frame = accumulated_rot.as_euler("XYZ")
-
-                            q_new = self._project_delta_for_collision(
-                                anchor_qt,
-                                delta_pos_in_t_frame,
-                                delta_rot_in_t_frame,
-                                skip_collision=self.skip_collision,
-                            )
-                            raw_step = np.concatenate([q_new, [float(d_gripper)]])
-                            step_t = torch.tensor(
-                                raw_step, dtype=anchor_chunk.dtype, device=device
-                            ).unsqueeze(0)
-                            step_norm = self._normalize_policy_guidance_action(step_t)
-                            guidance_chunk[:, t_abs, :action_dim] = step_norm
-
-            else:
-                raise NotImplementedError(
-                    f"Unsupported policy_guidance_representation: {self.policy_guidance_representation}"
-                )
-
-            # Diagnostic: decode the constructed guidance_chunk back to raw joints so callers
-            # can compare what is being fed into the blend against the demo trajectory. If
-            # this matches the demo, any deviation in the blended output is the blend math's
-            # fault; if it doesn't match, the reconstruction (accumulation/anchor-seeding) is.
-            decoded_steps = [
-                self.postprocessor(guidance_chunk[:, t_abs, :action_dim]) for t_abs in range(anchor_len)
-            ]
-            self._last_decoded_guidance_chunk = torch.stack(decoded_steps, dim=1).detach().cpu().numpy()
-
-            # ratio=0 is handled by the early return above; this path is only for 0 < ratio < 1.
-
-            # build the guidance noise regardless of blend strategy to consume the rng seed
-            # It's ok to do this duplicate work for interpolate because that is a debug mode, anyways
-            x_tsw = self._build_guidance_noise_from_chunk(guidance_chunk, ratio, base_noise=base_noise)
-            if self.guidance_blend_strategy == GuidanceBlendStrategy.INTERPOLATE:
-                # Simple linear interpolation in clean action space — no denoising.
-                # guidance_chunk[:, :, :action_dim] is the normalized guidance.
-                # anchor_chunk is the pure policy output (normalized).
-                # blended = ratio * anchor + (1-ratio) * guidance
-                blended = anchor_chunk.clone()
-                g = guidance_chunk[:, :, :action_dim]
-                blended[:, :, :action_dim] = ratio * anchor_chunk + (1.0 - ratio) * g
-                # Snap first n_anchor_steps to guidance exactly (mirrors DENOISE inpainting).
-                if self.n_anchor_steps > 0:
-                    n_a = min(self.n_anchor_steps, anchor_len - self._chunk_step)
-                    blended[:, self._chunk_step : self._chunk_step + n_a, :action_dim] = guidance_chunk[
-                        :, self._chunk_step : self._chunk_step + n_a, :action_dim
-                    ]
-                self._guided_chunk = blended
-            elif self.guidance_blend_strategy == GuidanceBlendStrategy.DENOISE:
-                denoise_kwargs: dict = {"noise": x_tsw, "sa_noise_ratio": ratio}
-                if self.n_anchor_steps > 0:
-                    # Pass first n_anchor_steps of normalized guidance as anchor_action.
-                    # The denoising loop will re-anchor these positions at every step,
-                    # so the final chunk exactly matches guidance at steps 0..n_anchor_steps-1
-                    # while letting the model generate a coherent continuation.
-                    n_a = min(self.n_anchor_steps, anchor_len - self._chunk_step)
-                    denoise_kwargs["anchor_action"] = guidance_chunk[
-                        :, self._chunk_step : self._chunk_step + n_a, :action_dim
-                    ]
-                blended = self.inner_policy.predict_action_chunk(batch, **denoise_kwargs)
-                self._guided_chunk = blended
-            else:
-                raise NotImplementedError(
-                    f"Unsupported guidance_blend_strategy: {self.guidance_blend_strategy}"
-                )
-
-            action = self._guided_chunk[:, self._chunk_step, :]
-            self._chunk_step += 1
+            action = inner_action
 
         # Update _desired_q from the action we're about to send, so all modes
         # accumulate in raw joint space (like KeyboardInterfaceAgent._desired_q).

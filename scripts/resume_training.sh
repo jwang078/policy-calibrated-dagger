@@ -23,12 +23,43 @@ set -euo pipefail
 #   --eval_freq=N              Override eval frequency.
 #   --save_freq=N              Override save frequency.
 #   --scheduler_decay_steps=N  Explicit override (defaults to --steps when set).
+#   --dataset.repo_id=ID       Override the dataset to finetune on. Usually paired
+#                              with --dataset.stats_path (the inherited stats path
+#                              from train_config.json is from the prior dataset
+#                              and almost certainly wrong for a new one).
+#   --dataset.stats_path=PATH  Override the sidecar relative-action stats path.
+#                              Required when changing --dataset.repo_id under a
+#                              policy that uses relative-action normalization.
+#   --env.external_port=N      Connect lerobot-train's inline eval to an external
+#                              SplatSim ZMQ server at this port (e.g. 6001) instead
+#                              of spawning a new one. Required when running this
+#                              alongside other GPU-hungry processes — see the
+#                              dagger_orchestrate.sh shared-sim setup.
+#   --policy.repo_id=ID        Rename the resumed run's policy.repo_id. Useful for
+#                              tagging a finetune as a NEW training run (e.g. an
+#                              _ft suffix) so it doesn't write back into the
+#                              original training dir.
+#   --output_dir=PATH          Redirect the resumed run's output to a new dir.
+#                              Usually paired with --policy.repo_id and --job_name
+#                              when creating a finetune-distinguished training dir.
+#   --job_name=STR             Rename the wandb job. Pair with --output_dir.
 #   --dry-run                  Print the command without executing.
 #
-# Example:
+# Example (basic, extend an existing run):
 #   bash my_scripts/resume_training.sh \
 #       outputs/training/pi05_approach_lever_11_biasend_5path_grip0_abs_basewrist \
 #       --steps=50000 --eval_freq=2000 --save_freq=2000
+#
+# Example (finetune on a new merged DAgger dataset into a NEW _ft training dir):
+#   bash my_scripts/resume_training.sh \
+#       outputs/training/pi05_xyz \
+#       --dataset.repo_id=JennyWWW/splatsim_xyz_dag1_merged \
+#       --dataset.stats_path=~/code/lerobot/outputs/dataset_stats/xyz_dag1_merged/stats_rel50.json \
+#       --policy.repo_id=pi05_xyz_dag1_merged_ft_delta_basewrist \
+#       --output_dir=outputs/training/pi05_xyz_dag1_merged_ft_delta_basewrist \
+#       --job_name=pi05_xyz_dag1_merged_ft_delta_basewrist \
+#       --env.external_port=6001 \
+#       --steps=4000 --eval_freq=2000 --save_freq=2000
 
 # ── parse positional ─────────────────────────────────────────────────────────
 if [[ $# -lt 1 || "$1" == --* ]]; then
@@ -75,11 +106,45 @@ fi
 # Make absolute so the resume command works no matter where it's run from.
 CONFIG_PATH="$(readlink -f "$CONFIG_PATH")"
 
+# Migrate legacy SplatSimEnv field `use_fisheye_wrist_camera` (bool) →
+# `wrist_cam_ver` (int) so configs saved before the refactor still load.
+# Idempotent and a no-op if the field is absent. See
+# splatsim/robots/sim_robot_pybullet_base.py:WRIST_CAM_FISHEYE_CALIBRATIONS.
+python3 - "$CONFIG_PATH" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    cfg = json.load(f)
+env = cfg.get("env") or {}
+if "use_fisheye_wrist_camera" in env:
+    old = env.pop("use_fisheye_wrist_camera")
+    env.setdefault("wrist_cam_ver", 1 if old else 0)
+    cfg["env"] = env
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=4)
+    print(f"  Migrated env.use_fisheye_wrist_camera={old} → env.wrist_cam_ver={env['wrist_cam_ver']} in {path}")
+PY
+
 # ── parse options ────────────────────────────────────────────────────────────
 STEPS=""
 EVAL_FREQ=""
 SAVE_FREQ=""
 SCHEDULER_DECAY_STEPS=""
+# decay_lr is the FLOOR of the cosine decay (the LR the scheduler holds
+# forever after num_decay_steps). When resuming past the decay end, runtime LR
+# is parked at this floor. Set this equal to the optimizer's peak LR to force
+# constant-peak-LR behavior throughout the finetune, which is what you want
+# when 200-2000 finetune steps at the (much smaller) cosine floor would
+# barely move the model.
+SCHEDULER_DECAY_LR=""
+DATASET_REPO_ID=""
+DATASET_STATS_PATH=""
+ENV_EXTERNAL_PORT=""
+POLICY_REPO_ID=""
+POLICY_PUSH_TO_HUB=""   # empty = inherit from train_config.json
+OUTPUT_DIR=""
+JOB_NAME=""
+BATCH_SIZE=""           # empty = inherit from train_config.json
 DRY_RUN=false
 
 for arg in "$@"; do
@@ -88,6 +153,15 @@ for arg in "$@"; do
         --eval_freq=*)              EVAL_FREQ="${arg#*=}" ;;
         --save_freq=*)              SAVE_FREQ="${arg#*=}" ;;
         --scheduler_decay_steps=*)  SCHEDULER_DECAY_STEPS="${arg#*=}" ;;
+        --scheduler_decay_lr=*)     SCHEDULER_DECAY_LR="${arg#*=}" ;;
+        --dataset.repo_id=*)        DATASET_REPO_ID="${arg#*=}" ;;
+        --dataset.stats_path=*)     DATASET_STATS_PATH="${arg#*=}" ;;
+        --env.external_port=*)      ENV_EXTERNAL_PORT="${arg#*=}" ;;
+        --policy.repo_id=*)         POLICY_REPO_ID="${arg#*=}" ;;
+        --policy.push_to_hub=*)     POLICY_PUSH_TO_HUB="${arg#*=}" ;;
+        --output_dir=*)             OUTPUT_DIR="${arg#*=}" ;;
+        --job_name=*)               JOB_NAME="${arg#*=}" ;;
+        --batch_size=*)             BATCH_SIZE="${arg#*=}" ;;
         --dry-run)                  DRY_RUN=true ;;
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
@@ -101,6 +175,35 @@ if [[ -n "$STEPS" && -z "$SCHEDULER_DECAY_STEPS" ]]; then
     SCHEDULER_DECAY_STEPS="$STEPS"
 fi
 
+# Defensive check: switching --dataset.repo_id without also overriding
+# --dataset.stats_path inherits the prior dataset's stats path from
+# train_config.json, which yields wrong relative-action normalization on the
+# new dataset (silent degradation, not a crash). Warn loudly. Don't fail —
+# user might do this intentionally for absolute-action policies (ACT) where
+# the sidecar stats aren't used.
+if [[ -n "$DATASET_REPO_ID" && -z "$DATASET_STATS_PATH" ]]; then
+    INHERITED_STATS_PATH="$(python3 -c "
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+    print(cfg.get('dataset', {}).get('stats_path') or '')
+except Exception:
+    print('')
+" "$CONFIG_PATH" 2>/dev/null)"
+    if [[ -n "$INHERITED_STATS_PATH" ]]; then
+        echo "" >&2
+        echo "⚠  WARNING: --dataset.repo_id is set but --dataset.stats_path is not." >&2
+        echo "   The inherited dataset.stats_path from train_config.json is:" >&2
+        echo "     $INHERITED_STATS_PATH" >&2
+        echo "   That sidecar was computed for the PRIOR dataset and is almost" >&2
+        echo "   certainly wrong for $DATASET_REPO_ID. Pass --dataset.stats_path" >&2
+        echo "   explicitly to override (e.g. point at the new dataset's sidecar)." >&2
+        echo "   Continuing anyway — only ignore this if you're finetuning an" >&2
+        echo "   absolute-action policy (ACT) that doesn't use the sidecar." >&2
+        echo "" >&2
+    fi
+fi
+
 # ── build command ────────────────────────────────────────────────────────────
 CMD="PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True lerobot-train"
 CMD="$CMD --resume=true"
@@ -109,6 +212,21 @@ CMD="$CMD --config_path=$CONFIG_PATH"
 [[ -n "$EVAL_FREQ" ]]              && CMD="$CMD --eval_freq=$EVAL_FREQ"
 [[ -n "$SAVE_FREQ" ]]              && CMD="$CMD --save_freq=$SAVE_FREQ"
 [[ -n "$SCHEDULER_DECAY_STEPS" ]]  && CMD="$CMD --policy.scheduler_decay_steps=$SCHEDULER_DECAY_STEPS"
+# On resume, cfg.scheduler is already populated from the loaded train_config.json
+# and the `use_policy_training_preset` rebuild-from-policy branch does NOT fire,
+# so overriding --policy.scheduler_decay_lr saves the new value into the policy
+# config but the *runtime* scheduler keeps the original decay_lr. Override BOTH
+# (policy field for consistency on the next save; top-level cfg.scheduler.decay_lr
+# is the one that actually drives the runtime LR schedule).
+[[ -n "$SCHEDULER_DECAY_LR" ]]     && CMD="$CMD --policy.scheduler_decay_lr=$SCHEDULER_DECAY_LR --scheduler.decay_lr=$SCHEDULER_DECAY_LR"
+[[ -n "$DATASET_REPO_ID" ]]        && CMD="$CMD --dataset.repo_id=$DATASET_REPO_ID"
+[[ -n "$DATASET_STATS_PATH" ]]     && CMD="$CMD --dataset.stats_path=$DATASET_STATS_PATH"
+[[ -n "$ENV_EXTERNAL_PORT" ]]      && CMD="$CMD --env.external_port=$ENV_EXTERNAL_PORT"
+[[ -n "$POLICY_REPO_ID" ]]         && CMD="$CMD --policy.repo_id=$POLICY_REPO_ID"
+[[ -n "$POLICY_PUSH_TO_HUB" ]]     && CMD="$CMD --policy.push_to_hub=$POLICY_PUSH_TO_HUB"
+[[ -n "$OUTPUT_DIR" ]]             && CMD="$CMD --output_dir=$OUTPUT_DIR"
+[[ -n "$JOB_NAME" ]]               && CMD="$CMD --job_name=$JOB_NAME"
+[[ -n "$BATCH_SIZE" ]]             && CMD="$CMD --batch_size=$BATCH_SIZE"
 
 # ── print summary ────────────────────────────────────────────────────────────
 echo "================================================================"
@@ -120,8 +238,17 @@ if [[ -n "$STEPS" ]]; then
 elif [[ -n "$SCHEDULER_DECAY_STEPS" ]]; then
     echo "Override:      --policy.scheduler_decay_steps=$SCHEDULER_DECAY_STEPS"
 fi
-[[ -n "$EVAL_FREQ" ]] && echo "Override:      --eval_freq=$EVAL_FREQ"
-[[ -n "$SAVE_FREQ" ]] && echo "Override:      --save_freq=$SAVE_FREQ"
+[[ -n "$SCHEDULER_DECAY_LR" ]] && echo "Override:      --policy.scheduler_decay_lr=$SCHEDULER_DECAY_LR --scheduler.decay_lr=$SCHEDULER_DECAY_LR"
+[[ -n "$EVAL_FREQ" ]]          && echo "Override:      --eval_freq=$EVAL_FREQ"
+[[ -n "$SAVE_FREQ" ]]          && echo "Override:      --save_freq=$SAVE_FREQ"
+[[ -n "$DATASET_REPO_ID" ]]    && echo "Override:      --dataset.repo_id=$DATASET_REPO_ID"
+[[ -n "$DATASET_STATS_PATH" ]] && echo "Override:      --dataset.stats_path=$DATASET_STATS_PATH"
+[[ -n "$ENV_EXTERNAL_PORT" ]]  && echo "Override:      --env.external_port=$ENV_EXTERNAL_PORT"
+[[ -n "$POLICY_REPO_ID" ]]     && echo "Override:      --policy.repo_id=$POLICY_REPO_ID"
+[[ -n "$POLICY_PUSH_TO_HUB" ]] && echo "Override:      --policy.push_to_hub=$POLICY_PUSH_TO_HUB"
+[[ -n "$OUTPUT_DIR" ]]         && echo "Override:      --output_dir=$OUTPUT_DIR"
+[[ -n "$JOB_NAME" ]]           && echo "Override:      --job_name=$JOB_NAME"
+[[ -n "$BATCH_SIZE" ]]         && echo "Override:      --batch_size=$BATCH_SIZE"
 echo "================================================================"
 echo
 echo "Command:"

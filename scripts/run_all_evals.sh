@@ -447,10 +447,10 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
 
         # Dataset #7 (approach_lever_7_lowres_5path) was generated before the
         # fisheye wrist-camera change, so eval must also render the wrist cam
-        # as pinhole to match training distribution.
+        # as pinhole (wrist_cam_ver=0) to match training distribution.
         if [[ "$exp_name" == *"approach_lever_7_lowres_5path"* ]]; then
             eval_cmd="$eval_cmd \\
-            --env.use_fisheye_wrist_camera=false"
+            --env.wrist_cam_ver=0"
         fi
 
         # Temporal ensembling: applies the TemporalEnsemblePolicyWrapper at eval
@@ -476,15 +476,14 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
             fi
         fi
 
-        # DEBUG: oracle last-mile override. Pulls commanded joint targets
-        # toward oracle's q_goal_bias when within threshold. Diagnostic only;
-        # the wrapper, factory call, and these CLI flags can all be removed
-        # together once the precision hypothesis test is done.
+        # Last-mile help wrapper. Pulls commanded joint targets toward oracle's
+        # q_goal_bias when EE is within threshold of the goal. (Was named
+        # last_mile_debug_config before the generalized refactor.)
         if [ "$LAST_MILE_DEBUG" = true ]; then
             eval_cmd="$eval_cmd \\
-            --policy.last_mile_debug_config.enabled=true \\
-            --policy.last_mile_debug_config.ee_distance_threshold=$LAST_MILE_DEBUG_THRESHOLD \\
-            --policy.last_mile_debug_config.blend_alpha=$LAST_MILE_DEBUG_ALPHA"
+            --policy.last_mile_config.enabled=true \\
+            --policy.last_mile_config.oracle_ee_distance_params.ee_distance_threshold=$LAST_MILE_DEBUG_THRESHOLD \\
+            --policy.last_mile_config.blend_to_goal_bias_params.blend_alpha=$LAST_MILE_DEBUG_ALPHA"
         fi
 
         if [ "$DRY_RUN" = true ]; then

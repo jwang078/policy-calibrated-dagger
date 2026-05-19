@@ -125,17 +125,15 @@ def recompute_all_stats(dst_root: str, dst_repo_id: str, dataset_short: str) -> 
     os.makedirs(sidecar_dir, exist_ok=True)
     stats_json = os.path.join(dst_root, "meta", "stats.json")
 
-    # 1) pi05 relative stats (chunk=50)
-    run_recompute_stats(dst_repo_id, dst_root, relative=True, chunk_size=_PI05_CHUNK_SIZE)
-    pi05_sidecar = os.path.join(sidecar_dir, "stats_pi05_rel50.json")
-    shutil.copy2(stats_json, pi05_sidecar)
-    print(f"Saved → {pi05_sidecar}")
-
-    # 2) diffusion relative stats (chunk=8)
-    run_recompute_stats(dst_repo_id, dst_root, relative=True, chunk_size=_DIFFUSION_CHUNK_SIZE)
-    diffusion_sidecar = os.path.join(sidecar_dir, "stats_diffusion_rel8.json")
-    shutil.copy2(stats_json, diffusion_sidecar)
-    print(f"Saved → {diffusion_sidecar}")
+    # Relative-action stats files are named by their chunk size (which is what
+    # they actually depend on — policy type doesn't matter, only the chunk over
+    # which action deltas are computed). Consumers look up the file using their
+    # policy's chunk_size / n_action_steps.
+    for chunk in (_PI05_CHUNK_SIZE, _DIFFUSION_CHUNK_SIZE):
+        run_recompute_stats(dst_repo_id, dst_root, relative=True, chunk_size=chunk)
+        sidecar = os.path.join(sidecar_dir, f"stats_rel{chunk}.json")
+        shutil.copy2(stats_json, sidecar)
+        print(f"Saved → {sidecar}")
 
     # 3) Final pass: restore absolute stats in meta/stats.json so this dataset's
     #    own stats reflect the cleaned absolute-action distribution. ACT and any

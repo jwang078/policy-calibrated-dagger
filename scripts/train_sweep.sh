@@ -12,47 +12,120 @@ set -euo pipefail
 # All options have defaults (see USER CONFIG below).
 #
 # Options:
-#   --dataset_short=STR     Short dataset name (without the "splatsim_" prefix)
+#   --dataset_repo=ID       Full dataset repo id, e.g.
+#                           "JennyWWW/splatsim_approach_lever_11_50failsrrtpi05".
+#                           DATASET_SHORT (used for the stats sidecar dir and
+#                           the auto-derived run_name) is inferred by stripping
+#                           "JennyWWW/" and an optional "splatsim_" prefix.
 #   --ratio_sweep           Enable the augmented-ratio sweep
 #   --ratios="N N N"        Space-separated ratio list (used when --ratio_sweep)
 #   --no_relative           Disable relative-action training (default: enabled)
+#   --env_external_port=N   Connect lerobot-train's inline eval to an external
+#                           SplatSim ZMQ server at this port (e.g. 6001) instead
+#                           of spawning a new one. Required when training has to
+#                           share a GPU with other SplatSim consumers (e.g. the
+#                           dagger_orchestrate.sh pipeline). User must launch
+#                           SplatSim on that port BEFORE invoking this script.
 #   --dry-run               Print commands without executing
 #
 # Example:
 #   bash my_scripts/train_sweep.sh \
-#       --dataset_short=approach_lever_11_50failsrrtpi05 \
+#       --dataset_repo=JennyWWW/splatsim_approach_lever_11_50failsrrtpi05 \
 #       --ratio_sweep \
 #       --ratios="0.2 0.4 0.6 0.8 1.0"
 
 # ── USER CONFIG (defaults) ────────────────────────────────────────────────────
-DATASET_SHORT="approach_lever_11_50failsrrtpi05"
+DATASET_REPO="JennyWWW/splatsim_approach_lever_11_50failsrrtpi05"
 USE_RELATIVE_ACTIONS=true
 RATIO_SWEEP=false
 RATIOS=(0.2 0.4 0.6 0.8 1.0)
+ENV_EXTERNAL_PORT=""
+POLICY_PUSH_TO_HUB=""   # empty = use whatever the policy config default is
+RUN_NAME_OVERRIDE=""    # set to override the auto-derived run_name (training dir basename)
 DRY_RUN=false
 # ─────────────────────────────────────────────────────────────────────────────
 
 for arg in "$@"; do
     case "$arg" in
-        --dry-run)          DRY_RUN=true ;;
-        --ratio_sweep)      RATIO_SWEEP=true ;;
-        --no_relative)      USE_RELATIVE_ACTIONS=false ;;
-        --dataset_short=*)  DATASET_SHORT="${arg#*=}" ;;
-        --ratios=*)         IFS=' ' read -ra RATIOS <<< "${arg#*=}" ;;
+        --dry-run)              DRY_RUN=true ;;
+        --ratio_sweep)          RATIO_SWEEP=true ;;
+        --no_relative)          USE_RELATIVE_ACTIONS=false ;;
+        --dataset_repo=*)       DATASET_REPO="${arg#*=}" ;;
+        --ratios=*)             IFS=' ' read -ra RATIOS <<< "${arg#*=}" ;;
+        --env_external_port=*)  ENV_EXTERNAL_PORT="${arg#*=}" ;;
+        --policy.push_to_hub=*) POLICY_PUSH_TO_HUB="${arg#*=}" ;;
+        --run_name=*)           RUN_NAME_OVERRIDE="${arg#*=}" ;;
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
 
-DATASET_REPO="JennyWWW/splatsim_${DATASET_SHORT}"
+# DATASET_SHORT is derived from DATASET_REPO by stripping "JennyWWW/" and an
+# optional "splatsim_" prefix. It's used to construct the stats sidecar dir
+# and the auto-derived run_name. Keeping a single source of truth (DATASET_REPO)
+# avoids the bug where --dataset_short=foo passes a short that doesn't match
+# the actual repo on disk (e.g. dag-merged datasets that omit the splatsim_
+# prefix).
+DATASET_SHORT="${DATASET_REPO#*/}"
+DATASET_SHORT="${DATASET_SHORT#splatsim_}"
 
-# Paths written by compute_relative_stats.sh
+# Paths written by compute_relative_stats.sh. The sidecar files are named by
+# the chunk size they were computed against (stats_rel{N}.json) — the policy
+# type doesn't matter, only the chunk over which action deltas are computed.
+# run_job picks the right one based on each policy's chunk_size.
 STATS_DIR=~/code/lerobot/outputs/dataset_stats/${DATASET_SHORT}
-PI05_STATS_PATH="${STATS_DIR}/stats_pi05_rel50.json"
-DIFFUSION_STATS_PATH="${STATS_DIR}/stats_diffusion_rel8.json"
 
-# Validate that stats files exist when USE_RELATIVE_ACTIONS=true
+# Resolve the chunk size (== n_action_steps for policies that consume their
+# full chunk) used to construct the relative-action stats sidecar path
+# (stats_rel${chunk}.json). Source of truth, in priority order:
+#   1. Explicit --policy.n_action_steps=N in the policy args array.
+#   2. Explicit --policy.chunk_size=N in the policy args array.
+#   3. The policy class's default (per-prefix fallback): pi05/pi0 → 50,
+#      diffusion → 8.
+# Empty for policies that don't use the relative-action pipeline (e.g. act with
+# temporal ensembling — n_action_steps=1 but chunk_size=50, and the policy uses
+# absolute actions anyway).
+#
+# Note: we can't read this from a train_config.json the way dagger_orchestrate
+# does for finetune, because run_job trains from scratch — no config exists yet.
+# Args: $1 = policy_prefix, $2 = name of policy_args array (nameref).
+_chunk_size_for_job() {
+    local prefix="$1"
+    local -n args_ref="$2"
+    local override_nsteps="" override_chunk=""
+    for a in "${args_ref[@]}"; do
+        case "$a" in
+            --policy.n_action_steps=*) override_nsteps="${a#*=}" ;;
+            --policy.chunk_size=*)     override_chunk="${a#*=}" ;;
+        esac
+    done
+    if [[ -n "$override_nsteps" ]]; then echo "$override_nsteps"; return; fi
+    if [[ -n "$override_chunk"  ]]; then echo "$override_chunk";  return; fi
+    case "$prefix" in
+        diffusion*) echo 8 ;;
+        pi05*|pi0*) echo 50 ;;
+        *)          echo "" ;;
+    esac
+}
+
+# Bare per-prefix fallback used only by the early validation block below (which
+# doesn't have access to the per-job policy_args arrays). Keep these in sync
+# with the per-prefix defaults in _chunk_size_for_job.
+_chunk_size_for_prefix() {
+    case "$1" in
+        diffusion*) echo 8 ;;
+        pi05*|pi0*) echo 50 ;;
+        *)          echo "" ;;
+    esac
+}
+
+# Validate that stats files exist for each policy chunk size we'd use when
+# USE_RELATIVE_ACTIONS=true. We check the union of chunk sizes across the known
+# policy prefixes — even if not all are enabled in _run_all_jobs, missing files
+# usually means the user forgot to run compute_relative_stats.sh.
 if [[ "$USE_RELATIVE_ACTIONS" == true ]]; then
-    for f in "$PI05_STATS_PATH" "$DIFFUSION_STATS_PATH"; do
+    for prefix in diffusion pi05; do
+        chunk="$(_chunk_size_for_prefix "$prefix")"
+        f="${STATS_DIR}/stats_rel${chunk}.json"
         if [[ ! -f "$f" ]]; then
             echo "ERROR: USE_RELATIVE_ACTIONS=true but stats file not found: $f" >&2
             echo "Run my_scripts/compute_relative_stats.sh first." >&2
@@ -133,6 +206,17 @@ SHARED_ARGS=(
     --eval.use_async_envs=false
     --dataset.image_transforms.enable=true
 )
+
+# When --env_external_port is set, route lerobot-train's inline eval to that
+# port so it shares a single SplatSim ZMQ server with the rest of the pipeline.
+# Otherwise lerobot-train spawns its own (which conflicts with another running
+# SplatSim on the same GPU). User must launch SplatSim on this port externally.
+if [[ -n "$ENV_EXTERNAL_PORT" ]]; then
+    SHARED_ARGS+=( "--env.external_port=$ENV_EXTERNAL_PORT" )
+fi
+if [[ -n "$POLICY_PUSH_TO_HUB" ]]; then
+    SHARED_ARGS+=( "--policy.push_to_hub=$POLICY_PUSH_TO_HUB" )
+fi
 
 # ── Policy-specific args ─────────────────────────────────────
 
@@ -243,7 +327,16 @@ run_job() {
 
     local action_suffix
     action_suffix=$([[ "$USE_RELATIVE_ACTIONS" == true ]] && echo "delta" || echo "abs")
-    local run_name="${policy_prefix}_${DATASET_SHORT}_${action_suffix}_${camera_suffix}"
+    # RUN_NAME_OVERRIDE (top-level, set via --run_name flag) overrides the
+    # default naming derived from policy_prefix/dataset_short/action/camera.
+    # Used by dagger_orchestrate.sh so scratch-mode rounds land at the same
+    # path as finetune-mode rounds (${BASE_POLICY_NAME}_dag${r}).
+    local run_name
+    if [[ -n "${RUN_NAME_OVERRIDE:-}" ]]; then
+        run_name="$RUN_NAME_OVERRIDE"
+    else
+        run_name="${policy_prefix}_${DATASET_SHORT}_${action_suffix}_${camera_suffix}"
+    fi
 
     set_camera_args "$resize_mode" "$camera_suffix"
 
@@ -258,14 +351,16 @@ run_job() {
         "${CAMERA_ARGS[@]}"
     )
 
-    # Append relative-action flags if enabled, using the per-policy stats file.
+    # Append relative-action flags if enabled, picking the stats sidecar by
+    # the policy's chunk size (stats_rel{N}.json).
     if [[ "$USE_RELATIVE_ACTIONS" == true ]]; then
         full_cmd+=(--policy.use_relative_actions=true)
         full_cmd+=(--policy.relative_exclude_joints='["gripper"]')
-        case "$policy_prefix" in
-            diffusion*) full_cmd+=(--dataset.stats_path="$DIFFUSION_STATS_PATH") ;;
-            pi05*|pi0*) full_cmd+=(--dataset.stats_path="$PI05_STATS_PATH") ;;
-        esac
+        local chunk_size
+        chunk_size="$(_chunk_size_for_job "$policy_prefix" "$3")"
+        if [[ -n "$chunk_size" ]]; then
+            full_cmd+=(--dataset.stats_path="${STATS_DIR}/stats_rel${chunk_size}.json")
+        fi
     fi
 
     # Append per-job extra args last so they override any earlier defaults (e.g. batch_size)
@@ -347,11 +442,13 @@ _run_all_jobs() {
 if [[ "$RATIO_SWEEP" == false ]]; then
     _run_all_jobs
 else
-    # Snapshot base dataset vars so each sweep iteration can restore stats paths.
+    # Snapshot base dataset vars so each sweep iteration can restore them.
+    # STATS_DIR is derived from DATASET_SHORT and rewritten per iteration; the
+    # per-chunk file paths are built on demand inside run_job, so no separate
+    # PI05/DIFFUSION variables need snapshotting.
     _BASE_DATASET_REPO="$DATASET_REPO"
     _BASE_DATASET_SHORT="$DATASET_SHORT"
-    _BASE_PI05_STATS="$PI05_STATS_PATH"
-    _BASE_DIFFUSION_STATS="$DIFFUSION_STATS_PATH"
+    _BASE_STATS_DIR="$STATS_DIR"
     _HF_LEROBOT_HOME="$(python3 -c "
 import os; from pathlib import Path
 print(Path(os.environ.get('HF_LEROBOT_HOME', Path.home()/'.cache/huggingface/lerobot')))")"
@@ -387,11 +484,10 @@ print(Path(os.environ.get('HF_LEROBOT_HOME', Path.home()/'.cache/huggingface/ler
             echo "    --base $_BASE_DATASET_REPO --ratios ${_CUMULATIVE_RATIOS[*]}"
         fi
 
-        # Step 2: point training at merged dataset; reuse base stats
+        # Step 2: point training at merged dataset; reuse base stats dir.
         DATASET_REPO="$_MERGED_REPO"
         DATASET_SHORT="$_MERGED_NAME"
-        PI05_STATS_PATH="$_BASE_PI05_STATS"
-        DIFFUSION_STATS_PATH="$_BASE_DIFFUSION_STATS"
+        STATS_DIR="$_BASE_STATS_DIR"
 
         _run_all_jobs
 
@@ -408,6 +504,5 @@ print(Path(os.environ.get('HF_LEROBOT_HOME', Path.home()/'.cache/huggingface/ler
     # Restore base vars
     DATASET_REPO="$_BASE_DATASET_REPO"
     DATASET_SHORT="$_BASE_DATASET_SHORT"
-    PI05_STATS_PATH="$_BASE_PI05_STATS"
-    DIFFUSION_STATS_PATH="$_BASE_DIFFUSION_STATS"
+    STATS_DIR="$_BASE_STATS_DIR"
 fi

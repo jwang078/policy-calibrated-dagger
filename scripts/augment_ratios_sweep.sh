@@ -14,15 +14,33 @@
 #
 # Options:
 #   --dataset_short=STR     Short dataset name (default: approach_lever_11_50failsrrtpi05)
-#   --policy_path=PATH      Policy checkpoint path
+#   --policy_path=PATH      Policy checkpoint path (required when any ratio > 0)
 #   --episode_range=RANGE   Episode range, e.g. "301-379" or "all"
 #   --ratios="N N N"        Space-separated ratio list, e.g. "0.2 0.4 0.6"
-#   --env_task=STR          Splatsim task name
-#   --env_port=INT          Splatsim ZMQ port
+#                           Special value 0.0 = NO-OP: skip SplatSim replay and
+#                           just register the source dataset under the canonical
+#                           suffix via a zero-copy hardlink alias. Useful for
+#                           DAgger intervention datasets (which already pair
+#                           obs with human/RRT actions — no replay needed).
+#   --model=STR             Suffix tag for model class: "pi" / "diff" / "act"
+#                           (default: pi). Replaces the old hardcoded "pi" in
+#                           the _piabsden suffix.
+#   --action_format=STR     Suffix tag for action format: "abs" or "rel"
+#                           (default: rel — reflects use_relative_actions=true).
+#                           Replaces the old hardcoded "abs" in the suffix.
+#   --env_task=STR          Splatsim task name (ratio>0 only)
+#   --env_port=INT          Splatsim ZMQ port (ratio>0 only)
 #   --dry-run               Print commands without executing
 #   --push                  Push output datasets to HuggingFace Hub
 #
-# Example:
+# Example (DAgger no-op merge):
+#   bash my_scripts/augment_ratios_sweep.sh \
+#       --dataset_short=approach_lever_7_lowres_5path_dag1 \
+#       --ratios="0.0"
+#   →  creates JennyWWW/splatsim_approach_lever_7_lowres_5path_dag1_pirel00 as
+#      a hardlink alias of the source dataset, no SplatSim required.
+#
+# Example (full blending sweep):
 #   bash my_scripts/augment_ratios_sweep.sh \
 #       --dataset_short=approach_lever_11_50failsrrtpi05 \
 #       --policy_path=outputs/training/pi05_.../checkpoints/006000/pretrained_model \
@@ -31,9 +49,9 @@
 #       --push
 #
 # Outputs:
-#   JennyWWW/${SOURCE_SHORT}_piabsden02   (ratio 0.2)
-#   JennyWWW/${SOURCE_SHORT}_piabsden04   (ratio 0.4)
-#   ...
+#   ratio=0.0 (no-op):  JennyWWW/${SOURCE_SHORT}_${MODEL}${ACTION_FORMAT}00
+#   ratio>0:            JennyWWW/${SOURCE_SHORT}_${MODEL}${ACTION_FORMAT}${BLEND_TAG}${NN}
+#                       where BLEND_TAG is "den" (denoise) or "lerp" (interpolate)
 
 set -euo pipefail
 
@@ -48,6 +66,8 @@ BLEND_MODE="once_per_chunk"
 ENV_TASK="upright_small_engine_new"
 ENV_EXTERNAL_PORT=6001
 RATIOS=(0.2 0.4 0.6 0.8 1.0)
+MODEL="pi"
+ACTION_FORMAT="rel"
 DRY_RUN=false
 PUSH_TO_HUB=false
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,9 +82,19 @@ for arg in "$@"; do
         --ratios=*)           IFS=' ' read -ra RATIOS <<< "${arg#*=}" ;;
         --env_task=*)         ENV_TASK="${arg#*=}" ;;
         --env_port=*)         ENV_EXTERNAL_PORT="${arg#*=}" ;;
+        --model=*)            MODEL="${arg#*=}" ;;
+        --action_format=*)    ACTION_FORMAT="${arg#*=}" ;;
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
+
+# Map blend_strategy to a short tag for the dataset suffix.
+# Only used for ratio>0; ratio=0 omits the blend tag entirely.
+case "$BLEND_STRATEGY" in
+    denoise)     BLEND_TAG="den"  ;;
+    interpolate) BLEND_TAG="lerp" ;;
+    *)           BLEND_TAG="$BLEND_STRATEGY" ;;
+esac
 
 SOURCE_DATASET="${HF_USER}/${SOURCE_SHORT}"
 
@@ -82,22 +112,70 @@ run() {
     fi
 }
 
+# Compute the per-ratio target name. Ratio=0 omits the blend tag entirely
+# because no blending happens — the source dataset is used as-is via hardlink.
+target_name_for_ratio() {
+    local r="$1"
+    local tag
+    tag=$(ratio_to_tag "$r")
+    if [[ "$tag" == "00" ]]; then
+        echo "${SOURCE_SHORT}_${MODEL}${ACTION_FORMAT}${tag}"
+    else
+        echo "${SOURCE_SHORT}_${MODEL}${ACTION_FORMAT}${BLEND_TAG}${tag}"
+    fi
+}
+
 echo "=== augment_ratios_sweep.sh ==="
-echo "Source:  ${SOURCE_DATASET}"
-echo "Policy:  ${POLICY_PATH}"
-echo "Episodes: ${EPISODE_RANGE}"
-echo "Ratios:  ${RATIOS[*]}"
-echo "Push:    ${PUSH_TO_HUB}"
+echo "Source:        ${SOURCE_DATASET}"
+echo "Policy:        ${POLICY_PATH}"
+echo "Episodes:      ${EPISODE_RANGE}"
+echo "Ratios:        ${RATIOS[*]}"
+echo "Model tag:     ${MODEL}"
+echo "Action format: ${ACTION_FORMAT}"
+echo "Blend tag:     ${BLEND_TAG}  (used only for ratio>0)"
+echo "Push:          ${PUSH_TO_HUB}"
 echo
+
+LEROBOT_CACHE="$HOME/.cache/huggingface/lerobot"
 
 for RATIO in "${RATIOS[@]}"; do
     TAG=$(ratio_to_tag "$RATIO")
-    TARGET_SHORT="${SOURCE_SHORT}_piabsden${TAG}"
+    TARGET_SHORT=$(target_name_for_ratio "$RATIO")
     TARGET_DATASET="${HF_USER}/${TARGET_SHORT}"
 
     echo "──────────────────────────────────────────────"
     echo "ratio=${RATIO}  →  ${TARGET_DATASET}"
     echo "──────────────────────────────────────────────"
+
+    # Ratio=0 ⇒ NO-OP: skip the SplatSim closed-loop replay entirely. The
+    # source dataset already pairs the right obs with the right actions
+    # (e.g. DAgger interventions), so we just register it under the canonical
+    # suffix via a hardlink alias. cp -r --link uses hardlinks where possible;
+    # falls back to copies otherwise.
+    if [[ "$TAG" == "00" ]]; then
+        SRC_DIR="${LEROBOT_CACHE}/${SOURCE_DATASET}"
+        DST_DIR="${LEROBOT_CACHE}/${TARGET_DATASET}"
+        if [[ ! -d "$SRC_DIR" ]]; then
+            if [[ "$DRY_RUN" == true ]]; then
+                echo "[DRY-RUN] [ratio=0 no-op] would hardlink ${SRC_DIR} → ${DST_DIR} (source not on disk yet — expected to be created upstream)"
+                echo
+                continue
+            fi
+            echo "[ratio=0 no-op] source dataset not on disk at $SRC_DIR — aborting." >&2
+            echo "  Run the upstream step that creates ${SOURCE_DATASET} first" >&2
+            echo "  (e.g. lerobot-eval --intervention.method=rrt for DAgger datasets)." >&2
+            exit 1
+        fi
+        if [[ -e "$DST_DIR" ]]; then
+            echo "[ratio=0 no-op] alias already exists at $DST_DIR — leaving in place."
+        else
+            echo "[ratio=0 no-op] hardlinking ${SRC_DIR} → ${DST_DIR}"
+            run mkdir -p "$(dirname "$DST_DIR")"
+            run cp -r --link --reflink=auto "$SRC_DIR" "$DST_DIR"
+        fi
+        echo
+        continue
+    fi
 
     PUSH_FLAG=""
     [[ "$PUSH_TO_HUB" == true ]] && PUSH_FLAG="--push_to_hub"
@@ -121,9 +199,8 @@ done
 
 echo "=== Done.  Per-ratio datasets ==="
 for RATIO in "${RATIOS[@]}"; do
-    TAG=$(ratio_to_tag "$RATIO")
-    echo "  ${HF_USER}/${SOURCE_SHORT}_piabsden${TAG}  (ratio=${RATIO})"
+    echo "  ${HF_USER}/$(target_name_for_ratio "$RATIO")  (ratio=${RATIO})"
 done
 echo
-echo "Next step: run merge_datasets_for_training.py to create local merged"
-echo "training datasets (zero-copy via hardlinks)."
+echo "Next step: run merge_augmented_datasets_for_training.py to create the"
+echo "merged training dataset (zero-copy via hardlinks)."

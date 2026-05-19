@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+
+# Summarize DAgger progress: scans `outputs/training/${MODEL_PREFIX}_*[_ft]_dag*/`
+# and prints, FOR EACH discovered DAgger lineage, a one-row-per-round table
+# with final train metrics (loss, grad-norm, runtime LR) and final eval metrics
+# (success rate, position error, collision count, truncation rate). Designed to
+# be safe to run WHILE dagger_orchestrate.sh is running — it only reads the
+# wandb run's output.log files.
+#
+# A "lineage" is the dir-name part between ${MODEL_PREFIX}_ and the trailing
+# [_ft]_dag${N} suffix. Both finetune (`..._ft_dag{N}`) and scratch
+# (`..._dag{N}`) round dirs from the same lineage are folded into one table.
+#
+# Usage:
+#   bash my_scripts/dagger_progress.sh [OPTIONS]
+#
+# Options:
+#   --base_short=STR    Lineage filter: restrict to a single lineage built from
+#                       ${BASE_SHORT}_${ACTION_TAG}_basewrist[_${RUN_TAG}]. Omit
+#                       to print every lineage found under TRAINING_ROOT.
+#   --action=TAG        Action format tag (abs|delta). Default: abs. Only used
+#                       when --base_short is set.
+#   --run_tag=TAG       Optional run tag appended to the lineage (e.g. "d30"),
+#                       matching --run_tag in dagger_orchestrate.sh. Only used
+#                       when --base_short is set.
+#   --model=PREFIX      Policy prefix in dir name (default: pi05).
+#   --watch=SECONDS     Re-print the table every SECONDS seconds. Ctrl-C to stop.
+#                       Default: print once and exit.
+
+set -euo pipefail
+
+BASE_SHORT=""
+ACTION_TAG="abs"
+RUN_TAG=""
+MODEL_PREFIX="pi05"
+WATCH_SEC=""
+TRAINING_ROOT="${HOME}/code/lerobot/outputs/training"
+
+for arg in "$@"; do
+    case "$arg" in
+        --base_short=*)  BASE_SHORT="${arg#*=}" ;;
+        --action=*)      ACTION_TAG="${arg#*=}" ;;
+        --run_tag=*)     RUN_TAG="${arg#*=}" ;;
+        --model=*)       MODEL_PREFIX="${arg#*=}" ;;
+        --watch=*)       WATCH_SEC="${arg#*=}" ;;
+        -h|--help)
+            sed -n '1,/^set -euo pipefail/p' "$0" | grep '^#' | sed 's/^# \?//'
+            exit 0
+            ;;
+        *) echo "Unknown argument: $arg" >&2; exit 1 ;;
+    esac
+done
+
+# discover_lineages: print every unique lineage key for DAgger training dirs.
+# A lineage key is the dir-name part between ${MODEL_PREFIX}_ and the trailing
+# [_ft]_dag${N} suffix. Examples:
+#   pi05_foo_abs_basewrist_ft_dag5  →  foo_abs_basewrist
+#   pi05_foo_abs_basewrist_dag10    →  foo_abs_basewrist  (same lineage, scratch round)
+discover_lineages() {
+    # A lineage is identified by having at least one _dag${N} or _ft_dag${N}
+    # dir under it. The base policy dir alone (no dag rounds) doesn't count —
+    # it'd surface every standalone training dir under TRAINING_ROOT and clutter
+    # the output. The dag0 row inside each lineage's table only appears when
+    # that lineage has at least one dag round (per the check in print_table).
+    #
+    # The strip regex also handles --retrain_suffix runs (orchestrator writes
+    # to `..._ft_dag${N}_${suffix}`): the optional `(_[^/]*)?` consumes any
+    # trailing suffix so a retrain dir folds into the same lineage as its
+    # canonical round.
+    ls -d "$TRAINING_ROOT/${MODEL_PREFIX}_"*_dag[0-9]* 2>/dev/null \
+        | while read -r d; do basename "$d"; done \
+        | sed -E "s/^${MODEL_PREFIX}_//; s/(_ft)?_dag[0-9]+(_[^/]*)?$//" \
+        | sort -u
+}
+
+# Extract train/eval metrics from a single training dir's most-recent wandb
+# log and print one table row. Args: $1=round_label (e.g. "dag0", "dag5"),
+# $2=training_dir. Returns 0 if a row was printed (even an "(no log yet)"
+# placeholder), so callers can use `&& found=1`.
+print_row() {
+    local round_label="$1"
+    local DIR="$2"
+    local log
+    log=$(ls -t "$DIR"/wandb/run-*/files/output.log 2>/dev/null | head -1)
+    if [[ -z "$log" || ! -f "$log" ]]; then
+        printf "%-6s %s\n" "$round_label" "(no log yet)"
+        return 0
+    fi
+    # Train line: last `step:NNk smpl:...` entry. Empty if no progress yet.
+    # Wrap each extraction in `|| true` because `set -e + pipefail` will
+    # otherwise blow up on the grep-with-no-match common during in-flight runs.
+    local train_line=""
+    train_line=$({ grep -E "step:[0-9]+K?\s+smpl" "$log" 2>/dev/null | tail -1; } || true)
+    local loss="" grad="" lr=""
+    loss=$({ echo "$train_line" | grep -oE "loss:[0-9.]+"  | cut -d: -f2; } || true)
+    grad=$({ echo "$train_line" | grep -oE "grdn:[0-9.]+"  | cut -d: -f2; } || true)
+    lr=$(  { echo "$train_line" | grep -oE "lr:[0-9.e+-]+" | cut -d: -f2; } || true)
+    # Eval line: last "Suite overall aggregated" entry.
+    local eval_line=""
+    eval_line=$({ grep "Suite overall aggregated" "$log" 2>/dev/null | tail -1; } || true)
+    local eval_step=""
+    eval_step=$({ grep -oE "Eval policy at step [0-9]+" "$log" 2>/dev/null | tail -1 | grep -oE '[0-9]+$'; } || true)
+    local eval_summary=""
+    if [[ -n "$eval_line" ]]; then
+        eval_summary=$(echo "$eval_line" | python3 -c "
+import sys, ast, re
+line = sys.stdin.read()
+m = re.search(r'(\{.*\})', line)
+if m:
+    d = ast.literal_eval(m.group(1))
+    succ = d.get('pc_success', float('nan'))
+    pos  = d.get('avg_final_position_error_m', float('nan'))
+    ori  = d.get('avg_final_orientation_error_deg', float('nan'))
+    coll = d.get('avg_in_collision', float('nan'))
+    trunc= d.get('avg_truncated', float('nan'))
+    print(f'{succ:.0f} {pos:.3f} {ori:.1f} {coll:.1f} {trunc:.1f}')
+" 2>/dev/null || echo "")
+    fi
+    local succ="" pos_err="" ori_err="" in_coll="" trunc=""
+    if [[ -n "$eval_summary" ]]; then
+        read -r succ pos_err ori_err in_coll trunc <<< "$eval_summary"
+    else
+        succ="-"; pos_err="-"; ori_err="-"; in_coll="-"; trunc="-"
+    fi
+    [[ -z "$loss" ]]  && loss="-"
+    [[ -z "$grad" ]]  && grad="-"
+    [[ -z "$lr"   ]]  && lr="-"
+    [[ -z "$eval_step" ]] && eval_step="-"
+    printf "%-6s %-9s %-9s %-9s %-6s %-9s %-9s %-8s %-6s %s\n" \
+        "$round_label" "$loss" "$grad" "$lr" "$succ" "$pos_err" "$ori_err" "$in_coll" "$trunc" "$eval_step"
+}
+
+print_table() {
+    local lineage="$1"
+    echo "DAgger progress for: ${MODEL_PREFIX}_${lineage}{,[_ft]_dag*}"
+    # Surface the plot path (whether it currently exists or not, so users can
+    # ctrl-click as soon as `python my_scripts/dagger_plot.py` is run).
+    local plot_path="${HOME}/code/lerobot/outputs/dagger/dagger_progress_${lineage}.png"
+    if [[ -f "$plot_path" ]]; then
+        echo "Plot: $plot_path"
+    else
+        echo "Plot: $plot_path  (not generated yet — run: python my_scripts/dagger_plot.py)"
+    fi
+    printf "%-6s %-9s %-9s %-9s %-6s %-9s %-9s %-8s %-6s %s\n" \
+        "Round" "loss" "grad" "lr" "succ%" "pos_err" "ori_err" "in_coll" "trunc" "eval_step"
+    printf "%-6s %-9s %-9s %-9s %-6s %-9s %-9s %-8s %-6s %s\n" \
+        "-----" "----" "----" "--" "-----" "-------" "-------" "-------" "-----" "---------"
+
+    local found=0
+
+    # Gather dag rounds by globbing both finetune and scratch round dirs for
+    # this lineage. The trailing `_dag[0-9]*` glob matches `_dag5`, `_dag10`,
+    # etc.
+    local dirs
+    dirs=$( { ls -d "$TRAINING_ROOT/${MODEL_PREFIX}_${lineage}_dag"[0-9]*    2>/dev/null; \
+              ls -d "$TRAINING_ROOT/${MODEL_PREFIX}_${lineage}_ft_dag"[0-9]* 2>/dev/null; \
+            } | awk -F'_dag' '{print $NF"\t"$0}' | sort -n | cut -f2- )
+
+    # Round 0: the base policy training dir for this lineage. Same naming
+    # scheme as the dag rounds but without any _dag${N} suffix. Only show it
+    # when at least one dag round exists, since otherwise every standalone
+    # base training dir would show up as "dag0" in its own one-row table.
+    #
+    # Lineage may include a run tag (e.g. `..._basewrist_d30`) that's only
+    # present on the dag artifacts — the actual base policy dir is untagged
+    # (`..._basewrist`). Try the tagged path first, then strip everything
+    # after `_basewrist` and retry.
+    local base_dir="$TRAINING_ROOT/${MODEL_PREFIX}_${lineage}"
+    if [[ -n "$dirs" && ! -d "$base_dir" && "$lineage" == *_basewrist_* ]]; then
+        base_dir="$TRAINING_ROOT/${MODEL_PREFIX}_${lineage%_basewrist_*}_basewrist"
+    fi
+    if [[ -n "$dirs" && -d "$base_dir" ]]; then
+        print_row "dag0" "$base_dir" && found=1
+    fi
+
+    for DIR in $dirs; do
+        local round_label round_num variant retrain_suffix
+        # Distinguish three variants:
+        #   _ft_dag10               → "dag10"             (canonical finetune)
+        #   _dag10                  → "dag10_s"           (post-loop scratch)
+        #   _ft_dag1_${suffix}      → "dag1_${suffix}"    (--retrain_round=1)
+        #   _dag10_${suffix}        → "dag10_s_${suffix}" (scratch retrain, rare)
+        local _basename
+        _basename="$(basename "$DIR")"
+        if [[ "$_basename" == *_ft_dag[0-9]* ]]; then
+            variant=ft
+        else
+            variant=scratch
+        fi
+        round_num=$(echo "$_basename"   | sed -E 's/.*_dag([0-9]+)(_.*)?$/\1/')
+        retrain_suffix=$(echo "$_basename" | sed -E 's/.*_dag[0-9]+(_.*)?$/\1/')
+        if [[ "$variant" == "scratch" ]]; then
+            round_label="dag${round_num}_s${retrain_suffix}"
+        else
+            round_label="dag${round_num}${retrain_suffix}"
+        fi
+        print_row "$round_label" "$DIR" && found=1
+    done
+
+    if (( found == 0 )); then
+        echo "(no training dirs found for lineage=$lineage)"
+        return
+    fi
+
+    # Show what's currently happening for the latest in-flight round of THIS
+    # lineage. Best-effort; never fail the table on probe errors.
+    local newest_log=""
+    newest_log=$( { ls -t "$TRAINING_ROOT/${MODEL_PREFIX}_${lineage}_dag"[0-9]*/wandb/run-*/files/output.log    2>/dev/null; \
+                    ls -t "$TRAINING_ROOT/${MODEL_PREFIX}_${lineage}_ft_dag"[0-9]*/wandb/run-*/files/output.log 2>/dev/null; \
+                  } | xargs -r ls -t 2>/dev/null | head -1 || true)
+    if [[ -n "$newest_log" && -f "$newest_log" ]]; then
+        local last_step=""
+        last_step=$( { grep -E "step:[0-9]+K?\s+smpl" "$newest_log" 2>/dev/null | tail -1 | grep -oE "step:[0-9]+K?" | head -1; } || true )
+        if [[ -n "$last_step" ]]; then
+            # Four dirnames to climb from .../wandb/run-XXX/files/output.log up to the training dir.
+            echo "Latest train log: $(basename "$(dirname "$(dirname "$(dirname "$(dirname "$newest_log")")")")")  ($last_step)"
+        fi
+    fi
+    return 0
+}
+
+print_all() {
+    local lineages
+    if [[ -n "$BASE_SHORT" ]]; then
+        lineages="${BASE_SHORT}_${ACTION_TAG}_basewrist"
+        [[ -n "$RUN_TAG" ]] && lineages="${lineages}_${RUN_TAG}"
+    else
+        lineages=$(discover_lineages)
+        if [[ -z "$lineages" ]]; then
+            echo "ERROR: no DAgger training dirs found under $TRAINING_ROOT" >&2
+            echo "  expected pattern: ${MODEL_PREFIX}_<lineage>[_ft]_dag<N>" >&2
+            return 1
+        fi
+    fi
+
+    echo "Scanned at: $(date '+%Y-%m-%d %H:%M:%S')"
+    local first=1
+    for lin in $lineages; do
+        if (( first == 0 )); then
+            echo
+            echo "----------------------------------------------------------------------"
+            echo
+        fi
+        print_table "$lin"
+        first=0
+    done
+
+    # Show the orchestrator's intervention output dir for the in-flight round, if any.
+    # Shared across lineages; print once at the bottom.
+    local dagger_root="${HOME}/code/lerobot/outputs/dagger"
+    if [[ -d "$dagger_root" ]]; then
+        local current_round_dir=""
+        current_round_dir=$(ls -td "$dagger_root"/round_* 2>/dev/null | head -1 || true)
+        if [[ -n "$current_round_dir" ]]; then
+            echo
+            echo "Latest intervention dir: $current_round_dir"
+        fi
+    fi
+
+    # Regenerate the PNG plots via dagger_plot.py. Best-effort, never fails
+    # the table. We always run dagger_plot.py in auto-discover mode (no
+    # --base_short) because its --base_short filter doesn't yet understand
+    # run_tag-suffixed lineages; auto-discover finds every lineage
+    # including the tagged ones. Output prefixed with "[plot] " so it's
+    # clearly attributed.
+    local plot_script="$(dirname "$0")/dagger_plot.py"
+    if [[ -f "$plot_script" ]]; then
+        echo
+        python3 "$plot_script" --model="$MODEL_PREFIX" 2>&1 | sed 's/^/  [plot] /' || true
+    fi
+}
+
+if [[ -n "$WATCH_SEC" ]]; then
+    while true; do
+        clear
+        print_all || true
+        echo
+        echo "Refreshing every ${WATCH_SEC}s. Ctrl-C to stop."
+        sleep "$WATCH_SEC"
+    done
+else
+    print_all
+fi

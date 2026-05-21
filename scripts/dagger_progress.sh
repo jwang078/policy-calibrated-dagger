@@ -23,7 +23,10 @@
 #   --run_tag=TAG       Optional run tag appended to the lineage (e.g. "d30"),
 #                       matching --run_tag in dagger_orchestrate.sh. Only used
 #                       when --base_short is set.
-#   --model=PREFIX      Policy prefix in dir name (default: pi05).
+#   --model=PREFIX      Policy prefix in dir name. Default: scan all known
+#                       prefixes (pi05, diffusion, act) and print one block
+#                       per prefix that has at least one matching lineage on
+#                       disk. Pass an explicit value to filter to one prefix.
 #   --watch=SECONDS     Re-print the table every SECONDS seconds. Ctrl-C to stop.
 #                       Default: print once and exit.
 
@@ -32,9 +35,12 @@ set -euo pipefail
 BASE_SHORT=""
 ACTION_TAG="abs"
 RUN_TAG=""
-MODEL_PREFIX="pi05"
+MODEL_PREFIX=""   # empty = scan all known prefixes; set via --model=PREFIX to filter
 WATCH_SEC=""
 TRAINING_ROOT="${HOME}/code/lerobot/outputs/training"
+
+# Known model prefixes — must match train_sweep.sh's run_job() prefix arg.
+KNOWN_MODEL_PREFIXES=(pi05 diffusion act)
 
 for arg in "$@"; do
     case "$arg" in
@@ -219,7 +225,9 @@ print_table() {
     return 0
 }
 
-print_all() {
+# Per-prefix block: tables + plot. Caller must set MODEL_PREFIX before
+# invoking. Returns 0 if any lineages were found and printed; 1 if none.
+print_all_for_prefix() {
     local lineages
     if [[ -n "$BASE_SHORT" ]]; then
         lineages="${BASE_SHORT}_${ACTION_TAG}_basewrist"
@@ -227,13 +235,10 @@ print_all() {
     else
         lineages=$(discover_lineages)
         if [[ -z "$lineages" ]]; then
-            echo "ERROR: no DAgger training dirs found under $TRAINING_ROOT" >&2
-            echo "  expected pattern: ${MODEL_PREFIX}_<lineage>[_ft]_dag<N>" >&2
             return 1
         fi
     fi
 
-    echo "Scanned at: $(date '+%Y-%m-%d %H:%M:%S')"
     local first=1
     for lin in $lineages; do
         if (( first == 0 )); then
@@ -245,18 +250,6 @@ print_all() {
         first=0
     done
 
-    # Show the orchestrator's intervention output dir for the in-flight round, if any.
-    # Shared across lineages; print once at the bottom.
-    local dagger_root="${HOME}/code/lerobot/outputs/dagger"
-    if [[ -d "$dagger_root" ]]; then
-        local current_round_dir=""
-        current_round_dir=$(ls -td "$dagger_root"/round_* 2>/dev/null | head -1 || true)
-        if [[ -n "$current_round_dir" ]]; then
-            echo
-            echo "Latest intervention dir: $current_round_dir"
-        fi
-    fi
-
     # Regenerate the PNG plots via dagger_plot.py. Best-effort, never fails
     # the table. We always run dagger_plot.py in auto-discover mode (no
     # --base_short) because its --base_short filter doesn't yet understand
@@ -267,6 +260,79 @@ print_all() {
     if [[ -f "$plot_script" ]]; then
         echo
         python3 "$plot_script" --model="$MODEL_PREFIX" 2>&1 | sed 's/^/  [plot] /' || true
+    fi
+    return 0
+}
+
+print_all() {
+    echo "Scanned at: $(date '+%Y-%m-%d %H:%M:%S')"
+
+    # Determine which prefixes to scan: explicit --model=X → just that one;
+    # empty → all known prefixes that have at least one matching lineage.
+    local prefixes_to_scan=()
+    if [[ -n "$MODEL_PREFIX" ]]; then
+        prefixes_to_scan=("$MODEL_PREFIX")
+    else
+        prefixes_to_scan=("${KNOWN_MODEL_PREFIXES[@]}")
+    fi
+
+    local n_blocks=0
+    local first_block=1
+    for pfx in "${prefixes_to_scan[@]}"; do
+        MODEL_PREFIX="$pfx"
+        # Pre-check: does this prefix have any matching dag dir? If not, skip
+        # silently in multi-prefix mode (so the output isn't littered with
+        # "no DAgger training dirs found" errors for prefixes the user
+        # doesn't use). In single-prefix mode (--model=X) we DO want the
+        # error, so handle that at the end.
+        if [[ -z "$BASE_SHORT" ]] && [[ -z "$(discover_lineages)" ]]; then
+            continue
+        fi
+
+        if (( first_block == 0 )); then
+            echo
+            echo "======================================================================"
+            echo "== MODEL: $pfx"
+            echo "======================================================================"
+            echo
+        elif (( ${#prefixes_to_scan[@]} > 1 )); then
+            echo
+            echo "======================================================================"
+            echo "== MODEL: $pfx"
+            echo "======================================================================"
+            echo
+        fi
+        if print_all_for_prefix; then
+            n_blocks=$((n_blocks + 1))
+        fi
+        first_block=0
+    done
+
+    if (( n_blocks == 0 )); then
+        echo "ERROR: no DAgger training dirs found under $TRAINING_ROOT" >&2
+        if [[ -n "$MODEL_PREFIX" ]]; then
+            echo "  expected pattern: ${MODEL_PREFIX}_<lineage>[_ft]_dag<N>" >&2
+        else
+            echo "  scanned prefixes: ${KNOWN_MODEL_PREFIXES[*]}" >&2
+            echo "  expected pattern: <prefix>_<lineage>[_ft]_dag<N>" >&2
+        fi
+        return 1
+    fi
+
+    # Show the orchestrator's intervention output dir for the in-flight round,
+    # if any. Shared across lineages and prefixes; print once at the bottom.
+    # Three layouts to handle (newest first):
+    #   1. outputs/training/<policy>_dag<N>/dagger/interventions  (current)
+    #   2. outputs/dagger/<policy>_dag<N>/interventions           (legacy mirror)
+    #   3. outputs/dagger/round_<N>/interventions                 (original)
+    local current_round_dir=""
+    current_round_dir=$( { ls -td "${TRAINING_ROOT}"/*/dagger/interventions 2>/dev/null; \
+                          ls -td "${HOME}"/code/lerobot/outputs/dagger/*/interventions 2>/dev/null; \
+                          ls -td "${HOME}"/code/lerobot/outputs/dagger/round_*       2>/dev/null; \
+                        } | head -1 || true)
+    if [[ -n "$current_round_dir" ]]; then
+        echo
+        echo "Latest intervention dir: $current_round_dir"
     fi
 }
 

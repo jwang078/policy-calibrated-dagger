@@ -150,14 +150,18 @@ set -euo pipefail
 #                                 training had to itself, so the finetune step is
 #                                 tighter on memory than the round-0 training was.
 #   --finetune_decay_lr=FLOAT     Override the cosine scheduler's floor LR
-#                                 (--policy.scheduler_decay_lr). Set this equal
-#                                 to the policy's peak optimizer_lr (e.g. 2.5e-5
-#                                 for pi05) to force a CONSTANT peak LR through
-#                                 the finetune. Default empty = inherit, which
-#                                 for resumes past decay-end (typical for DAgger)
-#                                 parks runtime LR at the original 2.5e-6 floor
-#                                 — too small to actually move the policy in
-#                                 200-2000 steps even with large gradients.
+#                                 (--policy.scheduler_decay_lr). Default empty
+#                                 = AUTO-SET to the policy's peak optimizer_lr
+#                                 (read from train_config.json — 2.5e-5 for
+#                                 pi05, 1e-5 for diffusion). This forces a
+#                                 CONSTANT peak LR through the finetune, which
+#                                 is what you want for DAgger resumes past the
+#                                 cosine decay end (otherwise runtime LR is
+#                                 parked at the original ~1e-6 floor — too
+#                                 small to actually move the policy in
+#                                 200-2000 steps even with large gradients).
+#                                 Pass an explicit value to override the
+#                                 auto-set (e.g. 5e-5 for an aggressive run).
 #
 # Resume/restart:
 #   --start_round=N               Explicitly start at round N (default: auto-detect).
@@ -526,6 +530,22 @@ fi
 if [[ -n "$RUN_TAG" ]]; then
     BASE_DATASET_SHORT="${BASE_DATASET_SHORT}_${RUN_TAG}"
 fi
+# Model-type tag. "pi" (pi05) gets no tag — preserves back-compat with every
+# existing pi05 DAgger lineage on disk (dag artifact names were originally
+# model-agnostic). "diff" / "act" get an explicit tag so pi05 and diffusion/act
+# runs on the same base + run_tag + method don't collide on the same dataset
+# names. Training dirs are already disambiguated by the model prefix
+# (pi05_/diffusion_/act_), but dag artifact names were not.
+MODEL_TAG=""
+case "$MODEL" in
+    pi)   MODEL_TAG="" ;;
+    diff) MODEL_TAG="diff" ;;
+    act)  MODEL_TAG="act" ;;
+    *) echo "ERROR: no MODEL_TAG mapping for model='$MODEL'" >&2; exit 1 ;;
+esac
+if [[ -n "$MODEL_TAG" ]]; then
+    BASE_DATASET_SHORT="${BASE_DATASET_SHORT}_${MODEL_TAG}"
+fi
 # Intervention-method tag. "rrt" gets no tag (preserves existing artifact
 # names on disk and on the hub — back-compat with all DAgger runs to date).
 # Other methods get a 2-char tag so the user can tell runs apart at a glance,
@@ -765,7 +785,20 @@ stats_exists() {
     fi
     # Files are named by chunk size (stats_rel{N}.json), produced by
     # compute_relative_stats.sh — currently chunks 50 (pi05) and 8 (diffusion).
-    [[ -f "$STATS_BASE/$short/stats_rel50.json" && -f "$STATS_BASE/$short/stats_rel8.json" ]]
+    # We check whichever sidecar corresponds to the active model's chunk size;
+    # the other one isn't needed but compute_relative_stats.sh writes both
+    # anyway, so a successful run yields both and either model is satisfied.
+    local needed_chunk
+    case "$TRAIN_OUTPUT_MODEL_PREFIX" in
+        diffusion*) needed_chunk=8 ;;
+        pi05*|pi0*) needed_chunk=50 ;;
+        *)          needed_chunk="" ;;
+    esac
+    if [[ -z "$needed_chunk" ]]; then
+        # No chunk applies (e.g. act → absolute actions only). Treat as present.
+        return 0
+    fi
+    [[ -f "$STATS_BASE/$short/stats_rel${needed_chunk}.json" ]]
 }
 
 # Read the policy's n_action_steps (== chunk size for the relative-action stats
@@ -1172,7 +1205,13 @@ restart_from_scratch() {
         RESTART_PATHS+=( "$STATS_BASE/$(int_short_for_round "$r")" )
         RESTART_PATHS+=( "$STATS_BASE/$(merged_short_for_round "$r")" )
         RESTART_PATHS+=( "$(train_output_dir_for_round "$r")" )
-        # lerobot-eval's per-round output_dir (logs / per-scenario CSV / etc).
+        # Intervention output dir lives INSIDE the training dir
+        # (<train>/dagger/interventions/), so the rm above already takes it
+        # out. Legacy paths from older orchestrator layouts kept here so
+        # --force_restart still cleans pre-migration runs:
+        #   outputs/dagger/<train_basename>/   (mirror layout, briefly used)
+        #   outputs/dagger/round_${r}/          (original layout)
+        RESTART_PATHS+=( "$LEROBOT_ROOT/outputs/dagger/$(basename "$(train_output_dir_for_round "$r")")" )
         RESTART_PATHS+=( "$LEROBOT_ROOT/outputs/dagger/round_${r}" )
     done
     do_final_scratch && RESTART_PATHS+=( "$(train_output_dir_final_scratch)" )
@@ -1274,7 +1313,11 @@ elif [[ "$FORCE_RESTART" == true ]]; then
         run_or_echo rm -rf "$LEROBOT_CACHE/$(merged_repo_for_round "$r")"
         run_or_echo rm -rf "$STATS_BASE/$(int_short_for_round "$r")"
         run_or_echo rm -rf "$STATS_BASE/$(merged_short_for_round "$r")"
+        # New layout nests interventions under the training dir
+        # (<train>/dagger/...), so this rm already takes them out.
         run_or_echo rm -rf "$(train_output_dir_for_round "$r")"
+        # Legacy intervention layouts kept here for back-compat:
+        run_or_echo rm -rf "$LEROBOT_ROOT/outputs/dagger/$(basename "$(train_output_dir_for_round "$r")")"
         run_or_echo rm -rf "$LEROBOT_ROOT/outputs/dagger/round_${r}"
     done
     do_final_scratch && run_or_echo rm -rf "$(train_output_dir_final_scratch)"
@@ -1522,6 +1565,7 @@ if (( EFFECTIVE_START_ROUND == 1 )); then
         TRAIN_OUTPUT_DIR="$BASE_TRAINING_DIR"
         run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
             --dataset_repo="$BASE_REPO" \
+            --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
             "${ROUND0_ABS_ACTION_ARG[@]}" \
             "${TRAIN_EXT_PORT_SWEEP[@]}" \
             "${OFFLINE_POLICY_ARG[@]}"
@@ -1640,7 +1684,7 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             --eval.batch_size=1 \
             --eval.use_async_envs=false \
             --seed=0 \
-            --output_dir="$LEROBOT_ROOT/outputs/dagger/round_${r}/interventions" \
+            --output_dir="$TRAIN_OUTPUT_DIR/dagger/interventions" \
             --intervention.method="$INTERVENTION_METHOD" \
             --intervention.oracle_goal_chunk_steps="$INTERVENTION_ORACLE_GOAL_CHUNK_STEPS" \
             "${SUBSET_ARG[@]}" \
@@ -1761,7 +1805,7 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
         print_gpu_state
         if [[ "$MODE" == "scratch" ]]; then
             # Pass --run_name so train_sweep.sh writes to ${BASE_POLICY_NAME}_dag${r}
-            # instead of its default pi05_<dataset>_<action>_basewrist naming.
+            # instead of its default ${MODEL}_<dataset>_<action>_basewrist naming.
             # This keeps scratch-mode and finetune-mode rounds at the same path.
             # In retrain mode the same suffix used for TRAIN_OUTPUT_DIR is also
             # applied to the run_name so wandb/job_name don't collide.
@@ -1780,6 +1824,7 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
                 --dataset_repo="$MERGED_REPO" \
                 --run_name="$SCRATCH_RUN_NAME" \
+                --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
                 "${ABS_ACTION_ARG[@]}" \
                 "${TRAIN_EXT_PORT_SWEEP[@]}" \
                 "${OFFLINE_POLICY_ARG[@]}"
@@ -1828,29 +1873,98 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             # normalization → silent policy corruption. Fail loudly here so the
             # user catches it before training kicks off rather than discovering
             # the policy got worse after the fact.
-            if [[ "$DRY_RUN" != true ]]; then
-                RESUME_CFG_PATH="$(readlink -f "$CURRENT_POLICY")/train_config.json"
-                if [[ -f "$RESUME_CFG_PATH" ]]; then
-                    POLICY_REL="$(python3 -c "
+            #
+            # Gate on the config file existing rather than DRY_RUN so dry-run
+            # of round 1 (real --initial_policy_path) catches mismatches just
+            # like a real run would; later-round dry-runs with synthetic paths
+            # silently skip.
+            RESUME_CFG_PATH="$(readlink -f "$CURRENT_POLICY")/train_config.json"
+            if [[ -f "$RESUME_CFG_PATH" ]]; then
+                POLICY_REL="$(python3 -c "
 import json,sys
 c = json.load(open(sys.argv[1]))
 print('true' if c.get('policy',{}).get('use_relative_actions') else 'false')
 " "$RESUME_CFG_PATH")"
-                    EXPECTED_REL="false"
-                    [[ "$ACTION_FORMAT" == "rel" ]] && EXPECTED_REL="true"
-                    if [[ "$POLICY_REL" != "$EXPECTED_REL" ]]; then
-                        echo "ERROR: --action_format=$ACTION_FORMAT but resumed policy has use_relative_actions=$POLICY_REL." >&2
-                        echo "  Resumed policy:   $CURRENT_POLICY" >&2
-                        echo "  Set --action_format=$([[ "$POLICY_REL" == "true" ]] && echo rel || echo abs) on the orchestrator." >&2
-                        echo "  (Mismatch would re-normalize actions with the wrong sidecar and silently corrupt the policy.)" >&2
-                        exit 1
-                    fi
+                EXPECTED_REL="false"
+                [[ "$ACTION_FORMAT" == "rel" ]] && EXPECTED_REL="true"
+                if [[ "$POLICY_REL" != "$EXPECTED_REL" ]]; then
+                    echo "ERROR: --action_format=$ACTION_FORMAT but resumed policy has use_relative_actions=$POLICY_REL." >&2
+                    echo "  Resumed policy:   $CURRENT_POLICY" >&2
+                    echo "  Set --action_format=$([[ "$POLICY_REL" == "true" ]] && echo rel || echo abs) on the orchestrator." >&2
+                    echo "  (Mismatch would re-normalize actions with the wrong sidecar and silently corrupt the policy.)" >&2
+                    exit 1
                 fi
             fi
             FT_BATCH_SIZE_ARG=()
             [[ -n "$FINETUNE_BATCH_SIZE" ]] && FT_BATCH_SIZE_ARG=(--batch_size="$FINETUNE_BATCH_SIZE")
+            # Force a CONSTANT peak LR for the finetune. Mechanism depends on
+            # the resumed policy's scheduler config:
+            #
+            # - cosine_decay_with_warmup (pi05/pi0): set decay_lr = peak_lr.
+            #   The lambda blends toward decay_lr at end-of-decay; equating
+            #   the two gives a flat peak. Default to auto-detected
+            #   optimizer_lr from train_config.json; override with
+            #   --finetune_decay_lr=<value>.
+            # - diffuser/cosine (diffusion): the HF cosine scheduler decays
+            #   to 0 by num_training_steps and is useless past the original
+            #   end. Switch to scheduler.name=constant which returns a
+            #   constant lambda=1, giving lr = base_lr (peak from the saved
+            #   optimizer's initial_lr) every step.
+            #
+            # Both knobs default to "flatten at peak"; an explicit
+            # --finetune_decay_lr=<value> still wins for cosine_decay_with_warmup.
+            EFFECTIVE_DECAY_LR="$FINETUNE_DECAY_LR"
+            FT_SCHEDULER_NAME_ARG=()
+            # Gate detection on the train_config.json existing rather than on
+            # DRY_RUN. This way the round-1 dry-run (which has a real
+            # --initial_policy_path on disk) shows the auto-set scheduler
+            # flag; later-round dry-runs with synthetic paths fall through
+            # silently because the file isn't there yet.
+            # Always recompute from the current CURRENT_POLICY — bash variables
+            # persist across loop iterations and we'd otherwise reuse round
+            # (r-1)'s config path in round r.
+            RESUME_CFG_PATH="$(readlink -f "$CURRENT_POLICY")/train_config.json"
+            if [[ -f "$RESUME_CFG_PATH" ]]; then
+                POLICY_SUPPORTS_DECAY_LR="$(python3 -c "
+import json,sys
+c = json.load(open(sys.argv[1]))
+print('true' if 'scheduler_decay_lr' in c.get('policy',{}) else 'false')
+" "$RESUME_CFG_PATH")"
+                SCHEDULER_TYPE="$(python3 -c "
+import json,sys
+c = json.load(open(sys.argv[1]))
+print((c.get('scheduler') or {}).get('type') or '')
+" "$RESUME_CFG_PATH")"
+                if [[ "$POLICY_SUPPORTS_DECAY_LR" != "true" ]]; then
+                    if [[ -n "$EFFECTIVE_DECAY_LR" ]]; then
+                        echo "WARNING: --finetune_decay_lr=$EFFECTIVE_DECAY_LR ignored — policy at $CURRENT_POLICY has no scheduler_decay_lr field (likely diffusion). Skipping override." >&2
+                    fi
+                    EFFECTIVE_DECAY_LR=""
+                    # Diffuser scheduler (HF cosine that decays to 0 by end-of-training):
+                    # switch to constant so the finetune runs at peak LR.
+                    if [[ "$SCHEDULER_TYPE" == "diffuser" ]]; then
+                        FT_SCHEDULER_NAME_ARG=(--scheduler.name=constant)
+                        echo "Finetune: auto-set --scheduler.name=constant (diffuser scheduler decays to 0 at end-of-training; flat LR keeps the finetune effective)."
+                    fi
+                elif [[ -z "$EFFECTIVE_DECAY_LR" ]]; then
+                    PEAK_LR="$(python3 -c "
+import json,sys
+c = json.load(open(sys.argv[1]))
+print(c.get('policy',{}).get('optimizer_lr') or '')
+" "$RESUME_CFG_PATH")"
+                    if [[ -n "$PEAK_LR" ]]; then
+                        EFFECTIVE_DECAY_LR="$PEAK_LR"
+                        echo "Finetune: auto-set --scheduler_decay_lr=$EFFECTIVE_DECAY_LR (peak optimizer_lr from train_config.json — override with --finetune_decay_lr=<value>)."
+                    fi
+                fi
+            elif [[ "$DRY_RUN" != true ]]; then
+                # A real run with no train_config.json under CURRENT_POLICY is
+                # a real problem — the resume itself will fail downstream. Warn
+                # so the user notices it here rather than after the sim spins up.
+                echo "WARNING: train_config.json not found at $RESUME_CFG_PATH; skipping scheduler/decay-lr auto-detection." >&2
+            fi
             FT_DECAY_LR_ARG=()
-            [[ -n "$FINETUNE_DECAY_LR" ]] && FT_DECAY_LR_ARG=(--scheduler_decay_lr="$FINETUNE_DECAY_LR")
+            [[ -n "$EFFECTIVE_DECAY_LR" ]] && FT_DECAY_LR_ARG=(--scheduler_decay_lr="$EFFECTIVE_DECAY_LR")
             # The relative-action stats sidecar (stats_rel{N}.json, where N is
             # the policy's chunk size) is only correct for policies trained with
             # use_relative_actions=True. For absolute-action policies, overriding
@@ -1868,11 +1982,34 @@ print('true' if c.get('policy',{}).get('use_relative_actions') else 'false')
                 # per-model hardcoding required.
                 FT_CHUNK="$(n_action_steps_from_policy_path "$CURRENT_POLICY")"
                 if [[ -z "$FT_CHUNK" ]]; then
-                    echo "ERROR: could not read policy.n_action_steps from $CURRENT_POLICY/train_config.json" >&2
-                    echo "  Needed to pick the right stats_rel{N}.json sidecar for finetune." >&2
-                    exit 1
+                    if [[ "$DRY_RUN" == true ]]; then
+                        # Dry-run for round >1 walks through synthetic policy
+                        # paths whose train_config.json doesn't exist yet
+                        # (the prior round wasn't actually trained). Use a
+                        # placeholder so the dry-run can continue and the user
+                        # sees the rest of the planned commands. The placeholder
+                        # is wrapped in <> to make it obvious it's not a real
+                        # path that would resolve.
+                        FT_CHUNK="<unknown-in-dry-run>"
+                        echo "  [dry-run] could not read policy.n_action_steps from $CURRENT_POLICY/train_config.json (round >1 dry-run); using <unknown-in-dry-run> placeholder in --dataset.stats_path."
+                    else
+                        echo "ERROR: could not read policy.n_action_steps from $CURRENT_POLICY/train_config.json" >&2
+                        echo "  Needed to pick the right stats_rel{N}.json sidecar for finetune." >&2
+                        exit 1
+                    fi
                 fi
                 FT_STATS_PATH_ARG=( --dataset.stats_path="$MERGED_STATS_DIR/stats_rel${FT_CHUNK}.json" )
+            fi
+            # Force inline eval onto the benchmark dataset + the same subset
+            # the intervention recording uses, regardless of what the resumed
+            # train_config.json had baked in. Some checkpoints (especially
+            # older ones, or diffusion runs that predate the benchmark wiring
+            # in train_sweep.sh) save these as None and would otherwise have
+            # their inline eval fall back to random scenarios — which breaks
+            # round-over-round DAgger progress comparison.
+            FT_EVAL_BENCHMARK_ARG=( --env.eval_benchmark_repo_id="$EVAL_BENCHMARK_REPO_ID" )
+            if [[ -n "$INTERVENTION_SUBSET_JSON" ]]; then
+                FT_EVAL_BENCHMARK_ARG+=( --env.eval_benchmark_subset="$INTERVENTION_SUBSET_JSON" )
             fi
             run_training_step bash "$SCRIPT_DIR/resume_training.sh" "$CURRENT_POLICY" \
                 --dataset.repo_id="$MERGED_REPO" \
@@ -1886,6 +2023,8 @@ print('true' if c.get('policy',{}).get('use_relative_actions') else 'false')
                 "${TRAIN_EXT_PORT_RESUME[@]}" \
                 "${FT_BATCH_SIZE_ARG[@]}" \
                 "${FT_DECAY_LR_ARG[@]}" \
+                "${FT_SCHEDULER_NAME_ARG[@]}" \
+                "${FT_EVAL_BENCHMARK_ARG[@]}" \
                 "${OFFLINE_POLICY_ARG[@]}"
         fi
         # Relaunch the external sim now that training has freed the GPU,
@@ -2006,6 +2145,7 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
         run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
             --dataset_repo="$LAST_MERGED_REPO" \
             --run_name="$FINAL_SCRATCH_RUN_NAME" \
+            --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
             "${ABS_ACTION_ARG[@]}" \
             "${TRAIN_EXT_PORT_SWEEP[@]}" \
             "${OFFLINE_POLICY_ARG[@]}"

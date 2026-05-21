@@ -357,6 +357,168 @@ class StallDetector:
 
 
 # ---------------------------------------------------------------------------
+# EEDistanceProgressTracker — shared algorithm
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EEProgressUpdate:
+    """One-step output from EEDistanceProgressTracker.update()."""
+
+    should_fire: bool
+    ee_dist: float
+    anchor_ee: float
+    min_ee_so_far: float
+
+
+class EEDistanceProgressTracker:
+    """Anchor-based no-progress detector on a 1D scalar that should decrease.
+
+    Unit-agnostic — the algorithm just needs a value where "lower is better"
+    and treats ``min_decrease`` / ``reposition_turnaround`` in the same units
+    as the incoming signal. Used with metres (position error) by both
+    ``NoEEProgressDetector`` and the position arm of
+    ``InterventionController``; used with degrees (orientation error) by the
+    orientation arm of ``InterventionController``.
+
+    See ``NoEEProgressDetector`` for the full algorithm doc — this class
+    is the state machine extracted from it. Local-anchor semantics:
+
+      (1) Progress past the anchor by ``min_decrease`` → new anchor.
+      (2) Above the anchor for ``reposition_grace_steps`` consecutive
+          steps AND back down from the away-phase peak by at least
+          ``reposition_turnaround`` → new anchor at current value.
+      (3) Otherwise increment ``steps_without_progress``; fire when it
+          reaches ``no_progress_window``. Warmup of ``min_warmup_steps``
+          suppresses early-episode fires.
+
+    Per-call diagnostics on ``self`` (read after each ``update()``):
+    ``min_ee_so_far`` / ``min_ee_step``, ``anchor_resets_via_progress``,
+    ``anchor_resets_via_repositioning``, ``fire_count``,
+    ``steps_without_progress``.
+
+    Caller is responsible for incrementing ``step_index`` before each
+    ``update()`` call (so warmup logic sees the right step number).
+    """
+
+    def __init__(
+        self,
+        no_progress_window: int,
+        min_decrease: float,
+        min_warmup_steps: int,
+        reposition_grace_steps: int = 30,
+        reposition_turnaround: float = 0.01,
+    ) -> None:
+        self.no_progress_window = int(no_progress_window)
+        self.min_decrease = float(min_decrease)
+        self.min_warmup_steps = int(min_warmup_steps)
+        self.reposition_grace_steps = int(reposition_grace_steps)
+        self.reposition_turnaround = float(reposition_turnaround)
+        self.reset()
+
+    def reset(self) -> None:
+        self._anchor_ee: float = float("inf")
+        self._anchor_set_step: int = -1
+        self._away_phase_min: float = float("inf")
+        self._away_phase_max: float = -float("inf")
+        self._steps_above_anchor: int = 0
+        self.steps_without_progress: int = 0
+        self.min_ee_so_far: float = float("inf")
+        self.min_ee_step: int = -1
+        self.anchor_resets_via_progress: int = 0
+        self.anchor_resets_via_repositioning: int = 0
+        self.fire_count: int = 0
+
+    @property
+    def anchor_ee(self) -> float:
+        return self._anchor_ee
+
+    def update(self, step_index: int, ee_dist: float) -> EEProgressUpdate:
+        """Advance one step. ``step_index`` is the 1-based per-episode counter
+        the caller maintains; ``ee_dist`` is the current EE-to-goal distance
+        in metres. Returns whether the no-progress trigger fired this step.
+        """
+        # Diagnostic: global best across episode.
+        if ee_dist < self.min_ee_so_far:
+            self.min_ee_so_far = ee_dist
+            self.min_ee_step = step_index
+
+        # ----- update anchor / counters -----
+        if ee_dist < self._anchor_ee - self.min_decrease:
+            # (1) Progress past the current anchor → new anchor.
+            self._anchor_ee = ee_dist
+            self._anchor_set_step = step_index
+            self._away_phase_min = float("inf")
+            self._away_phase_max = -float("inf")
+            self._steps_above_anchor = 0
+            self.steps_without_progress = 0
+            self.anchor_resets_via_progress += 1
+        else:
+            self.steps_without_progress += 1
+            if ee_dist > self._anchor_ee:
+                # Away-phase. Track local min/max and count consecutive
+                # above-steps.
+                if self._steps_above_anchor == 0:
+                    # Entering away-phase.
+                    self._away_phase_min = ee_dist
+                    self._away_phase_max = ee_dist
+                else:
+                    self._away_phase_min = min(self._away_phase_min, ee_dist)
+                    self._away_phase_max = max(self._away_phase_max, ee_dist)
+                self._steps_above_anchor += 1
+
+                # (2) Repositioning detected → reset anchor. Two conditions
+                # must BOTH hold:
+                #   (a) We've been above the anchor long enough that this
+                #       counts as a genuine epoch (not a one-step blip).
+                #   (b) The EE has come BACK DOWN from the away-phase peak
+                #       by at least ``reposition_turnaround``.
+                if (
+                    self._steps_above_anchor >= self.reposition_grace_steps
+                    and ee_dist < self._away_phase_max - self.reposition_turnaround
+                ):
+                    self._anchor_ee = ee_dist
+                    self._anchor_set_step = step_index
+                    self._away_phase_min = float("inf")
+                    self._away_phase_max = -float("inf")
+                    self._steps_above_anchor = 0
+                    self.steps_without_progress = 0
+                    self.anchor_resets_via_repositioning += 1
+            else:
+                # ee_dist is at or just below anchor but not enough below to
+                # count as progress. Reset away-phase tracking.
+                self._steps_above_anchor = 0
+                self._away_phase_min = float("inf")
+                self._away_phase_max = -float("inf")
+
+        # ----- decide whether to fire -----
+        if step_index < self.min_warmup_steps:
+            return EEProgressUpdate(
+                should_fire=False,
+                ee_dist=ee_dist,
+                anchor_ee=self._anchor_ee,
+                min_ee_so_far=self.min_ee_so_far,
+            )
+
+        if self.steps_without_progress < self.no_progress_window:
+            return EEProgressUpdate(
+                should_fire=False,
+                ee_dist=ee_dist,
+                anchor_ee=self._anchor_ee,
+                min_ee_so_far=self.min_ee_so_far,
+            )
+
+        # Stuck — fire.
+        self.fire_count += 1
+        return EEProgressUpdate(
+            should_fire=True,
+            ee_dist=ee_dist,
+            anchor_ee=self._anchor_ee,
+            min_ee_so_far=self.min_ee_so_far,
+        )
+
+
+# ---------------------------------------------------------------------------
 # NoEEProgressDetector
 # ---------------------------------------------------------------------------
 
@@ -415,34 +577,25 @@ class NoEEProgressDetector:
         reposition_grace_steps: int = 30,
         reposition_turnaround_m: float = 0.01,
     ) -> None:
-        self.no_progress_window = int(no_progress_window)
-        self.min_decrease_m = float(min_decrease_m)
-        self.min_warmup_steps = int(min_warmup_steps)
-        self.reposition_grace_steps = int(reposition_grace_steps)
-        self.reposition_turnaround_m = float(reposition_turnaround_m)
-
-        # Local anchor and per-epoch tracking.
-        self._anchor_ee: float = float("inf")
-        self._anchor_set_step: int = -1
-        # Running min/max observed during the current away-phase. The MAX
-        # is used to detect turnaround: if the current EE is meaningfully
-        # below the peak, the robot has come back down (repositioning ended).
-        # If it's still equal to the max, the robot is still drifting away
-        # (or stuck at peak) — no turnaround, no anchor-reset.
-        self._away_phase_min: float = float("inf")
-        self._away_phase_max: float = -float("inf")
-        self._steps_above_anchor: int = 0
-        self._steps_without_progress: int = 0
-
-        # Diagnostics.
-        self._min_ee_so_far: float = float("inf")
-        self._min_ee_step: int = -1
-        self._anchor_resets_via_progress: int = 0
-        self._anchor_resets_via_repositioning: int = 0
-        self._fire_count: int = 0
+        self._tracker = EEDistanceProgressTracker(
+            no_progress_window=no_progress_window,
+            min_decrease=min_decrease_m,
+            min_warmup_steps=min_warmup_steps,
+            reposition_grace_steps=reposition_grace_steps,
+            reposition_turnaround=reposition_turnaround_m,
+        )
         self._missing_oracle_warned: bool = False
         self._saw_oracle_logged: bool = False
         self._ever_invoked: bool = False
+
+    # Convenience access to the tracker's config for the summary line.
+    @property
+    def no_progress_window(self) -> int:
+        return self._tracker.no_progress_window
+
+    @property
+    def min_decrease_m(self) -> float:
+        return self._tracker.min_decrease
 
     def detect(self, state: DetectorState) -> DetectorVerdict:
         self._ever_invoked = True
@@ -463,10 +616,10 @@ class NoEEProgressDetector:
                 "NoEEProgressDetector: ✓ oracle ready. target_ee_pos=%s, "
                 "no_progress_window=%d, reposition_grace=%d, min_decrease=%.4f m, warmup=%d.",
                 target_ee_pos.detach().cpu().numpy().round(3).tolist(),
-                self.no_progress_window,
-                self.reposition_grace_steps,
-                self.min_decrease_m,
-                self.min_warmup_steps,
+                self._tracker.no_progress_window,
+                self._tracker.reposition_grace_steps,
+                self._tracker.min_decrease,
+                self._tracker.min_warmup_steps,
             )
             self._saw_oracle_logged = True
 
@@ -475,128 +628,39 @@ class NoEEProgressDetector:
                 current_ee_pos.to(dtype=torch.float32) - target_ee_pos.to(dtype=torch.float32)
             ).item()
         )
-
-        # Diagnostic: global best across episode.
-        if ee_dist < self._min_ee_so_far:
-            self._min_ee_so_far = ee_dist
-            self._min_ee_step = state.step_index
-
-        # ----- update anchor / counters -----
-        if ee_dist < self._anchor_ee - self.min_decrease_m:
-            # (1) Progress past the current anchor → new anchor.
-            self._anchor_ee = ee_dist
-            self._anchor_set_step = state.step_index
-            self._away_phase_min = float("inf")
-            self._away_phase_max = -float("inf")
-            self._steps_above_anchor = 0
-            self._steps_without_progress = 0
-            self._anchor_resets_via_progress += 1
-        else:
-            self._steps_without_progress += 1
-            if ee_dist > self._anchor_ee:
-                # Away-phase. Track local min/max and count consecutive
-                # above-steps.
-                if self._steps_above_anchor == 0:
-                    # Entering away-phase.
-                    self._away_phase_min = ee_dist
-                    self._away_phase_max = ee_dist
-                else:
-                    self._away_phase_min = min(self._away_phase_min, ee_dist)
-                    self._away_phase_max = max(self._away_phase_max, ee_dist)
-                self._steps_above_anchor += 1
-
-                # (2) Repositioning detected → reset anchor. Two conditions
-                # must BOTH hold:
-                #   (a) We've been above the anchor long enough that this
-                #       counts as a genuine epoch (not a one-step blip).
-                #   (b) The EE has come BACK DOWN from the away-phase peak
-                #       by at least ``reposition_turnaround_m``. This is the
-                #       turnaround signal — without it, slow monotonic drift
-                #       would just keep resetting the anchor forever.
-                if (
-                    self._steps_above_anchor >= self.reposition_grace_steps
-                    and ee_dist < self._away_phase_max - self.reposition_turnaround_m
-                ):
-                    self._anchor_ee = ee_dist
-                    self._anchor_set_step = state.step_index
-                    self._away_phase_min = float("inf")
-                    self._away_phase_max = -float("inf")
-                    self._steps_above_anchor = 0
-                    self._steps_without_progress = 0
-                    self._anchor_resets_via_repositioning += 1
-            else:
-                # ee_dist is at or just below anchor but not enough below to
-                # count as progress. Reset away-phase tracking.
-                self._steps_above_anchor = 0
-                self._away_phase_min = float("inf")
-                self._away_phase_max = -float("inf")
-
-        # ----- decide whether to fire -----
-        if state.step_index < self.min_warmup_steps:
-            return DetectorVerdict(
-                should_help=False,
-                context={
-                    "ee_dist": ee_dist,
-                    "anchor_ee": self._anchor_ee,
-                    "min_ee_so_far": self._min_ee_so_far,
-                },
-            )
-
-        if self._steps_without_progress < self.no_progress_window:
-            return DetectorVerdict(
-                should_help=False,
-                context={
-                    "ee_dist": ee_dist,
-                    "anchor_ee": self._anchor_ee,
-                    "min_ee_so_far": self._min_ee_so_far,
-                },
-            )
-
-        # Stuck — fire.
-        self._fire_count += 1
-        return DetectorVerdict(
-            should_help=True,
-            context={
-                "q_goal_bias": q_goal_bias,
-                "ee_dist": ee_dist,
-                "anchor_ee": self._anchor_ee,
-                "min_ee_so_far": self._min_ee_so_far,
-            },
-        )
+        update = self._tracker.update(state.step_index, ee_dist)
+        context = {
+            "ee_dist": update.ee_dist,
+            "anchor_ee": update.anchor_ee,
+            "min_ee_so_far": update.min_ee_so_far,
+        }
+        if update.should_fire:
+            context["q_goal_bias"] = q_goal_bias
+        return DetectorVerdict(should_help=update.should_fire, context=context)
 
     def reset(self) -> None:
-        self._anchor_ee = float("inf")
-        self._anchor_set_step = -1
-        self._away_phase_min = float("inf")
-        self._away_phase_max = -float("inf")
-        self._steps_above_anchor = 0
-        self._steps_without_progress = 0
-        self._min_ee_so_far = float("inf")
-        self._min_ee_step = -1
-        self._anchor_resets_via_progress = 0
-        self._anchor_resets_via_repositioning = 0
-        self._fire_count = 0
+        self._tracker.reset()
         self._saw_oracle_logged = False
         self._ever_invoked = False
 
     def episode_summary(self) -> str | None:
         if not self._ever_invoked:
             return None
-        if self._min_ee_so_far == float("inf"):
+        if self._tracker.min_ee_so_far == float("inf"):
             return "NoEEProgressDetector: oracle never read; detector never measured."
-        verdict = "FIRED" if self._fire_count > 0 else "NEVER FIRED"
+        verdict = "FIRED" if self._tracker.fire_count > 0 else "NEVER FIRED"
         tail = (
-            f"→ try lowering no_progress_window (currently {self.no_progress_window}) to see it fire."
-            if self._fire_count == 0
+            f"→ try lowering no_progress_window (currently {self._tracker.no_progress_window}) to see it fire."
+            if self._tracker.fire_count == 0
             else ""
         )
         return (
-            f"NoEEProgressDetector: {verdict} ({self._fire_count} times). "
-            f"Best EE approach (global): {self._min_ee_so_far:.4f} m at step {self._min_ee_step}. "
-            f"Anchor resets: {self._anchor_resets_via_progress} via progress, "
-            f"{self._anchor_resets_via_repositioning} via repositioning. "
-            f"Final no-progress streak: {self._steps_without_progress} steps "
-            f"(window={self.no_progress_window}, min_decrease={self.min_decrease_m:.4f} m). "
+            f"NoEEProgressDetector: {verdict} ({self._tracker.fire_count} times). "
+            f"Best EE approach (global): {self._tracker.min_ee_so_far:.4f} m at step {self._tracker.min_ee_step}. "
+            f"Anchor resets: {self._tracker.anchor_resets_via_progress} via progress, "
+            f"{self._tracker.anchor_resets_via_repositioning} via repositioning. "
+            f"Final no-progress streak: {self._tracker.steps_without_progress} steps "
+            f"(window={self._tracker.no_progress_window}, min_decrease={self._tracker.min_decrease:.4f} m). "
             f"{tail}"
         ).rstrip()
 

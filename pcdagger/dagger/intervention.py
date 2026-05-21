@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from lerobot.configs.intervention import InterventionConfig
+from lerobot.policies.last_mile.detectors import EEDistanceProgressTracker
 from lerobot.policies.rrt_to_goal import RRTMode
 
 if TYPE_CHECKING:
@@ -83,6 +84,31 @@ def _extract_in_collision(info: dict) -> bool:
     return _extract_info_bool(info, "in_collision")
 
 
+def _extract_float_metric(info: dict, key: str) -> float | None:
+    """Pull a scalar metric out of info under either the live or final_info
+    path. Returns None if absent. Same final_info dispatch as
+    ``_extract_info_bool``.
+    """
+    val = info["final_info"].get(key) if "final_info" in info else info.get(key)
+    if val is None:
+        return None
+    if hasattr(val, "tolist"):
+        # Numpy array per-env (num_envs=1 in intervention mode).
+        vals = val.tolist()
+        return float(vals[0]) if vals else None
+    return float(val)
+
+
+def _extract_position_error_m(info: dict) -> float | None:
+    """Pull the env's per-step EE-to-goal distance out of info."""
+    return _extract_float_metric(info, "position_error_m")
+
+
+def _extract_orientation_error_deg(info: dict) -> float | None:
+    """Pull the env's per-step EE-to-goal orientation error (degrees)."""
+    return _extract_float_metric(info, "orientation_error_deg")
+
+
 # ---------------------------------------------------------------------------
 # Per-scenario result
 # ---------------------------------------------------------------------------
@@ -97,6 +123,11 @@ class ScenarioResult:
     cycles_used: int
     status: str
     plan_failures: int
+    method: str = ""
+    # Comma-separated chronological list of trigger reasons for each cycle
+    # that fired this scenario. Possible values: "stall", "in_collision",
+    # "no_progress". Empty string if no cycles fired (e.g. instant success).
+    triggers: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +166,37 @@ class InterventionController:
             self._cancel = wrapper._cancel_oracle_goal
         else:
             raise ValueError(f"InterventionConfig.method must be 'rrt' or 'oracle_goal', got {cfg.method!r}")
+        # Optional no-progress triggers. Both share the anchor-based algorithm
+        # with last_mile's NoEEProgressDetector. None when disabled
+        # (window_steps=0); otherwise update() is called each tick with the
+        # env's position_error_m / orientation_error_deg, and a should_fire
+        # verdict behaves like the step-count stall trigger. Both can be
+        # enabled together — they fire independently.
+        if cfg.no_progress_window_steps > 0:
+            self._progress_tracker: EEDistanceProgressTracker | None = EEDistanceProgressTracker(
+                no_progress_window=cfg.no_progress_window_steps,
+                min_decrease=cfg.no_progress_min_decrease_m,
+                min_warmup_steps=cfg.no_progress_warmup_steps,
+                reposition_grace_steps=cfg.no_progress_reposition_grace_steps,
+                reposition_turnaround=cfg.no_progress_reposition_turnaround_m,
+            )
+        else:
+            self._progress_tracker = None
+        if cfg.no_progress_orientation_window_steps > 0:
+            self._orientation_tracker: EEDistanceProgressTracker | None = EEDistanceProgressTracker(
+                no_progress_window=cfg.no_progress_orientation_window_steps,
+                min_decrease=cfg.no_progress_orientation_min_decrease_deg,
+                min_warmup_steps=cfg.no_progress_orientation_warmup_steps,
+                reposition_grace_steps=cfg.no_progress_orientation_reposition_grace_steps,
+                reposition_turnaround=cfg.no_progress_orientation_reposition_turnaround_deg,
+            )
+        else:
+            self._orientation_tracker = None
+        # Set once per scenario (first missing-metric tick) so the warning
+        # doesn't spam every tick when the env doesn't surface the metric.
+        self._missing_position_error_warned: bool = False
+        self._missing_orientation_error_warned: bool = False
+
         # per-scenario state — set in ``reset_for_new_scenario``
         self.policy_step_count: int = 0
         self.rrt_step_count: int = 0
@@ -167,6 +229,11 @@ class InterventionController:
         # cap (otherwise unbounded since cycles_used only counts executed cycles).
         self.backoff_rounds: int = 0
         self.last_status: str = "running"
+        # Chronological list of trigger reasons for each intervention cycle
+        # that fired this scenario. Same vocabulary as the "Triggering %s
+        # (%s)..." log line: "stall", "in_collision", "no_progress".
+        # Reset on scenario reset; appended on every trigger fire.
+        self.trigger_reasons: list[str] = []
 
     def reset_for_new_scenario(self) -> None:
         self.policy_step_count = 0
@@ -182,6 +249,48 @@ class InterventionController:
         self.in_backoff_cooldown = False
         self.backoff_rounds = 0
         self.last_status = "running"
+        self.trigger_reasons = []
+        if self._progress_tracker is not None:
+            self._progress_tracker.reset()
+        if self._orientation_tracker is not None:
+            self._orientation_tracker.reset()
+        self._missing_position_error_warned = False
+        self._missing_orientation_error_warned = False
+
+    def _check_no_progress(
+        self,
+        tracker: EEDistanceProgressTracker | None,
+        metric_value: float | None,
+        metric_name: str,
+        window_attr: str,
+        missing_flag: str,
+    ) -> bool:
+        """Feed one metric into its tracker, return whether it fired this tick.
+
+        ``tracker`` is None when the trigger is disabled via window=0 — fast
+        return. Otherwise:
+        * If the env didn't surface the metric, warn once per scenario.
+        * If the controller is in backoff cooldown, skip the update so the
+          tracker doesn't accumulate stalled-progress credit while the
+          policy is on a forced grace window.
+        """
+        if tracker is None:
+            return False
+        if metric_value is None:
+            if not getattr(self, missing_flag):
+                logger.warning(
+                    "InterventionConfig.%s=%d but env info has no `%s` "
+                    "field; this no-progress trigger will not fire.",
+                    window_attr,
+                    getattr(self.cfg, window_attr),
+                    metric_name,
+                )
+                setattr(self, missing_flag, True)
+            return False
+        if self.in_backoff_cooldown:
+            return False
+        update = tracker.update(self.policy_step_count, float(metric_value))
+        return update.should_fire
 
     def _resample_post_intervention_threshold(self) -> None:
         """Pick the next ``policy_step_count`` threshold to use AFTER an
@@ -194,7 +303,13 @@ class InterventionController:
         hi = max(lo, self.cfg.policy_steps_between_rrt_max)
         self.next_policy_threshold = random.randint(lo, hi)
 
-    def tick(self, success: bool, in_collision: bool = False) -> str:
+    def tick(
+        self,
+        success: bool,
+        in_collision: bool = False,
+        position_error_m: float | None = None,
+        orientation_error_deg: float | None = None,
+    ) -> str:
         """Advance one step. Returns ``"continue"`` or ``"advance"``.
 
         ``in_collision`` is the env's current collision state (read from
@@ -203,6 +318,19 @@ class InterventionController:
         rather than waiting for ``policy_step_count`` to reach the threshold —
         collisions mean the policy is already failing, so there's no reason
         to keep accumulating bad transitions.
+
+        ``position_error_m`` is the env's per-step EE-to-goal distance (read
+        from ``info["position_error_m"]``). When the no-progress tracker is
+        enabled (``cfg.no_progress_window_steps > 0``), this value is fed to
+        the tracker each tick; a no-progress verdict triggers an intervention
+        the same way ``policy_step_count >= threshold`` does. Pass ``None``
+        to skip the position no-progress trigger for this step (also
+        auto-skipped when the tracker is disabled at construction).
+
+        ``orientation_error_deg`` is the env's per-step EE-to-goal orientation
+        error in degrees (read from ``info["orientation_error_deg"]``). Same
+        wiring as ``position_error_m`` but on the orientation tracker — catches
+        wrist-twist failure modes that the position tracker misses.
 
         Pure-teleop fast path: when the SA wrapper's ``forward_flow_ratio``
         is 0.0, the user is in full manual control and the automated
@@ -346,20 +474,57 @@ class InterventionController:
         # Reset the controller-cancel flag now that the cancel has settled.
         self.controller_initiated_cancel = False
         self.policy_step_count += 1
-        # Two triggers, both gated on mode == IDLE: stall (policy_step_count
-        # >= threshold) and collision (the policy has driven the robot into
-        # an obstacle, no point in waiting). Trigger fires whichever first.
-        # During backoff cooldown the collision trigger is suppressed so we
-        # don't burst-retrigger right after a backoff (the policy gets the
-        # full window to make progress on its own); the stall trigger still
-        # fires on the threshold and lifts the cooldown.
+
+        # No-progress triggers: feed per-step metrics into the (optional)
+        # trackers. Each maintains anchor-based progress tracking and fires
+        # when its metric hasn't improved for the configured window of
+        # consecutive policy steps. Position and orientation trackers are
+        # independent — either firing triggers an intervention.
+        should_trigger_no_progress_pos = self._check_no_progress(
+            self._progress_tracker,
+            position_error_m,
+            metric_name="position_error_m",
+            window_attr="no_progress_window_steps",
+            missing_flag="_missing_position_error_warned",
+        )
+        should_trigger_no_progress_ori = self._check_no_progress(
+            self._orientation_tracker,
+            orientation_error_deg,
+            metric_name="orientation_error_deg",
+            window_attr="no_progress_orientation_window_steps",
+            missing_flag="_missing_orientation_error_warned",
+        )
+
+        # Triggers, all gated on mode == IDLE:
+        #   * stall: policy_step_count >= threshold (lifts backoff cooldown)
+        #   * collision: policy hit an obstacle (suppressed during cooldown)
+        #   * no-progress (position): EE position not improving (suppressed
+        #     during cooldown)
+        #   * no-progress (orientation): EE orientation not improving (also
+        #     suppressed during cooldown)
+        # Trigger fires whichever first. Backoff cooldown gives the policy
+        # the full window after a planning backoff so we don't burst-retrigger
+        # the moment it's handed back control.
         should_trigger_stall = self.policy_step_count >= self.next_policy_threshold
         should_trigger_collision = in_collision and not self.in_backoff_cooldown
         if should_trigger_stall:
             self.in_backoff_cooldown = False
-        if should_trigger_stall or should_trigger_collision:
+        if (
+            should_trigger_stall
+            or should_trigger_collision
+            or should_trigger_no_progress_pos
+            or should_trigger_no_progress_ori
+        ):
             self.target_rrt_steps = random.randint(self.cfg.rrt_steps_min, self.cfg.rrt_steps_max)
-            reason = "in_collision" if should_trigger_collision else "stall"
+            if should_trigger_collision:
+                reason = "in_collision"
+            elif should_trigger_no_progress_pos:
+                reason = "no_progress"
+            elif should_trigger_no_progress_ori:
+                reason = "no_progress_ori"
+            else:
+                reason = "stall"
+            self.trigger_reasons.append(reason)
             logger.info(
                 "Triggering %s (%s) after %d policy steps (cycle %d/%d, target=%d).",
                 self.cfg.method.upper(),
@@ -413,7 +578,22 @@ class InterventionContext:
     scenario_idx: int = 0
     n_committed_episodes: int = 0
 
-    CSV_COLUMNS = ("scenario_idx", "success", "cycles_used", "status", "plan_failures")
+    # `method`: per-run constant ("rrt" / "oracle_goal"), recorded on every
+    # row so when CSVs from different runs are concatenated (or when grepping
+    # one), each scenario carries its intervention method.
+    # `triggers`: chronological comma-separated list of what fired each cycle
+    # in the scenario ("stall", "in_collision", "no_progress"). Empty when no
+    # cycles fired (instant success). Useful for diagnosing whether
+    # interventions are triggering at the right times.
+    CSV_COLUMNS = (
+        "scenario_idx",
+        "success",
+        "cycles_used",
+        "status",
+        "plan_failures",
+        "method",
+        "triggers",
+    )
 
     def open_csv(self) -> None:
         """Open the per-scenario CSV file for writing. Header row is emitted
@@ -442,6 +622,8 @@ class InterventionContext:
             ctrl.cycles_used,
             ctrl.last_status,
             ctrl.plan_failures,
+            ctrl.cfg.method,
+            ",".join(ctrl.trigger_reasons),
         )
         self._csv_writer.writerow(row)
         self._csv_file.flush()

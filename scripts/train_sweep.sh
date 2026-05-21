@@ -20,6 +20,12 @@ set -euo pipefail
 #   --ratio_sweep           Enable the augmented-ratio sweep
 #   --ratios="N N N"        Space-separated ratio list (used when --ratio_sweep)
 #   --no_relative           Disable relative-action training (default: enabled)
+#   --model=NAME            Which policy to train: "pi05" | "diffusion" | "act".
+#                           Default: pi05. Selects which run_job(...) invocation
+#                           runs inside _run_all_jobs, which policy-args block
+#                           is used, and which chunk size the relative-action
+#                           stats sidecar is keyed off (pi05/pi0 → 50, diffusion
+#                           → 8, act → none — uses absolute actions).
 #   --env_external_port=N   Connect lerobot-train's inline eval to an external
 #                           SplatSim ZMQ server at this port (e.g. 6001) instead
 #                           of spawning a new one. Required when training has to
@@ -42,6 +48,7 @@ RATIOS=(0.2 0.4 0.6 0.8 1.0)
 ENV_EXTERNAL_PORT=""
 POLICY_PUSH_TO_HUB=""   # empty = use whatever the policy config default is
 RUN_NAME_OVERRIDE=""    # set to override the auto-derived run_name (training dir basename)
+MODEL="pi05"            # which policy to train: pi05 | diffusion | act
 DRY_RUN=false
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -55,9 +62,15 @@ for arg in "$@"; do
         --env_external_port=*)  ENV_EXTERNAL_PORT="${arg#*=}" ;;
         --policy.push_to_hub=*) POLICY_PUSH_TO_HUB="${arg#*=}" ;;
         --run_name=*)           RUN_NAME_OVERRIDE="${arg#*=}" ;;
+        --model=*)              MODEL="${arg#*=}" ;;
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
+
+case "$MODEL" in
+    pi05|diffusion|act) ;;
+    *) echo "ERROR: --model must be one of pi05/diffusion/act (got '$MODEL')" >&2; exit 1 ;;
+esac
 
 # DATASET_SHORT is derived from DATASET_REPO by stripping "JennyWWW/" and an
 # optional "splatsim_" prefix. It's used to construct the stats sidecar dir
@@ -118,20 +131,19 @@ _chunk_size_for_prefix() {
     esac
 }
 
-# Validate that stats files exist for each policy chunk size we'd use when
-# USE_RELATIVE_ACTIONS=true. We check the union of chunk sizes across the known
-# policy prefixes — even if not all are enabled in _run_all_jobs, missing files
-# usually means the user forgot to run compute_relative_stats.sh.
+# Validate that the stats file exists for the SELECTED model's chunk size when
+# USE_RELATIVE_ACTIONS=true. Missing → the user forgot to run
+# compute_relative_stats.sh. act uses absolute actions so no sidecar applies.
 if [[ "$USE_RELATIVE_ACTIONS" == true ]]; then
-    for prefix in diffusion pi05; do
-        chunk="$(_chunk_size_for_prefix "$prefix")"
+    chunk="$(_chunk_size_for_prefix "$MODEL")"
+    if [[ -n "$chunk" ]]; then
         f="${STATS_DIR}/stats_rel${chunk}.json"
         if [[ ! -f "$f" ]]; then
             echo "ERROR: USE_RELATIVE_ACTIONS=true but stats file not found: $f" >&2
             echo "Run my_scripts/compute_relative_stats.sh first." >&2
             exit 1
         fi
-    done
+    fi
 fi
 
 # ── Validate names before doing anything ─────────────────────
@@ -415,26 +427,32 @@ maybe_sleep() { [[ "$DRY_RUN" == false ]] && sleep 10; }
 
 # All training jobs live here.  Wrapped in a function so the ratio sweep loop
 # can call it once per merged dataset, then clean up before the next iteration.
+# Dispatches by $MODEL — only the selected model's basewrist job runs. Other
+# camera variants (base/wrist-only) remain commented out — uncomment to enable.
 _run_all_jobs() {
-    run_job "pi05" "basewrist" PI05_ARGS "$PI05_RESIZE_MODE" "$PI05_BASEWRIST_ENV" PI05_BASEWRIST_EXTRA
-    maybe_sleep
-
-    # run_job "act" "basewrist" ACT_ARGS "$ACT_RESIZE_MODE" "$ACT_BASEWRIST_ENV" ACT_BASEWRIST_EXTRA
-    # maybe_sleep
-
-    # run_job "diffusion" "basewrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$DIFFUSION_BASEWRIST_ENV" DIFFUSION_BASEWRIST_EXTRA
-    # maybe_sleep
-
-    # run_job "pi05" "base"  PI05_ARGS "$PI05_RESIZE_MODE" "$PI05_BASE_ENV"  PI05_BASE_EXTRA
-    # maybe_sleep
-
-    # run_job "pi05" "wrist" PI05_ARGS "$PI05_RESIZE_MODE" "$PI05_WRIST_ENV" PI05_WRIST_EXTRA
-
-    # run_job "diffusion" "base"  DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$DIFFUSION_BASE_ENV"  DIFFUSION_BASE_EXTRA
-    # maybe_sleep
-
-    # run_job "diffusion" "wrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$DIFFUSION_WRIST_ENV" DIFFUSION_WRIST_EXTRA
-    # maybe_sleep
+    case "$MODEL" in
+        pi05)
+            run_job "pi05" "basewrist" PI05_ARGS "$PI05_RESIZE_MODE" "$PI05_BASEWRIST_ENV" PI05_BASEWRIST_EXTRA
+            maybe_sleep
+            # run_job "pi05" "base"  PI05_ARGS "$PI05_RESIZE_MODE" "$PI05_BASE_ENV"  PI05_BASE_EXTRA
+            # maybe_sleep
+            # run_job "pi05" "wrist" PI05_ARGS "$PI05_RESIZE_MODE" "$PI05_WRIST_ENV" PI05_WRIST_EXTRA
+            ;;
+        diffusion)
+            run_job "diffusion" "basewrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$DIFFUSION_BASEWRIST_ENV" DIFFUSION_BASEWRIST_EXTRA
+            maybe_sleep
+            # run_job "diffusion" "base"  DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$DIFFUSION_BASE_ENV"  DIFFUSION_BASE_EXTRA
+            # maybe_sleep
+            # run_job "diffusion" "wrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$DIFFUSION_WRIST_ENV" DIFFUSION_WRIST_EXTRA
+            ;;
+        act)
+            run_job "act" "basewrist" ACT_ARGS "$ACT_RESIZE_MODE" "$ACT_BASEWRIST_ENV" ACT_BASEWRIST_EXTRA
+            maybe_sleep
+            # run_job "act" "base"  ACT_ARGS "$ACT_RESIZE_MODE" "$ACT_BASE_ENV"  ACT_BASE_EXTRA
+            # maybe_sleep
+            # run_job "act" "wrist" ACT_ARGS "$ACT_RESIZE_MODE" "$ACT_WRIST_ENV" ACT_WRIST_EXTRA
+            ;;
+    esac
 }
 
 # ── Plain run or ratio sweep ───────────────────────────────────

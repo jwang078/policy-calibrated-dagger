@@ -12,10 +12,19 @@
 #
 # Handles diffusion_approach_lever_*, pi05_approach_lever_*, and act_approach_lever_* folders.
 #
-# Usage: ./run_all_evals.sh [--dry-run] [--list] [--first-only] [--n-episodes int] [--episode-length int] [--temporal-ensemble] [--temporal-ensemble-coeff float] [--temporal-ensemble-n-action-steps int]
+# Usage: ./run_all_evals.sh [--dry-run] [--list] [--first-only] [--n-episodes int] [--episode-length int] [--temporal-ensemble] [--temporal-ensemble-coeff float] [--temporal-ensemble-n-action-steps int] [--filter PATTERN]
 #   --dry-run:                          Show commands without executing them
 #   --list:                             Only list experiments and checkpoints to evaluate, then exit
 #   --first-only:                       Only evaluate the first checkpoint per experiment (for debugging)
+#   --filter PATTERN:                   Restrict to experiments whose folder basename matches PATTERN.
+#                                       Uses bash glob syntax (case-sensitive): *, ?, [abc], [a-z].
+#                                       Examples:
+#                                         --filter 'diffusion*'                      → only diffusion_* folders
+#                                         --filter 'pi05_approach_lever_*_d30jvm*'   → just the d30jvm pi05 lineage
+#                                         --filter '*_ft_dag[3-9]'                   → only finetune rounds 3..9
+#                                       Quote the pattern so the shell doesn't expand it before this
+#                                       script sees it. Applied in both the listing summary and the
+#                                       actual eval loop.
 #   --n-episodes:                       Number of first-N benchmark scenarios to evaluate (default 5)
 #   --episode-length:                   Max steps per episode (default: use env default)
 #   --temporal-ensemble:                Enable TemporalEnsemblePolicyWrapper at eval time. Adds
@@ -78,6 +87,7 @@ TEMPORAL_ENSEMBLE_PIN_NOISE=false
 LAST_MILE_DEBUG=false
 LAST_MILE_DEBUG_THRESHOLD=0.05
 LAST_MILE_DEBUG_ALPHA=1.0
+FILTER=""  # empty = no filter; set via --filter to a bash glob like "diffusion*"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -137,6 +147,10 @@ while [[ $# -gt 0 ]]; do
             LAST_MILE_DEBUG_ALPHA="$2"
             shift 2
             ;;
+        --filter)
+            FILTER="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown argument: $1" >&2
             echo "See the header comment for the supported flags." >&2
@@ -158,6 +172,31 @@ EXP_PATTERNS=("$OUTPUTS_DIR"/training/diffusion_approach_lever_* "$OUTPUTS_DIR"/
 # --seed=0 in lerobot-eval, the seed-pinned reset path picks scenarios
 # 0..n_episodes-1 in order, so all checkpoints see the same scenarios.
 EVAL_BENCHMARK_REPO_ID="JennyWWW/eval_splatsim_approach_lever_benchmark_1000"
+
+# Apply --filter to EXP_PATTERNS. The filter is a bash glob pattern matched
+# against the experiment folder basename. Done once here so both the
+# listing summary loop and the eval loop below use the same set, and any
+# downstream code that iterates EXP_PATTERNS sees the filtered list.
+if [[ -n "$FILTER" ]]; then
+    _FILTERED_EXPS=()
+    for _exp_dir in "${EXP_PATTERNS[@]}"; do
+        [[ -d "$_exp_dir" ]] || continue
+        _exp_name=$(basename "$_exp_dir")
+        # Intentional unquoted $FILTER so bash treats it as a glob pattern,
+        # not a literal string. Quotes around the LHS are fine.
+        # shellcheck disable=SC2053
+        if [[ "$_exp_name" == $FILTER ]]; then
+            _FILTERED_EXPS+=("$_exp_dir")
+        fi
+    done
+    EXP_PATTERNS=("${_FILTERED_EXPS[@]}")
+    echo "Filter '$FILTER' applied: ${#EXP_PATTERNS[@]} experiment(s) match."
+    echo ""
+    if (( ${#EXP_PATTERNS[@]} == 0 )); then
+        echo "Nothing to evaluate after applying --filter. Exiting."
+        exit 0
+    fi
+fi
 
 # Collect all experiment folders that will be processed
 echo "========================================"

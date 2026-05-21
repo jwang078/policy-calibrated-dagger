@@ -23,6 +23,13 @@ set -euo pipefail
 #   --eval_freq=N              Override eval frequency.
 #   --save_freq=N              Override save frequency.
 #   --scheduler_decay_steps=N  Explicit override (defaults to --steps when set).
+#   --scheduler.name=NAME      Override the top-level cfg.scheduler.name (only
+#                              applies to schedulers that expose a `name` field,
+#                              i.e. the `diffuser` HF-diffusers wrapper). Use
+#                              `constant` to flatten the LR at peak for a
+#                              diffusion finetune — the HF cosine scheduler
+#                              decays to 0 by end-of-training and is useless
+#                              for resumes past the original step count.
 #   --dataset.repo_id=ID       Override the dataset to finetune on. Usually paired
 #                              with --dataset.stats_path (the inherited stats path
 #                              from train_config.json is from the prior dataset
@@ -35,6 +42,18 @@ set -euo pipefail
 #                              of spawning a new one. Required when running this
 #                              alongside other GPU-hungry processes — see the
 #                              dagger_orchestrate.sh shared-sim setup.
+#   --env.eval_benchmark_repo_id=ID
+#                              Override the inline eval's benchmark dataset.
+#                              Resumed configs sometimes have this unset (e.g.
+#                              checkpoints trained before benchmark eval was
+#                              wired up), causing inline eval to fall back to
+#                              random scenarios. Pass this to lock eval to the
+#                              benchmark set.
+#   --env.eval_benchmark_subset=JSON
+#                              Restrict inline eval to a specific subset of
+#                              benchmark episodes, e.g. "[0,1,2,3,4]". Pair
+#                              with --env.eval_benchmark_repo_id for fixed
+#                              round-over-round eval scenarios.
 #   --policy.repo_id=ID        Rename the resumed run's policy.repo_id. Useful for
 #                              tagging a finetune as a NEW training run (e.g. an
 #                              _ft suffix) so it doesn't write back into the
@@ -137,9 +156,12 @@ SCHEDULER_DECAY_STEPS=""
 # when 200-2000 finetune steps at the (much smaller) cosine floor would
 # barely move the model.
 SCHEDULER_DECAY_LR=""
+SCHEDULER_NAME=""
 DATASET_REPO_ID=""
 DATASET_STATS_PATH=""
 ENV_EXTERNAL_PORT=""
+ENV_EVAL_BENCHMARK_REPO_ID=""
+ENV_EVAL_BENCHMARK_SUBSET=""
 POLICY_REPO_ID=""
 POLICY_PUSH_TO_HUB=""   # empty = inherit from train_config.json
 OUTPUT_DIR=""
@@ -154,9 +176,12 @@ for arg in "$@"; do
         --save_freq=*)              SAVE_FREQ="${arg#*=}" ;;
         --scheduler_decay_steps=*)  SCHEDULER_DECAY_STEPS="${arg#*=}" ;;
         --scheduler_decay_lr=*)     SCHEDULER_DECAY_LR="${arg#*=}" ;;
+        --scheduler.name=*)         SCHEDULER_NAME="${arg#*=}" ;;
         --dataset.repo_id=*)        DATASET_REPO_ID="${arg#*=}" ;;
         --dataset.stats_path=*)     DATASET_STATS_PATH="${arg#*=}" ;;
         --env.external_port=*)      ENV_EXTERNAL_PORT="${arg#*=}" ;;
+        --env.eval_benchmark_repo_id=*) ENV_EVAL_BENCHMARK_REPO_ID="${arg#*=}" ;;
+        --env.eval_benchmark_subset=*) ENV_EVAL_BENCHMARK_SUBSET="${arg#*=}" ;;
         --policy.repo_id=*)         POLICY_REPO_ID="${arg#*=}" ;;
         --policy.push_to_hub=*)     POLICY_PUSH_TO_HUB="${arg#*=}" ;;
         --output_dir=*)             OUTPUT_DIR="${arg#*=}" ;;
@@ -205,23 +230,61 @@ except Exception:
 fi
 
 # ── build command ────────────────────────────────────────────────────────────
+# scheduler_decay_steps / scheduler_decay_lr are pi05/pi0-specific fields.
+# Diffusion uses HF diffusers' cosine scheduler (no decay_lr concept); ACT
+# uses a flat LR. For those, the --policy.scheduler_decay_* overrides would
+# raise a draccus DecodingError ("fields not valid for DiffusionConfig").
+# Probe the resumed config to determine which fields are supported and emit
+# overrides accordingly.
+POLICY_SUPPORTS_DECAY_STEPS="$(python3 -c "
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+    print('true' if 'scheduler_decay_steps' in c.get('policy', {}) else 'false')
+except Exception:
+    print('false')
+" "$CONFIG_PATH" 2>/dev/null)"
+POLICY_SUPPORTS_DECAY_LR="$(python3 -c "
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+    print('true' if 'scheduler_decay_lr' in c.get('policy', {}) else 'false')
+except Exception:
+    print('false')
+" "$CONFIG_PATH" 2>/dev/null)"
+
 CMD="PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True lerobot-train"
 CMD="$CMD --resume=true"
 CMD="$CMD --config_path=$CONFIG_PATH"
 [[ -n "$STEPS" ]]                  && CMD="$CMD --steps=$STEPS"
 [[ -n "$EVAL_FREQ" ]]              && CMD="$CMD --eval_freq=$EVAL_FREQ"
 [[ -n "$SAVE_FREQ" ]]              && CMD="$CMD --save_freq=$SAVE_FREQ"
-[[ -n "$SCHEDULER_DECAY_STEPS" ]]  && CMD="$CMD --policy.scheduler_decay_steps=$SCHEDULER_DECAY_STEPS"
+if [[ -n "$SCHEDULER_DECAY_STEPS" ]]; then
+    if [[ "$POLICY_SUPPORTS_DECAY_STEPS" == "true" ]]; then
+        CMD="$CMD --policy.scheduler_decay_steps=$SCHEDULER_DECAY_STEPS"
+    else
+        echo "  Skipping --policy.scheduler_decay_steps=$SCHEDULER_DECAY_STEPS (policy has no scheduler_decay_steps field)."
+    fi
+fi
 # On resume, cfg.scheduler is already populated from the loaded train_config.json
 # and the `use_policy_training_preset` rebuild-from-policy branch does NOT fire,
 # so overriding --policy.scheduler_decay_lr saves the new value into the policy
 # config but the *runtime* scheduler keeps the original decay_lr. Override BOTH
 # (policy field for consistency on the next save; top-level cfg.scheduler.decay_lr
 # is the one that actually drives the runtime LR schedule).
-[[ -n "$SCHEDULER_DECAY_LR" ]]     && CMD="$CMD --policy.scheduler_decay_lr=$SCHEDULER_DECAY_LR --scheduler.decay_lr=$SCHEDULER_DECAY_LR"
+if [[ -n "$SCHEDULER_DECAY_LR" ]]; then
+    if [[ "$POLICY_SUPPORTS_DECAY_LR" == "true" ]]; then
+        CMD="$CMD --policy.scheduler_decay_lr=$SCHEDULER_DECAY_LR --scheduler.decay_lr=$SCHEDULER_DECAY_LR"
+    else
+        echo "  Skipping --policy.scheduler_decay_lr=$SCHEDULER_DECAY_LR (policy has no scheduler_decay_lr field; diffusion/act use a different scheduler API)."
+    fi
+fi
+[[ -n "$SCHEDULER_NAME" ]] && CMD="$CMD --scheduler.name=$SCHEDULER_NAME"
 [[ -n "$DATASET_REPO_ID" ]]        && CMD="$CMD --dataset.repo_id=$DATASET_REPO_ID"
 [[ -n "$DATASET_STATS_PATH" ]]     && CMD="$CMD --dataset.stats_path=$DATASET_STATS_PATH"
 [[ -n "$ENV_EXTERNAL_PORT" ]]      && CMD="$CMD --env.external_port=$ENV_EXTERNAL_PORT"
+[[ -n "$ENV_EVAL_BENCHMARK_REPO_ID" ]] && CMD="$CMD --env.eval_benchmark_repo_id=$ENV_EVAL_BENCHMARK_REPO_ID"
+[[ -n "$ENV_EVAL_BENCHMARK_SUBSET" ]] && CMD="$CMD --env.eval_benchmark_subset=$ENV_EVAL_BENCHMARK_SUBSET"
 [[ -n "$POLICY_REPO_ID" ]]         && CMD="$CMD --policy.repo_id=$POLICY_REPO_ID"
 [[ -n "$POLICY_PUSH_TO_HUB" ]]     && CMD="$CMD --policy.push_to_hub=$POLICY_PUSH_TO_HUB"
 [[ -n "$OUTPUT_DIR" ]]             && CMD="$CMD --output_dir=$OUTPUT_DIR"
@@ -239,11 +302,14 @@ elif [[ -n "$SCHEDULER_DECAY_STEPS" ]]; then
     echo "Override:      --policy.scheduler_decay_steps=$SCHEDULER_DECAY_STEPS"
 fi
 [[ -n "$SCHEDULER_DECAY_LR" ]] && echo "Override:      --policy.scheduler_decay_lr=$SCHEDULER_DECAY_LR --scheduler.decay_lr=$SCHEDULER_DECAY_LR"
+[[ -n "$SCHEDULER_NAME" ]]     && echo "Override:      --scheduler.name=$SCHEDULER_NAME"
 [[ -n "$EVAL_FREQ" ]]          && echo "Override:      --eval_freq=$EVAL_FREQ"
 [[ -n "$SAVE_FREQ" ]]          && echo "Override:      --save_freq=$SAVE_FREQ"
 [[ -n "$DATASET_REPO_ID" ]]    && echo "Override:      --dataset.repo_id=$DATASET_REPO_ID"
 [[ -n "$DATASET_STATS_PATH" ]] && echo "Override:      --dataset.stats_path=$DATASET_STATS_PATH"
 [[ -n "$ENV_EXTERNAL_PORT" ]]  && echo "Override:      --env.external_port=$ENV_EXTERNAL_PORT"
+[[ -n "$ENV_EVAL_BENCHMARK_REPO_ID" ]] && echo "Override:      --env.eval_benchmark_repo_id=$ENV_EVAL_BENCHMARK_REPO_ID"
+[[ -n "$ENV_EVAL_BENCHMARK_SUBSET" ]] && echo "Override:      --env.eval_benchmark_subset=$ENV_EVAL_BENCHMARK_SUBSET"
 [[ -n "$POLICY_REPO_ID" ]]     && echo "Override:      --policy.repo_id=$POLICY_REPO_ID"
 [[ -n "$POLICY_PUSH_TO_HUB" ]] && echo "Override:      --policy.push_to_hub=$POLICY_PUSH_TO_HUB"
 [[ -n "$OUTPUT_DIR" ]]         && echo "Override:      --output_dir=$OUTPUT_DIR"

@@ -42,13 +42,18 @@ class PathSelectionStrategy(Enum):
       consecutive waypoints. Legacy behavior; tends to prefer paths that
       happen to land near `q_start` in configuration space even if the EE
       swings wide.
-    * ``JOINT_VELOCITY_MATCH`` — L2 distance between the candidate's
-      initial joint velocity (averaged over the first few path samples)
-      and the robot's recent joint velocity (averaged over the last few
-      samples before the trigger). Picks the path that maintains the
-      current motion direction the most, minimizing the velocity
-      discontinuity at the trigger moment. Requires `recent_joint_velocity`
-      to be passed to `plan()`; raises `RRTPlanningError` if not.
+    * ``JOINT_VELOCITY_MATCH`` — cosine distance between the candidate's
+      initial direction (averaged over the first few path samples) and
+      the robot's recent direction (averaged over the last few samples
+      before the trigger). Picks the path that starts off in the same
+      direction the robot was already moving, minimizing the velocity
+      discontinuity at the trigger moment. Direction-only (not
+      magnitude-matching) because the candidate's raw waypoint deltas
+      are in different units than the robot's per-tick velocity — see
+      ``_path_velocity_deviation``. When the robot's recent velocity is
+      near zero (typical from a collision/stall trigger), falls back to
+      EE_ARC_LENGTH. Requires `recent_joint_velocity` to be passed to
+      `plan()`; raises `RRTPlanningError` if not.
     """
 
     EE_ARC_LENGTH = "ee_arc_length"
@@ -656,25 +661,53 @@ class RRTToGoalPlanner:
         path: np.ndarray,
         recent_joint_velocity: np.ndarray,
     ) -> float:
-        """L2 norm of (candidate initial velocity − robot recent velocity).
+        """Cosine distance between candidate's initial DIRECTION and the
+        robot's recent DIRECTION (lower = better aligned).
 
-        Both velocities are computed as the mean per-step joint delta
-        averaged over `velocity_match_window` samples — the candidate path's
-        leading samples (`path[1] - path[0]`, `path[2] - path[1]`, ...) on
-        the candidate side, and the caller-provided `recent_joint_velocity`
-        (already averaged) on the robot side. Lower deviation = the
-        candidate's first few steps continue the robot's current motion the
-        most, minimizing the velocity discontinuity at the trigger moment.
+        An earlier version computed an L2 distance between magnitudes
+        directly, but that conflates two different units: the candidate's
+        ``leading_deltas`` are spatial deltas between raw RRT waypoints
+        (which aren't uniformly time-spaced), while ``recent_joint_velocity``
+        is a real per-step velocity (rad / control-tick). Comparing their
+        magnitudes ranked paths in a way that didn't survive Ruckig's
+        time-parametrization, producing sustained high-velocity stretches
+        in some recorded trajectories (e.g. one joint at 5 rad/s for many
+        consecutive frames). Direction-only comparison sidesteps the
+        unit mismatch — we ask "does the candidate START in the same
+        direction the robot was already moving" without trying to match
+        magnitudes that aren't comparable.
+
+        Fallback: when the robot's recent velocity is near zero (typical
+        when RRT triggers from a collision/stall — no direction to match),
+        we delegate to EE arc-length so the candidate selection isn't
+        random. Threshold is sized to per-step deltas at 30 Hz, where
+        ~5e-4 rad/step ≈ 1.5e-2 rad/s of total joint motion across the
+        ``velocity_match_window`` — below that, the direction is dominated
+        by sensor noise.
         """
         if path.shape[0] < 2:
             # Degenerate path — no motion to compare against. Return a large
             # penalty so any candidate with real motion wins over this one.
             return float("inf")
+        recent_vel = recent_joint_velocity.reshape(-1)[: self._num_dofs]
+        recent_norm = float(np.linalg.norm(recent_vel))
+        if recent_norm < 5e-4:
+            # No meaningful direction — fall back to EE arc length to avoid
+            # picking among candidates at random.
+            return self._path_ee_arc_length(path)
         window = max(1, min(self._velocity_match_window, path.shape[0] - 1))
         leading_deltas = np.diff(path[: window + 1], axis=0)  # [window, num_dofs]
         candidate_vel = leading_deltas.mean(axis=0)
-        recent_vel = recent_joint_velocity.reshape(-1)[: self._num_dofs]
-        return float(np.linalg.norm(candidate_vel - recent_vel))
+        cand_norm = float(np.linalg.norm(candidate_vel))
+        if cand_norm < 1e-9:
+            # Candidate path starts with all-zero deltas (degenerate RRT
+            # sampling). Maximally misaligned with any nonzero recent_vel.
+            return 1.0
+        cos_sim = float(np.dot(candidate_vel, recent_vel) / (cand_norm * recent_norm))
+        # Clip to [-1, 1] to guard against rounding errors, then 1 - cos:
+        # range becomes [0, 2], with 0 = perfectly aligned, 2 = opposite.
+        cos_sim = max(-1.0, min(1.0, cos_sim))
+        return 1.0 - cos_sim
 
     def _path_ee_arc_length(self, path: np.ndarray) -> float:
         """Sum of Euclidean distances between consecutive end-effector world

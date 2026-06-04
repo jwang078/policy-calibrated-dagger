@@ -158,6 +158,13 @@ SCHEDULER_DECAY_STEPS=""
 SCHEDULER_DECAY_LR=""
 SCHEDULER_NAME=""
 DATASET_REPO_ID=""
+# Tri-state: empty string + "not explicit" → omit the flag entirely (resumed
+# train_config.json's repo_id wins). Empty string + "explicit" → forward as
+# `--dataset.repo_id=` so it overrides the loaded value with empty, which is
+# exactly what weighted-multi-dataset mode needs (the loaded repo_id would
+# otherwise collide with --dataset.repo_ids via the mutual-exclusion check
+# in TrainPipelineConfig.validate). Non-empty → forward normally.
+DATASET_REPO_ID_EXPLICIT=false
 DATASET_STATS_PATH=""
 ENV_EXTERNAL_PORT=""
 ENV_EVAL_BENCHMARK_REPO_ID=""
@@ -168,6 +175,11 @@ OUTPUT_DIR=""
 JOB_NAME=""
 BATCH_SIZE=""           # empty = inherit from train_config.json
 DRY_RUN=false
+# Unknown --key=value args are passed through to lerobot-train verbatim. Lets
+# callers (e.g. dagger_orchestrate.sh's --finetune_extra_args) override any
+# lerobot-train flag without this script having to enumerate them. Bare
+# positional args or unknown --flag (without =) still error so typos are caught.
+EXTRA_LEROBOT_TRAIN_ARGS=()
 
 for arg in "$@"; do
     case "$arg" in
@@ -177,7 +189,7 @@ for arg in "$@"; do
         --scheduler_decay_steps=*)  SCHEDULER_DECAY_STEPS="${arg#*=}" ;;
         --scheduler_decay_lr=*)     SCHEDULER_DECAY_LR="${arg#*=}" ;;
         --scheduler.name=*)         SCHEDULER_NAME="${arg#*=}" ;;
-        --dataset.repo_id=*)        DATASET_REPO_ID="${arg#*=}" ;;
+        --dataset.repo_id=*)        DATASET_REPO_ID="${arg#*=}"; DATASET_REPO_ID_EXPLICIT=true ;;
         --dataset.stats_path=*)     DATASET_STATS_PATH="${arg#*=}" ;;
         --env.external_port=*)      ENV_EXTERNAL_PORT="${arg#*=}" ;;
         --env.eval_benchmark_repo_id=*) ENV_EVAL_BENCHMARK_REPO_ID="${arg#*=}" ;;
@@ -188,6 +200,7 @@ for arg in "$@"; do
         --job_name=*)               JOB_NAME="${arg#*=}" ;;
         --batch_size=*)             BATCH_SIZE="${arg#*=}" ;;
         --dry-run)                  DRY_RUN=true ;;
+        --*=*)                      EXTRA_LEROBOT_TRAIN_ARGS+=( "$arg" ) ;;
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
@@ -253,15 +266,27 @@ except Exception:
     print('false')
 " "$CONFIG_PATH" 2>/dev/null)"
 
-CMD="PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True lerobot-train"
-CMD="$CMD --resume=true"
-CMD="$CMD --config_path=$CONFIG_PATH"
-[[ -n "$STEPS" ]]                  && CMD="$CMD --steps=$STEPS"
-[[ -n "$EVAL_FREQ" ]]              && CMD="$CMD --eval_freq=$EVAL_FREQ"
-[[ -n "$SAVE_FREQ" ]]              && CMD="$CMD --save_freq=$SAVE_FREQ"
+# Build the lerobot-train invocation as a bash array (NOT a flat string).
+# This preserves quoting on values that contain shell metacharacters — e.g.
+# the bracketed JSON lists passed for weighted-multi-dataset training:
+#   --dataset.repo_ids=["A","B"]
+# The earlier flat-string + `eval "$CMD"` form word-split on the spaces inside
+# such values and stripped the inner double-quotes, which broke draccus's
+# JSON-mode list parser (the `--config_path=...json` path activates
+# `draccus.config_type("json")` which requires `["A","B"]` not `[A,B]`).
+# Array form sidesteps both problems: argv elements pass through exec
+# unmolested, no eval, no word-splitting.
+#
+# PYTORCH_CUDA_ALLOC_CONF is exported so it sticks for the lerobot-train
+# child without needing a separate `env` wrapper around the array exec.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+CMD_ARGS=( lerobot-train --resume=true --config_path="$CONFIG_PATH" )
+[[ -n "$STEPS" ]]                  && CMD_ARGS+=( --steps="$STEPS" )
+[[ -n "$EVAL_FREQ" ]]              && CMD_ARGS+=( --eval_freq="$EVAL_FREQ" )
+[[ -n "$SAVE_FREQ" ]]              && CMD_ARGS+=( --save_freq="$SAVE_FREQ" )
 if [[ -n "$SCHEDULER_DECAY_STEPS" ]]; then
     if [[ "$POLICY_SUPPORTS_DECAY_STEPS" == "true" ]]; then
-        CMD="$CMD --policy.scheduler_decay_steps=$SCHEDULER_DECAY_STEPS"
+        CMD_ARGS+=( --policy.scheduler_decay_steps="$SCHEDULER_DECAY_STEPS" )
     else
         echo "  Skipping --policy.scheduler_decay_steps=$SCHEDULER_DECAY_STEPS (policy has no scheduler_decay_steps field)."
     fi
@@ -274,22 +299,27 @@ fi
 # is the one that actually drives the runtime LR schedule).
 if [[ -n "$SCHEDULER_DECAY_LR" ]]; then
     if [[ "$POLICY_SUPPORTS_DECAY_LR" == "true" ]]; then
-        CMD="$CMD --policy.scheduler_decay_lr=$SCHEDULER_DECAY_LR --scheduler.decay_lr=$SCHEDULER_DECAY_LR"
+        CMD_ARGS+=( --policy.scheduler_decay_lr="$SCHEDULER_DECAY_LR" --scheduler.decay_lr="$SCHEDULER_DECAY_LR" )
     else
         echo "  Skipping --policy.scheduler_decay_lr=$SCHEDULER_DECAY_LR (policy has no scheduler_decay_lr field; diffusion/act use a different scheduler API)."
     fi
 fi
-[[ -n "$SCHEDULER_NAME" ]] && CMD="$CMD --scheduler.name=$SCHEDULER_NAME"
-[[ -n "$DATASET_REPO_ID" ]]        && CMD="$CMD --dataset.repo_id=$DATASET_REPO_ID"
-[[ -n "$DATASET_STATS_PATH" ]]     && CMD="$CMD --dataset.stats_path=$DATASET_STATS_PATH"
-[[ -n "$ENV_EXTERNAL_PORT" ]]      && CMD="$CMD --env.external_port=$ENV_EXTERNAL_PORT"
-[[ -n "$ENV_EVAL_BENCHMARK_REPO_ID" ]] && CMD="$CMD --env.eval_benchmark_repo_id=$ENV_EVAL_BENCHMARK_REPO_ID"
-[[ -n "$ENV_EVAL_BENCHMARK_SUBSET" ]] && CMD="$CMD --env.eval_benchmark_subset=$ENV_EVAL_BENCHMARK_SUBSET"
-[[ -n "$POLICY_REPO_ID" ]]         && CMD="$CMD --policy.repo_id=$POLICY_REPO_ID"
-[[ -n "$POLICY_PUSH_TO_HUB" ]]     && CMD="$CMD --policy.push_to_hub=$POLICY_PUSH_TO_HUB"
-[[ -n "$OUTPUT_DIR" ]]             && CMD="$CMD --output_dir=$OUTPUT_DIR"
-[[ -n "$JOB_NAME" ]]               && CMD="$CMD --job_name=$JOB_NAME"
-[[ -n "$BATCH_SIZE" ]]             && CMD="$CMD --batch_size=$BATCH_SIZE"
+[[ -n "$SCHEDULER_NAME" ]]             && CMD_ARGS+=( --scheduler.name="$SCHEDULER_NAME" )
+[[ "$DATASET_REPO_ID_EXPLICIT" == true ]] && CMD_ARGS+=( --dataset.repo_id="$DATASET_REPO_ID" )
+[[ -n "$DATASET_STATS_PATH" ]]         && CMD_ARGS+=( --dataset.stats_path="$DATASET_STATS_PATH" )
+[[ -n "$ENV_EXTERNAL_PORT" ]]          && CMD_ARGS+=( --env.external_port="$ENV_EXTERNAL_PORT" )
+[[ -n "$ENV_EVAL_BENCHMARK_REPO_ID" ]] && CMD_ARGS+=( --env.eval_benchmark_repo_id="$ENV_EVAL_BENCHMARK_REPO_ID" )
+[[ -n "$ENV_EVAL_BENCHMARK_SUBSET" ]]  && CMD_ARGS+=( --env.eval_benchmark_subset="$ENV_EVAL_BENCHMARK_SUBSET" )
+[[ -n "$POLICY_REPO_ID" ]]             && CMD_ARGS+=( --policy.repo_id="$POLICY_REPO_ID" )
+[[ -n "$POLICY_PUSH_TO_HUB" ]]         && CMD_ARGS+=( --policy.push_to_hub="$POLICY_PUSH_TO_HUB" )
+[[ -n "$OUTPUT_DIR" ]]                 && CMD_ARGS+=( --output_dir="$OUTPUT_DIR" )
+[[ -n "$JOB_NAME" ]]                   && CMD_ARGS+=( --job_name="$JOB_NAME" )
+[[ -n "$BATCH_SIZE" ]]                 && CMD_ARGS+=( --batch_size="$BATCH_SIZE" )
+# Forward any unknown --key=value args verbatim. Note: if an override here
+# duplicates one of the explicit flags above, lerobot-train uses the LAST
+# value seen, so passthrough takes precedence — caller can override e.g.
+# --eval_freq via the passthrough path if they really want to.
+CMD_ARGS+=( "${EXTRA_LEROBOT_TRAIN_ARGS[@]}" )
 
 # ── print summary ────────────────────────────────────────────────────────────
 echo "================================================================"
@@ -318,7 +348,13 @@ fi
 echo "================================================================"
 echo
 echo "Command:"
-echo "$CMD"
+# Print the array with single-quoted args so the printed command is also
+# the LITERAL command (no quote-stripping surprise for the user copying it
+# into a shell). printf '%q' renders each token in shell-quoted form;
+# stitching them together yields an exact, copy-pasteable command line.
+printf 'PYTORCH_CUDA_ALLOC_CONF=%q' "$PYTORCH_CUDA_ALLOC_CONF"
+for _a in "${CMD_ARGS[@]}"; do printf ' %q' "$_a"; done
+echo
 echo
 
 if [[ "$DRY_RUN" == true ]]; then
@@ -326,6 +362,7 @@ if [[ "$DRY_RUN" == true ]]; then
     exit 0
 fi
 
-# eval is safe here because every interpolated value either comes from the
-# resolved config path or from numeric option values (no shell metachars).
-eval "$CMD"
+# Direct array exec — no eval, no flat string. Each CMD_ARGS element passes
+# through as a single argv token, so quoted values like
+# `--dataset.repo_ids=["A","B"]` reach lerobot-train byte-for-byte.
+"${CMD_ARGS[@]}"

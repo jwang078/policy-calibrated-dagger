@@ -369,8 +369,11 @@ class RRTGuidanceSource:
             logger.warning("RRT planning failed: %s", e)
             st.mode = GuidanceMode.IDLE
             return
-        except Exception:
-            logger.exception("Unexpected error during RRT planning")
+        except Exception as e:
+            # Surface the exception type + message inline so it's visible
+            # alongside the "ERROR ... Unexpected error" line, in addition to
+            # the full traceback that logger.exception() writes via exc_info.
+            logger.exception("Unexpected error during RRT planning: %s: %s", type(e).__name__, e)
             st.mode = GuidanceMode.IDLE
             return
 

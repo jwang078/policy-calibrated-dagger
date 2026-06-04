@@ -125,9 +125,25 @@ class ScenarioResult:
     plan_failures: int
     method: str = ""
     # Comma-separated chronological list of trigger reasons for each cycle
-    # that fired this scenario. Possible values: "stall", "in_collision",
-    # "no_progress". Empty string if no cycles fired (e.g. instant success).
+    # that fired this scenario. Possible values: "time stall", "in_collision",
+    # "no_progress", "no_progress_ori". Empty string if no cycles fired
+    # (e.g. instant success).
     triggers: str = ""
+    # Comma-separated chronological list of scenario-relative step indices at
+    # which each trigger fired. Parallel to `triggers` (same ordering and
+    # length): trigger_steps.split(",")[i] is when triggers.split(",")[i]
+    # fired. Step 0 = first tick of the scenario; counts every tick (policy
+    # phase + RRT phase). Empty string when no cycles fired.
+    trigger_steps: str = ""
+    # Comma-separated count of plan steps the i-th triggered cycle actually
+    # executed. Parallel to `triggers` / `trigger_steps`. Two completion
+    # modes: controller-cancel (value == target_rrt_steps, sampled in
+    # [rrt_steps_min, rrt_steps_max]) OR natural finish (value < target).
+    # 0 indicates the trigger fired but the plan never reached EXECUTING
+    # (planning failed). Use with `trigger_steps[i]` to derive video frame
+    # ranges: intervention spans [trigger_steps[i], trigger_steps[i] +
+    # rrt_steps_executed[i]).
+    rrt_steps_executed: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -231,9 +247,31 @@ class InterventionController:
         self.last_status: str = "running"
         # Chronological list of trigger reasons for each intervention cycle
         # that fired this scenario. Same vocabulary as the "Triggering %s
-        # (%s)..." log line: "stall", "in_collision", "no_progress".
-        # Reset on scenario reset; appended on every trigger fire.
+        # (%s)..." log line: "time stall", "in_collision", "no_progress",
+        # "no_progress_ori". Reset on scenario reset; appended on every fire.
         self.trigger_reasons: list[str] = []
+        # Parallel list of scenario-relative step indices at which each
+        # trigger in ``trigger_reasons`` fired. Together these answer "what
+        # caused intervention N, and when in the scenario did it happen".
+        self.trigger_steps: list[int] = []
+        # Parallel list of how many RRT/oracle plan steps actually executed
+        # for the i-th triggered cycle. Two completion modes feed this:
+        #   * controller-initiated cancel → final value == ``target_rrt_steps``
+        #     (the random cap chosen at trigger time from
+        #     [rrt_steps_min, rrt_steps_max]).
+        #   * natural finish (plan exhausted before the cap) → final value <
+        #     ``target_rrt_steps`` — the plan was shorter than the cap.
+        # Appended as 0 at trigger fire (in case the trigger never reaches
+        # EXECUTING — e.g. planning fails) and overwritten by ``rrt_step_count``
+        # at cycle completion. Used by downstream tooling (and humans grepping
+        # the per-scenario CSV) to map video timestamps back to "policy vs
+        # intervention" segments: cycle i runs the env for
+        # ``rrt_steps_executed[i]`` ticks starting at ``trigger_steps[i]``.
+        self.rrt_steps_executed: list[int] = []
+        # Total ticks (policy + RRT phases) since the last scenario reset.
+        # Incremented at the top of every ``tick()`` call so it's monotonic
+        # within a scenario regardless of which phase is active.
+        self.total_step_count: int = 0
 
     def reset_for_new_scenario(self) -> None:
         self.policy_step_count = 0
@@ -250,6 +288,9 @@ class InterventionController:
         self.backoff_rounds = 0
         self.last_status = "running"
         self.trigger_reasons = []
+        self.trigger_steps = []
+        self.rrt_steps_executed = []
+        self.total_step_count = 0
         if self._progress_tracker is not None:
             self._progress_tracker.reset()
         if self._orientation_tracker is not None:
@@ -303,6 +344,25 @@ class InterventionController:
         hi = max(lo, self.cfg.policy_steps_between_rrt_max)
         self.next_policy_threshold = random.randint(lo, hi)
 
+    def _finalize_active_rrt_steps(self) -> None:
+        """If a cycle was still mid-EXECUTING when the scenario ends, overwrite
+        the placeholder 0 in ``rrt_steps_executed[-1]`` with the actual
+        ``rrt_step_count``.
+
+        Background: ``tick()`` appends 0 to ``rrt_steps_executed`` at trigger
+        fire and overwrites it at cycle completion (controller-cancel /
+        natural-finish). But if the scenario ends via ``return "advance"``
+        BEFORE either completion path runs (e.g. env reports success while
+        RRT is still actively executing), the placeholder stays 0 and the
+        CSV misreports "0 steps executed" for the last cycle.
+
+        Idempotent — only updates when the placeholder is still its initial
+        0 AND a cycle is currently in flight (``rrt_step_count > 0``). Safe
+        to call before every ``return "advance"`` exit path.
+        """
+        if self.rrt_step_count > 0 and self.rrt_steps_executed and self.rrt_steps_executed[-1] == 0:
+            self.rrt_steps_executed[-1] = self.rrt_step_count
+
     def tick(
         self,
         success: bool,
@@ -344,9 +404,14 @@ class InterventionController:
         # Capture mode for next tick BEFORE branches that might mutate it via
         # _cancel — we want the mode the source had when this tick started.
         self.prev_mode = mode
+        # Scenario-relative step index. Incremented before any return so the
+        # counter accurately reflects "ticks observed since scenario reset"
+        # whether or not this tick ends up doing real work.
+        self.total_step_count += 1
 
         if success:
             self.last_status = "success"
+            self._finalize_active_rrt_steps()
             return "advance"
 
         # Pure teleop priority — no automated triggers while ratio==0. We do
@@ -368,6 +433,11 @@ class InterventionController:
             )
             self.unexpected_natural_finish = True
             self.cycles_used += 1
+            # Record this cycle's executed step count BEFORE the reset so the
+            # CSV shows how far the plan got before exhausting itself. Mirrors
+            # the controller-cancel branch above.
+            if self.rrt_steps_executed:
+                self.rrt_steps_executed[-1] = self.rrt_step_count
             self.policy_step_count = 0
             self.rrt_step_count = 0
             self.backoff_rounds = 0
@@ -385,6 +455,7 @@ class InterventionController:
                 self.cfg.method.upper(),
             )
             self.last_status = "rrt_finished_no_success"
+            self._finalize_active_rrt_steps()
             return "advance"
 
         # Plan failure detection — RRT-only. We use a "pending trigger" flag set
@@ -423,6 +494,7 @@ class InterventionController:
                     self.cfg.max_backoff_rounds_per_scenario,
                 )
                 self.last_status = "max_backoff_rounds"
+                self._finalize_active_rrt_steps()
                 return "advance"
             self.plan_failures = 0
             self.policy_step_count = 0
@@ -448,6 +520,11 @@ class InterventionController:
                 self._cancel()
                 self.controller_initiated_cancel = True
                 self.cycles_used += 1
+                # Record this cycle's executed step count BEFORE resetting
+                # rrt_step_count. Overwrites the 0 placeholder appended at
+                # trigger fire. Mirrored in the natural-finish branch below.
+                if self.rrt_steps_executed:
+                    self.rrt_steps_executed[-1] = self.rrt_step_count
                 self.rrt_step_count = 0
                 self.policy_step_count = 0
                 # An intervention cycle just executed successfully — the planner
@@ -463,12 +540,14 @@ class InterventionController:
                         self.cfg.max_cycles_per_scenario,
                     )
                     self.last_status = "max_cycles_reached"
+                    self._finalize_active_rrt_steps()
                     return "advance"
             return "continue"
 
         # mode == RRTMode.IDLE
         if self.cycles_used >= self.cfg.max_cycles_per_scenario:
             self.last_status = "max_cycles_reached"
+            self._finalize_active_rrt_steps()
             return "advance"
 
         # Reset the controller-cancel flag now that the cancel has settled.
@@ -523,12 +602,22 @@ class InterventionController:
             elif should_trigger_no_progress_ori:
                 reason = "no_progress_ori"
             else:
-                reason = "stall"
+                reason = "time stall"
             self.trigger_reasons.append(reason)
+            # Step index at which this trigger fired (since scenario reset).
+            # Parallels trigger_reasons by position — written together into
+            # intervention_per_scenario.csv's `triggers` + `trigger_steps`
+            # columns.
+            self.trigger_steps.append(self.total_step_count)
+            # Placeholder; overwritten at cycle completion (controller-cancel
+            # or natural-finish branches below). Stays 0 iff this trigger
+            # never reaches EXECUTING — i.e. planning failed outright.
+            self.rrt_steps_executed.append(0)
             logger.info(
-                "Triggering %s (%s) after %d policy steps (cycle %d/%d, target=%d).",
+                "Triggering %s (%s) at scenario step %d, after %d policy steps (cycle %d/%d, target=%d).",
                 self.cfg.method.upper(),
                 reason,
+                self.total_step_count,
                 self.policy_step_count,
                 self.cycles_used + 1,
                 self.cfg.max_cycles_per_scenario,
@@ -582,9 +671,23 @@ class InterventionContext:
     # row so when CSVs from different runs are concatenated (or when grepping
     # one), each scenario carries its intervention method.
     # `triggers`: chronological comma-separated list of what fired each cycle
-    # in the scenario ("stall", "in_collision", "no_progress"). Empty when no
-    # cycles fired (instant success). Useful for diagnosing whether
-    # interventions are triggering at the right times.
+    # in the scenario ("time stall", "in_collision", "no_progress",
+    # "no_progress_ori"). Empty when no cycles fired (instant success).
+    # Useful for diagnosing whether interventions are triggering at the right
+    # times.
+    # `trigger_steps`: parallel to `triggers`, same comma-separated layout.
+    # Each integer is the scenario-relative tick index at which the
+    # corresponding trigger fired (ticks counted from 0 at scenario reset).
+    # So `triggers="no_progress,time stall"` + `trigger_steps="450,1120"`
+    # means the first cycle fired at step 450 for "no_progress" and the second
+    # at step 1120 for "time stall". Empty string when no cycles fired.
+    # `rrt_steps_executed`: parallel to `triggers` / `trigger_steps`. Each
+    # integer is how many plan steps the i-th cycle actually ran (== target
+    # when the controller cancelled the cycle at its random cap, < target
+    # when the plan exhausted itself first, 0 when planning failed outright
+    # before any EXECUTING steps). Combined with `trigger_steps[i]` it gives
+    # the exact [start, end) tick range of intervention i — useful for
+    # mapping back to video frames.
     CSV_COLUMNS = (
         "scenario_idx",
         "success",
@@ -593,6 +696,8 @@ class InterventionContext:
         "plan_failures",
         "method",
         "triggers",
+        "trigger_steps",
+        "rrt_steps_executed",
     )
 
     def open_csv(self) -> None:
@@ -624,6 +729,8 @@ class InterventionContext:
             ctrl.plan_failures,
             ctrl.cfg.method,
             ",".join(ctrl.trigger_reasons),
+            ",".join(str(s) for s in ctrl.trigger_steps),
+            ",".join(str(s) for s in ctrl.rrt_steps_executed),
         )
         self._csv_writer.writerow(row)
         self._csv_file.flush()

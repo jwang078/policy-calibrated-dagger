@@ -29,6 +29,17 @@
 #                       disk. Pass an explicit value to filter to one prefix.
 #   --watch=SECONDS     Re-print the table every SECONDS seconds. Ctrl-C to stop.
 #                       Default: print once and exit.
+#   --filter SUBSTR [SUBSTR ...]
+#                       Substring filter on lineage names. Each value is
+#                       wrapped as `*SUBSTR*` and matched (case-sensitive)
+#                       with OR semantics — a lineage shows up if ANY filter
+#                       value appears in its name. Multiple values can be
+#                       passed three equivalent ways:
+#                           --filter grip0 g0           (space-separated)
+#                           --filter=grip0,g0           (comma-separated, =)
+#                           --filter grip0 --filter g0  (repeated flag)
+#                       Both the per-lineage tables and the dagger_plot.py
+#                       outputs are filtered to the matching lineages.
 
 set -euo pipefail
 
@@ -37,24 +48,59 @@ ACTION_TAG="abs"
 RUN_TAG=""
 MODEL_PREFIX=""   # empty = scan all known prefixes; set via --model=PREFIX to filter
 WATCH_SEC=""
+FILTERS=()
 TRAINING_ROOT="${HOME}/code/lerobot/outputs/training"
 
 # Known model prefixes — must match train_sweep.sh's run_job() prefix arg.
 KNOWN_MODEL_PREFIXES=(pi05 diffusion act)
 
-for arg in "$@"; do
+# Manual arg loop so `--filter SUBSTR` (space, no `=`) works alongside
+# the existing `--name=value` forms. The previous for-loop didn't support
+# the bare-arg variant.
+args=( "$@" )
+i=0
+while (( i < ${#args[@]} )); do
+    arg="${args[$i]}"
     case "$arg" in
         --base_short=*)  BASE_SHORT="${arg#*=}" ;;
         --action=*)      ACTION_TAG="${arg#*=}" ;;
         --run_tag=*)     RUN_TAG="${arg#*=}" ;;
         --model=*)       MODEL_PREFIX="${arg#*=}" ;;
         --watch=*)       WATCH_SEC="${arg#*=}" ;;
+        --filter=*)
+            # Single-value form. Comma-separated values are split so
+            # `--filter=A,B` is equivalent to `--filter A B`.
+            IFS=',' read -ra _fparts <<< "${arg#*=}"
+            for _f in "${_fparts[@]}"; do
+                [[ -n "$_f" ]] && FILTERS+=( "$_f" )
+            done
+            ;;
+        --filter)
+            # Space-separated multi-value form: consume every following arg
+            # until we hit another `--*` flag (or run out). A lineage matches
+            # if ANY of the collected substrings appears in its name (OR
+            # semantics), so `--filter grip0 g0` shows lineages containing
+            # either `grip0` OR `g0`. Requires at least one value.
+            i=$((i + 1))
+            if (( i >= ${#args[@]} )) || [[ "${args[$i]}" == --* ]]; then
+                echo "ERROR: --filter requires at least one value" >&2; exit 1
+            fi
+            while (( i < ${#args[@]} )) && [[ "${args[$i]}" != --* ]]; do
+                FILTERS+=( "${args[$i]}" )
+                i=$((i + 1))
+            done
+            # The outer `i+=1` below will over-increment by one — back off
+            # so the next iteration processes the flag we stopped at (or
+            # exits cleanly if we ran off the end).
+            i=$((i - 1))
+            ;;
         -h|--help)
             sed -n '1,/^set -euo pipefail/p' "$0" | grep '^#' | sed 's/^# \?//'
             exit 0
             ;;
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
+    i=$((i + 1))
 done
 
 # discover_lineages: print every unique lineage key for DAgger training dirs.
@@ -141,7 +187,7 @@ print_table() {
     echo "DAgger progress for: ${MODEL_PREFIX}_${lineage}{,[_ft]_dag*}"
     # Surface the plot path (whether it currently exists or not, so users can
     # ctrl-click as soon as `python my_scripts/dagger_plot.py` is run).
-    local plot_path="${HOME}/code/lerobot/outputs/dagger/dagger_progress_${lineage}.png"
+    local plot_path="${HOME}/code/lerobot/outputs/dagger/dagger_progress_${MODEL_PREFIX}_${lineage}.png"
     if [[ -f "$plot_path" ]]; then
         echo "Plot: $plot_path"
     else
@@ -239,6 +285,27 @@ print_all_for_prefix() {
         fi
     fi
 
+    # Apply the --filter substrings (each treated as *FILTER*) to the
+    # discovered lineage list before we walk it. OR semantics: a lineage is
+    # kept if ANY filter substring appears in it. Returning 1 here propagates
+    # "nothing matched in this prefix" upward so multi-prefix mode silently
+    # skips.
+    if (( ${#FILTERS[@]} > 0 )); then
+        local filtered=""
+        for lin in $lineages; do
+            for _f in "${FILTERS[@]}"; do
+                if [[ "$lin" == *"$_f"* ]]; then
+                    filtered+="${lin}"$'\n'
+                    break
+                fi
+            done
+        done
+        lineages="${filtered%$'\n'}"
+        if [[ -z "$lineages" ]]; then
+            return 1
+        fi
+    fi
+
     local first=1
     for lin in $lineages; do
         if (( first == 0 )); then
@@ -256,10 +323,21 @@ print_all_for_prefix() {
     # run_tag-suffixed lineages; auto-discover finds every lineage
     # including the tagged ones. Output prefixed with "[plot] " so it's
     # clearly attributed.
+    #
+    # When --filter is set, forward it to dagger_plot.py so the plot script
+    # itself skips work for non-matching lineages (no PNG regeneration, no
+    # comparison plots for filtered-out source lineages, no metric scans).
     local plot_script="$(dirname "$0")/dagger_plot.py"
     if [[ -f "$plot_script" ]]; then
         echo
-        python3 "$plot_script" --model="$MODEL_PREFIX" 2>&1 | sed 's/^/  [plot] /' || true
+        local plot_args=( --model="$MODEL_PREFIX" )
+        # Forward EVERY filter substring to dagger_plot.py via its nargs='+'
+        # --filter (OR-matched there too). When no filters set, omit the
+        # flag so the plot script auto-discovers all lineages.
+        if (( ${#FILTERS[@]} > 0 )); then
+            plot_args+=( --filter "${FILTERS[@]}" )
+        fi
+        python3 "$plot_script" "${plot_args[@]}" 2>&1 | sed 's/^/  [plot] /' || true
     fi
     return 0
 }
@@ -309,12 +387,20 @@ print_all() {
     done
 
     if (( n_blocks == 0 )); then
-        echo "ERROR: no DAgger training dirs found under $TRAINING_ROOT" >&2
-        if [[ -n "$MODEL_PREFIX" ]]; then
-            echo "  expected pattern: ${MODEL_PREFIX}_<lineage>[_ft]_dag<N>" >&2
+        if (( ${#FILTERS[@]} > 0 )); then
+            local _flist
+            _flist=$(printf "'%s' " "${FILTERS[@]}")
+            echo "ERROR: --filter ${_flist}matched no DAgger lineages (OR semantics)." >&2
+            echo "  Tried prefix(es): ${prefixes_to_scan[*]}" >&2
+            echo "  Drop --filter to see every lineage, or adjust the substrings." >&2
         else
-            echo "  scanned prefixes: ${KNOWN_MODEL_PREFIXES[*]}" >&2
-            echo "  expected pattern: <prefix>_<lineage>[_ft]_dag<N>" >&2
+            echo "ERROR: no DAgger training dirs found under $TRAINING_ROOT" >&2
+            if [[ -n "$MODEL_PREFIX" ]]; then
+                echo "  expected pattern: ${MODEL_PREFIX}_<lineage>[_ft]_dag<N>" >&2
+            else
+                echo "  scanned prefixes: ${KNOWN_MODEL_PREFIXES[*]}" >&2
+                echo "  expected pattern: <prefix>_<lineage>[_ft]_dag<N>" >&2
+            fi
         fi
         return 1
     fi

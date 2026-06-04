@@ -136,11 +136,15 @@ class AugmentationConfig:
     forward_flow_ratios: list[float] = field(default_factory=lambda: [0.5])
 
     # Episode selection — choose ONE of the two (mutually exclusive):
-    #   episode_index:   single int OR "start-end" range string (inclusive).
-    #                    Examples: --episode_index=305  or  --episode_index=300-310
-    #                    Mirrors visualize_shared_autonomy_sim.py's --episode_index.
+    #   episode_index:   single int ("305"), inclusive range ("300-310"), or
+    #                    the literal "all" / "ALL" (every episode in the source
+    #                    dataset). Mirrors visualize_shared_autonomy_sim.py's
+    #                    --episode_index, with the "all" shorthand added so
+    #                    callers (e.g. dagger_orchestrate.sh) can be explicit
+    #                    about meaning "every episode" instead of relying on
+    #                    the field being unset.
     #   episode_indices: explicit JSON list, e.g. '[3, 8, 23]'.
-    # If both are None, every episode in the source dataset is processed.
+    # If both are None, every episode is processed (same as --episode_index=all).
     episode_index: str | None = None
     episode_indices: list[int] | None = None
 
@@ -213,16 +217,20 @@ class AugmentationConfig:
 def _resolve_episode_selection(cfg: AugmentationConfig, available_eps: list[int]) -> list[int]:
     """Resolve episode selection from --episode_index / --episode_indices.
 
-    ``--episode_index`` accepts a single int ("305") or an inclusive range
-    ("300-310" → episodes 300, 301, …, 310).  ``--episode_indices`` accepts an
-    explicit JSON list ('[3, 8, 23]'). If neither is set, all available episodes
-    are used.
+    ``--episode_index`` accepts:
+      * a single int ("305"),
+      * an inclusive range ("300-310" → episodes 300, 301, …, 310),
+      * the literal "all" (case-insensitive) → every available episode.
+    ``--episode_indices`` accepts an explicit JSON list ('[3, 8, 23]').
+    If neither is set, all available episodes are used (same as ``=all``).
     """
     if cfg.episode_index is not None and cfg.episode_indices is not None:
         raise ValueError("Set at most one of --episode_index and --episode_indices.")
 
     if cfg.episode_index is not None:
         s = str(cfg.episode_index).strip()
+        if s.lower() == "all":
+            return sorted(available_eps)
         if "-" in s:
             parts = s.split("-", 1)
             start, end = int(parts[0]), int(parts[1])

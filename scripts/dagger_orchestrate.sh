@@ -88,18 +88,28 @@ set -euo pipefail
 #                                 (default 0). Same seed = same subset across reruns,
 #                                 which is what you want for DAgger optimizing the
 #                                 same scenarios round over round.
-#   --intervention_oversample=N   Repeat each per-round intervention dataset N
-#                                 times in the cumulative merge (default 1 = no
-#                                 oversample). Useful when intervention frames
-#                                 are a small fraction of the merged dataset
-#                                 (e.g. 5 intervention episodes vs 300 base eps
-#                                 = 1.6% of frames) and the policy under-weights
-#                                 them during random batch sampling. With N=3,
-#                                 the intervention frames make up ~5% of the
-#                                 merged dataset → ~3× more likely to be drawn
-#                                 in a random batch. Each round's merge becomes
-#                                 N× larger on disk; pair with a reasonable
-#                                 N value (2-5) and watch disk usage.
+#   --target_intervention_volume=N
+#                                 (REQUIRED, positive integer.) Total
+#                                 intervention-related content per round, in
+#                                 units of "1× raw intervention". The merge
+#                                 composes:
+#                                     raw × (N - n_blends) + each_blend × 1
+#                                 so every condition (0 / 1 / 2 / … blends)
+#                                 ends up with N× raw_intervention worth of
+#                                 intervention-related content per round —
+#                                 apples-to-apples across blend counts. The
+#                                 1-blend case puts the leftover budget on
+#                                 raw (raw:blend = (N-1):1, so 67/33 at N=3).
+#                                 Must satisfy N >= n_blends (N == n_blends
+#                                 drops raw and merges blends only); startup
+#                                 errors if N < n_blends.
+#                                 Typical values 1-3. Each round's merge is
+#                                 ~N× the size of the raw intervention; watch
+#                                 disk usage.
+#
+#                                 REPLACES the prior --intervention_oversample;
+#                                 commands using the old flag name will fail
+#                                 at the parser with an unknown-flag error.
 #   --intervention_max_episode_length=N
 #                                 Forwarded to lerobot-eval as
 #                                 --env.episode_length (default 5000). This is the
@@ -130,6 +140,132 @@ set -euo pipefail
 #                                 (typically less than N → partial playback).
 #                                 Forwarded as
 #                                 --intervention.oracle_goal_chunk_steps=N.
+#   --blends="0.9 0.8"            Space-separated forward_flow_ratios to produce
+#                                 EXTRA blended-intervention datasets per round
+#                                 (alongside the raw intervention dataset).
+#                                 For each ratio R in (0, 1), the orchestrator
+#                                 invokes augment_dataset_with_blending.py to
+#                                 closed-loop-replay the round's intervention
+#                                 episodes through SplatSim with the SA wrapper's
+#                                 forward_flow_ratio set to R, producing a
+#                                 dataset named <int_short>_blend<NNN> (NNN =
+#                                 3-digit int(R*100), e.g. blend090 / blend080).
+#                                 These blend datasets are then merged into the
+#                                 round's training dataset alongside the raw
+#                                 intervention. The mix is controlled by
+#                                 --target_intervention_volume (raw × (N -
+#                                 n_blends) + each blend × 1). Empty/unset →
+#                                 disabled (only raw intervention in merge).
+#                                 Ratio=1.0 is silently dropped (= raw intervention,
+#                                 no blending needed). Ratio=0.0 errors out
+#                                 ("pure policy" needs separate handling we don't
+#                                 yet have). Brackets/commas tolerated:
+#                                 --blends='[0.9, 0.8]' is equivalent.
+#   --blend_extra_args=STR        Raw passthrough to augment_dataset_with_blending.py
+#                                 for every per-ratio invocation. Useful to override
+#                                 blend_strategy / guidance_repr / blend_mode away
+#                                 from the defaults (denoise / absolute_pos /
+#                                 once_per_chunk / drain_chunk), or for any future
+#                                 blend-side filter flag.
+#   --filter_blend_collisions     Replay each blend dataset through a headless
+#                                 splatsim and drop / trim episodes that hit
+#                                 obstacles. Step 2 produces `_nocoll` siblings
+#                                 (<blend>_nocoll) which step 4 substitutes into
+#                                 the merge in place of the raw blends. The raw
+#                                 blends stay on disk (cross-rerun cacheable);
+#                                 toggling the flag off makes the merge use
+#                                 them again without re-running step 2. Default
+#                                 false. See filter_blend_collisions.py for
+#                                 trim semantics (drop frames before collision,
+#                                 drop episode if remaining length < 60).
+#   --filter_collision_extra_args=STR
+#                                 Raw passthrough to filter_blend_collisions.py.
+#                                 Examples: --pre_collision_margin=20, or
+#                                 --min_episode_length=90.
+#   --filter_collision_env_port=N
+#                                 Port for the auxiliary headless splatsim used
+#                                 by the filter step. Default: --env_external_port
+#                                 + 100, so the two sims don't collide.
+#   --finetune_extra_args=STR     Raw passthrough to resume_training.sh for the
+#                                 per-round FINETUNE training step (step 6 in
+#                                 --intermediate_mode=finetune). Multi-flag, word-
+#                                 split. Examples:
+#                                   --finetune_extra_args='--eval.n_episodes=30'
+#                                   --finetune_extra_args='--eval.n_episodes=20 --policy.use_amp=true'
+#                                 Note: does NOT apply to scratch trainings via
+#                                 train_sweep.sh (round 0 base, per-round scratch,
+#                                 post-loop final scratch). Empty → no extras.
+#   --use_weighted_sampling       Switch the per-round training pipeline from
+#                                 "merge then train on a fixed-share dataset" to
+#                                 "train on the per-source weighted union via
+#                                 lerobot-train's --dataset.repo_ids / sample_weights
+#                                 / stats_paths". When set, steps 4 (merge) and 5
+#                                 (merged-rel-stats) are SKIPPED — the per-source
+#                                 datasets and their stats sidecars (already on
+#                                 disk from steps 1b/2b) are passed to step 6
+#                                 directly. The DataLoader's WeightedRandomSampler
+#                                 then enforces an EXACT per-batch share of base
+#                                 vs DAgger data, regardless of how the dataset
+#                                 sizes diverge across rounds. Default: false
+#                                 (legacy merge-mode behavior). Currently requires
+#                                 --action_format=rel (abs uses each dataset's
+#                                 meta/stats.json and isn't wired here yet).
+#                                 Mode-purity is enforced at startup: a lineage
+#                                 that already has merge-mode `_m` artifacts
+#                                 cannot be resumed in weighted mode (and vice
+#                                 versa). Use a fresh --run_tag to start a new
+#                                 lineage in the desired mode.
+#   --dagger_data_fraction=F      Share of every batch sampled from DAgger
+#                                 sub-datasets (raw intervention + any blends),
+#                                 equal-split across them. Base gets the
+#                                 remaining (1 - F). F must be in (0.0, 1.0).
+#                                 Only meaningful with --use_weighted_sampling.
+#                                 Default: 0.3.
+#
+# Rerun-blends mode (reuse an existing lineage's intervention data, iterate on
+# blend ratios without re-collecting):
+#   --rerun_blends_from=TAG[:BLENDS_TAG]
+#                                 Activates rerun mode. Reads as "rerun blends
+#                                 on top of the <TAG> lineage". The orchestrator
+#                                 SKIPS step 1's intervention recording, REUSES
+#                                 source's per-round intervention datasets, and
+#                                 trains a NEW lineage that branches off SOURCE's
+#                                 _ft_dag(r-1) at each round. Examples:
+#                                   --rerun_blends_from=d5jvm
+#                                       → source = no-blends d5jvm lineage
+#                                   --rerun_blends_from=d5jvm:b090_080
+#                                       → source = d5jvm lineage's b090_080
+#                                         in-lineage-blends sub-lineage
+#                                 Requirements (validated at startup):
+#                                   * --blends must be non-empty (rerun w/o
+#                                     blends would just reproduce source's
+#                                     training)
+#                                   * --run_tag must differ from the source's
+#                                     run_tag (avoid lineage collision)
+#                                   * source intervention dirs exist on disk
+#                                     for rounds 1..NUM_ROUNDS
+#                                   * source _ft_dag(r-1) training dir exists
+#                                     for rounds 2..NUM_ROUNDS
+#                                 --num_rounds becomes optional in rerun mode:
+#                                 auto-detected from source lineage on disk
+#                                 (highest contiguous N with source intervention
+#                                 dataset present in HF cache). Override with
+#                                 --num_rounds=N to subset.
+#                                 Assumes source and current command share
+#                                 task/dataset_tag/model/method. If they differ,
+#                                 use the explicit prefix flags below.
+#                                 Intervention-recording flags
+#                                 (--intervention_n_episodes/_sample_from_first/
+#                                 _sample_seed/_extra_args) are IGNORED in rerun
+#                                 mode (a warning is emitted if set).
+#   --reuse_intervention_from=PFX Advanced override: source intervention dataset
+#                                 short prefix (everything before _<a|r>_dag<N>).
+#                                 Use when --rerun_blends_from's auto-derivation
+#                                 is wrong (source/current differ in
+#                                 task/dataset_tag/model/method).
+#   --reuse_policy_from=BASENAME  Advanced override: source training-dir
+#                                 basename (everything before _ft_dag<N>). Must
+#                                 be set together with --reuse_intervention_from.
 #
 # Model / action format (controls naming, must match train_sweep.sh's choices):
 #   --model=MODEL                 "pi" / "diff" / "act"  (default "pi")
@@ -144,6 +280,16 @@ set -euo pipefail
 #   --finetune_steps=N            (default 4000)
 #   --finetune_eval_freq=N        (default 2000)
 #   --finetune_save_freq=N        (default 2000)
+#   --extend_last_round           When set, the orchestrator re-runs step 6 for
+#                                 the highest fully-complete round R if its
+#                                 originally-trained target_steps is less than
+#                                 what the CURRENT --finetune_steps value implies.
+#                                 Resumes training from R's existing checkpoint
+#                                 (no work lost), runs until the new target, and
+#                                 leaves earlier complete rounds untouched. Use
+#                                 this when bumping --finetune_steps to extend
+#                                 the tail of a lineage in place. Default off →
+#                                 complete rounds stay skipped (legacy behavior).
 #   --finetune_batch_size=N       (default empty = inherit from base train_config.json)
 #                                 Lower this if you hit CUDA OOM — the shared external
 #                                 SplatSim costs ~2.75 GiB the original from-scratch
@@ -165,9 +311,27 @@ set -euo pipefail
 #
 # Resume/restart:
 #   --start_round=N               Explicitly start at round N (default: auto-detect).
+#   --resume                      Skip the resume-prompt and auto-confirm resuming
+#                                 from the detected partial-progress point. When
+#                                 nothing remains to do (all rounds + optional
+#                                 final-scratch complete), exits 0 instead of
+#                                 prompting for restart. Designed for batch/sweep
+#                                 invocations that shouldn't block on stdin.
+#                                 Mutually exclusive with --force_restart.
 #   --force_restart               Skip resume-prompt; restart from round 1, deleting
 #                                 any existing dag1..dag{num_rounds} artifacts. Asks
 #                                 for confirmation token.
+#   --also_delete_blends          Opt-in modifier for --force_restart in rerun mode.
+#                                 By default rerun-mode cleanup PRESERVES blend
+#                                 datasets (<src_int>_dagN_blendXXX) since they're
+#                                 deterministic functions of (source, ratio) and
+#                                 are cross-rerun-cacheable: other rerun lineages
+#                                 using the same ratio at the same source round
+#                                 reuse them. Set this flag when you want a true
+#                                 clean slate (knows no other rerun shares the
+#                                 blends, or wants them regenerated). Has no
+#                                 effect outside rerun mode: non-rerun lineages
+#                                 own their blends, so they're always deleted.
 #   --retrain_round=N             Re-run ONLY round N's training step (step 6), writing
 #                                 to a suffixed output dir so the original training dir
 #                                 isn't overwritten. Use this to iterate on finetune
@@ -223,6 +387,23 @@ set -euo pipefail
 #                                 and training will keep --env.external_port set.
 #                                 Risk: external sim's 2.7 GiB CUDA context is
 #                                 hard-partitioned during training → potential OOM.
+#   --headless                    Aggregator: disable every GUI/visualizer the
+#                                 orchestrator controls — for fast batch runs.
+#                                 Forwards:
+#                                   * --headless to SplatSim's launch_nodes.py
+#                                     in start_sim() (pybullet via p.DIRECT)
+#                                   * --policy.shared_autonomy_config.show_slider=false
+#                                     to step 1's lerobot-eval (disables the
+#                                     Tkinter ratio slider AND the SA wrapper's
+#                                     per-policy pybullet GUI window)
+#                                   * --env.headless=true and the same
+#                                     show_slider=false to step 6's training
+#                                     (in-process inline-eval sim → p.DIRECT)
+#                                 In --no_manage_splatsim mode, the training-side
+#                                 --env.headless=true is suppressed (the user
+#                                 owns their sim; training connects via
+#                                 external_port and doesn't spawn pybullet).
+#                                 Default: false (interactive behavior).
 #   --splatsim_root=PATH          Root of the SplatSim repo (default $HOME/code/SplatSim).
 #                                 launch_nodes.py is run from this dir.
 #   --splatsim_robot=NAME         --robot arg for launch_nodes.py
@@ -267,12 +448,70 @@ ENV_EXTERNAL_HOST="127.0.0.1"
 INTERMEDIATE_MODE="finetune"
 FINAL_MODE="scratch"
 INTERVENTION_N_EPISODES="100"
-INTERVENTION_OVERSAMPLE="1"
+TARGET_INTERVENTION_VOLUME=""   # required; validated after BLENDS is parsed
 INTERVENTION_MAX_EPISODE_LENGTH="5000"
 INTERVENTION_SAMPLE_FROM_FIRST=""   # empty → run first N in order; set → random subset
 INTERVENTION_SAMPLE_SEED="0"
 EVAL_BENCHMARK_REPO_ID="JennyWWW/eval_splatsim_approach_lever_benchmark_1000"
 INTERVENTION_EXTRA_ARGS=""
+# Blended-intervention data sources. Space-separated list of forward_flow_ratio
+# floats; for each ratio R in (0,1) the orchestrator creates an additional
+# per-round dataset alongside the raw intervention via
+# augment_dataset_with_blending.py — same policy that recorded the intervention
+# drives a closed-loop replay at SA-wrapper ratio=R. Each blend is then
+# included in the merge alongside the raw intervention (oversampled the same
+# way). Empty → disabled (back-compat). Ratio=1.0 is dropped with an info log
+# (raw intervention already covers it). Ratio=0.0 errors out (would require
+# separate "policy-only" handling we don't have yet).
+BLENDS_STR=""
+BLEND_EXTRA_ARGS=""
+# Collision-free blend filtering. When true, each blend dataset produced in
+# step 2 gets a sibling `_nocoll` variant created by replaying its episodes
+# through a headless splatsim and dropping (or trimming) episodes that hit
+# obstacles. Step 4's merge then uses the `_nocoll` siblings instead of the
+# raw blends. The raw blends stay on disk so they're cross-rerun-cacheable
+# and the user can flip the flag off without re-running step 2.
+# Default false → byte-identical to today's behavior.
+FILTER_BLEND_COLLISIONS=false
+# Extra args forwarded to filter_blend_collisions.py (e.g. to override
+# --pre_collision_margin, --min_episode_length). Word-split.
+FILTER_COLLISION_EXTRA_ARGS=""
+# Auxiliary headless splatsim port (used only by the filter step). Defaults
+# to main port + 100 so the two sims can coexist.
+FILTER_COLLISION_ENV_PORT=""
+# Raw passthrough to resume_training.sh for the per-round FINETUNE training
+# step. Lets callers override individual lerobot-train flags (e.g.
+# --eval.n_episodes, --batch_size adjustments) without baking each one into
+# the orchestrator. Word-split, so multi-flag strings work:
+# --finetune_extra_args='--eval.n_episodes=30 --policy.use_amp=true'. Empty
+# (default) → no extra args. Note: only applies to the finetune training
+# path (step 6 in --intermediate_mode=finetune); scratch trainings via
+# train_sweep.sh aren't covered.
+FINETUNE_EXTRA_ARGS=""
+# Multi-dataset weighted-sampling mode. When true, step 4 (merge) and step 5
+# (merged-dataset rel-action stats) are SKIPPED — instead, step 6 trains
+# directly against the union of {base, all per-round raw intervention, all
+# per-round blends} via lerobot-train's --dataset.repo_ids / sample_weights
+# / stats_paths multi-dataset path. Per-source normalization happens inside
+# the DataLoader; the policy's normalize layer is a no-op (see
+# src/lerobot/datasets/multi_source_normalizing_dataset.py + lerobot_train.py).
+# Equal share among all DAgger sub-datasets, BASE gets (1 - DAGGER_DATA_FRACTION).
+# A lineage runs entirely in one mode — switching mid-lineage is rejected at
+# startup (see mode-purity validation below).
+USE_WEIGHTED_SAMPLING=false
+DAGGER_DATA_FRACTION="0.3"
+# Rerun-blends mode. When --rerun_blends_from=<source_run_tag>[:<source_blends_tag>]
+# is set, the orchestrator REUSES an existing lineage's intervention datasets
+# (skipping step 1's lerobot-eval recording) and trains a NEW lineage that
+# branches off SOURCE's _ft_dag(r-1) at each round. See header doc + AGENTS.md.
+RERUN_BLENDS_FROM=""
+# Advanced overrides — explicit source dataset/policy prefixes (everything
+# before _<a|r>_dag<N> and _ft_dag<N> respectively). Use when source and
+# current command differ in task/dataset_tag/model/method, or when the source
+# lineage has a non-standard name. If set, take precedence over the
+# auto-derivation from --rerun_blends_from.
+REUSE_INTERVENTION_FROM=""
+REUSE_POLICY_FROM=""
 # Intervention method selector. "rrt" uses the SA wrapper's RRT-to-goal
 # planner (existing behavior); "oracle_goal" uses a straight-line joint-space
 # interpolation from q_start to the oracle's q_goal_bias. Recorded frames are
@@ -289,11 +528,82 @@ FINETUNE_BATCH_SIZE=""
 FINETUNE_DECAY_LR=""
 START_ROUND=""    # empty → auto-detect
 FORCE_RESTART=false
+# --resume: auto-confirm the resume prompt (default Y). Useful for batch /
+# sweep invocations that shouldn't block on stdin. When prior work is fully
+# complete (nothing to resume from), the orchestrator exits 0 instead of
+# prompting for restart. Mutually exclusive with --force_restart.
+RESUME=false
+# --cleanup_only: when combined with --force_restart, deletes all lineage
+# artifacts and exits 0 without starting a fresh run. Designed to be called
+# by my_scripts/dagger_cleanup_lineage.sh, which derives the orchestrator
+# flags from a training-dir path. Has no effect without --force_restart.
+CLEANUP_ONLY=false
+# --also_delete_blends: opt-in flag for --force_restart. In rerun-blends
+# mode, blend datasets are named after the SOURCE (e.g.
+# `<src_int>_dagN_blendXXX`) and are deterministic functions of
+# (source_intervention, source_branching_policy, ratio). Two reruns asking
+# for the same ratio at the same source round share these files via the
+# blend cache. By default we preserve them on --force_restart so that other
+# rerun lineages on disk aren't forced to regenerate. Set this flag to also
+# delete blend datasets — useful when the user knows no other rerun shares
+# them, or wants a clean slate. Has no effect outside rerun mode (a
+# non-rerun lineage owns its own blends, so they're always deleted).
+ALSO_DELETE_BLENDS=false
+# --preserve_round_1_intervention: when set, --force_restart's cleanup leaves
+# round 1's raw intervention dataset + alias + int-stats sidecar in place
+# (the expensive human-in-the-loop recording). Everything else — round 1's
+# merged dataset, training dir, blends, plus rounds 2..N entirely — still
+# gets deleted, so the lineage restarts from "round 1 step 4 (merge)" rather
+# than "round 1 step 1 (record interventions)". No-op in rerun mode where
+# intervention paths are source-owned and never touched.
+PRESERVE_ROUND_1_INTERVENTION=false
+# --extend_last_round: when set, the orchestrator re-runs step 6 for the
+# HIGHEST fully-complete round R *iff* the user's current --finetune_steps
+# would have produced a higher target step count for R than what R was
+# originally trained to. Useful when bumping --finetune_steps to extend
+# the last round's training in place, without losing the steps already
+# done. Earlier complete rounds are NOT touched; the chain is only extended
+# at the tail. Default false → existing behavior (complete rounds stay
+# skipped). Safe to leave on across sweep iterations.
+#
+# Mechanics: at resume-detection time, after deciding which rounds are
+# complete, we read R's saved cfg.steps from
+# <train_dir_R>/checkpoints/last/pretrained_model/train_config.json, compute
+# its starting step (= the carried-forward CURRENT_STEP at the top of round R,
+# i.e. previous round's actual final or the initial policy's step for R=1),
+# and form planned_target = starting_step + FINETUNE_STEPS. If planned > saved,
+# we demote ROUND_COMPLETED_STEPS[R] from 6 → 5 so step 6 re-runs. lerobot-train
+# --resume=true loads checkpoints/last from R's output_dir and continues from
+# the existing checkpoint until reaching --steps=planned_target, so no work is
+# lost.
+EXTEND_LAST_ROUND=false
 RETRAIN_ROUND=""    # empty → not in retrain mode; set → only re-train this round to a suffixed dir
 RETRAIN_SUFFIX="v2"
 SKIP_ALIAS_STEP=false
 PUSH_TO_HUB=false   # offline by default — see header for rationale
 MANAGE_SPLATSIM=true
+# --headless: aggregator flag that disables every GUI/visualizer the
+# orchestrator controls — for fast batch runs where no human is watching.
+# Specifically:
+#   * `start_sim()` appends `--headless` to SplatSim's launch_nodes.py call
+#     (pybullet connects via p.DIRECT instead of p.GUI; no rendering window).
+#   * Step 1's lerobot-eval invocation appends
+#     `--policy.shared_autonomy_config.show_slider=false`, which gates BOTH
+#     the Tkinter ratio slider AND the SA wrapper's per-policy pybullet GUI
+#     client (one field, two surfaces — see shared_autonomy_wrapper.py:240).
+#   * Step 6 training (both scratch via train_sweep.sh and finetune via
+#     resume_training.sh) appends `--env.headless=true` so lerobot-train's
+#     in-process inline-eval sim connects via p.DIRECT, plus
+#     `--policy.shared_autonomy_config.show_slider=false` in case the policy
+#     has SA wrapper config (defensive — most training configs don't enable
+#     SA but a few that resume from intervention-recording dirs do).
+# In `--no_manage_splatsim` mode the user is responsible for the external
+# sim's GUI mode; the training-side `--env.headless` injection is suppressed
+# (the user is connecting to their own sim via external_port and the env
+# never spawns an in-process pybullet client). Step 1's `show_slider=false`
+# is still injected — it controls a wrapper-side surface, not the sim.
+# Default false → byte-identical to today's interactive behavior.
+HEADLESS=false
 SPLATSIM_ROOT="$HOME/code/SplatSim"
 SPLATSIM_ROBOT="sim_ur_pybullet_small_engine_new_interactive"
 SPLATSIM_ROBOT_NAME="robot_iphone_w_engine_new"
@@ -306,12 +616,23 @@ LEROBOT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LEROBOT_CACHE="$HOME/.cache/huggingface/lerobot"
 STATS_BASE="$LEROBOT_ROOT/outputs/dataset_stats"
 
+# Thin shim around the canonical naming module so forward-direction naming
+# (config → name) lives in ONE place — `my_scripts/dagger_naming.py` — and
+# can't drift between the bash orchestrator and the Python viz scripts. See
+# the module docstring for available subcommands.
+_py_dagger_name() {
+    python3 "$SCRIPT_DIR/dagger_naming.py" "$@"
+}
+
 # Computed at the end of arg parsing (see "intervention scenario subset" block):
 # JSON list of episode indices to pass as --env.eval_benchmark_subset, or empty
 # when using default first-N-in-order behavior.
 INTERVENTION_SUBSET_JSON=""
 
 # ── parse args ────────────────────────────────────────────────────────────────
+# Capture original argv before parsing so the dagger config sidecar can log
+# the exact invocation that produced each per-round training dir.
+ORIG_ARGV=( "$@" )
 for arg in "$@"; do
     case "$arg" in
         --base_short=*)               BASE_SHORT="${arg#*=}" ;;
@@ -327,12 +648,23 @@ for arg in "$@"; do
         --intermediate_mode=*)        INTERMEDIATE_MODE="${arg#*=}" ;;
         --final_mode=*)               FINAL_MODE="${arg#*=}" ;;
         --intervention_n_episodes=*)         INTERVENTION_N_EPISODES="${arg#*=}" ;;
-        --intervention_oversample=*)         INTERVENTION_OVERSAMPLE="${arg#*=}" ;;
+        --target_intervention_volume=*)      TARGET_INTERVENTION_VOLUME="${arg#*=}" ;;
         --intervention_max_episode_length=*) INTERVENTION_MAX_EPISODE_LENGTH="${arg#*=}" ;;
         --intervention_sample_from_first=*)  INTERVENTION_SAMPLE_FROM_FIRST="${arg#*=}" ;;
         --intervention_sample_seed=*)        INTERVENTION_SAMPLE_SEED="${arg#*=}" ;;
         --eval_benchmark_repo_id=*)          EVAL_BENCHMARK_REPO_ID="${arg#*=}" ;;
         --intervention_extra_args=*)         INTERVENTION_EXTRA_ARGS="${arg#*=}" ;;
+        --blends=*)                          BLENDS_STR="${arg#*=}" ;;
+        --blend_extra_args=*)                BLEND_EXTRA_ARGS="${arg#*=}" ;;
+        --filter_blend_collisions)           FILTER_BLEND_COLLISIONS=true ;;
+        --filter_collision_extra_args=*)     FILTER_COLLISION_EXTRA_ARGS="${arg#*=}" ;;
+        --filter_collision_env_port=*)       FILTER_COLLISION_ENV_PORT="${arg#*=}" ;;
+        --finetune_extra_args=*)             FINETUNE_EXTRA_ARGS="${arg#*=}" ;;
+        --use_weighted_sampling)             USE_WEIGHTED_SAMPLING=true ;;
+        --dagger_data_fraction=*)            DAGGER_DATA_FRACTION="${arg#*=}" ;;
+        --rerun_blends_from=*)               RERUN_BLENDS_FROM="${arg#*=}" ;;
+        --reuse_intervention_from=*)         REUSE_INTERVENTION_FROM="${arg#*=}" ;;
+        --reuse_policy_from=*)               REUSE_POLICY_FROM="${arg#*=}" ;;
         --intervention_method=*)             INTERVENTION_METHOD="${arg#*=}" ;;
         --intervention_oracle_goal_chunk_steps=*) INTERVENTION_ORACLE_GOAL_CHUNK_STEPS="${arg#*=}" ;;
         --model=*)                    MODEL="${arg#*=}" ;;
@@ -344,12 +676,18 @@ for arg in "$@"; do
         --finetune_decay_lr=*)        FINETUNE_DECAY_LR="${arg#*=}" ;;
         --start_round=*)              START_ROUND="${arg#*=}" ;;
         --force_restart)              FORCE_RESTART=true ;;
+        --resume)                     RESUME=true ;;
+        --cleanup_only)               CLEANUP_ONLY=true ;;
+        --also_delete_blends)         ALSO_DELETE_BLENDS=true ;;
+        --preserve_round_1_intervention) PRESERVE_ROUND_1_INTERVENTION=true ;;
+        --extend_last_round)          EXTEND_LAST_ROUND=true ;;
         --retrain_round=*)            RETRAIN_ROUND="${arg#*=}" ;;
         --retrain_suffix=*)           RETRAIN_SUFFIX="${arg#*=}" ;;
         --skip_alias_step)            SKIP_ALIAS_STEP=true ;;
         --push_to_hub)                PUSH_TO_HUB=true ;;
         --manage_splatsim)            MANAGE_SPLATSIM=true ;;
         --no_manage_splatsim)         MANAGE_SPLATSIM=false ;;
+        --headless)                   HEADLESS=true ;;
         --splatsim_root=*)            SPLATSIM_ROOT="${arg#*=}" ;;
         --splatsim_robot=*)           SPLATSIM_ROBOT="${arg#*=}" ;;
         --splatsim_robot_name=*)      SPLATSIM_ROBOT_NAME="${arg#*=}" ;;
@@ -361,7 +699,38 @@ done
 if [[ -z "$BASE_SHORT" ]]; then
     echo "ERROR: --base_short is required" >&2; exit 1
 fi
-if [[ -z "$NUM_ROUNDS" || ! "$NUM_ROUNDS" =~ ^[0-9]+$ ]] || (( NUM_ROUNDS < 1 )); then
+
+# Parse --rerun_blends_from=<run_tag>[:<blends_tag>] into its two components.
+# Either piece may be empty; the source's blends_tag is empty when reusing a
+# no-blends source lineage. RERUN_MODE_ENABLED is the single boolean every
+# downstream branch checks to decide "is this a rerun command?"
+SOURCE_RUN_TAG=""
+SOURCE_BLENDS_TAG=""
+if [[ -n "$RERUN_BLENDS_FROM" ]]; then
+    if [[ "$RERUN_BLENDS_FROM" == *:* ]]; then
+        SOURCE_RUN_TAG="${RERUN_BLENDS_FROM%%:*}"
+        SOURCE_BLENDS_TAG="${RERUN_BLENDS_FROM#*:}"
+    else
+        SOURCE_RUN_TAG="$RERUN_BLENDS_FROM"
+        SOURCE_BLENDS_TAG=""
+    fi
+    if [[ -z "$SOURCE_RUN_TAG" ]]; then
+        echo "ERROR: --rerun_blends_from='$RERUN_BLENDS_FROM' must include a non-empty source run_tag" >&2; exit 1
+    fi
+fi
+RERUN_MODE_ENABLED=false
+if [[ -n "$RERUN_BLENDS_FROM" || -n "$REUSE_INTERVENTION_FROM" || -n "$REUSE_POLICY_FROM" ]]; then
+    RERUN_MODE_ENABLED=true
+fi
+
+# In rerun mode --num_rounds is optional (auto-detected from source lineage on
+# disk). Outside rerun mode it's still required. Either way: if present, must
+# be a positive integer.
+if [[ -n "$NUM_ROUNDS" ]]; then
+    if ! [[ "$NUM_ROUNDS" =~ ^[0-9]+$ ]] || (( NUM_ROUNDS < 1 )); then
+        echo "ERROR: --num_rounds=$NUM_ROUNDS must be a positive integer" >&2; exit 1
+    fi
+elif [[ "$RERUN_MODE_ENABLED" != "true" ]]; then
     echo "ERROR: --num_rounds=N (positive integer) is required" >&2; exit 1
 fi
 # Validate intervention sampling: when --intervention_sample_from_first=Y is set,
@@ -376,15 +745,17 @@ if [[ -n "$INTERVENTION_SAMPLE_FROM_FIRST" ]]; then
              "--intervention_n_episodes ($INTERVENTION_N_EPISODES) — can't sample more than the pool size" >&2; exit 1
     fi
 fi
-if ! [[ "$INTERVENTION_OVERSAMPLE" =~ ^[0-9]+$ ]] || (( INTERVENTION_OVERSAMPLE < 1 )); then
-    echo "ERROR: --intervention_oversample=$INTERVENTION_OVERSAMPLE must be a positive integer (1 = no oversampling)" >&2; exit 1
-fi
 
 # Retrain-mode validation. --retrain_round=N is mutually exclusive with
 # --start_round/--force_restart since it pins the start at round N step 6 and
 # uses a different code path that skips the resume-prompt entirely.
 if [[ -n "$RETRAIN_ROUND" ]]; then
-    if ! [[ "$RETRAIN_ROUND" =~ ^[0-9]+$ ]] || (( RETRAIN_ROUND < 1 || RETRAIN_ROUND > NUM_ROUNDS )); then
+    if ! [[ "$RETRAIN_ROUND" =~ ^[0-9]+$ ]] || (( RETRAIN_ROUND < 1 )); then
+        echo "ERROR: --retrain_round=$RETRAIN_ROUND must be a positive integer" >&2; exit 1
+    fi
+    # Upper bound depends on NUM_ROUNDS, which in rerun mode is auto-detected
+    # later. Defer the upper-bound check to the rerun validation block.
+    if [[ -n "$NUM_ROUNDS" ]] && (( RETRAIN_ROUND > NUM_ROUNDS )); then
         echo "ERROR: --retrain_round=$RETRAIN_ROUND must be between 1 and $NUM_ROUNDS" >&2; exit 1
     fi
     if [[ -z "$RETRAIN_SUFFIX" ]]; then
@@ -398,10 +769,118 @@ if [[ -n "$RETRAIN_ROUND" ]]; then
     fi
 fi
 
+# --resume is the inverse of --force_restart; setting both is a user error.
+if [[ "$RESUME" == true && "$FORCE_RESTART" == true ]]; then
+    echo "ERROR: --resume and --force_restart are mutually exclusive." >&2; exit 1
+fi
+
 case "$INTERMEDIATE_MODE" in finetune|scratch) ;; *) echo "ERROR: --intermediate_mode must be 'finetune' or 'scratch'" >&2; exit 1;; esac
 case "$FINAL_MODE"        in finetune|scratch) ;; *) echo "ERROR: --final_mode must be 'finetune' or 'scratch'" >&2; exit 1;; esac
 case "$MODEL"             in pi|diff|act)      ;; *) echo "ERROR: --model must be one of pi/diff/act" >&2; exit 1;; esac
 case "$INTERVENTION_METHOD" in rrt|oracle_goal) ;; *) echo "ERROR: --intervention_method must be 'rrt' or 'oracle_goal'" >&2; exit 1;; esac
+
+# Parse --blends="0.9 0.8" into BLENDS bash array. Drop 1.0 (covered by raw
+# intervention dataset), error on 0.0 (would need separate "pure policy"
+# handling we don't support yet), validate each entry is in (0,1).
+BLENDS=()
+if [[ -n "$BLENDS_STR" ]]; then
+    # Allow optional brackets / commas for ergonomics: "[0.9, 0.8]" → "0.9 0.8".
+    _blends_clean=$(echo "$BLENDS_STR" | tr ',[]' '   ')
+    # shellcheck disable=SC2206  # word-split is intentional here
+    _blends_raw=( $_blends_clean )
+    for r in "${_blends_raw[@]}"; do
+        # Validate numeric in (0,1). python3 used so we get float comparison.
+        _verdict=$(python3 -c "
+import sys
+try:
+    v = float(sys.argv[1])
+except ValueError:
+    print('ERR_NOT_FLOAT'); sys.exit()
+if v == 0.0:
+    print('ERR_ZERO')
+elif v == 1.0:
+    print('DROP_ONE')
+elif 0.0 < v < 1.0:
+    print('OK')
+else:
+    print('ERR_OUT_OF_RANGE')
+" "$r" 2>/dev/null || echo "ERR_NOT_FLOAT")
+        case "$_verdict" in
+            OK)
+                BLENDS+=( "$r" )
+                ;;
+            DROP_ONE)
+                echo "[blends] dropping ratio=1.0 (= raw intervention dataset; no blending needed)."
+                ;;
+            ERR_ZERO)
+                echo "ERROR: --blends contains ratio=0.0 which would be 'pure policy'. This is not the raw intervention dataset and requires separate handling we don't yet support. Pick a ratio in (0, 1)." >&2
+                exit 1
+                ;;
+            ERR_OUT_OF_RANGE|ERR_NOT_FLOAT)
+                echo "ERROR: --blends entry '$r' is not a valid forward_flow_ratio. Each entry must be a float in (0.0, 1.0); 1.0 is silently dropped." >&2
+                exit 1
+                ;;
+        esac
+    done
+fi
+
+# Validate --target_intervention_volume now that BLENDS is built. Must be a
+# positive integer N with N >= n_blends. raw_count = N - n_blends; N == n_blends
+# is allowed and means the merge contains blends only (no raw intervention).
+#
+# In weighted-sampling mode --target_intervention_volume is irrelevant (no
+# merge step happens) — silently default it to a sentinel that satisfies the
+# downstream invariants (must be >= n_blends) but is never used. Required ONLY
+# in merge mode.
+if [[ "$USE_WEIGHTED_SAMPLING" != "true" ]]; then
+    if [[ -z "$TARGET_INTERVENTION_VOLUME" ]]; then
+        echo "ERROR: --target_intervention_volume=N is required (positive integer)." >&2
+        echo "  N = total intervention-related content per round, in units of '1× raw intervention'." >&2
+        echo "  Each round's merge = raw × (N - n_blends) + each_blend × 1." >&2
+        echo "  Typical values: 1-3 (must be >= number of blend ratios; == drops raw)." >&2
+        echo "  REPLACES the prior --intervention_oversample flag." >&2
+        echo "  (Not required when --use_weighted_sampling is set — weighted mode skips the merge entirely.)" >&2
+        exit 1
+    fi
+    if ! [[ "$TARGET_INTERVENTION_VOLUME" =~ ^[0-9]+$ ]] || (( TARGET_INTERVENTION_VOLUME < 1 )); then
+        echo "ERROR: --target_intervention_volume=$TARGET_INTERVENTION_VOLUME must be a positive integer." >&2
+        exit 1
+    fi
+    if (( TARGET_INTERVENTION_VOLUME < ${#BLENDS[@]} )); then
+        echo "ERROR: --target_intervention_volume=$TARGET_INTERVENTION_VOLUME must be >= number of blends (${#BLENDS[@]})." >&2
+        echo "  raw_count = N - n_blends would be negative." >&2
+        echo "  Increase --target_intervention_volume or remove blends." >&2
+        exit 1
+    fi
+else
+    # Default sentinel for sidecar logging / format strings. Never consumed by
+    # the merge path (which is gated off in weighted mode).
+    [[ -z "$TARGET_INTERVENTION_VOLUME" ]] && TARGET_INTERVENTION_VOLUME=1
+fi
+
+# Validate --dagger_data_fraction (only meaningful in weighted mode). Must be
+# a float in (0, 1) — at exactly 0 the DAgger data is invisible (defeats the
+# point), at exactly 1 the base is invisible (defeats DAgger). Validate via
+# python3 so floats compare correctly.
+if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
+    _frac_verdict=$(python3 -c "
+import sys
+try:
+    v = float(sys.argv[1])
+except ValueError:
+    print('ERR_NOT_FLOAT'); sys.exit()
+if 0.0 < v < 1.0:
+    print('OK')
+else:
+    print('ERR_OUT_OF_RANGE')
+" "$DAGGER_DATA_FRACTION" 2>/dev/null || echo "ERR_NOT_FLOAT")
+    if [[ "$_frac_verdict" != "OK" ]]; then
+        echo "ERROR: --dagger_data_fraction='$DAGGER_DATA_FRACTION' must be a float in (0.0, 1.0)." >&2
+        echo "  This is the share of every batch that comes from DAgger sub-datasets" >&2
+        echo "  (raw intervention + any blends). Base gets the remaining (1 - fraction)." >&2
+        exit 1
+    fi
+fi
 
 # Auto-detect ACTION_FORMAT from --initial_policy_path's train_config.json when
 # the user didn't pass --action_format explicitly. Reading use_relative_actions
@@ -511,24 +990,33 @@ fi
 #   BASE_DATASET_SHORT = approach_lever_11_biasend_5path_grip0
 #   dag1 dataset       = JennyWWW/approach_lever_11_biasend_5path_grip0_dag1
 #   dag3_m merged      = JennyWWW/approach_lever_11_biasend_5path_grip0_dag3_m
-BASE_DATASET_SHORT="${BASE_REPO#${HF_USER}/}"
+# Compute the BASE_DATASET_STEM: the BASE_REPO basename minus optional
+# `splatsim_` prefix, then optionally replaced by --dag_short_override.
+# This is the "stem" that all tag suffixes (run_tag, model_tag, method_tag,
+# blends_tag) hang off of. Extracted so the rerun-blends mode can re-derive
+# source's dataset short with a different run_tag/blends_tag via the
+# _derive_base_dataset_short_for_tags helper below.
+BASE_DATASET_STEM="${BASE_REPO#${HF_USER}/}"
 if [[ "$STRIP_SPLATSIM_PREFIX" == true ]]; then
-    BASE_DATASET_SHORT="${BASE_DATASET_SHORT#splatsim_}"
+    BASE_DATASET_STEM="${BASE_DATASET_STEM#splatsim_}"
 fi
-# --dag_short_override lets the user completely replace BASE_DATASET_SHORT
-# with a shorter name. Useful when the auto-derived BASE_DATASET_SHORT is
-# at the HF 56-char limit and would overflow after adding _dag${N}_m or
-# adding a --run_tag. Doesn't affect BASE_REPO (the actual data source);
-# only changes what the dag artifacts are named on disk and on the hub.
+# Capture the BASE DATASET's actual short name BEFORE --dag_short_override
+# replaces the stem. The base dataset's stats sidecar dir (produced by
+# compute_relative_stats.sh against BASE_REPO) is keyed by the dataset's
+# OWN short name, not by the dag-artifact stem. Weighted-mode training
+# (which feeds the base + every round's intervention into lerobot-train as
+# parallel --dataset.repo_ids / --dataset.stats_paths) needs the base
+# sidecar at $STATS_BASE/$BASE_REPO_DATASET_SHORT/stats_rel{N}.json.
+# Without this, --dag_short_override=foo points the loader at
+# $STATS_BASE/foo/... which doesn't exist.
+BASE_REPO_DATASET_SHORT="$BASE_DATASET_STEM"
+# --dag_short_override lets the user completely replace the stem with a
+# shorter name. Useful when the auto-derived stem is at the HF 56-char limit
+# and would overflow after adding _dag${N}_m or adding a --run_tag. Doesn't
+# affect BASE_REPO (the actual data source); only changes what the dag
+# artifacts are named on disk and on the hub.
 if [[ -n "$DAG_SHORT_OVERRIDE" ]]; then
-    BASE_DATASET_SHORT="$DAG_SHORT_OVERRIDE"
-fi
-# Optional --run_tag suffix to differentiate from prior dag runs on the same
-# base. Inserted into both BASE_DATASET_SHORT and BASE_POLICY_NAME so dataset
-# names and training dirs both get tagged. Applied AFTER the override so the
-# user can combine them, e.g. --dag_short_override=lever_grip0 --run_tag=d30.
-if [[ -n "$RUN_TAG" ]]; then
-    BASE_DATASET_SHORT="${BASE_DATASET_SHORT}_${RUN_TAG}"
+    BASE_DATASET_STEM="$DAG_SHORT_OVERRIDE"
 fi
 # Model-type tag. "pi" (pi05) gets no tag — preserves back-compat with every
 # existing pi05 DAgger lineage on disk (dag artifact names were originally
@@ -543,9 +1031,6 @@ case "$MODEL" in
     act)  MODEL_TAG="act" ;;
     *) echo "ERROR: no MODEL_TAG mapping for model='$MODEL'" >&2; exit 1 ;;
 esac
-if [[ -n "$MODEL_TAG" ]]; then
-    BASE_DATASET_SHORT="${BASE_DATASET_SHORT}_${MODEL_TAG}"
-fi
 # Intervention-method tag. "rrt" gets no tag (preserves existing artifact
 # names on disk and on the hub — back-compat with all DAgger runs to date).
 # Other methods get a 2-char tag so the user can tell runs apart at a glance,
@@ -557,10 +1042,50 @@ case "$INTERVENTION_METHOD" in
     oracle_goal) METHOD_TAG="og" ;;
     *) echo "ERROR: no METHOD_TAG mapping for intervention_method='$INTERVENTION_METHOD'" >&2; exit 1 ;;
 esac
-if [[ -n "$METHOD_TAG" ]]; then
-    BASE_DATASET_SHORT="${BASE_DATASET_SHORT}_${METHOD_TAG}"
+# Blends-lineage tag. When --blends is set, this configuration produces a
+# DIFFERENT progression of policies than the no-blends lineage (rounds 2+
+# train on different merged data → ft_dag{N} checkpoints diverge), so the
+# round-N dag artifacts must use distinct names — otherwise resume detection
+# would false-positive on the no-blends lineage's artifacts. Empty $BLENDS
+# → empty tag (back-compat: byte-identical to today). Sorted descending so
+# `--blends='0.8 0.9'` and `--blends='0.9 0.8'` produce the same tag.
+BLENDS_TAG=""
+if (( ${#BLENDS[@]} > 0 )); then
+    # Delegate to dagger_naming.format_blends_tag — sorts descending,
+    # zero-pads each pct, joins with `_`, prefixes `b`.
+    BLENDS_TAG="$(_py_dagger_name format_blends_tag --blends="${BLENDS[*]}")"
 fi
+
+# Helper: combine BASE_DATASET_STEM + MODEL_TAG + METHOD_TAG with a given
+# (run_tag, blends_tag) pair. Used twice: once with the current command's
+# $RUN_TAG/$BLENDS_TAG (= BASE_DATASET_SHORT), and once in rerun mode with
+# the source lineage's run_tag/blends_tag (= SOURCE_INT_SHORT_PREFIX).
+_derive_base_dataset_short_for_tags() {
+    local run_tag="$1"
+    local blends_tag="$2"
+    _py_dagger_name derive_base_dataset_short \
+        --stem="$BASE_DATASET_STEM" \
+        --run_tag="$run_tag" \
+        --model_tag="$MODEL_TAG" \
+        --method_tag="$METHOD_TAG" \
+        --blends_tag="$blends_tag"
+}
+
+BASE_DATASET_SHORT="$(_derive_base_dataset_short_for_tags "$RUN_TAG" "$BLENDS_TAG")"
 echo "Dag dataset short prefix (dag artifacts named ${BASE_DATASET_SHORT}_${ACTION_INFIX}_dag{N}{,_m,_${MODEL}${ACTION_FORMAT}00}): $BASE_DATASET_SHORT"
+
+# Blends summary (only if any are configured). Delegate ratio→tag via the
+# canonical naming module so the formatting stays in lock-step with the
+# blend_short_for_round helper (defined later in the file).
+if (( ${#BLENDS[@]} > 0 )); then
+    _blend_tags=()
+    for r in "${BLENDS[@]}"; do
+        _tag=$(_py_dagger_name blend_tag --ratio="$r")
+        _blend_tags+=( "blend${_tag}(ratio=$r)" )
+    done
+    echo "Blend datasets per round:        ${_blend_tags[*]}"
+    echo "  → each round's intervention will be replayed at each ratio above and stored separately."
+fi
 
 # ── intervention scenario subset (computed once, reused every round) ──────────
 # When --intervention_sample_from_first=Y is set, pick INTERVENTION_N_EPISODES
@@ -607,31 +1132,146 @@ esac
 # When --initial_policy_path is set we use its basename (walking up if the path
 # points at /checkpoints/.../pretrained_model). When not set, fall back to the
 # name train_sweep.sh would produce for a from-scratch round-0 base training.
-BASE_POLICY_NAME=""
+BASE_POLICY_STEM=""
 if [[ -n "$INITIAL_POLICY_PATH" ]]; then
     # Normalize the path: strip a trailing /pretrained_model and any
     # /checkpoints/<step|last>/ segment so basename returns the run dir name.
     _stripped="${INITIAL_POLICY_PATH%/}"
     _stripped="${_stripped%/pretrained_model}"
     _stripped="${_stripped%/checkpoints/*}"
-    BASE_POLICY_NAME="$(basename "$_stripped")"
+    BASE_POLICY_STEM="$(basename "$_stripped")"
 else
     # No initial policy: round 0 will train from scratch using train_sweep.sh,
     # which produces this name pattern. Round 1+ dag dirs hang off of it.
-    BASE_POLICY_NAME="${TRAIN_OUTPUT_MODEL_PREFIX}_${BASE_SHORT}_${TRAIN_OUTPUT_ACTION_TAG}_basewrist"
+    BASE_POLICY_STEM="${TRAIN_OUTPUT_MODEL_PREFIX}_${BASE_SHORT}_${TRAIN_OUTPUT_ACTION_TAG}_basewrist"
 fi
-# Optional --run_tag suffix on the policy name (mirrors the dataset-name
-# tagging above). Training dirs have no length limit (local FS), so we apply
-# the tag unconditionally when set.
-if [[ -n "$RUN_TAG" ]]; then
-    BASE_POLICY_NAME="${BASE_POLICY_NAME}_${RUN_TAG}"
-fi
-# Intervention-method tag on the policy name (mirrors the dataset-name tagging
-# above). "rrt" gets no tag — back-compat with every existing DAgger lineage.
-if [[ -n "$METHOD_TAG" ]]; then
-    BASE_POLICY_NAME="${BASE_POLICY_NAME}_${METHOD_TAG}"
-fi
+
+# Helper: combine BASE_POLICY_STEM + METHOD_TAG with a given (run_tag,
+# blends_tag) pair. Mirrors _derive_base_dataset_short_for_tags but for
+# training dirs. Note: no MODEL_TAG suffix on policy names — the model
+# prefix (pi05_/diffusion_/act_) on the stem already disambiguates.
+_derive_base_policy_name_for_tags() {
+    local run_tag="$1"
+    local blends_tag="$2"
+    _py_dagger_name derive_base_policy_name \
+        --stem="$BASE_POLICY_STEM" \
+        --run_tag="$run_tag" \
+        --method_tag="$METHOD_TAG" \
+        --blends_tag="$blends_tag"
+}
+
+BASE_POLICY_NAME="$(_derive_base_policy_name_for_tags "$RUN_TAG" "$BLENDS_TAG")"
 echo "Base policy name (dag dirs will be named ${BASE_POLICY_NAME}_dag{N}):  $BASE_POLICY_NAME"
+
+# Source lineage prefixes for rerun-blends mode. In rerun mode the
+# intervention + blend datasets read from SOURCE's lineage names; the merged
+# datasets + training dirs write to the CURRENT command's BASE_DATASET_SHORT /
+# BASE_POLICY_NAME (= NEW lineage). Outside rerun mode, source = current
+# (back-compat: every helper that reads SOURCE_* sees identical values).
+if [[ "$RERUN_MODE_ENABLED" == "true" ]]; then
+    if [[ -n "$SOURCE_RUN_TAG" ]]; then
+        SOURCE_INT_SHORT_PREFIX="$(_derive_base_dataset_short_for_tags "$SOURCE_RUN_TAG" "$SOURCE_BLENDS_TAG")"
+        SOURCE_POLICY_BASENAME="$(_derive_base_policy_name_for_tags "$SOURCE_RUN_TAG" "$SOURCE_BLENDS_TAG")"
+    else
+        SOURCE_INT_SHORT_PREFIX="$BASE_DATASET_SHORT"
+        SOURCE_POLICY_BASENAME="$BASE_POLICY_NAME"
+    fi
+    # Explicit overrides win when set (advanced cases — source and current
+    # command differ in task/dataset_tag/model/method).
+    [[ -n "$REUSE_INTERVENTION_FROM" ]] && SOURCE_INT_SHORT_PREFIX="$REUSE_INTERVENTION_FROM"
+    [[ -n "$REUSE_POLICY_FROM"       ]] && SOURCE_POLICY_BASENAME="$REUSE_POLICY_FROM"
+    echo "[rerun] Source intervention prefix: $SOURCE_INT_SHORT_PREFIX"
+    echo "[rerun] Source policy basename:    $SOURCE_POLICY_BASENAME"
+else
+    SOURCE_INT_SHORT_PREFIX="$BASE_DATASET_SHORT"
+    SOURCE_POLICY_BASENAME="$BASE_POLICY_NAME"
+fi
+
+# Rerun-blends mode: auto-detect NUM_ROUNDS from source lineage on disk if
+# omitted. Scans the local HF cache for source intervention datasets named
+# `<SOURCE_INT_SHORT_PREFIX>_<ACTION_INFIX>_dag<N>` and uses the highest
+# contiguous N. Existing dagger lineages are always contiguous (dag1, dag2,
+# ...), so contiguous-scan matches the invariant.
+auto_detect_source_num_rounds() {
+    local n=0 dir
+    while :; do
+        dir="${LEROBOT_CACHE}/${HF_USER}/${SOURCE_INT_SHORT_PREFIX}_${ACTION_INFIX}_dag$((n + 1))"
+        [[ -d "$dir" ]] || break
+        n=$((n + 1))
+    done
+    echo "$n"
+}
+if [[ "$RERUN_MODE_ENABLED" == "true" && -z "$NUM_ROUNDS" ]]; then
+    NUM_ROUNDS="$(auto_detect_source_num_rounds)"
+    if (( NUM_ROUNDS < 1 )); then
+        echo "ERROR: --num_rounds omitted and no source rounds found under" >&2
+        echo "  ${LEROBOT_CACHE}/${HF_USER}/${SOURCE_INT_SHORT_PREFIX}_${ACTION_INFIX}_dag1" >&2
+        echo "  Check --rerun_blends_from / --reuse_intervention_from spelling, or" >&2
+        echo "  ensure the source lineage's interventions are in the HF cache." >&2
+        exit 1
+    fi
+    echo "[rerun] Auto-detected $NUM_ROUNDS source rounds; defaulting --num_rounds=$NUM_ROUNDS"
+fi
+
+# Deferred RETRAIN_ROUND upper-bound check (NUM_ROUNDS now resolved).
+if [[ -n "$RETRAIN_ROUND" ]] && (( RETRAIN_ROUND > NUM_ROUNDS )); then
+    echo "ERROR: --retrain_round=$RETRAIN_ROUND must be between 1 and $NUM_ROUNDS" >&2; exit 1
+fi
+
+# Rerun-blends startup validation. Runs once after NUM_ROUNDS is known; checks
+# that the source lineage is fully on disk and that the new lineage won't
+# collide with the source.
+if [[ "$RERUN_MODE_ENABLED" == "true" ]]; then
+    if [[ -n "$REUSE_INTERVENTION_FROM" && -z "$REUSE_POLICY_FROM" ]] \
+    || [[ -z "$REUSE_INTERVENTION_FROM" && -n "$REUSE_POLICY_FROM" ]]; then
+        echo "ERROR: --reuse_intervention_from and --reuse_policy_from must be set together." >&2
+        echo "  (Use --rerun_blends_from for the simple form, or set both flags.)" >&2
+        exit 1
+    fi
+    if (( ${#BLENDS[@]} == 0 )) && (( TARGET_INTERVENTION_VOLUME == 1 )); then
+        echo "ERROR: rerun mode with no blends AND --target_intervention_volume=1 would reproduce source's training." >&2
+        echo "  Add --blends, OR set --target_intervention_volume > 1 to create a meaningfully" >&2
+        echo "  different lineage (= 'what would happen if I retrained with higher intervention" >&2
+        echo "  oversample on the same recorded data')." >&2
+        exit 1
+    fi
+    if [[ -n "$SOURCE_RUN_TAG" && "$RUN_TAG" == "$SOURCE_RUN_TAG" && "$BLENDS_TAG" == "$SOURCE_BLENDS_TAG" ]]; then
+        echo "ERROR: --run_tag='$RUN_TAG' (+ blends_tag='$BLENDS_TAG') matches source." >&2
+        echo "  Choose a different --run_tag so the new lineage's artifacts don't" >&2
+        echo "  collide with the source lineage on disk." >&2
+        exit 1
+    fi
+    for f in INTERVENTION_N_EPISODES INTERVENTION_SAMPLE_FROM_FIRST INTERVENTION_SAMPLE_SEED INTERVENTION_EXTRA_ARGS; do
+        case "$f" in
+            INTERVENTION_N_EPISODES)         _default="100" ;;
+            INTERVENTION_SAMPLE_FROM_FIRST)  _default="" ;;
+            INTERVENTION_SAMPLE_SEED)        _default="0" ;;
+            INTERVENTION_EXTRA_ARGS)         _default="" ;;
+        esac
+        if [[ "${!f}" != "$_default" ]]; then
+            echo "[rerun] WARN: --${f,,}='${!f}' ignored in rerun mode (no new intervention recorded)." >&2
+        fi
+    done
+    # Inline the path expansions here (int_repo_for_round +
+    # source_train_output_dir_for_round are defined further down in the
+    # helpers section; we run this validation block before those helpers).
+    for r in $(seq 1 "$NUM_ROUNDS"); do
+        _src_int_dir="$LEROBOT_CACHE/${HF_USER}/${SOURCE_INT_SHORT_PREFIX}_${ACTION_INFIX}_dag${r}"
+        if [[ ! -d "$_src_int_dir" ]]; then
+            echo "ERROR: source intervention missing on disk." >&2
+            echo "  Expected at: $_src_int_dir" >&2
+            exit 1
+        fi
+    done
+    for r in $(seq 2 "$NUM_ROUNDS"); do
+        _src_pol_dir="$LEROBOT_ROOT/outputs/training/${SOURCE_POLICY_BASENAME}_ft_dag$((r - 1))"
+        if [[ ! -d "$_src_pol_dir/checkpoints" ]]; then
+            echo "ERROR: source policy dir not found: $_src_pol_dir" >&2
+            echo "  Need source's _ft_dag$((r - 1)) for blending + training at round $r." >&2
+            exit 1
+        fi
+    done
+fi
 
 # Derive the lineage tag dagger_progress.sh uses to filter training dirs. It
 # expects `${BASE_SHORT}_${ACTION_TAG}_basewrist` as a SUFFIX of training dirs.
@@ -669,6 +1309,119 @@ validate_repo_name() {
     return 0
 }
 
+# Write a per-round dagger config sidecar to <train_dir>/dagger/config.json.
+# Logs the orchestrator invocation, computed naming, and (in rerun mode) the
+# source-lineage pointers — primary mechanism by which my_scripts/dagger_plot.py
+# auto-pairs rerun lineages with their source for the overlay comparison plots.
+# Called once at the top of each round; re-writes idempotently on resume so the
+# latest invocation's values win.
+write_dagger_config_sidecar() {
+    local round_n="$1"
+    local out_path="$2"
+    local round_train_output_dir="$3"
+    run_or_echo mkdir -p "$(dirname "$out_path")"
+    # In --dry-run, the JSON is not actually written (the mkdir above is a
+    # no-op too). Bail to keep the dry-run clean — readers should never
+    # encounter half-built sidecars from a dry-run.
+    [[ "$DRY_RUN" == true ]] && { echo "[DRY-RUN] would write dagger config sidecar: $out_path"; return 0; }
+    # Use python3 to construct the JSON safely (handles escaping, types).
+    # Pass everything via env vars to dodge shell-quoting issues with argv.
+    local _argv_json
+    _argv_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${ORIG_ARGV[@]}")"
+    DAG_CFG_ROUND="$round_n" \
+    DAG_CFG_OUT_PATH="$out_path" \
+    DAG_CFG_ARGV_JSON="$_argv_json" \
+    DAG_CFG_BASE_DATASET_SHORT="$BASE_DATASET_SHORT" \
+    DAG_CFG_BASE_POLICY_NAME="$BASE_POLICY_NAME" \
+    DAG_CFG_TRAIN_OUTPUT_DIR="$round_train_output_dir" \
+    DAG_CFG_RUN_TAG="$RUN_TAG" \
+    DAG_CFG_BLENDS_TAG="$BLENDS_TAG" \
+    DAG_CFG_MODEL_TAG="$MODEL_TAG" \
+    DAG_CFG_METHOD_TAG="$METHOD_TAG" \
+    DAG_CFG_RERUN_MODE_ENABLED="$RERUN_MODE_ENABLED" \
+    DAG_CFG_SOURCE_RUN_TAG="$SOURCE_RUN_TAG" \
+    DAG_CFG_SOURCE_BLENDS_TAG="$SOURCE_BLENDS_TAG" \
+    DAG_CFG_SOURCE_INT_SHORT_PREFIX="$SOURCE_INT_SHORT_PREFIX" \
+    DAG_CFG_SOURCE_POLICY_BASENAME="$SOURCE_POLICY_BASENAME" \
+    DAG_CFG_BRANCHING_POLICY="${CURRENT_POLICY:-}" \
+    DAG_CFG_BLENDS_STR="${BLENDS[*]}" \
+    DAG_CFG_MODEL="$MODEL" \
+    DAG_CFG_ACTION_FORMAT="$ACTION_FORMAT" \
+    DAG_CFG_INTERMEDIATE_MODE="$INTERMEDIATE_MODE" \
+    DAG_CFG_FINAL_MODE="$FINAL_MODE" \
+    DAG_CFG_FINETUNE_STEPS="$FINETUNE_STEPS" \
+    DAG_CFG_TARGET_INTERVENTION_VOLUME="$TARGET_INTERVENTION_VOLUME" \
+    DAG_CFG_FILTER_BLEND_COLLISIONS="$FILTER_BLEND_COLLISIONS" \
+    DAG_CFG_INTERVENTION_METHOD="$INTERVENTION_METHOD" \
+    DAG_CFG_INITIAL_POLICY_PATH="${INITIAL_POLICY_PATH:-}" \
+    DAG_CFG_BASE_REPO="${BASE_REPO:-}" \
+    DAG_CFG_USE_WEIGHTED_SAMPLING="$USE_WEIGHTED_SAMPLING" \
+    DAG_CFG_DAGGER_DATA_FRACTION="$DAGGER_DATA_FRACTION" \
+    DAG_CFG_WEIGHTED_REPO_IDS_JSON="${DAG_CFG_WEIGHTED_REPO_IDS_JSON:-[]}" \
+    DAG_CFG_WEIGHTED_WEIGHTS_JSON="${DAG_CFG_WEIGHTED_WEIGHTS_JSON:-[]}" \
+    DAG_CFG_WEIGHTED_STATS_PATHS_JSON="${DAG_CFG_WEIGHTED_STATS_PATHS_JSON:-[]}" \
+    DAG_CFG_HEADLESS="$HEADLESS" \
+    python3 - <<'PY'
+import json, os, datetime, socket, getpass
+rerun_mode = None
+if os.environ["DAG_CFG_RERUN_MODE_ENABLED"] == "true":
+    rerun_mode = {
+        "source_run_tag":          os.environ["DAG_CFG_SOURCE_RUN_TAG"],
+        "source_blends_tag":       os.environ["DAG_CFG_SOURCE_BLENDS_TAG"],
+        "source_int_short_prefix": os.environ["DAG_CFG_SOURCE_INT_SHORT_PREFIX"],
+        "source_policy_basename":  os.environ["DAG_CFG_SOURCE_POLICY_BASENAME"],
+        "branching_policy_path":   os.environ["DAG_CFG_BRANCHING_POLICY"],
+    }
+blends_str = os.environ["DAG_CFG_BLENDS_STR"].strip()
+blends = [float(x) for x in blends_str.split()] if blends_str else []
+config = {
+    "schema_version": 1,
+    "round": int(os.environ["DAG_CFG_ROUND"]),
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "user": getpass.getuser(),
+    "host": socket.gethostname(),
+    "training_output_dir": os.environ["DAG_CFG_TRAIN_OUTPUT_DIR"],
+    "rerun_mode": rerun_mode,
+    "naming": {
+        "base_dataset_short": os.environ["DAG_CFG_BASE_DATASET_SHORT"],
+        "base_policy_name":   os.environ["DAG_CFG_BASE_POLICY_NAME"],
+        "base_repo":          os.environ["DAG_CFG_BASE_REPO"],
+        "run_tag":            os.environ["DAG_CFG_RUN_TAG"],
+        "blends_tag":         os.environ["DAG_CFG_BLENDS_TAG"],
+        "model_tag":          os.environ["DAG_CFG_MODEL_TAG"],
+        "method_tag":         os.environ["DAG_CFG_METHOD_TAG"],
+    },
+    "config": {
+        "model":                  os.environ["DAG_CFG_MODEL"],
+        "action_format":          os.environ["DAG_CFG_ACTION_FORMAT"],
+        "intermediate_mode":      os.environ["DAG_CFG_INTERMEDIATE_MODE"],
+        "final_mode":             os.environ["DAG_CFG_FINAL_MODE"],
+        "finetune_steps":         int(os.environ["DAG_CFG_FINETUNE_STEPS"]),
+        "blends":                 blends,
+        "target_intervention_volume": int(os.environ["DAG_CFG_TARGET_INTERVENTION_VOLUME"]),
+        "filter_blend_collisions": os.environ["DAG_CFG_FILTER_BLEND_COLLISIONS"] == "true",
+        "intervention_method":    os.environ["DAG_CFG_INTERVENTION_METHOD"],
+        "initial_policy_path":    os.environ["DAG_CFG_INITIAL_POLICY_PATH"],
+        "use_weighted_sampling":  os.environ["DAG_CFG_USE_WEIGHTED_SAMPLING"] == "true",
+        "dagger_data_fraction":   float(os.environ["DAG_CFG_DAGGER_DATA_FRACTION"]),
+        "weighted_repo_ids":      json.loads(os.environ["DAG_CFG_WEIGHTED_REPO_IDS_JSON"]),
+        "weighted_sample_weights": json.loads(os.environ["DAG_CFG_WEIGHTED_WEIGHTS_JSON"]),
+        "weighted_stats_paths":   json.loads(os.environ["DAG_CFG_WEIGHTED_STATS_PATHS_JSON"]),
+        "headless":               os.environ["DAG_CFG_HEADLESS"] == "true",
+    },
+    "orchestrator_invocation": {
+        "argv": json.loads(os.environ["DAG_CFG_ARGV_JSON"]),
+    },
+}
+out_path = os.environ["DAG_CFG_OUT_PATH"]
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+tmp_path = out_path + ".tmp"
+with open(tmp_path, "w") as f:
+    json.dump(config, f, indent=2)
+os.replace(tmp_path, out_path)
+PY
+}
+
 # Per-round name derivations. All dag artifact names hang off BASE_DATASET_SHORT
 # (derived from BASE_REPO above, splatsim_ prefix stripped), so the dag names
 # inherit every identifying suffix from the base dataset (_grip0, _lowres, etc.)
@@ -682,15 +1435,46 @@ validate_repo_name() {
 # sits between BASE_DATASET_SHORT and _dag${N}, so the dataset short for round 1
 # of a rel run on the grip0 base is e.g.
 # "approach_lever_11_biasend_5path_grip0_r_dag1".
-int_short_for_round()    { echo "${BASE_DATASET_SHORT}_${ACTION_INFIX}_dag$1"; }
-int_repo_for_round()     { echo "${HF_USER}/$(int_short_for_round "$1")"; }
-alias_short_for_round()  { echo "$(int_short_for_round "$1")_${MODEL}${ACTION_FORMAT}00"; }
-alias_repo_for_round()   { echo "${HF_USER}/$(alias_short_for_round "$1")"; }
+# Intervention + alias + blend names use SOURCE_INT_SHORT_PREFIX so that in
+# rerun mode they resolve to the SOURCE lineage's names (read-only artifacts);
+# outside rerun mode SOURCE_INT_SHORT_PREFIX == BASE_DATASET_SHORT so behavior
+# is unchanged.
+# Per-round name helpers — all delegated to the canonical naming module via
+# _py_dagger_name. Forward derivation (config → name) lives in
+# my_scripts/dagger_naming.py so the bash orchestrator and downstream Python
+# viz scripts share one source of truth.
+int_short_for_round()    { _py_dagger_name int_short    --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1"; }
+int_repo_for_round()     { _py_dagger_name int_repo     --hf_user="$HF_USER" --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1"; }
+alias_short_for_round()  { _py_dagger_name alias_short  --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1" --model="$MODEL" --action_format="$ACTION_FORMAT"; }
+alias_repo_for_round()   { _py_dagger_name alias_repo   --hf_user="$HF_USER" --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1" --model="$MODEL" --action_format="$ACTION_FORMAT"; }
 # Merged dataset uses a compact "_m" suffix (not "_merged") to fit under the
 # 56-char HuggingFace repo-name limit. The merged dataset is a derived artifact
 # that gets deleted between rounds anyway; the cryptic suffix is acceptable.
-merged_short_for_round() { echo "${BASE_DATASET_SHORT}_${ACTION_INFIX}_dag$1_m"; }
-merged_repo_for_round()  { echo "${HF_USER}/$(merged_short_for_round "$1")"; }
+# Merged datasets are THIS run's artifacts → use BASE_DATASET_SHORT (NEW lineage).
+merged_short_for_round() { _py_dagger_name merged_short --base_dataset_short="$BASE_DATASET_SHORT" --infix="$ACTION_INFIX" --round="$1"; }
+merged_repo_for_round()  { _py_dagger_name merged_repo  --hf_user="$HF_USER" --base_dataset_short="$BASE_DATASET_SHORT" --infix="$ACTION_INFIX" --round="$1"; }
+
+# Blend datasets: per round per ratio. Built off int_short_for_round so they
+# inherit every identifying suffix the raw intervention has (including, in
+# rerun mode, the source lineage's run_tag/blends_tag — so two reruns asking
+# for the same ratio at the same source round produce IDENTICAL blend dataset
+# names → safe cross-rerun cache reuse). Tag is 3-digit zero-padded
+# int(ratio*100) — e.g. 0.9 → "090", 0.1 → "010", 0.95 → "095".
+_blend_tag_for_ratio()   { _py_dagger_name blend_tag    --ratio="$1"; }
+blend_short_for_round()  { _py_dagger_name blend_short  --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1" --ratio="$2"; }
+blend_repo_for_round()   { _py_dagger_name blend_repo   --hf_user="$HF_USER" --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1" --ratio="$2"; }
+# Collision-filtered blend dataset (produced by filter_blend_collisions.py
+# when --filter_blend_collisions is on). Naming: `<blend_short>_nocoll`.
+nocoll_short_for_round() { _py_dagger_name nocoll_short --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1" --ratio="$2"; }
+nocoll_repo_for_round()  { _py_dagger_name nocoll_repo  --hf_user="$HF_USER" --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1" --ratio="$2"; }
+
+# Source training-dir lookup for rerun-blends mode. At round r, the rerun
+# branches off SOURCE's _ft_dag(r-1) for both blending (step 2) and finetune
+# (step 6). Returns the training dir path; resolve_latest_checkpoint walks
+# inside it to find the actual checkpoint.
+source_train_output_dir_for_round() {
+    echo "$LEROBOT_ROOT/outputs/training/${SOURCE_POLICY_BASENAME}_ft_dag$1"
+}
 
 # Training mode for a given round number. As of the refactor away from
 # "last round special-cases to FINAL_MODE", every dag round uses the same
@@ -828,17 +1612,41 @@ print(n if n is not None else '')
 }
 training_exists() {
     local exp_dir="$1"
-    local last="$exp_dir/checkpoints/last/pretrained_model"
+    # Find the "best" checkpoint dir to validate against. Prefer the `last`
+    # symlink (canonical), but fall back to the highest-numbered numeric
+    # checkpoint when `last` is missing — that's the same fallback the
+    # `resolve_latest_checkpoint` helper uses, and a completed run whose
+    # `last` symlink got cleaned up (manual disk cleanup, etc.) still has
+    # its final numeric checkpoint dir on disk.
+    local last_dir="" actual_steps=""
+    if [[ -L "$exp_dir/checkpoints/last" || -d "$exp_dir/checkpoints/last" ]]; then
+        last_dir="$exp_dir/checkpoints/last/pretrained_model"
+        actual_steps=$(readlink -f "$exp_dir/checkpoints/last" 2>/dev/null \
+            | xargs -r basename \
+            | grep -oE '^[0-9]+$' || echo "")
+    fi
+    if [[ -z "$actual_steps" && -d "$exp_dir/checkpoints" ]]; then
+        # Pick the highest-numbered numeric checkpoint dir under checkpoints/.
+        local highest
+        highest=$(find "$exp_dir/checkpoints" -mindepth 1 -maxdepth 1 -type d \
+            -regextype posix-extended -regex '.*/[0-9]+$' 2>/dev/null \
+            | sort -V | tail -1)
+        if [[ -n "$highest" ]]; then
+            last_dir="$highest/pretrained_model"
+            actual_steps=$(basename "$highest" | grep -oE '^[0-9]+$' || echo "")
+        fi
+    fi
     # 1. Both descriptor AND weights file must exist (descriptor alone could
     #    be from a save that crashed mid-write).
-    [[ -f "$last/train_config.json" && -f "$last/model.safetensors" ]] || return 1
+    [[ -n "$last_dir" && -f "$last_dir/train_config.json" && -f "$last_dir/model.safetensors" ]] || return 1
     # 2. The last checkpoint's step number must match the planned total
     #    steps from train_config.json. Otherwise training was interrupted
     #    (crash, OOM, ctrl-C) and we should re-run from where it left off.
     #    lerobot-train's save_freq writes checkpoints/{step}/ on every save,
     #    and 'last' symlinks to the most recent. If steps=4000 in
-    #    train_config.json but `last` points at 002000, training was cut off.
-    local target_steps actual_steps
+    #    train_config.json but the resolved checkpoint is at step 002000,
+    #    training was cut off.
+    local target_steps
     target_steps=$(python3 -c "
 import json, sys
 try:
@@ -846,13 +1654,8 @@ try:
     print(int(cfg.get('steps', 0)))
 except Exception:
     print(0)
-" "$last/train_config.json" 2>/dev/null)
+" "$last_dir/train_config.json" 2>/dev/null)
     [[ -n "$target_steps" && "$target_steps" -gt 0 ]] || return 1
-    # 'last' is a symlink to e.g. checkpoints/004000. Resolve and grab the
-    # numeric step from the path.
-    actual_steps=$(readlink -f "$exp_dir/checkpoints/last" 2>/dev/null \
-        | xargs -r basename \
-        | grep -oE '^[0-9]+$' || echo "")
     [[ -n "$actual_steps" ]] || return 1
     # Force base-10 arithmetic; otherwise "004000" gets parsed as octal and
     # silently mismatches 4000.
@@ -914,6 +1717,15 @@ run_or_echo() {
 # orchestrator dies mid-run.
 MANAGED_SIM_PID=""
 MANAGED_SIM_LOG=""
+# Auxiliary headless sim — used by the collision-filter step when
+# --filter_blend_collisions is on. Lifecycle mirrors the main sim: started
+# lazily before the first filter call, stopped at orchestrator exit. Lives
+# on a separate port so it can coexist with the main intervention sim.
+MANAGED_FILTER_SIM_PID=""
+MANAGED_FILTER_SIM_LOG=""
+# Resolved aux port. Lazily filled by start_filter_sim() the first time it's
+# called: explicit --filter_collision_env_port wins; else ENV_EXTERNAL_PORT + 100.
+FILTER_COLLISION_ENV_PORT_RESOLVED=""
 
 port_in_use() {
     # echoes pid bound to TCP port $1 (first one found), or empty.
@@ -947,9 +1759,11 @@ start_sim() {
     if [[ "$DRY_RUN" == true ]]; then
         # Idempotent in dry-run too — only print "would start" on transitions.
         [[ "$MANAGED_SIM_PID" == "DRYRUN" ]] && return 0
+        local _hl=""
+        [[ "$HEADLESS" == true ]] && _hl=" --headless"
         echo "[DRY-RUN] would start SplatSim on port $ENV_EXTERNAL_PORT:"
         echo "[DRY-RUN]   cwd: $SPLATSIM_ROOT"
-        echo "[DRY-RUN]   cmd: python scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $ENV_EXTERNAL_PORT --hostname $ENV_EXTERNAL_HOST --robot_name $SPLATSIM_ROBOT_NAME --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID"
+        echo "[DRY-RUN]   cmd: python scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $ENV_EXTERNAL_PORT --hostname $ENV_EXTERNAL_HOST --robot_name $SPLATSIM_ROBOT_NAME --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID$_hl"
         MANAGED_SIM_PID="DRYRUN"
         return 0
     fi
@@ -975,6 +1789,10 @@ start_sim() {
         --robot_name         "$SPLATSIM_ROBOT_NAME"
         --eval_benchmark_repo_id "$EVAL_BENCHMARK_REPO_ID"
     )
+    # --headless connects pybullet via p.DIRECT instead of p.GUI — no
+    # visualizer window, ~50% less GPU memory, faster startup. Mirrors what
+    # start_filter_sim() does unconditionally for the collision-filter sim.
+    [[ "$HEADLESS" == true ]] && launch_cmd+=( --headless )
     echo "Starting SplatSim:"
     echo "  cwd:     $SPLATSIM_ROOT"
     echo "  cmd:     ${launch_cmd[*]}"
@@ -1048,20 +1866,120 @@ stop_sim() {
     echo "  stopped."
 }
 
-# Cleanup on exit (success or crash). Idempotent.
-trap 'stop_sim' EXIT
+# Headless auxiliary sim helpers, used only by the collision-filter step.
+# Same lifecycle pattern as start_sim/stop_sim above, but pinned to
+# $FILTER_COLLISION_ENV_PORT_RESOLVED and launched with --headless.
+start_filter_sim() {
+    [[ "$FILTER_BLEND_COLLISIONS" == "true" ]] || return 0
+    [[ "$MANAGE_SPLATSIM" == true ]] || return 0
+    # Resolve the aux port lazily: explicit flag wins; else main port + 100
+    # so the two sims don't collide on the same TCP port.
+    if [[ -z "$FILTER_COLLISION_ENV_PORT_RESOLVED" ]]; then
+        if [[ -n "$FILTER_COLLISION_ENV_PORT" ]]; then
+            FILTER_COLLISION_ENV_PORT_RESOLVED="$FILTER_COLLISION_ENV_PORT"
+        else
+            FILTER_COLLISION_ENV_PORT_RESOLVED=$(( ENV_EXTERNAL_PORT + 100 ))
+        fi
+    fi
+    if [[ "$DRY_RUN" == true ]]; then
+        [[ "$MANAGED_FILTER_SIM_PID" == "DRYRUN" ]] && return 0
+        echo "[DRY-RUN] would start HEADLESS SplatSim on port $FILTER_COLLISION_ENV_PORT_RESOLVED:"
+        echo "[DRY-RUN]   cwd: $SPLATSIM_ROOT"
+        echo "[DRY-RUN]   cmd: python scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $FILTER_COLLISION_ENV_PORT_RESOLVED --hostname $ENV_EXTERNAL_HOST --robot_name $SPLATSIM_ROBOT_NAME --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID --headless"
+        MANAGED_FILTER_SIM_PID="DRYRUN"
+        return 0
+    fi
+    if [[ -n "$MANAGED_FILTER_SIM_PID" ]] && kill -0 "$MANAGED_FILTER_SIM_PID" 2>/dev/null; then
+        return 0
+    fi
+    local existing
+    existing="$(port_in_use "$FILTER_COLLISION_ENV_PORT_RESOLVED")"
+    if [[ -n "$existing" ]]; then
+        echo "ERROR: aux headless port $FILTER_COLLISION_ENV_PORT_RESOLVED already in use by pid $existing." >&2
+        echo "  Either kill it, change --filter_collision_env_port, or skip the filter step." >&2
+        exit 1
+    fi
+    mkdir -p "$LEROBOT_ROOT/outputs/dagger"
+    MANAGED_FILTER_SIM_LOG="$LEROBOT_ROOT/outputs/dagger/splatsim_filter_$(date +%Y%m%d_%H%M%S).log"
+    local launch_cmd=(
+        python scripts/launch_nodes.py
+        --robot              "$SPLATSIM_ROBOT"
+        --robot_port         "$FILTER_COLLISION_ENV_PORT_RESOLVED"
+        --hostname           "$ENV_EXTERNAL_HOST"
+        --robot_name         "$SPLATSIM_ROBOT_NAME"
+        --eval_benchmark_repo_id "$EVAL_BENCHMARK_REPO_ID"
+        --headless
+    )
+    echo "Starting HEADLESS SplatSim (for collision filter):"
+    echo "  cwd:     $SPLATSIM_ROOT"
+    echo "  cmd:     ${launch_cmd[*]}"
+    echo "  log:     $MANAGED_FILTER_SIM_LOG"
+    (
+        cd "$SPLATSIM_ROOT" || exit 1
+        setsid "${launch_cmd[@]}" </dev/null >"$MANAGED_FILTER_SIM_LOG" 2>&1
+    ) &
+    echo "  launcher subshell pid: $! (sim will fork under setsid)"
+    echo -n "  waiting for port $FILTER_COLLISION_ENV_PORT_RESOLVED to come up "
+    if wait_for_port "$FILTER_COLLISION_ENV_PORT_RESOLVED" 300; then
+        echo "ready."
+    else
+        echo
+        echo "ERROR: headless SplatSim did not come up within 300s. Last 30 log lines:" >&2
+        tail -30 "$MANAGED_FILTER_SIM_LOG" >&2 || true
+        exit 1
+    fi
+    MANAGED_FILTER_SIM_PID="$(port_in_use "$FILTER_COLLISION_ENV_PORT_RESOLVED")"
+    sleep 3
+}
+
+stop_filter_sim() {
+    [[ "$MANAGE_SPLATSIM" == true ]] || return 0
+    if [[ "$MANAGED_FILTER_SIM_PID" == "DRYRUN" ]]; then
+        echo "[DRY-RUN] would stop HEADLESS SplatSim on port $FILTER_COLLISION_ENV_PORT_RESOLVED"
+        MANAGED_FILTER_SIM_PID=""
+        return 0
+    fi
+    [[ -z "$MANAGED_FILTER_SIM_PID" ]] && return 0
+    if ! kill -0 "$MANAGED_FILTER_SIM_PID" 2>/dev/null; then
+        MANAGED_FILTER_SIM_PID=""
+        return 0
+    fi
+    echo "Stopping HEADLESS SplatSim (pid=$MANAGED_FILTER_SIM_PID)..."
+    local pgid
+    pgid="$(ps -o pgid= -p "$MANAGED_FILTER_SIM_PID" 2>/dev/null | tr -d ' ' || true)"
+    [[ -n "$pgid" ]] && kill -TERM -"$pgid" 2>/dev/null || kill -TERM "$MANAGED_FILTER_SIM_PID" 2>/dev/null || true
+    for ((i=1; i<=20; i++)); do
+        kill -0 "$MANAGED_FILTER_SIM_PID" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$MANAGED_FILTER_SIM_PID" 2>/dev/null; then
+        [[ -n "$pgid" ]] && kill -KILL -"$pgid" 2>/dev/null || kill -KILL "$MANAGED_FILTER_SIM_PID" 2>/dev/null || true
+    fi
+    MANAGED_FILTER_SIM_PID=""
+    echo "  stopped."
+}
+
+# Cleanup on exit (success or crash). Idempotent. Both sims get stopped.
+trap 'stop_sim; stop_filter_sim' EXIT
 
 # ── pre-flight: validate every round's derived names ──────────────────────────
 echo "Pre-flight: validating derived repo names for $NUM_ROUNDS rounds..."
 ANY_NAME_TOO_LONG=false
 ALIAS_NAMES_OVERFLOW=false
 for r in $(seq 1 "$NUM_ROUNDS"); do
-    # Always validate the raw intervention and merged-output names.
-    for name in "$(int_repo_for_round "$r")" "$(merged_repo_for_round "$r")"; do
-        if ! validate_repo_name "$name"; then
+    # Always validate the raw intervention name.
+    if ! validate_repo_name "$(int_repo_for_round "$r")"; then
+        ANY_NAME_TOO_LONG=true
+    fi
+    # Only validate the merged-output name in merge mode — weighted mode never
+    # creates a merged dataset on disk, so its name length doesn't matter.
+    # This is what lets long base names (which would overflow `_dag${N}_m`)
+    # still run in weighted mode where the merge step is skipped entirely.
+    if [[ "$USE_WEIGHTED_SAMPLING" != "true" ]]; then
+        if ! validate_repo_name "$(merged_repo_for_round "$r")"; then
             ANY_NAME_TOO_LONG=true
         fi
-    done
+    fi
     # Only validate the alias name when the alias step is enabled.
     if [[ "$SKIP_ALIAS_STEP" == false ]]; then
         if ! validate_repo_name "$(alias_repo_for_round "$r")"; then
@@ -1089,11 +2007,117 @@ fi
 echo "  ✓ all derived names valid (alias step: $([ "$SKIP_ALIAS_STEP" == true ] && echo SKIPPED || echo enabled))."
 echo
 
+# ── mode-purity validation ────────────────────────────────────────────────────
+# A single lineage must run end-to-end in one mode — merge OR weighted, never
+# half-and-half. Two distinguishing artifacts on disk:
+#   * merge-mode runs produce `<lineage>_dag${r}_m` merged datasets.
+#   * weighted-mode runs write a per-round dagger/config.json sidecar with
+#     `use_weighted_sampling=true` (added below in write_dagger_config_sidecar).
+# Mixed-mode reuse silently corrupts: a weighted-mode resume on top of an
+# already-merged round would skip the merge but try to retrain on incompatible
+# stats; a merge-mode resume on top of a weighted-mode round would re-merge
+# (slow + wasteful, but not corrupting). Reject both upfront.
+echo "Mode-purity validation:"
+if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
+    _conflicting=()
+    for _r in $(seq 1 "$NUM_ROUNDS"); do
+        _m_repo="$(merged_repo_for_round "$_r")"
+        if [[ -d "$LEROBOT_CACHE/$_m_repo" ]]; then
+            _conflicting+=( "round $_r: $LEROBOT_CACHE/$_m_repo" )
+        fi
+    done
+    if (( ${#_conflicting[@]} > 0 )); then
+        echo "ERROR: lineage already has merge-mode artifacts but --use_weighted_sampling is set." >&2
+        echo "  Conflicting (merged datasets from a prior merge-mode run):" >&2
+        for _c in "${_conflicting[@]}"; do echo "    $_c" >&2; done
+        echo "  Resolve by either:" >&2
+        echo "    (1) starting a weighted-mode lineage under a different --run_tag, OR" >&2
+        echo "    (2) running my_scripts/dagger_cleanup_lineage.sh first." >&2
+        exit 1
+    fi
+    echo "  ✓ no prior merge-mode artifacts; safe to run in weighted mode."
+else
+    _conflicting=()
+    for _r in $(seq 1 "$NUM_ROUNDS"); do
+        _train_dir="$(train_output_dir_for_round "$_r")"
+        _sidecar="$_train_dir/dagger/config.json"
+        if [[ -f "$_sidecar" ]]; then
+            _flag=$(python3 -c "
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+except Exception:
+    print('false'); sys.exit()
+v = (c.get('config') or {}).get('use_weighted_sampling')
+print('true' if v else 'false')
+" "$_sidecar" 2>/dev/null || echo "false")
+            if [[ "$_flag" == "true" ]]; then
+                _conflicting+=( "round $_r: $_sidecar (use_weighted_sampling=true)" )
+            fi
+        fi
+    done
+    if (( ${#_conflicting[@]} > 0 )); then
+        echo "ERROR: lineage already has weighted-sampling-mode artifacts but the new run defaults to merge mode." >&2
+        echo "  Conflicting (per-round sidecars from a prior weighted-mode run):" >&2
+        for _c in "${_conflicting[@]}"; do echo "    $_c" >&2; done
+        echo "  Resolve by either:" >&2
+        echo "    (1) passing --use_weighted_sampling to stay in weighted mode, OR" >&2
+        echo "    (2) starting a merge-mode lineage under a different --run_tag, OR" >&2
+        echo "    (3) running my_scripts/dagger_cleanup_lineage.sh first." >&2
+        exit 1
+    fi
+    echo "  ✓ no prior weighted-mode artifacts; safe to run in merge mode."
+fi
+echo
+
+# ── headless-mode banner ──────────────────────────────────────────────────────
+# Single-line summary so the user can confirm at a glance that GUI-killing
+# is active before launching what's likely a multi-hour batch run.
+if [[ "$HEADLESS" == true ]]; then
+    if [[ "$MANAGE_SPLATSIM" == true ]]; then
+        echo "Headless mode ON: SplatSim launch + step-1 SA wrapper + step-6 inline-eval sim all run with no GUI."
+    else
+        echo "Headless mode ON: step-1 SA wrapper GUI disabled. (--no_manage_splatsim → orchestrator does not"
+        echo "                  set --env.headless on training; the user's external sim's GUI is unchanged.)"
+    fi
+    echo
+fi
+
 # ── resume detection ──────────────────────────────────────────────────────────
 # For each round r, count completed steps (1..7). Step 7 (cleanup) is treated
 # as auto-complete once step 6 succeeds, so we only probe steps 1..6.
 declare -a ROUND_COMPLETED_STEPS  # parallel array indexed 1..N
 ROUND_COMPLETED_STEPS[0]=0  # unused
+
+# Per-round blend completion check. Step 2 is "all blend datasets (one per
+# ratio in $BLENDS) exist AND their stats sidecars exist". Empty $BLENDS →
+# vacuously true (step 2 is a no-op when no blends are configured).
+all_blends_complete_for_round() {
+    local r="$1"
+    (( ${#BLENDS[@]} == 0 )) && return 0
+    local R blend_repo blend_short nocoll_repo nocoll_short
+    for R in "${BLENDS[@]}"; do
+        blend_repo="$(blend_repo_for_round "$r" "$R")"
+        blend_short="$(blend_short_for_round "$r" "$R")"
+        dataset_exists "$blend_repo" || return 1
+        if [[ "$ACTION_FORMAT" == "rel" ]]; then
+            stats_exists "$blend_short" || return 1
+        fi
+        # When collision filtering is on, step 2 isn't complete until each
+        # blend has a `_nocoll` sibling on disk too (with its own stats
+        # sidecar for rel mode). The filter step is idempotent — if these
+        # exist, step 2 short-circuits and goes straight to step 3.
+        if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
+            nocoll_repo="$(nocoll_repo_for_round "$r" "$R")"
+            nocoll_short="$(nocoll_short_for_round "$r" "$R")"
+            dataset_exists "$nocoll_repo" || return 1
+            if [[ "$ACTION_FORMAT" == "rel" ]]; then
+                stats_exists "$nocoll_short" || return 1
+            fi
+        fi
+    done
+    return 0
+}
 
 for r in $(seq 1 "$NUM_ROUNDS"); do
     int_short="$(int_short_for_round "$r")"
@@ -1114,19 +2138,111 @@ for r in $(seq 1 "$NUM_ROUNDS"); do
        && { training_exists "$ft_dir" || training_exists "$scratch_dir"; }; then
         step=6
     else
-        dataset_exists "$int_repo"             && step=1
-        (( step == 1 )) && stats_exists "$int_short"      && step=2
+        # Step 1 = record + stats-on-int (folded). Requires BOTH the dataset
+        # AND its rel-action stats sidecar (when ACTION_FORMAT=rel). When the
+        # dataset exists but sidecar is missing, resume detection treats step 1
+        # as "not done" so that step 1 execution runs — but the step 1 EXECUTION
+        # block detects the existing dataset and just regenerates the sidecar
+        # instead of destructively re-recording.
+        if dataset_exists "$int_repo"; then
+            if [[ "$ACTION_FORMAT" == "rel" ]]; then
+                stats_exists "$int_short" && step=1
+            else
+                step=1
+            fi
+        fi
+        # Step 2 = all blends produced + their stats sidecars (or empty $BLENDS).
+        (( step == 1 )) && all_blends_complete_for_round "$r" && step=2
         if [[ "$SKIP_ALIAS_STEP" == true ]]; then
             # Step 3 is a no-op when skipped; auto-advance.
             (( step == 2 )) && step=3
         else
             (( step == 2 )) && dataset_exists "$alias_repo"   && step=3
         fi
-        (( step == 3 )) && dataset_exists "$merged_repo"  && step=4
-        (( step == 4 )) && stats_exists "$merged_short"   && step=5
+        # Step 4 = cumulative merge (merge-mode) OR skipped (weighted-mode).
+        # In weighted mode the per-source datasets ARE the training inputs;
+        # there's no merged artifact on disk. Auto-advance once step 3 is done.
+        if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
+            (( step == 3 )) && step=4
+        else
+            (( step == 3 )) && dataset_exists "$merged_repo" && step=4
+        fi
+        # Step 5 = stats on merged dataset (merge-mode) OR skipped (weighted-
+        # mode; per-source stats sidecars are already on disk from step 1b/2b
+        # checks above, which are prerequisites for step 4 advancing here).
+        if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
+            (( step == 4 )) && step=5
+        else
+            (( step == 4 )) && stats_exists "$merged_short" && step=5
+        fi
     fi
     ROUND_COMPLETED_STEPS[$r]=$step
 done
+
+# ── --extend_last_round: demote the highest fully-complete round to PARTIAL
+# when the current --finetune_steps would have produced a higher target than
+# what's saved. Only touches the LAST complete round; earlier rounds are
+# preserved (extending them would require redoing the whole chain).
+# Reads:
+#   * R = highest round with ROUND_COMPLETED_STEPS[R] == 6
+#   * R's starting step (= previous round's saved cfg.steps, or initial
+#     policy's saved cfg.steps for R=1) so we can compute planned_target =
+#     starting_step + FINETUNE_STEPS.
+#   * R's currently-saved cfg.steps (from its checkpoints/last/.../train_config.json).
+# If planned > saved → set ROUND_COMPLETED_STEPS[R]=5 and log.
+# Helper that returns cfg.steps from a train_config.json (or empty if missing).
+_steps_from_train_config() {
+    local cfg_path="$1"
+    [[ -f "$cfg_path" ]] || { echo ""; return; }
+    python3 -c "
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+    print(int(c.get('steps', 0)))
+except Exception:
+    print('')
+" "$cfg_path"
+}
+if [[ "$EXTEND_LAST_ROUND" == "true" ]]; then
+    # Find the highest fully-complete round.
+    LAST_COMPLETE_ROUND=0
+    for r in $(seq 1 "$NUM_ROUNDS"); do
+        (( ${ROUND_COMPLETED_STEPS[$r]} == 6 )) && LAST_COMPLETE_ROUND=$r
+    done
+    if (( LAST_COMPLETE_ROUND > 0 )); then
+        _R=$LAST_COMPLETE_ROUND
+        # Starting step for round R.
+        if (( _R == 1 )); then
+            _start_cfg="$INITIAL_POLICY_PATH/checkpoints/last/pretrained_model/train_config.json"
+            # Fall back to other common layouts for --initial_policy_path.
+            [[ -f "$_start_cfg" ]] || _start_cfg="$INITIAL_POLICY_PATH/pretrained_model/train_config.json"
+            [[ -f "$_start_cfg" ]] || _start_cfg="$INITIAL_POLICY_PATH/train_config.json"
+        else
+            _prev_dir="$(train_output_dir_for_round "$((_R - 1))")"
+            _start_cfg="$_prev_dir/checkpoints/last/pretrained_model/train_config.json"
+        fi
+        _R_dir="$(train_output_dir_for_round "$_R")"
+        _R_saved_cfg="$_R_dir/checkpoints/last/pretrained_model/train_config.json"
+        _start_steps="$(_steps_from_train_config "$_start_cfg")"
+        _saved_steps="$(_steps_from_train_config "$_R_saved_cfg")"
+        if [[ -n "$_start_steps" && -n "$_saved_steps" ]]; then
+            _planned_target=$(( _start_steps + FINETUNE_STEPS ))
+            if (( _planned_target > _saved_steps )); then
+                echo "[extend_last_round] Round $_R complete at saved target=$_saved_steps (started from $_start_steps);"
+                echo "  new --finetune_steps=$FINETUNE_STEPS implies planned target=$_planned_target."
+                echo "  Demoting round $_R to step 6 so step 6 re-runs and resumes from existing checkpoint."
+                ROUND_COMPLETED_STEPS[$_R]=5
+            else
+                echo "[extend_last_round] Round $_R complete at saved target=$_saved_steps; current --finetune_steps=$FINETUNE_STEPS"
+                echo "  implies planned target=$_planned_target (≤ saved). No extension needed."
+            fi
+        else
+            echo "[extend_last_round] WARNING: could not read steps from round $_R's saved config or the previous-round/initial config." >&2
+            echo "  start_cfg=$_start_cfg ($_start_steps), saved_cfg=$_R_saved_cfg ($_saved_steps)" >&2
+            echo "  Skipping extension; behaving as if --extend_last_round were unset." >&2
+        fi
+    fi
+fi
 
 # Find the furthest round/step combo.
 FURTHEST_ROUND=0
@@ -1152,16 +2268,27 @@ fi
 # Print the step legend so the user understands what "5/6 steps complete"
 # refers to in the detection table below.
 echo "Steps per round:"
-echo "  1. Record interventions on benchmark scenarios (lerobot-eval --intervention.method=...)"
-echo "  2. Compute sidecar relative-action stats for the intervention dataset"
+echo "  1. Record interventions (lerobot-eval --intervention.method=...) + sidecar rel-action stats"
+if (( ${#BLENDS[@]} > 0 )); then
+    echo "  2. Produce blended-intervention datasets at ratios ${BLENDS[*]} (augment_dataset_with_blending.py) + sidecar stats"
+else
+    echo "  2. (SKIPPED — --blends is empty) Blend intervention at configured ratios"
+fi
 if [[ "$SKIP_ALIAS_STEP" == true ]]; then
     echo "  3. (SKIPPED — --skip_alias_step) Hardlink-alias under _${MODEL}${ACTION_FORMAT}00 naming"
 else
     echo "  3. Hardlink-alias intervention dataset under _${MODEL}${ACTION_FORMAT}00 naming (augment_ratios_sweep.sh ratio=0)"
 fi
-echo "  4. Cumulative merge: base + dag1[..dag${NUM_ROUNDS}] → training dataset"
-echo "  5. Compute sidecar relative-action stats for the merged dataset"
-echo "  6. Train policy ($INTERMEDIATE_MODE) on the merged dataset"
+if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
+    echo "  4. (SKIPPED — --use_weighted_sampling) Cumulative merge"
+    echo "  5. (SKIPPED — --use_weighted_sampling) Merged-dataset rel-action stats"
+    echo "  6. Train policy ($INTERMEDIATE_MODE) on weighted union of {base + every round's intervention + every round's blends}"
+    echo "     → per-source DataLoader weights: base=$(python3 -c "print(round(1-float('$DAGGER_DATA_FRACTION'), 4))"), DAgger=${DAGGER_DATA_FRACTION} split equally across DAgger sub-datasets"
+else
+    echo "  4. Cumulative merge: base + dag1[..dag${NUM_ROUNDS}] → training dataset"
+    echo "  5. Compute sidecar relative-action stats for the merged dataset"
+    echo "  6. Train policy ($INTERMEDIATE_MODE) on the merged dataset"
+fi
 if do_final_scratch; then
     echo "  + (post-loop) Extra from-scratch train on round $NUM_ROUNDS's merged data"
     echo "                → $(train_output_dir_final_scratch)"
@@ -1199,12 +2326,47 @@ echo
 restart_from_scratch() {
     RESTART_PATHS=()
     for r in $(seq 1 "$NUM_ROUNDS"); do
-        RESTART_PATHS+=( "$LEROBOT_CACHE/$(int_repo_for_round "$r")" )
-        RESTART_PATHS+=( "$LEROBOT_CACHE/$(alias_repo_for_round "$r")" )
+        # In rerun-blends mode, the intervention + alias + int-stats artifacts
+        # belong to the SOURCE lineage (read-only). The new lineage we're
+        # building owns the merged + training + blend artifacts only. Never
+        # delete source artifacts on --force_restart.
+        #
+        # --preserve_round_1_intervention skips round 1's int/alias/int-stats
+        # too, since those represent the (expensive) human-recorded intervention
+        # that the user often wants to keep across "restart all finetuning from
+        # scratch" runs. Rounds 2..N still get cleaned because their
+        # intervention recordings depend on (and would be inconsistent with)
+        # the new fresh-policy chain.
+        _skip_int_for_this_round=false
+        if [[ "$RERUN_MODE_ENABLED" == "true" ]]; then
+            _skip_int_for_this_round=true
+        elif [[ "$PRESERVE_ROUND_1_INTERVENTION" == "true" && "$r" == "1" ]]; then
+            _skip_int_for_this_round=true
+        fi
+        if [[ "$_skip_int_for_this_round" != "true" ]]; then
+            RESTART_PATHS+=( "$LEROBOT_CACHE/$(int_repo_for_round "$r")" )
+            RESTART_PATHS+=( "$LEROBOT_CACHE/$(alias_repo_for_round "$r")" )
+            RESTART_PATHS+=( "$STATS_BASE/$(int_short_for_round "$r")" )
+        fi
         RESTART_PATHS+=( "$LEROBOT_CACHE/$(merged_repo_for_round "$r")" )
-        RESTART_PATHS+=( "$STATS_BASE/$(int_short_for_round "$r")" )
         RESTART_PATHS+=( "$STATS_BASE/$(merged_short_for_round "$r")" )
         RESTART_PATHS+=( "$(train_output_dir_for_round "$r")" )
+        # Blended-intervention datasets + their rel-action stats sidecars,
+        # one per ratio in $BLENDS. No-op when $BLENDS is empty.
+        # In rerun mode blends are cross-rerun-cacheable (see comment on
+        # ALSO_DELETE_BLENDS); preserve unless the user opted in. In
+        # non-rerun mode the lineage owns its blends → always delete.
+        if [[ "$RERUN_MODE_ENABLED" != "true" || "$ALSO_DELETE_BLENDS" == "true" ]]; then
+            for R in "${BLENDS[@]}"; do
+                RESTART_PATHS+=( "$LEROBOT_CACHE/$(blend_repo_for_round "$r" "$R")" )
+                RESTART_PATHS+=( "$STATS_BASE/$(blend_short_for_round "$r" "$R")" )
+                # Collision-filtered siblings (always include in the cleanup
+                # list; the underlying rm is idempotent on missing paths, so
+                # this is safe whether the user ran with the flag or not).
+                RESTART_PATHS+=( "$LEROBOT_CACHE/$(nocoll_repo_for_round "$r" "$R")" )
+                RESTART_PATHS+=( "$STATS_BASE/$(nocoll_short_for_round "$r" "$R")" )
+            done
+        fi
         # Intervention output dir lives INSIDE the training dir
         # (<train>/dagger/interventions/), so the rm above already takes it
         # out. Legacy paths from older orchestrator layouts kept here so
@@ -1282,6 +2444,19 @@ if [[ -n "$RETRAIN_ROUND" ]]; then
                 echo "  regenerate the data pipeline before retrying." >&2
                 exit 1
             fi
+            # Same check for every blend ratio. If any blend is missing, the
+            # merge will fail mid-flight; tell the user to re-run normally
+            # (which re-blends that round) before retrying.
+            for R in "${BLENDS[@]}"; do
+                rt_blend_repo="$(blend_repo_for_round "$prev" "$R")"
+                if ! dataset_exists "$rt_blend_repo"; then
+                    echo "ERROR: --retrain_round=$RETRAIN_ROUND with missing merged dataset needs" >&2
+                    echo "  $rt_blend_repo (round $prev's blend at ratio=$R) on disk, but it is missing." >&2
+                    echo "  Either remove --blends to skip blending, or re-run the orchestrator" >&2
+                    echo "  normally (without --retrain_round) to regenerate the data pipeline." >&2
+                    exit 1
+                fi
+            done
         done
         EFFECTIVE_START_STEP=4
         echo "Retrain mode: round $RETRAIN_ROUND, merged dataset missing → running steps 4-6."
@@ -1300,19 +2475,70 @@ elif [[ "$FORCE_RESTART" == true ]]; then
     EFFECTIVE_START_ROUND=1
     EFFECTIVE_START_STEP=1
     if [[ "$DRY_RUN" != true ]]; then
-        echo "--force_restart: this will rm -rf all dag1..dag${NUM_ROUNDS} datasets,"
-        echo "  their stats sidecars, and per-round training output dirs."
+        if [[ "$RERUN_MODE_ENABLED" == "true" ]]; then
+            echo "--force_restart (rerun mode): this will rm -rf the NEW lineage's"
+            if [[ "$ALSO_DELETE_BLENDS" == "true" ]]; then
+                echo "  merged datasets + training dirs + blend datasets for dag1..dag${NUM_ROUNDS}."
+                echo "  (--also_delete_blends set; blend datasets will be deleted too)"
+            else
+                echo "  merged datasets + training dirs for dag1..dag${NUM_ROUNDS}."
+                echo "  Blend datasets (<src_int>_dagN_blendXXX) will be PRESERVED for cross-rerun"
+                echo "  cache reuse — pass --also_delete_blends to delete them too."
+            fi
+            echo "  SOURCE intervention/alias/int-stats artifacts will be PRESERVED."
+        else
+            echo "--force_restart: this will rm -rf all dag1..dag${NUM_ROUNDS} datasets,"
+            echo "  their stats sidecars, and per-round training output dirs."
+            if [[ "$PRESERVE_ROUND_1_INTERVENTION" == "true" ]]; then
+                echo "  --preserve_round_1_intervention set: round 1's raw intervention dataset,"
+                echo "  alias, and int-stats sidecar will be PRESERVED (everything else is wiped)."
+            fi
+        fi
         echo -n "Type 'restart' to confirm: "
         read -r CONFIRM
         [[ "$CONFIRM" == "restart" ]] || { echo "Aborted."; exit 1; }
     fi
     echo "--force_restart: clearing prior dag artifacts..."
     for r in $(seq 1 "$NUM_ROUNDS"); do
-        run_or_echo rm -rf "$LEROBOT_CACHE/$(int_repo_for_round "$r")"
-        run_or_echo rm -rf "$LEROBOT_CACHE/$(alias_repo_for_round "$r")"
+        # In rerun-blends mode, source intervention/alias/int-stats artifacts
+        # are read-only and MUST be preserved. Only the new lineage's merged
+        # datasets + training dirs + blends get nuked. Mirrors the gate in
+        # restart_from_scratch() above.
+        #
+        # --preserve_round_1_intervention extends the same skip to round 1
+        # only — the human-recorded intervention dataset is preserved so the
+        # lineage restarts from "round 1 step 4 (merge)" instead of replaying
+        # step 1's expensive lerobot-eval recording.
+        _skip_int_for_this_round=false
+        if [[ "$RERUN_MODE_ENABLED" == "true" ]]; then
+            _skip_int_for_this_round=true
+        elif [[ "$PRESERVE_ROUND_1_INTERVENTION" == "true" && "$r" == "1" ]]; then
+            _skip_int_for_this_round=true
+        fi
+        if [[ "$_skip_int_for_this_round" != "true" ]]; then
+            run_or_echo rm -rf "$LEROBOT_CACHE/$(int_repo_for_round "$r")"
+            run_or_echo rm -rf "$LEROBOT_CACHE/$(alias_repo_for_round "$r")"
+            run_or_echo rm -rf "$STATS_BASE/$(int_short_for_round "$r")"
+        fi
         run_or_echo rm -rf "$LEROBOT_CACHE/$(merged_repo_for_round "$r")"
-        run_or_echo rm -rf "$STATS_BASE/$(int_short_for_round "$r")"
         run_or_echo rm -rf "$STATS_BASE/$(merged_short_for_round "$r")"
+        # Blended-intervention datasets + their rel-action stats sidecars
+        # (one per ratio in $BLENDS). No-op when $BLENDS is empty.
+        # Same gating as the RESTART_PATHS block above: in rerun mode,
+        # blends are cross-rerun-cacheable, so preserve them unless the
+        # user opted in via --also_delete_blends. In non-rerun mode the
+        # lineage owns its blends → always delete.
+        if [[ "$RERUN_MODE_ENABLED" != "true" || "$ALSO_DELETE_BLENDS" == "true" ]]; then
+            for R in "${BLENDS[@]}"; do
+                run_or_echo rm -rf "$LEROBOT_CACHE/$(blend_repo_for_round "$r" "$R")"
+                run_or_echo rm -rf "$STATS_BASE/$(blend_short_for_round "$r" "$R")"
+                # Collision-filtered siblings (always attempt; rm -rf is
+                # idempotent on missing paths so this is safe regardless of
+                # whether --filter_blend_collisions was used).
+                run_or_echo rm -rf "$LEROBOT_CACHE/$(nocoll_repo_for_round "$r" "$R")"
+                run_or_echo rm -rf "$STATS_BASE/$(nocoll_short_for_round "$r" "$R")"
+            done
+        fi
         # New layout nests interventions under the training dir
         # (<train>/dagger/...), so this rm already takes them out.
         run_or_echo rm -rf "$(train_output_dir_for_round "$r")"
@@ -1321,6 +2547,10 @@ elif [[ "$FORCE_RESTART" == true ]]; then
         run_or_echo rm -rf "$LEROBOT_ROOT/outputs/dagger/round_${r}"
     done
     do_final_scratch && run_or_echo rm -rf "$(train_output_dir_final_scratch)"
+    if [[ "$CLEANUP_ONLY" == true ]]; then
+        echo "--cleanup_only: deletion complete; exiting without starting a new run."
+        exit 0
+    fi
 elif (( FURTHEST_ROUND == 0 )); then
     # No prior work detected.
     EFFECTIVE_START_ROUND=1
@@ -1337,6 +2567,12 @@ elif [[ "$ALL_ROUNDS_DONE" == true ]] && { ! do_final_scratch || [[ "$FINAL_SCRA
     echo "Pipeline detected: $MSG."
     if [[ "$DRY_RUN" == true ]]; then
         echo "[DRY-RUN] Would exit without running anything."
+        exit 0
+    fi
+    if [[ "$RESUME" == true ]]; then
+        # Nothing to resume — already fully complete. Exit cleanly so sweep
+        # wrappers count this iteration as success and move on.
+        echo "--resume: nothing to do (already complete). Exiting 0."
         exit 0
     fi
     echo -n "Re-run anyway? [n/restart-from-scratch] "
@@ -1368,6 +2604,11 @@ else
 
     if [[ "$DRY_RUN" == true ]]; then
         echo "[DRY-RUN] Detected: $MSG. Would resume there."
+        EFFECTIVE_START_ROUND=$NEXT_R
+        EFFECTIVE_START_STEP=$NEXT_S
+    elif [[ "$RESUME" == true ]]; then
+        echo "Pipeline detected: $MSG"
+        echo "--resume: auto-confirming. Resuming there."
         EFFECTIVE_START_ROUND=$NEXT_R
         EFFECTIVE_START_STEP=$NEXT_S
     else
@@ -1464,6 +2705,36 @@ if [[ "$MANAGE_SPLATSIM" == false ]]; then
     TRAIN_EXT_PORT_SWEEP=( --env_external_port="$ENV_EXTERNAL_PORT" )
     TRAIN_EXT_PORT_RESUME=( --env.external_port="$ENV_EXTERNAL_PORT" )
 fi
+# --headless propagation into training (both scratch via train_sweep.sh and
+# finetune via resume_training.sh). Two surfaces to gate:
+#   * --env.headless=true → SplatSimEnv injects headless into its in-process
+#     PybulletRobotServerBase, so the inline-eval sim connects via p.DIRECT.
+#     Only meaningful in managed-splatsim mode (when MANAGE_SPLATSIM=false the
+#     env uses external_port and never spawns a local pybullet client, so
+#     the env-side toggle is a no-op — but suppressing it keeps the dry-run
+#     output clean and the user's external sim's GUI choice unaffected).
+#   * --policy.shared_autonomy_config.show_slider=false → defensive in case
+#     the resumed policy's saved train_config.json has SA wrapper enabled.
+#     Most finetune policies don't, but a few (e.g. those that resume from
+#     intervention-recording dirs) carry it forward. The wrapper's own
+#     fallback path tolerates the field even when SA is disabled (the cfg
+#     dataclass field always exists), so this is safe to add unconditionally.
+# Built ONCE here so the same array can be appended to all three training
+# invocations (scratch, finetune, post-loop final-scratch).
+HEADLESS_TRAIN_ARGS=()
+if [[ "$HEADLESS" == true ]]; then
+    HEADLESS_TRAIN_ARGS=( --policy.shared_autonomy_config.show_slider=false )
+    if [[ "$MANAGE_SPLATSIM" == true ]]; then
+        HEADLESS_TRAIN_ARGS+=( --env.headless=true )
+    fi
+fi
+# Scratch-mode training goes through train_sweep.sh, which has its own
+# strict arg parser. We added a `--headless` knob there that injects the
+# same two SHARED_ARGS as the finetune path (--env.headless=true when
+# splatsim is managed + --policy.shared_autonomy_config.show_slider=false
+# defensively). One flag at the boundary, same downstream effect.
+HEADLESS_TRAIN_SCRATCH_ARGS=()
+[[ "$HEADLESS" == true ]] && HEADLESS_TRAIN_SCRATCH_ARGS=( --headless )
 # Offline-mode flag: when --push_to_hub is NOT set on the orchestrator (the
 # default), disable the trained policy's hub push.
 OFFLINE_POLICY_ARG=()
@@ -1500,6 +2771,24 @@ run_training_step() {
     echo "  $TRAIN_OUTPUT_DIR/checkpoints/last/pretrained_model" >&2
     echo "  is missing or incomplete." >&2
     return "$rc"
+}
+# train_sweep.sh invokes lerobot-train without --resume; lerobot-train errors
+# on any pre-existing output dir. An earlier orchestrator invocation (or an
+# earlier version of this script that pre-mkdir'd the dagger/ sidecar subdir
+# before training) may have left a partial output dir with nothing but
+# `dagger/` inside. Detect that exact pattern and rm -rf it so the upcoming
+# train_sweep.sh call doesn't trip the FileExistsError check. Anything else
+# (checkpoints/, wandb/, config files, ...) means real training output is
+# present — left alone.
+cleanup_pre_train_partial() {
+    local dir="$1"
+    [[ -d "$dir" ]] || return 0
+    local entries
+    entries=$(ls -A "$dir" 2>/dev/null)
+    if [[ "$entries" == "dagger" ]]; then
+        echo "[cleanup] removing leftover partial dir $dir (only dagger/ subdir present — from a prior failed attempt)" >&2
+        run_or_echo rm -rf "$dir"
+    fi
 }
 # Print GPU state before training. Useful when finetune OOMs and you want
 # to identify the actual memory consumers.
@@ -1563,11 +2852,13 @@ if (( EFFECTIVE_START_ROUND == 1 )); then
         # way it is in the per-round and post-loop training steps. Reads
         # TRAIN_OUTPUT_DIR from this scope.
         TRAIN_OUTPUT_DIR="$BASE_TRAINING_DIR"
+        cleanup_pre_train_partial "$TRAIN_OUTPUT_DIR"
         run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
             --dataset_repo="$BASE_REPO" \
             --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
             "${ROUND0_ABS_ACTION_ARG[@]}" \
             "${TRAIN_EXT_PORT_SWEEP[@]}" \
+            "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
             "${OFFLINE_POLICY_ARG[@]}"
         if [[ "$DRY_RUN" != true ]]; then
             CURRENT_POLICY="$(resolve_latest_checkpoint "$BASE_TRAINING_DIR")"
@@ -1608,6 +2899,35 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
     MODE="$INTERMEDIATE_MODE"
     TRAIN_OUTPUT_DIR="$(train_output_dir_for_round "$r")"
 
+    # Rerun-blends mode: at each round, OVERRIDE the carried-forward
+    # CURRENT_POLICY with SOURCE's _ft_dag(r-1) (or --initial_policy_path at
+    # r=1). This is the "branching from source at each round" semantic — each
+    # rerun round is an independent "what would have happened at round r if
+    # we'd had these blends starting from source's _ft_dag(r-1)" experiment,
+    # NOT a continuation of the rerun's own previous round. The carried
+    # CURRENT_POLICY from end-of-round is ignored in rerun mode.
+    if [[ "$RERUN_MODE_ENABLED" == "true" ]]; then
+        if (( r == 1 )); then
+            # Round 1 starts from --initial_policy_path, same as the
+            # non-rerun's round 1. We don't bother resolving _ft_dag0 since
+            # there is no such thing; source's round-1 training also branched
+            # off --initial_policy_path.
+            if [[ -f "$INITIAL_POLICY_PATH/checkpoints/last/pretrained_model/config.json" ]]; then
+                CURRENT_POLICY="$INITIAL_POLICY_PATH/checkpoints/last/pretrained_model"
+            elif [[ -f "$INITIAL_POLICY_PATH/pretrained_model/config.json" ]]; then
+                CURRENT_POLICY="$INITIAL_POLICY_PATH/pretrained_model"
+            elif [[ -f "$INITIAL_POLICY_PATH/config.json" ]]; then
+                CURRENT_POLICY="$INITIAL_POLICY_PATH"
+            else
+                CURRENT_POLICY="$(resolve_latest_checkpoint "$INITIAL_POLICY_PATH")"
+            fi
+        else
+            _SRC_PREV_DIR="$LEROBOT_ROOT/outputs/training/${SOURCE_POLICY_BASENAME}_ft_dag$((r - 1))"
+            CURRENT_POLICY="$(resolve_latest_checkpoint "$_SRC_PREV_DIR")"
+        fi
+        echo "[rerun] Round $r branching from source policy: $CURRENT_POLICY"
+    fi
+
     # The starting step within this round.
     if (( r == EFFECTIVE_START_ROUND )); then STEP=$EFFECTIVE_START_STEP; else STEP=1; fi
 
@@ -1621,17 +2941,83 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
     echo "  Current policy:       $CURRENT_POLICY"
     echo "════════════════════════════════════════════════════════════════"
 
-    # Ensure the external SplatSim is running before step 1 (intervention
-    # recording) — the only sim-using step. Steps 2-5 are pure data ops
-    # (stats, alias, merge, stats) that don't touch the sim, and step 6
-    # explicitly stops the sim before training. Idempotent: no-op if we
-    # already launched it or if --no_manage_splatsim.
-    if (( STEP <= 1 )); then
+    # Ensure the external SplatSim is running before any sim-using step.
+    # Step 1 (intervention recording) and step 2 (blending) both need it;
+    # steps 3-5 are pure data ops (alias, merge, stats) that don't touch
+    # the sim; step 6 (train) spawns its own in-process sim. We stop the
+    # orchestrator-managed sim immediately after step 2 finishes (below)
+    # so it doesn't hold GPU memory idle across merge/stats/training-load.
+    # Idempotent: no-op if we already launched it or if --no_manage_splatsim.
+    # Resuming at step 2 (skipping step 1 because the intervention dataset
+    # already exists) still needs the sim brought up here — without this
+    # gate including step 2, blending would race against a possibly-dead
+    # sim from a prior run.
+    if (( STEP <= 2 )); then
         start_sim
     fi
 
-    # Step 1: Record interventions.
+    # Step 1: Record interventions (or in rerun mode, validate source).
     if (( STEP <= 1 )); then
+        if [[ "$RERUN_MODE_ENABLED" == "true" ]]; then
+            # Rerun mode: validate source intervention is on disk, then skip
+            # the lerobot-eval recording. The upfront validation block
+            # already checked round-by-round; this is the per-round guard
+            # against datasets disappearing mid-run (rare).
+            if [[ ! -d "$LEROBOT_CACHE/$INT_REPO" ]]; then
+                echo "ERROR: source intervention $INT_REPO missing on disk." >&2
+                echo "  Expected at: $LEROBOT_CACHE/$INT_REPO" >&2
+                exit 1
+            fi
+            echo "--- Round $r, Step 1: REUSING source intervention $INT_REPO ---"
+            # Stats sidecar: source-intervention sidecars are stable across
+            # reruns (the underlying dataset is read-only), so skip the
+            # recompute if the sidecar for the active model's chunk size is
+            # already on disk. The non-rerun branch below still runs the
+            # recompute unconditionally because that path just wrote a fresh
+            # intervention dataset whose stats need to be (re)derived.
+            if [[ "$ACTION_FORMAT" == "rel" ]]; then
+                if stats_exists "$INT_SHORT"; then
+                    echo "--- Round $r, Step 1b: source sidecar stats already on disk for $INT_SHORT; skipping ---"
+                else
+                    echo "--- Round $r, Step 1b: compute sidecar stats for $INT_SHORT ---"
+                    run_or_echo bash "$SCRIPT_DIR/compute_relative_stats.sh" --dataset_repo="$INT_REPO"
+                fi
+            fi
+            # Done with step 1 in rerun mode — skip the recording path below.
+            STEP_1_REUSED=true
+        else
+            STEP_1_REUSED=false
+        fi
+    fi
+    if (( STEP <= 1 )) && [[ "${STEP_1_REUSED:-false}" != "true" ]]; then
+        # Preserve-existing-dataset short-circuit: if the intervention dataset
+        # for this round is already on disk (e.g. a prior run lost only its
+        # stats sidecar, or the user preserved interventions while wiping
+        # training), DON'T re-launch lerobot-eval — its teleop_dataset_repo_id
+        # path appends to non-empty datasets, which would silently grow /
+        # pollute the original recording. Just regen the stats sidecar (if
+        # missing for rel mode) and treat step 1 as done. To force fresh
+        # recording, the user can delete the dataset directory first or pass
+        # --force_restart.
+        if dataset_exists "$INT_REPO"; then
+            echo "--- Round $r, Step 1: PRESERVING existing intervention dataset $INT_REPO ---"
+            echo "  (dataset on disk; skipping lerobot-eval recording)"
+            if [[ "$ACTION_FORMAT" == "rel" ]]; then
+                if stats_exists "$INT_SHORT"; then
+                    echo "--- Round $r, Step 1b: sidecar stats already on disk for $INT_SHORT; skipping ---"
+                else
+                    echo "--- Round $r, Step 1b: regen sidecar stats for existing $INT_SHORT ---"
+                    run_or_echo bash "$SCRIPT_DIR/compute_relative_stats.sh" --dataset_repo="$INT_REPO"
+                fi
+            fi
+            STEP_1_PRESERVED=true
+        else
+            STEP_1_PRESERVED=false
+        fi
+    else
+        STEP_1_PRESERVED=false
+    fi
+    if (( STEP <= 1 )) && [[ "${STEP_1_REUSED:-false}" != "true" ]] && [[ "${STEP_1_PRESERVED:-false}" != "true" ]]; then
         echo "--- Round $r, Step 1: record interventions ---"
         # Optional --env.eval_benchmark_subset for random-sample mode. When
         # empty, lerobot-eval defaults to the first N scenarios.
@@ -1667,6 +3053,15 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
         #         on the same hard scenarios round over round" semantics.
         # Other SA settings (forward_flow_ratio, blend_strategy, etc.) can
         # be added via --intervention_extra_args.
+        # --headless mode: turn off the Tkinter ratio slider AND the SA
+        # wrapper's per-policy pybullet GUI client (both gated by the same
+        # show_slider field — see shared_autonomy_wrapper.py:240). The
+        # external SplatSim was launched headless above; this kills the
+        # last visualizer in the loop.
+        HEADLESS_EVAL_ARG=()
+        if [[ "$HEADLESS" == true ]]; then
+            HEADLESS_EVAL_ARG=( --policy.shared_autonomy_config.show_slider=false )
+        fi
         # shellcheck disable=SC2086  # INTERVENTION_EXTRA_ARGS may contain multiple flags
         run_or_echo lerobot-eval \
             --policy.path="$CURRENT_POLICY" \
@@ -1689,20 +3084,131 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             --intervention.oracle_goal_chunk_steps="$INTERVENTION_ORACLE_GOAL_CHUNK_STEPS" \
             "${SUBSET_ARG[@]}" \
             "${OFFLINE_DATASET_ARG[@]}" \
+            "${HEADLESS_EVAL_ARG[@]}" \
             $INTERVENTION_EXTRA_ARGS
-    fi
 
-    # Step 2: Stats on intervention dataset (relative-action sidecar).
-    # Only meaningful for use_relative_actions=True policies; for absolute
-    # policies, lerobot-train uses the dataset's own meta/stats.json directly
-    # and this sidecar would be incorrect to apply via --dataset.stats_path.
-    if (( STEP <= 2 )); then
+        # Stats on the intervention dataset (relative-action sidecar).
+        # Folded into step 1 — completion of step 1 requires BOTH the recording
+        # AND its stats sidecar (when ACTION_FORMAT=rel). For absolute-action
+        # policies, lerobot-train uses the dataset's own meta/stats.json
+        # directly and this sidecar would be incorrect to apply.
         if [[ "$ACTION_FORMAT" == "rel" ]]; then
-            echo "--- Round $r, Step 2: compute sidecar stats for $INT_SHORT ---"
+            echo "--- Round $r, Step 1b: compute sidecar stats for $INT_SHORT ---"
             run_or_echo bash "$SCRIPT_DIR/compute_relative_stats.sh" --dataset_repo="$INT_REPO"
         else
-            echo "--- Round $r, Step 2: SKIPPED (--action_format=abs; rel-stats sidecar not used) ---"
+            echo "--- Round $r, Step 1b: SKIPPED (--action_format=abs; rel-stats sidecar not used) ---"
         fi
+    fi
+
+    # Step 2: Per-ratio blended-intervention datasets (--blends). Each ratio
+    # in $BLENDS triggers a closed-loop replay of the round's intervention
+    # episodes through SplatSim with the SA wrapper's forward_flow_ratio set
+    # to that ratio, producing a separate dataset stored alongside the raw
+    # intervention. Both raw and each blend get merged in step 4 — see the
+    # EXTRA_SOURCES build there. Empty $BLENDS → no-op.
+    #
+    # Reuses the existing orchestrator-managed SplatSim on $ENV_EXTERNAL_PORT
+    # (no separate start_sim/stop_sim cycling between step 1 and step 2).
+    if (( STEP <= 2 )) && (( ${#BLENDS[@]} > 0 )); then
+        echo "--- Round $r, Step 2: blend intervention at ratios=${BLENDS[*]} ---"
+        for R in "${BLENDS[@]}"; do
+            BLEND_SHORT="$(blend_short_for_round "$r" "$R")"
+            BLEND_REPO="$(blend_repo_for_round "$r" "$R")"
+            # Per-ratio resume: skip blend creation when the dataset is already
+            # on disk AND (action_format != rel OR its stats sidecar exists).
+            # Mirrors step 1's sub-check semantics. NOTE: this gate covers ONLY
+            # the augment_dataset_with_blending.py invocation — the collision-
+            # filter sub-step below has its own independent resume check, so a
+            # user who toggled --filter_blend_collisions on AFTER the blends
+            # were already built still gets the `_nocoll` siblings generated
+            # without redoing the blend.
+            _blend_complete=false
+            if dataset_exists "$BLEND_REPO"; then
+                if [[ "$ACTION_FORMAT" != "rel" ]] || stats_exists "$BLEND_SHORT"; then
+                    _blend_complete=true
+                fi
+            fi
+            if [[ "$_blend_complete" == true ]]; then
+                echo "  ratio=$R → $BLEND_REPO already on disk (with stats); skipping blend creation."
+            else
+                echo "  ratio=$R → producing $BLEND_REPO via augment_dataset_with_blending.py"
+                BLEND_PUSH_ARG=()
+                [[ "$PUSH_TO_HUB" == true ]] && BLEND_PUSH_ARG+=( "--push_to_hub" )
+                # shellcheck disable=SC2086  # BLEND_EXTRA_ARGS may contain multiple flags
+                # `--episode_index=all` explicitly says "process every episode in
+                # the source dataset" — recognized by augment_dataset_with_blending.py.
+                # The source intervention dataset already contains only the
+                # per-round subset, so "all" == that subset. Override via
+                # --blend_extra_args=--episode_index=N-M if you need finer control.
+                run_or_echo python "$SCRIPT_DIR/augment_dataset_with_blending.py" \
+                    --dataset_repo_id="$INT_REPO" \
+                    --target_dataset_repo_id="$BLEND_REPO" \
+                    --policy_path="$CURRENT_POLICY" \
+                    --forward_flow_ratios="[$R]" \
+                    --episode_index="all" \
+                    --env_external_port="$ENV_EXTERNAL_PORT" \
+                    --env_external_host="$ENV_EXTERNAL_HOST" \
+                    --env_task="upright_small_engine_new" \
+                    --eval_benchmark_repo_id="$EVAL_BENCHMARK_REPO_ID" \
+                    --blend_strategy="denoise" \
+                    --guidance_repr="absolute_pos" \
+                    --blend_mode="once_per_chunk" \
+                    --drain_chunk \
+                    "${BLEND_PUSH_ARG[@]}" \
+                    $BLEND_EXTRA_ARGS
+                # Stats sidecar for the blended dataset (mirrors step 1b for raw int).
+                if [[ "$ACTION_FORMAT" == "rel" ]]; then
+                    run_or_echo bash "$SCRIPT_DIR/compute_relative_stats.sh" --dataset_repo="$BLEND_REPO"
+                fi
+            fi
+            # Step 2b — collision filter (optional). Replays the blend dataset
+            # through a headless splatsim and drops episodes that hit obstacles
+            # (with a configurable pre-collision trim margin). Step 4's merge
+            # then uses the resulting `_nocoll` sibling instead of the raw blend.
+            # Idempotent: short-circuits if `_nocoll` (and its stats sidecar
+            # in rel mode) is already on disk.
+            if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
+                NOCOLL_SHORT="$(nocoll_short_for_round "$r" "$R")"
+                NOCOLL_REPO="$(nocoll_repo_for_round "$r" "$R")"
+                _nocoll_complete=false
+                if dataset_exists "$NOCOLL_REPO"; then
+                    if [[ "$ACTION_FORMAT" != "rel" ]] || stats_exists "$NOCOLL_SHORT"; then
+                        _nocoll_complete=true
+                    fi
+                fi
+                if [[ "$_nocoll_complete" == true ]]; then
+                    echo "  ratio=$R → $NOCOLL_REPO already on disk (with stats); skipping filter."
+                else
+                    echo "  ratio=$R → producing $NOCOLL_REPO via filter_blend_collisions.py (headless sim)"
+                    start_filter_sim
+                    # shellcheck disable=SC2086  # FILTER_COLLISION_EXTRA_ARGS may contain multiple flags
+                    run_or_echo python "$SCRIPT_DIR/filter_blend_collisions.py" \
+                        --source_repo_id="$BLEND_REPO" \
+                        --target_repo_id="$NOCOLL_REPO" \
+                        --env_task="upright_small_engine_new" \
+                        --env_robot_name="$SPLATSIM_ROBOT_NAME" \
+                        --env_external_port="$FILTER_COLLISION_ENV_PORT_RESOLVED" \
+                        --env_external_host="$ENV_EXTERNAL_HOST" \
+                        --env_eval_benchmark_repo_id="$EVAL_BENCHMARK_REPO_ID" \
+                        $FILTER_COLLISION_EXTRA_ARGS
+                    # Stats sidecar for the filtered dataset.
+                    if [[ "$ACTION_FORMAT" == "rel" ]]; then
+                        run_or_echo bash "$SCRIPT_DIR/compute_relative_stats.sh" --dataset_repo="$NOCOLL_REPO"
+                    fi
+                fi
+            fi
+        done
+    elif (( STEP <= 2 )); then
+        echo "--- Round $r, Step 2: SKIPPED (--blends is empty; no blended datasets to produce) ---"
+    fi
+
+    # Stop the orchestrator-managed external SplatSim now that the only
+    # sim-using steps of the round (1 and 2) are done. Steps 3-5 are pure
+    # dataset ops (alias / merge / stats); step 6 spawns its own in-process
+    # sim for inline eval. Idempotent + gated to mirror the start_sim above,
+    # so a resume at STEP>=3 (sim never started) is a clean no-op.
+    if (( STEP <= 2 )); then
+        stop_sim
     fi
 
     # Step 3: Hardlink-alias via augment_ratios_sweep.sh ratio=0 branch.
@@ -1721,8 +3227,14 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
 
     # Step 4: Merge cumulatively (base + dag1 + ... + dag{r}, using either
     # the _pirel00 aliases or the raw dag{N} datasets depending on whether
-    # the alias step is enabled).
-    if (( STEP <= 4 )); then
+    # the alias step is enabled). SKIPPED in weighted-sampling mode — step 6
+    # feeds the per-source datasets straight into lerobot-train's
+    # multi-dataset path (--dataset.repo_ids + sample_weights + stats_paths)
+    # and the DataLoader's WeightedRandomSampler picks per-source frames at
+    # the target ratio; no on-disk merged dataset is needed.
+    if (( STEP <= 4 )) && [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
+        echo "--- Round $r, Step 4: SKIPPED (--use_weighted_sampling; no merged dataset needed) ---"
+    elif (( STEP <= 4 )); then
         echo "--- Round $r, Step 4: cumulative merge → $MERGED_REPO ---"
         # The merge tool refuses to overwrite an existing target dir
         # (LeRobotDatasetMetadata.create uses mkdir(exist_ok=False)). If a
@@ -1737,37 +3249,117 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             echo "  Removing stale merged dataset dir before re-merge: $STALE_MERGED_DIR"
             run_or_echo rm -rf "$STALE_MERGED_DIR"
         fi
-        # Build the list of intervention sources, each repeated
-        # INTERVENTION_OVERSAMPLE times. aggregate_datasets just iterates the
-        # repo_ids list without dedup, so duplicate entries concatenate the
-        # same data multiple times into the merged dataset. Effect: the
-        # intervention frames make up oversample× their natural share of the
-        # merged dataset, so a random batch is N× more likely to draw them.
-        # Useful when the intervention is a small fraction of total data and
-        # the policy under-weights it during random sampling.
-        EXTRA_SOURCES=()
-        for prev in $(seq 1 "$r"); do
-            if [[ "$SKIP_ALIAS_STEP" == true ]]; then
-                SRC="$(int_repo_for_round "$prev")"
-            else
-                SRC="$(alias_repo_for_round "$prev")"
+        # Build the list of intervention sources with per-condition counts:
+        #   raw × (N - n_blends) + each_blend × 1
+        # where N = $TARGET_INTERVENTION_VOLUME. aggregate_datasets just
+        # iterates the repo_ids list without dedup, so duplicate entries
+        # concatenate the same data into the merged dataset. Total
+        # intervention-related content per round = N × raw_intervention,
+        # independent of how many blends — apples-to-apples across 0/1/2/…
+        # blend conditions.
+        #
+        # INCREMENTAL MERGE: if round (r-1)'s merged dataset is still on disk
+        # (it's only cleaned up at round r's pre-train-cleanup, AFTER step 4
+        # has run), we use it as the merge base and only feed round r's NEW
+        # sources to --extra_sources. The previous merged already contains
+        # base + every round-1..(r-1) source at the configured oversample, so
+        # this is mathematically equivalent to the full merge but processes
+        # 3× fewer sources per round (and per-source overhead in the merge
+        # tool — dataset open, metadata reads — dominates the wall time at
+        # high source counts). Falls back to a full merge when the previous
+        # merged is missing (round 1, or after a manual cleanup).
+        PREV_MERGED_REPO=""
+        if (( r >= 2 )); then
+            _prev_candidate="$(merged_repo_for_round "$((r - 1))")"
+            if [[ -d "$LEROBOT_CACHE/$_prev_candidate" ]]; then
+                PREV_MERGED_REPO="$_prev_candidate"
+            elif [[ "$DRY_RUN" == true ]]; then
+                # In dry-run, the previous round's merged isn't actually on
+                # disk (we skipped its real creation), so check whether the
+                # current dry-run "wrote" it on a prior iteration.
+                # DRY_RUN_MERGED_CREATED is populated below after each
+                # round's merge step prints its dry-run command.
+                if [[ " ${DRY_RUN_MERGED_CREATED:-} " == *" $_prev_candidate "* ]]; then
+                    PREV_MERGED_REPO="$_prev_candidate"
+                fi
             fi
-            for ((dup=0; dup < INTERVENTION_OVERSAMPLE; dup++)); do
-                EXTRA_SOURCES+=( "$SRC" )
+        fi
+        if [[ -n "$PREV_MERGED_REPO" ]]; then
+            MERGE_BASE_REPO="$PREV_MERGED_REPO"
+            ROUNDS_TO_ADD=( "$r" )
+            echo "  incremental merge: base = $PREV_MERGED_REPO; adding only round $r's new sources"
+        else
+            MERGE_BASE_REPO="$BASE_REPO"
+            ROUNDS_TO_ADD=( $(seq 1 "$r") )
+            if (( r >= 2 )); then
+                echo "  full merge (round $((r - 1))'s merged not on disk): $BASE_REPO + all rounds 1..$r"
+            else
+                echo "  full merge (round 1): $BASE_REPO + round 1's sources"
+            fi
+        fi
+        # Per-round source counts. Each round contributes:
+        #   raw_count copies of the raw intervention dataset
+        #   1 copy of each blend dataset
+        # totaling TARGET_INTERVENTION_VOLUME copies of intervention-sized data.
+        _raw_count=$(( TARGET_INTERVENTION_VOLUME - ${#BLENDS[@]} ))
+        EXTRA_SOURCES=()
+        for prev in "${ROUNDS_TO_ADD[@]}"; do
+            # Raw intervention dataset (or its alias when --skip_alias_step is
+            # false). Repeated _raw_count times so the total intervention-
+            # related content per round stays at N × raw regardless of blends.
+            if [[ "$SKIP_ALIAS_STEP" == true ]]; then
+                SRC_RAW="$(int_repo_for_round "$prev")"
+            else
+                SRC_RAW="$(alias_repo_for_round "$prev")"
+            fi
+            for ((dup=0; dup < _raw_count; dup++)); do
+                EXTRA_SOURCES+=( "$SRC_RAW" )
+            done
+            # Blended-intervention datasets (one per ratio in $BLENDS), each
+            # included exactly once. Empty $BLENDS → loop is a no-op and the
+            # round is composed entirely of raw_count copies of raw.
+            # When --filter_blend_collisions is on, swap in the `_nocoll`
+            # sibling produced in step 2b. The raw blend stays on disk
+            # (cross-rerun cacheable) but isn't part of THIS lineage's merge.
+            for R in "${BLENDS[@]}"; do
+                if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
+                    SRC_BLEND="$(nocoll_repo_for_round "$prev" "$R")"
+                else
+                    SRC_BLEND="$(blend_repo_for_round "$prev" "$R")"
+                fi
+                EXTRA_SOURCES+=( "$SRC_BLEND" )
             done
         done
-        if (( INTERVENTION_OVERSAMPLE > 1 )); then
-            echo "  intervention oversample: ${INTERVENTION_OVERSAMPLE}× → each dag{1..$r} included ${INTERVENTION_OVERSAMPLE} times in merge"
+        # Composition log. Always print so the merged dataset's makeup is
+        # discoverable in orchestrator logs without having to recount EXTRA_SOURCES.
+        if (( ${#BLENDS[@]} > 0 )); then
+            if (( _raw_count == 0 )); then
+                echo "  target intervention volume: N=${TARGET_INTERVENTION_VOLUME} → per round: blends only (raw dropped, N == n_blends) — ${#BLENDS[@]} blend(s) × 1 = ${TARGET_INTERVENTION_VOLUME}× raw_intervention worth"
+            else
+                echo "  target intervention volume: N=${TARGET_INTERVENTION_VOLUME} → per round: raw × ${_raw_count} + ${#BLENDS[@]} blend(s) × 1 = ${TARGET_INTERVENTION_VOLUME}× raw_intervention worth of intervention-related content"
+            fi
+            echo "  blend ratios: ${BLENDS[*]} (${#BLENDS[@]} extra source(s) per round at 1× each)"
+        else
+            echo "  target intervention volume: N=${TARGET_INTERVENTION_VOLUME} → per round: raw × ${_raw_count} (no blends) = ${TARGET_INTERVENTION_VOLUME}× raw_intervention"
         fi
         run_or_echo python "$SCRIPT_DIR/merge_augmented_datasets_for_training.py" \
-            --base "$BASE_REPO" \
+            --base "$MERGE_BASE_REPO" \
             --extra_sources "${EXTRA_SOURCES[@]}" \
             --output_repo_id="$MERGED_REPO"
+        if [[ "$DRY_RUN" == true ]]; then
+            # Track virtual creation so later rounds' dry-run output reflects
+            # the incremental-merge chain that would happen in a real run.
+            DRY_RUN_MERGED_CREATED="${DRY_RUN_MERGED_CREATED:-} $MERGED_REPO"
+        fi
     fi
 
     # Step 5: Stats on merged dataset (relative-action sidecar; only used when
-    # ACTION_FORMAT=rel — see Step 2 comment).
-    if (( STEP <= 5 )); then
+    # ACTION_FORMAT=rel — see Step 2 comment). SKIPPED in weighted mode (no
+    # merged dataset exists; per-source sidecars from step 1b/2b are what
+    # step 6 consumes via --dataset.stats_paths).
+    if (( STEP <= 5 )) && [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
+        echo "--- Round $r, Step 5: SKIPPED (--use_weighted_sampling; per-source stats sidecars already on disk from steps 1b/2b) ---"
+    elif (( STEP <= 5 )); then
         if [[ "$ACTION_FORMAT" == "rel" ]]; then
             echo "--- Round $r, Step 5: compute sidecar stats for $MERGED_SHORT ---"
             run_or_echo bash "$SCRIPT_DIR/compute_relative_stats.sh" --dataset_repo="$MERGED_REPO"
@@ -1795,13 +3387,12 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
     # Step 6: Train.
     if (( STEP <= 6 )); then
         echo "--- Round $r, Step 6: train ($MODE) ---"
-        # Stop the orchestrator-managed external SplatSim before training so
-        # lerobot-train can spawn its OWN in-process sim for inline eval. Both
-        # sims share GPU memory cost but the in-process one pools its CUDA
-        # context with training (lower fragmentation, lower OOM risk).
-        # In --no_manage_splatsim mode this is a no-op and the external sim
-        # stays up; the user takes responsibility for the memory tradeoff.
-        stop_sim
+        # External SplatSim was stopped right after step 2; lerobot-train
+        # spawns its OWN in-process sim for inline eval, which pools its
+        # CUDA context with training (lower fragmentation, lower OOM risk).
+        # In --no_manage_splatsim mode there's no orchestrator-managed sim
+        # to stop; the user-launched external sim stays up and the user
+        # takes responsibility for the memory tradeoff.
         print_gpu_state
         if [[ "$MODE" == "scratch" ]]; then
             # Pass --run_name so train_sweep.sh writes to ${BASE_POLICY_NAME}_dag${r}
@@ -1821,12 +3412,14 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             if [[ "$ACTION_FORMAT" == "abs" ]]; then
                 ABS_ACTION_ARG=( --no_relative )
             fi
+            cleanup_pre_train_partial "$TRAIN_OUTPUT_DIR"
             run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
                 --dataset_repo="$MERGED_REPO" \
                 --run_name="$SCRATCH_RUN_NAME" \
                 --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
                 "${ABS_ACTION_ARG[@]}" \
                 "${TRAIN_EXT_PORT_SWEEP[@]}" \
+                "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
                 "${OFFLINE_POLICY_ARG[@]}"
         else
             # Finetune mode. Two important details:
@@ -1865,6 +3458,30 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             fi
             # Force base-10 to avoid octal parsing of '026000'.
             TARGET_STEPS=$((10#${CURRENT_STEP} + FINETUNE_STEPS))
+
+            # ── Extension mode for the last complete round ──────────────
+            # When --extend_last_round demoted round r from 6/6 → 5/6, we want
+            # lerobot-train to resume from r's EXISTING checkpoint (not the
+            # carried-forward prev-round checkpoint), while the TARGET stays
+            # what the orchestrator would have planned originally (=
+            # starting_step + FINETUNE_STEPS — already computed above as
+            # TARGET_STEPS using CURRENT_STEP = starting step). Without this
+            # override, lerobot-train --resume reads checkpoint state from
+            # `config_path/..`, which is the carried-forward checkpoint —
+            # round r's existing weights would be overwritten by re-running
+            # the same steps from scratch.
+            if [[ "$EXTEND_LAST_ROUND" == "true" && "$r" == "${LAST_COMPLETE_ROUND:-0}" ]]; then
+                _ext_ckpt="$(resolve_latest_checkpoint "$TRAIN_OUTPUT_DIR" 2>/dev/null || true)"
+                if [[ -n "$_ext_ckpt" && -d "$_ext_ckpt" ]]; then
+                    echo "Finetune: --extend_last_round active for round $r:"
+                    echo "  Overriding resume checkpoint to round $r's existing $_ext_ckpt"
+                    echo "  Target stays $TARGET_STEPS (= starting step ${CURRENT_STEP} + FINETUNE_STEPS=${FINETUNE_STEPS})"
+                    CURRENT_POLICY="$_ext_ckpt"
+                else
+                    echo "WARNING: --extend_last_round set for round $r but resolve_latest_checkpoint returned empty." >&2
+                    echo "  Falling back to the carried-forward CURRENT_POLICY (will re-run from scratch)." >&2
+                fi
+            fi
             # Cache the predicted next-round step for dry-run continuation.
             DRYRUN_NEXT_STEP="$TARGET_STEPS"
             echo "Finetune: resuming from step ${CURRENT_STEP} → target step ${TARGET_STEPS} (+${FINETUNE_STEPS})"
@@ -1878,7 +3495,15 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             # of round 1 (real --initial_policy_path) catches mismatches just
             # like a real run would; later-round dry-runs with synthetic paths
             # silently skip.
-            RESUME_CFG_PATH="$(readlink -f "$CURRENT_POLICY")/train_config.json"
+            # Guard `readlink -f` so the action-format sanity check is skipped
+            # when the resumed policy dir doesn't exist on disk yet — which is
+            # always true for round ≥ 2 in --dry-run (synthesized "what round
+            # r-1 WOULD produce" path), and avoids `set -e` aborting the loop
+            # before the [DRY-RUN] resume_training.sh line is printed.
+            RESUME_CFG_PATH=""
+            if [[ -e "$CURRENT_POLICY" ]]; then
+                RESUME_CFG_PATH="$(readlink -f "$CURRENT_POLICY")/train_config.json"
+            fi
             if [[ -f "$RESUME_CFG_PATH" ]]; then
                 POLICY_REL="$(python3 -c "
 import json,sys
@@ -1923,7 +3548,15 @@ print('true' if c.get('policy',{}).get('use_relative_actions') else 'false')
             # Always recompute from the current CURRENT_POLICY — bash variables
             # persist across loop iterations and we'd otherwise reuse round
             # (r-1)'s config path in round r.
-            RESUME_CFG_PATH="$(readlink -f "$CURRENT_POLICY")/train_config.json"
+            # Guard `readlink -f` so the action-format sanity check is skipped
+            # when the resumed policy dir doesn't exist on disk yet — which is
+            # always true for round ≥ 2 in --dry-run (synthesized "what round
+            # r-1 WOULD produce" path), and avoids `set -e` aborting the loop
+            # before the [DRY-RUN] resume_training.sh line is printed.
+            RESUME_CFG_PATH=""
+            if [[ -e "$CURRENT_POLICY" ]]; then
+                RESUME_CFG_PATH="$(readlink -f "$CURRENT_POLICY")/train_config.json"
+            fi
             if [[ -f "$RESUME_CFG_PATH" ]]; then
                 POLICY_SUPPORTS_DECAY_LR="$(python3 -c "
 import json,sys
@@ -1974,7 +3607,12 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
             # When ACTION_FORMAT=abs, omit the override so lerobot-train uses the
             # merged dataset's own meta/stats.json (computed at merge time with
             # absolute actions).
+            #
+            # Weighted mode also needs FT_CHUNK (to pick the right per-source
+            # sidecar from $STATS_BASE/<short>/stats_rel${N}.json), so compute
+            # it unconditionally when ACTION_FORMAT=rel.
             FT_STATS_PATH_ARG=()
+            FT_CHUNK=""
             if [[ "$ACTION_FORMAT" == "rel" ]]; then
                 # Read the chunk size straight off the resumed policy's
                 # train_config.json (`policy.n_action_steps`) — that's the
@@ -1998,6 +3636,110 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                         exit 1
                     fi
                 fi
+            fi
+            # ── Weighted-sampling mode: build the multi-dataset arg set ──
+            # In weighted mode, lerobot-train consumes a list of sub-datasets
+            # via --dataset.repo_ids plus parallel sample_weights / stats_paths.
+            # We require rel actions for now — the stats_paths machinery in
+            # lerobot.datasets.multi_source_normalizing_dataset reads
+            # JSON sidecars at the paths we pass; for abs we'd need to point at
+            # each repo's meta/stats.json instead, which works but isn't tested
+            # for DAgger. Gate explicitly so the abs path doesn't silently
+            # corrupt.
+            FT_MULTI_DATASET_ARGS=()
+            DAG_CFG_WEIGHTED_REPO_IDS_JSON="[]"
+            DAG_CFG_WEIGHTED_WEIGHTS_JSON="[]"
+            DAG_CFG_WEIGHTED_STATS_PATHS_JSON="[]"
+            if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
+                if [[ "$ACTION_FORMAT" != "rel" ]]; then
+                    echo "ERROR: --use_weighted_sampling currently requires --action_format=rel." >&2
+                    echo "  Per-source stats sidecars (stats_rel{N}.json) drive normalization in" >&2
+                    echo "  multi-dataset mode. Abs-action support would need to point stats_paths" >&2
+                    echo "  at each repo's meta/stats.json instead, which isn't wired here yet." >&2
+                    exit 1
+                fi
+                # Build parallel arrays: repo_ids[i], stats_paths[i], and the
+                # final sample_weights[i]. Base is index 0; round 1..r contribute
+                # 1 raw + n_blends entries each (in that order).
+                W_REPO_IDS=( "$BASE_REPO" )
+                W_STATS_PATHS=( "$STATS_BASE/$BASE_REPO_DATASET_SHORT/stats_rel${FT_CHUNK}.json" )
+                for _p in $(seq 1 "$r"); do
+                    _p_int_repo="$(int_repo_for_round "$_p")"
+                    _p_int_short="$(int_short_for_round "$_p")"
+                    W_REPO_IDS+=( "$_p_int_repo" )
+                    W_STATS_PATHS+=( "$STATS_BASE/$_p_int_short/stats_rel${FT_CHUNK}.json" )
+                    for _R in "${BLENDS[@]}"; do
+                        if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
+                            _b_repo="$(nocoll_repo_for_round "$_p" "$_R")"
+                            _b_short="$(nocoll_short_for_round "$_p" "$_R")"
+                        else
+                            _b_repo="$(blend_repo_for_round "$_p" "$_R")"
+                            _b_short="$(blend_short_for_round "$_p" "$_R")"
+                        fi
+                        W_REPO_IDS+=( "$_b_repo" )
+                        W_STATS_PATHS+=( "$STATS_BASE/$_b_short/stats_rel${FT_CHUNK}.json" )
+                    done
+                done
+                # Equal-share semantics: base gets (1 - f); the remaining f is
+                # split equally across every DAgger sub-dataset. Use python3
+                # for the float math (last weight absorbs rounding so the sum
+                # matches 1.0 exactly within the validator's ±0.001 epsilon).
+                _n_dag=$(( ${#W_REPO_IDS[@]} - 1 ))
+                read -ra W_WEIGHTS <<< "$(python3 -c "
+import sys
+f = float(sys.argv[1])
+n = int(sys.argv[2])
+base = 1.0 - f
+per = f / n
+weights = [base] + [per] * n
+# Force exact sum=1 by absorbing accumulated FP error into the LAST weight.
+weights[-1] = 1.0 - sum(weights[:-1])
+print(' '.join(f'{w:.10f}' for w in weights))
+" "$DAGGER_DATA_FRACTION" "$_n_dag")"
+                # Format draccus list strings as JSON arrays — draccus accepts
+                # both [a,b,c] and ['a','b','c']; we go with quoted/JSON so paths
+                # with slashes (which draccus might otherwise mishandle) round-trip
+                # cleanly. python3's json.dumps gets the escaping right.
+                #
+                # IMPORTANT: use separators=(",", ":") so the output contains NO
+                # spaces. The downstream `resume_training.sh` concatenates these
+                # into a flat $CMD string and runs it via `eval "$CMD"`, which
+                # word-splits on whitespace. Default `json.dumps` emits `, ` (with
+                # a space) which would split `[A,` `B]` apart and break draccus
+                # parsing. Compact form (`[A,B]`) survives the eval intact.
+                DAG_CFG_WEIGHTED_REPO_IDS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${W_REPO_IDS[@]}")
+                DAG_CFG_WEIGHTED_STATS_PATHS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${W_STATS_PATHS[@]}")
+                DAG_CFG_WEIGHTED_WEIGHTS_JSON=$(python3 -c "import json,sys; print(json.dumps([float(x) for x in sys.argv[1:]], separators=(',', ':')))" "${W_WEIGHTS[@]}")
+                # IMPORTANT: pin --dataset.stats_path to the BASE sidecar
+                # for finetune. The policy was trained against BASE's stats,
+                # so its NormalizerProcessorStep / UnnormalizerProcessorStep
+                # buffers and the downstream Linear layers are all tuned to
+                # that mean/std (and min/max). Letting
+                # `MultiSourceNormalizingDataset` aggregate over base + every
+                # round's intervention + every blend would shift the input
+                # distribution on the first finetune step and create a
+                # normalization shock — empirically this caused catastrophic
+                # dag1 drops (b010: 20% succ, b050: 13% vs source: 43% at
+                # same compute). `lerobot_train.py:254-259` reads
+                # `--dataset.stats_path` and overrides `dataset.meta.stats`
+                # AFTER `MultiSourceNormalizingDataset.__init__` aggregates,
+                # so the per-source `_normalizers` (which apply per-frame in
+                # `_getitems_with_normalization`) still use each sub-dataset's
+                # OWN sidecar — sub-datasets get normalized to a consistent
+                # BASE-shaped distribution from the policy's perspective.
+                # (Train-from-scratch would prefer aggregated stats here,
+                # but the per-round scratch path uses train_sweep.sh +
+                # $MERGED_REPO and never reaches this block.)
+                FT_MULTI_DATASET_ARGS=(
+                    --dataset.repo_ids="$DAG_CFG_WEIGHTED_REPO_IDS_JSON"
+                    --dataset.sample_weights="$DAG_CFG_WEIGHTED_WEIGHTS_JSON"
+                    --dataset.stats_paths="$DAG_CFG_WEIGHTED_STATS_PATHS_JSON"
+                    --dataset.stats_path="$STATS_BASE/$BASE_REPO_DATASET_SHORT/stats_rel${FT_CHUNK}.json"
+                )
+                echo "Weighted sampling: ${#W_REPO_IDS[@]} sub-datasets (1 base + $_n_dag DAgger); weights=${W_WEIGHTS[*]}"
+            elif [[ "$ACTION_FORMAT" == "rel" ]]; then
+                # Merge-mode rel: point at the merged-dataset sidecar (default
+                # legacy behavior).
                 FT_STATS_PATH_ARG=( --dataset.stats_path="$MERGED_STATS_DIR/stats_rel${FT_CHUNK}.json" )
             fi
             # Force inline eval onto the benchmark dataset + the same subset
@@ -2011,8 +3753,26 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
             if [[ -n "$INTERVENTION_SUBSET_JSON" ]]; then
                 FT_EVAL_BENCHMARK_ARG+=( --env.eval_benchmark_subset="$INTERVENTION_SUBSET_JSON" )
             fi
+            # In weighted mode, --dataset.repo_id MUST NOT be set (mutually
+            # exclusive with --dataset.repo_ids per TrainPipelineConfig.validate).
+            # The CATCH: the resumed train_config.json has `dataset.repo_id` baked
+            # in from when the base policy was trained, so we must override it to
+            # an EMPTY STRING (`--dataset.repo_id=`) to clear the loaded value —
+            # not just omit the flag. The validator's check is on truthiness:
+            # empty string == "not set", so `repo_ids` and an empty `repo_id`
+            # coexist legally.
+            # In merge mode, --dataset.repo_id points at the merged dataset (and
+            # overwrites the loaded value with the new one).
+            FT_REPO_ID_ARG=()
+            if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
+                FT_REPO_ID_ARG=( --dataset.repo_id= )
+            else
+                FT_REPO_ID_ARG=( --dataset.repo_id="$MERGED_REPO" )
+            fi
+            # shellcheck disable=SC2086  # FINETUNE_EXTRA_ARGS is word-split intentionally
             run_training_step bash "$SCRIPT_DIR/resume_training.sh" "$CURRENT_POLICY" \
-                --dataset.repo_id="$MERGED_REPO" \
+                "${FT_REPO_ID_ARG[@]}" \
+                "${FT_MULTI_DATASET_ARGS[@]}" \
                 "${FT_STATS_PATH_ARG[@]}" \
                 --policy.repo_id="$FT_RUN_NAME" \
                 --output_dir="$TRAIN_OUTPUT_DIR" \
@@ -2025,8 +3785,17 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                 "${FT_DECAY_LR_ARG[@]}" \
                 "${FT_SCHEDULER_NAME_ARG[@]}" \
                 "${FT_EVAL_BENCHMARK_ARG[@]}" \
-                "${OFFLINE_POLICY_ARG[@]}"
+                "${HEADLESS_TRAIN_ARGS[@]}" \
+                "${OFFLINE_POLICY_ARG[@]}" \
+                $FINETUNE_EXTRA_ARGS
         fi
+        # Write the per-round config sidecar AFTER training succeeds. We
+        # intentionally don't write it before training: the scratch path
+        # invokes lerobot-train without --resume, and lerobot-train errors
+        # if the output dir already exists (which an early mkdir would
+        # create). Writing post-success means the sidecar marks "this round
+        # completed", which is also when dagger_plot.py wants to read it.
+        write_dagger_config_sidecar "$r" "$TRAIN_OUTPUT_DIR/dagger/config.json" "$TRAIN_OUTPUT_DIR"
         # Relaunch the external sim now that training has freed the GPU,
         # so the next round's intervention recording can use it. Gated on
         # EFFECTIVE_END_ROUND (not NUM_ROUNDS) so retrain mode — where the
@@ -2142,13 +3911,19 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
         fi
 
         TRAIN_OUTPUT_DIR="$FINAL_SCRATCH_DIR"   # consumed by run_training_step
+        cleanup_pre_train_partial "$TRAIN_OUTPUT_DIR"
         run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
             --dataset_repo="$LAST_MERGED_REPO" \
             --run_name="$FINAL_SCRATCH_RUN_NAME" \
             --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
             "${ABS_ACTION_ARG[@]}" \
             "${TRAIN_EXT_PORT_SWEEP[@]}" \
+            "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
             "${OFFLINE_POLICY_ARG[@]}"
+        # Sidecar written AFTER training (not before) — train_sweep.sh
+        # invokes lerobot-train without --resume, which errors on any
+        # pre-existing output dir; pre-mkdir would induce the failure.
+        write_dagger_config_sidecar "$NUM_ROUNDS" "$FINAL_SCRATCH_DIR/dagger/config.json" "$FINAL_SCRATCH_DIR"
 
         if [[ "$DRY_RUN" == true ]]; then
             FINAL_POLICY_PATH="$FINAL_SCRATCH_DIR/checkpoints/last/pretrained_model"

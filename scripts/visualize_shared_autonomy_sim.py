@@ -79,10 +79,18 @@ import pandas as pd  # noqa: E402
 import torch  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
-# Allow importing the sibling parquet-driven script directly.
+# Allow importing the sibling parquet-driven script directly. Also expose
+# the repo root on sys.path so `from my_scripts.X import Y` works even when
+# this module is invoked from inside `my_scripts/` (e.g. when
+# augment_dataset_with_blending.py is launched via
+# `python my_scripts/augment_dataset_with_blending.py` — Python sets
+# sys.path[0] to `my_scripts/`, not the repo root).
 _HERE = Path(__file__).resolve().parent
+_REPO_ROOT = _HERE.parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from lerobot.envs import close_envs  # noqa: E402
 from lerobot.envs.factory import make_env, make_env_config, make_env_pre_post_processors  # noqa: E402

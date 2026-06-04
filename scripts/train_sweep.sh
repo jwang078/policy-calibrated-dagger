@@ -44,6 +44,12 @@ set -euo pipefail
 DATASET_REPO="JennyWWW/splatsim_approach_lever_11_50failsrrtpi05"
 USE_RELATIVE_ACTIONS=true
 RATIO_SWEEP=false
+# --headless: route both --env.headless=true (in-process PybulletRobotServerBase
+# in p.DIRECT mode) and --policy.shared_autonomy_config.show_slider=false
+# (defensive; gates the Tkinter slider + SA wrapper's pybullet GUI client if
+# the policy carries SA config) into SHARED_ARGS. Default false → unchanged.
+# Forwarded from dagger_orchestrate.sh --headless via HEADLESS_TRAIN_SCRATCH_ARGS.
+HEADLESS=false
 RATIOS=(0.2 0.4 0.6 0.8 1.0)
 ENV_EXTERNAL_PORT=""
 POLICY_PUSH_TO_HUB=""   # empty = use whatever the policy config default is
@@ -57,6 +63,7 @@ for arg in "$@"; do
         --dry-run)              DRY_RUN=true ;;
         --ratio_sweep)          RATIO_SWEEP=true ;;
         --no_relative)          USE_RELATIVE_ACTIONS=false ;;
+        --headless)             HEADLESS=true ;;
         --dataset_repo=*)       DATASET_REPO="${arg#*=}" ;;
         --ratios=*)             IFS=' ' read -ra RATIOS <<< "${arg#*=}" ;;
         --env_external_port=*)  ENV_EXTERNAL_PORT="${arg#*=}" ;;
@@ -228,6 +235,18 @@ if [[ -n "$ENV_EXTERNAL_PORT" ]]; then
 fi
 if [[ -n "$POLICY_PUSH_TO_HUB" ]]; then
     SHARED_ARGS+=( "--policy.push_to_hub=$POLICY_PUSH_TO_HUB" )
+fi
+# --headless propagation. Same surfaces gated as on the orchestrator's
+# finetune path (HEADLESS_TRAIN_ARGS): env-side flag for the in-process sim,
+# wrapper-side flag for the SA GUI client. Skip --env.headless when
+# --env_external_port is set, since that path uses ZMQSplatSimGymEnv (no
+# local pybullet client) and the external sim's GUI mode is the user's
+# concern.
+if [[ "$HEADLESS" == true ]]; then
+    SHARED_ARGS+=( "--policy.shared_autonomy_config.show_slider=false" )
+    if [[ -z "$ENV_EXTERNAL_PORT" ]]; then
+        SHARED_ARGS+=( "--env.headless=true" )
+    fi
 fi
 
 # ── Policy-specific args ─────────────────────────────────────

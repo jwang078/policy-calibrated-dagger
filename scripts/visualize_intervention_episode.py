@@ -330,6 +330,32 @@ def _make_placeholder_frame(
     return img
 
 
+def _resolve_interventions_dir(root: Path) -> Path:
+    """Pick the directory under which we expect to find
+    ``intervention_per_scenario.csv`` + ``videos/splatsim_0/eval_episode_*.mp4``.
+
+    Two layouts are supported:
+      1. **Training-dir layout** (canonical DAgger output):
+         ``<root>/dagger/interventions/{intervention_per_scenario.csv, videos/}``.
+      2. **Eval-dir layout** (when lerobot-eval is invoked standalone, e.g.
+         for a one-off shield smoke test): the CSV + videos sit directly
+         under ``<root>/`` since there's no DAgger wrapper around the eval.
+
+    We auto-detect by looking for the CSV at each location.
+    """
+    nested = root / "dagger" / "interventions"
+    if (nested / "intervention_per_scenario.csv").is_file():
+        return nested
+    if (root / "intervention_per_scenario.csv").is_file():
+        return root
+    raise FileNotFoundError(
+        f"Couldn't find intervention_per_scenario.csv under either:\n"
+        f"  {nested / 'intervention_per_scenario.csv'} (training-dir layout)\n"
+        f"  {root / 'intervention_per_scenario.csv'} (eval-dir layout)\n"
+        f"Pass either a DAgger training_dir OR a standalone lerobot-eval output_dir."
+    )
+
+
 def annotate(
     training_dir: Path,
     episode_idx: int,
@@ -339,7 +365,7 @@ def annotate(
     cache_dir: Path | None = None,
     blend_camera_col: str = "observation.images.base_rgb_stretch",
 ) -> Path:
-    interventions_dir = training_dir / "dagger" / "interventions"
+    interventions_dir = _resolve_interventions_dir(training_dir)
     video_path = interventions_dir / "videos" / "splatsim_0" / f"eval_episode_{episode_idx}.mp4"
     csv_path = interventions_dir / "intervention_per_scenario.csv"
 
@@ -356,7 +382,13 @@ def annotate(
     triggers_raw = row.get("triggers", "")
     trigger_steps = _parse_int_list(row.get("trigger_steps", ""))
     rrt_steps_executed = _parse_int_list(row.get("rrt_steps_executed", ""))
-    triggers = [t for t in triggers_raw.split(",") if t] if triggers_raw else []
+    # Renamed labels: map pre-rename CSV rows to the current names so the
+    # rendered annotation matches what the controller emits now. Add new
+    # entries here if labels get renamed again.
+    _TRIGGER_REASON_ALIASES = {"future_chunk_shield": "future_chunk_coll"}
+    triggers = (
+        [_TRIGGER_REASON_ALIASES.get(t, t) for t in triggers_raw.split(",") if t] if triggers_raw else []
+    )
 
     # Sanity: parallel lists. We require rrt_steps_executed to be present —
     # without it we can't draw RRT-phase frames. Older CSVs (pre this column)
@@ -669,7 +701,16 @@ def main() -> None:
     p.add_argument(
         "training_dir",
         type=Path,
-        help="Path to a DAgger training output dir (e.g. outputs/training/diffusion_<...>_ft_dag2).",
+        help=(
+            "Path to one of: (a) a DAgger training output dir "
+            "(e.g. outputs/training/diffusion_<...>_ft_dag2 — the "
+            "script then looks under <dir>/dagger/interventions/), or "
+            "(b) a standalone lerobot-eval output dir "
+            "(e.g. outputs/eval/2026-06-16/15-30-00_splatsim_diffusion — "
+            "the script looks for intervention_per_scenario.csv + "
+            "videos/splatsim_0/ directly under <dir>). Auto-detected via "
+            "presence of intervention_per_scenario.csv."
+        ),
     )
     p.add_argument(
         "episode_idx",

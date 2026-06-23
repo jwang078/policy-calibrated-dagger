@@ -116,6 +116,15 @@ SWEEP_COMBINATIONS_OF=""
 CONTINUE_ON_ERROR=false
 AUTO_CREATE_SOURCE=false
 AUTO_RERUN_TAG_SUFFIX="_rr"   # appended to source's run_tag when sweep tag is missing or collides
+# When --interleave_rounds is set, the sweep does ROUND-FIRST iteration
+# instead of ITERATION-FIRST: for r in 1..NUM_ROUNDS, for each iteration,
+# call dagger_orchestrate.sh with --num_rounds=$r. Combined with the
+# orchestrator's existing resume detection, each per-round call only does
+# work for round r (earlier rounds are skip-detected, later rounds aren't
+# requested). Useful for "see early-round results across all iterations
+# before committing compute to later rounds" + helps surface late-round
+# regressions in one iteration before others have over-trained.
+INTERLEAVE_ROUNDS=false
 ORCHESTRATOR_ARGS=()
 
 for arg in "$@"; do
@@ -126,6 +135,7 @@ for arg in "$@"; do
         --continue_on_error)         CONTINUE_ON_ERROR=true ;;
         --auto_create_source)        AUTO_CREATE_SOURCE=true ;;
         --auto_rerun_tag_suffix=*)   AUTO_RERUN_TAG_SUFFIX="${arg#*=}" ;;
+        --interleave_rounds)         INTERLEAVE_ROUNDS=true ;;
         --blends=*)
             echo "ERROR: don't pass --blends to the sweep wrapper; use --sweep_blends or --combination_pool instead." >&2
             echo "  The wrapper splits the sweep spec into individual --blends invocations." >&2
@@ -270,6 +280,7 @@ from itertools import combinations
 
 from dagger_naming import (
     derive_base_dataset_short,
+    derive_base_policy_name,
     format_blends_tag,
     merged_repo,
     alias_repo,
@@ -345,22 +356,46 @@ method_tag = METHOD_TAGS[intervention_method]
 # NUM_ROUNDS in that range gives identical predicted lengths.
 num_rounds = int(num_rounds_str) if num_rounds_str else 10
 
-# Parse the pool. Mirror orchestrator's 1.0-drop and 0.0-reject behavior so
-# the user sees consistent semantics.
+# Derive BASE_POLICY_STEM the same way dagger_orchestrate.sh does (see
+# dagger_orchestrate.sh:1336-1347). Used to predict the longest `_nc` sibling
+# policy name when --filter_blend_collisions is on. Only the basename of
+# --initial_policy_path matters; the orchestrator strips trailing
+# /pretrained_model and /checkpoints/<step>/ segments before basename.
+import os as _os
+import posixpath as _pp
+def _strip_ckpt_suffix(path: str) -> str:
+    p = path.rstrip("/")
+    if p.endswith("/pretrained_model"):
+        p = p[: -len("/pretrained_model")]
+    # Drop the trailing /checkpoints/<seg> if present.
+    parts = p.split("/")
+    if len(parts) >= 2 and parts[-2] == "checkpoints":
+        p = "/".join(parts[:-2])
+    return p
+
+initial_policy_path = get_flag("initial_policy_path") or ""
+if initial_policy_path:
+    base_policy_stem = _os.path.basename(_strip_ckpt_suffix(initial_policy_path))
+else:
+    base_policy_stem = ""  # without it we can't predict nc names; skip the probe
+
+# Parse the pool. 0.0 is rejected (orchestrator silently drops it → empty
+# --blends — likely a typo). 1.0 is KEPT: when it's the only ratio in a
+# combination, the orchestrator enters PURE_POLICY_MODE and trains on the
+# base dataset only (matched-compute baseline, no DAgger data). When 1.0
+# is mixed with other ratios in a combination (e.g. {0.5, 1.0}), it's a
+# regular blend that produces an extra _blend100 sub-dataset alongside.
 pool = []
 for r_str in pool_str.replace(",", " ").replace("[", " ").replace("]", " ").split():
     r = float(r_str)
     if r == 0.0:
         print("ERROR: --combination_pool contains 0.0 (orchestrator rejects 0.0).", file=sys.stderr); sys.exit(1)
-    if r == 1.0:
-        # silently filter; matches the orchestrator's "= raw intervention" skip
-        continue
     pool.append(r)
 
 if k <= 0:
     print(f"ERROR: --sweep_combinations_of={k} must be >= 1.", file=sys.stderr); sys.exit(1)
 if k > len(pool):
-    print(f"ERROR: --sweep_combinations_of={k} exceeds pool size {len(pool)} (after filtering 1.0).", file=sys.stderr); sys.exit(1)
+    print(f"ERROR: --sweep_combinations_of={k} exceeds pool size {len(pool)}.", file=sys.stderr); sys.exit(1)
 
 combos = list(combinations(pool, k))
 
@@ -394,9 +429,29 @@ def predicted_longest(combo):
         candidates.append(f"{hf_user}/{nc_short}")
     return max(candidates, key=len)
 
+
+def predicted_longest_nc_policy(combo):
+    """Predict longest collision-filtered sibling policy name (= nocoll
+    training-dir basename) for a combination. Format:
+        ${BASE_POLICY_NAME}_ft_dag${num_rounds}_nc
+    where BASE_POLICY_NAME = derive_base_policy_name(stem, run_tag, ...).
+    Returns None when --filter_blend_collisions is off or we lack the
+    initial-policy basename needed to predict it.
+    """
+    if not filter_collisions:
+        return None
+    if not base_policy_stem:
+        return None
+    blends_tag = format_blends_tag(list(combo))
+    base_policy_name = derive_base_policy_name(
+        base_policy_stem, run_tag=run_tag, model_tag=model_tag,
+        method_tag=method_tag, blends_tag=blends_tag,
+    )
+    return f"{base_policy_name}_ft_dag{num_rounds}_nc"
+
 # Per-combination table + overflow detection.
 print(f"Combination-mode sweep: C({len(pool)}, {k}) = {len(combos)} combination(s)", file=sys.stderr)
-print(f"  Pool (after filtering 1.0): {pool}", file=sys.stderr)
+print(f"  Pool: {pool}", file=sys.stderr)
 print(f"  K (combination size): {k}", file=sys.stderr)
 print(f"  Length check uses NUM_ROUNDS=dag{num_rounds} (orchestrator does authoritative check at pre-flight)", file=sys.stderr)
 print(file=sys.stderr)
@@ -425,6 +480,46 @@ if overflows:
         print(f"    add --dag_short_override=<SHORTER> (current stem '{stem}', {len(stem)} chars)", file=sys.stderr)
     print(f"  Or reduce --sweep_combinations_of from {k} (fewer ratios per combination → shorter blends_tag).", file=sys.stderr)
     sys.exit(2)
+
+# Second table: collision-filtered sibling policy name (step 6b output, the
+# `_nc`-suffixed training-dir basename = --policy.repo_id). Limit is wandb's
+# 128-char run-name cap (HF Hub's 96 is only a constraint when push_to_hub=true;
+# the orchestrator's own pre-flight will catch that case). Only printed when
+# --filter_blend_collisions is on AND we could derive base_policy_stem
+# (requires --initial_policy_path).
+NC_POLICY_LIMIT = 128
+nc_rows = []
+for combo in combos:
+    nc_name = predicted_longest_nc_policy(combo)
+    if nc_name is not None:
+        nc_rows.append((combo, nc_name))
+
+if nc_rows:
+    # Use a wider name column (130) since _nc policy names are inherently
+    # longer than dataset names (BASE_POLICY_NAME + `_ft_dag10_nc` ≈ 80-120
+    # chars). 130 leaves a few chars of right padding above the limit so the
+    # `len` column stays aligned.
+    NC_COL = 130
+    print(file=sys.stderr)
+    print(f"  {'combination':<28}  {'predicted longest _nc policy name (step 6b)':<{NC_COL}}  {'len':>4}  status", file=sys.stderr)
+    print(f"  {'-'*28}  {'-'*NC_COL}  ----  ------", file=sys.stderr)
+    nc_overflows = []
+    for combo, nc_name in nc_rows:
+        combo_str = " ".join(f"{r:g}" for r in combo)
+        nc_overflow_flag = len(nc_name) > NC_POLICY_LIMIT
+        if nc_overflow_flag:
+            nc_overflows.append(combo_str)
+        print(f"  [{combo_str}]".ljust(30) + f"  {nc_name:<{NC_COL}}  {len(nc_name):>4}  " + ("OVERFLOW" if nc_overflow_flag else "ok"), file=sys.stderr)
+    if nc_overflows:
+        print(file=sys.stderr)
+        print(f"ERROR: {len(nc_overflows)} of {len(nc_rows)} combinations would exceed wandb's {NC_POLICY_LIMIT}-char run-name limit for the step-6b nocoll sibling policy.", file=sys.stderr)
+        print("  Shorten the lineage somewhere upstream (--run_tag, --dag_short_override) or drop --filter_blend_collisions.", file=sys.stderr)
+        sys.exit(2)
+elif filter_collisions and not base_policy_stem:
+    print(file=sys.stderr)
+    print("  Note: --filter_blend_collisions is on but --initial_policy_path was not provided;", file=sys.stderr)
+    print("  cannot predict the step-6b `_nc` policy name length here. The orchestrator's own", file=sys.stderr)
+    print("  pre-flight will validate against the 128-char wandb cap.", file=sys.stderr)
 
 # stdout: one combination per line, space-separated ratios. Consumed by the
 # bash caller into RATIO_LISTS_ARR.
@@ -462,10 +557,87 @@ else
     echo "Sweep over $total ratio(s): ${RATIO_LISTS_ARR[*]}"
 fi
 
+# Build the outer round-loop list. When --interleave_rounds, each value of $r
+# is appended to every orchestrator invocation as `--num_rounds=$r`, so all
+# iterations do round $r, then $r+1, etc. The orchestrator's existing resume
+# detection skip-finishes prior rounds, so per-round calls only do new work
+# for round $r. Without the flag, the loop runs ONCE with no override and
+# the orchestrator follows the user's original --num_rounds for each iter
+# in full sequence (= the historical behavior).
+if [[ "$INTERLEAVE_ROUNDS" == "true" ]]; then
+    INTERLEAVE_NUM_ROUNDS=""
+    for a in "${ORCHESTRATOR_ARGS[@]}"; do
+        case "$a" in
+            --num_rounds=*) INTERLEAVE_NUM_ROUNDS="${a#*=}" ;;
+        esac
+    done
+    if [[ -z "$INTERLEAVE_NUM_ROUNDS" ]]; then
+        echo "ERROR: --interleave_rounds requires an explicit --num_rounds=N." >&2
+        echo "  The sweep needs to know how many rounds to iterate; auto-detection happens" >&2
+        echo "  inside dagger_orchestrate.sh after invocation, which is too late for this wrapper." >&2
+        exit 1
+    fi
+    ROUND_VALUES=()
+    for r in $(seq 1 "$INTERLEAVE_NUM_ROUNDS"); do
+        ROUND_VALUES+=( "$r" )
+    done
+    # Pre-flight: without --resume, the orchestrator's "is the lineage already
+    # complete?" detection prompts interactively at every invocation. With
+    # --interleave_rounds that's NUM_ROUNDS × iterations prompts — way too
+    # many. Warn + confirm rather than silently dropping the user into a
+    # prompt swamp.
+    RESUME_SET=false
+    for a in "${ORCHESTRATOR_ARGS[@]}"; do
+        if [[ "$a" == "--resume" ]]; then
+            RESUME_SET=true
+            break
+        fi
+    done
+    if [[ "$RESUME_SET" != "true" ]]; then
+        _expected_prompts=$(( INTERLEAVE_NUM_ROUNDS * total ))
+        if [[ "$AUTO_CREATE_SOURCE" == "true" ]]; then
+            _expected_prompts=$(( _expected_prompts + INTERLEAVE_NUM_ROUNDS ))
+        fi
+        echo "WARNING: --resume is not set so the orchestrator will pause for"
+        echo "  '[Y/n/restart-from-scratch]' confirmation at every invocation."
+        echo "  With --interleave_rounds=true, that's ~${_expected_prompts} prompts"
+        echo "  across the sweep (NUM_ROUNDS=${INTERLEAVE_NUM_ROUNDS} × ${total} iteration(s)"
+        if [[ "$AUTO_CREATE_SOURCE" == "true" ]]; then
+            echo "   + ${INTERLEAVE_NUM_ROUNDS} source-create call(s) since --auto_create_source)."
+        else
+            echo "   no --auto_create_source so source step skipped)."
+        fi
+        echo "  Add --resume to skip these prompts entirely (recommended)."
+        echo
+        read -r -p "Continue WITHOUT --resume? (y/N) " _confirm
+        if [[ "$_confirm" != "y" && "$_confirm" != "Y" ]]; then
+            echo "Aborted. Re-run with --resume to proceed non-interactively."
+            exit 1
+        fi
+    fi
+    echo "[interleave_rounds] outer loop over rounds 1..${INTERLEAVE_NUM_ROUNDS};"
+    echo "  for each round r: auto-create source (if enabled) + all ${total} iteration(s), each capped at --num_rounds=\$r."
+    echo
+else
+    # Sentinel single-iteration so the per-round block runs exactly once.
+    ROUND_VALUES=( "" )
+fi
+
+for ROUND in "${ROUND_VALUES[@]}"; do
+if [[ -n "$ROUND" ]]; then
+    ROUND_ARGS=( "--num_rounds=$ROUND" )
+    echo "════════════════════════════════════════════════════════════════════════════════"
+    echo "[interleave_rounds] OUTER ROUND $ROUND / $INTERLEAVE_NUM_ROUNDS"
+    echo "════════════════════════════════════════════════════════════════════════════════"
+else
+    ROUND_ARGS=()
+fi
+
 # Optional source-create step. Always invoked with --resume so the orchestrator
 # is responsible for "is it already done?" detection; if complete, it exits 0
 # in seconds. The sweep iterations below assume the source exists; this step
-# guarantees that.
+# guarantees that. In interleave mode, ROUND_ARGS appends --num_rounds=$ROUND
+# so the source is built ONE round at a time too.
 if [[ "$AUTO_CREATE_SOURCE" == "true" ]]; then
     REVERSE_FROM=""
     for a in "${ORCHESTRATOR_ARGS[@]}"; do
@@ -506,7 +678,7 @@ if [[ "$AUTO_CREATE_SOURCE" == "true" ]]; then
     echo "    bash $ORCH ${CREATE_ARGS[*]}"
     echo "  (Idempotent: if the source is already fully complete, this exits 0 in seconds.)"
     echo "════════════════════════════════════════════════════════════════════════════════"
-    if ! bash "$ORCH" "${CREATE_ARGS[@]}"; then
+    if ! bash "$ORCH" "${CREATE_ARGS[@]}" "${ROUND_ARGS[@]}"; then
         echo "Auto-create source step FAILED. Aborting sweep before any blend iteration." >&2
         exit 1
     fi
@@ -532,7 +704,7 @@ for i in "${!RATIO_LISTS_ARR[@]}"; do
     echo "Sweep iteration $((i + 1)) / $total: K=$iter_k --blends=\"$combo\""
     echo "  (elapsed sweep time so far: $(( iter_start - sweep_start ))s)"
     echo "════════════════════════════════════════════════════════════════════════════════"
-    if bash "$ORCH" --blends="$combo" "${ORCHESTRATOR_ARGS[@]}"; then
+    if bash "$ORCH" --blends="$combo" "${ORCHESTRATOR_ARGS[@]}" "${ROUND_ARGS[@]}"; then
         n_succ=$((n_succ + 1))
         echo "Sweep iteration --blends=\"$combo\" SUCCEEDED ($(( $(date +%s) - iter_start ))s)."
     else
@@ -541,11 +713,13 @@ for i in "${!RATIO_LISTS_ARR[@]}"; do
         echo "Sweep iteration --blends=\"$combo\" FAILED ($(( $(date +%s) - iter_start ))s)."
         if [[ "$CONTINUE_ON_ERROR" != "true" ]]; then
             echo "Aborting sweep. Pass --continue_on_error to keep going past failures."
-            break
+            break 2  # break out of BOTH the iteration loop AND the outer round loop
         fi
     fi
     echo
 done
+
+done   # for ROUND in "${ROUND_VALUES[@]}" — outer interleave-rounds loop
 
 echo "════════════════════════════════════════════════════════════════════════════════"
 echo "Sweep complete: $n_succ succeeded, $n_fail failed (total wall time: $(( $(date +%s) - sweep_start ))s)."

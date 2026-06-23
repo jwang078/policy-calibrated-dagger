@@ -45,6 +45,28 @@
 #               `_nocoll` siblings whether this flag is set or not (rm is
 #               idempotent on missing paths), so this flag mainly serves
 #               to be recorded in the cleanup invocation's audit trail.
+#   --nc_only
+#               SURGICAL collision-filter cleanup: delete ONLY the
+#               artifacts produced by --filter_blend_collisions (step 2's
+#               filter sub-step and step 6b). Specifically:
+#                 - `_ft_dag<N>_nc` training dirs
+#                 - `dagger/blend_collision_filter/` audit subdirs under
+#                   each raw round's training dir
+#                 - `_blend<NNN>_nocoll` blend datasets in the HF cache
+#                 - `_blend<NNN>_nocoll` stats sidecars
+#               Raw policies, raw blends, intervention datasets, alias /
+#               merged datasets, and round-0 base policy are PRESERVED.
+#               Re-running dagger_orchestrate_sweep.sh with
+#               --filter_blend_collisions then triggers step 2's filter
+#               sub-step (re-creates `_nocoll` datasets) and step 6b
+#               (re-trains `_nc` policies).
+#               In rerun mode, `_nocoll` blend datasets are SHARED across
+#               reruns of the same source — deleting them for one rerun
+#               cascades to all sibling reruns' next sweep run (each
+#               re-filters once, then re-uses the result).
+#               Skips the keep-round-1-intervention prompt (R1 isn't
+#               touched). Skips the orchestrator delegation entirely
+#               (deletions run inline). Composes with --detect_siblings.
 #   --keep_round_1_intervention
 #               PRESERVE round 1's raw intervention dataset + alias +
 #               int-stats sidecar. Round 1's merged dataset + training dir,
@@ -55,18 +77,28 @@
 #               interactively. With -y but without this flag, defaults to
 #               DELETE round 1 (the legacy behavior). No-op in rerun mode.
 #   --detect_siblings
-#               Auto-detect "sibling" lineages on disk that share the same
-#               prefix (everything up through the run_tag) AND the same
-#               number of blend ratios K as the target, then run cleanup on
-#               all of them. Useful for cleaning up an entire K-fold sweep
-#               family in one command. Example: given a single 1-blend
-#               lineage `rerun_v1_b010`, detects all of
-#               {b010, b030, b050, b070, b090} (any rerun_v1_b<NNN> with
-#               exactly one blend) and cleans them up. K=0 (no blends) and
-#               K=2 (pair-blends) lineages are NOT included unless the
-#               target itself is K=0 / K=2. Confirmation prompt asks once
-#               for the whole batch (or -y to skip); each per-lineage
-#               cleanup runs non-interactively after that single confirm.
+#               Auto-detect related lineages on disk and clean them up too.
+#               Two flavors are detected and unioned:
+#                 - K-siblings: lineages sharing the target's prefix (through
+#                   the run_tag) AND the target's blend-count K. Useful for
+#                   cleaning up an entire K-fold sweep family in one command.
+#                   Example: given a single 1-blend lineage `rerun_v1_b010`,
+#                   detects all of {b010, b030, b050, b070, b090} (any
+#                   rerun_v1_b<NNN> with exactly one blend) and cleans them
+#                   up. K=0 (no blends) and K=2 (pair-blends) lineages are
+#                   NOT included unless the target itself is K=0 / K=2.
+#                 - Rerun children: lineages whose dagger/config.json sidecar
+#                   `rerun_mode.source_run_tag` (+ `source_blends_tag`)
+#                   matches the TARGET's run_tag (+ blends_tag). Catches the
+#                   case where the target is a BASE lineage and rerun
+#                   lineages were spawned from its intervention data —
+#                   they have a different prefix from the target so the
+#                   K-sibling regex doesn't catch them, but they're orphaned
+#                   by the target's deletion (no source interventions to
+#                   blend against) and worth cleaning up alongside.
+#               Confirmation prompt asks once for the whole batch (or -y to
+#               skip); each per-lineage cleanup runs non-interactively after
+#               that single confirm.
 #
 # Examples:
 #   bash my_scripts/dagger_cleanup_lineage.sh \
@@ -96,6 +128,10 @@ KEEP_ROUND_1=unset
 # across the three scripts. Forwarded to the orchestrator so it ends up in
 # the cleanup invocation's recorded argv for auditing.
 FILTER_BLEND_COLLISIONS_FLAG=()
+# --nc_only: surgical mode — wipe only step-6b/filter artifacts (nc training
+# dirs, nocoll blend datasets + stats, blend_collision_filter audit subdirs).
+# Raw policies and raw blends are preserved. See the docstring above.
+NC_ONLY=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -104,6 +140,7 @@ for arg in "$@"; do
         --detect_siblings) DETECT_SIBLINGS=true ;;
         --also_delete_blends) ALSO_DELETE_BLENDS_FLAG=( --also_delete_blends ) ;;
         --filter_blend_collisions) FILTER_BLEND_COLLISIONS_FLAG=( --filter_blend_collisions ) ;;
+        --nc_only)   NC_ONLY=true ;;
         --keep_round_1_intervention) KEEP_ROUND_1=explicit_yes ;;
         -h|--help)
             sed -n '1,/^set -euo pipefail/p' "$0" | grep '^#' | sed 's/^# \?//'
@@ -149,7 +186,9 @@ fi
 #       delete-all, matching the prior behavior of this script).
 # The choice propagates to --detect_siblings recursion below.
 PRESERVE_R1_FLAG=()
-if [[ "$KEEP_ROUND_1" == "explicit_yes" ]]; then
+if [[ "$NC_ONLY" == true ]]; then
+    : # nc-only mode doesn't touch R1 intervention; the prompt is irrelevant.
+elif [[ "$KEEP_ROUND_1" == "explicit_yes" ]]; then
     PRESERVE_R1_FLAG=( --preserve_round_1_intervention )
     echo "[cleanup] --keep_round_1_intervention set: round 1's raw intervention will be PRESERVED."
 elif [[ "$AUTO_CONFIRM" == true ]]; then
@@ -192,8 +231,9 @@ from collections import defaultdict
 
 training_root, target_basename = sys.argv[1], sys.argv[2]
 
-# Strip _ft_dag<N> / _dag<N> → lineage name.
-m = re.match(r"^(.+?)(?:_ft)?_dag\d+$", target_basename)
+# Strip _ft_dag<N> / _dag<N> (with an optional trailing retrain-suffix like
+# `_nc` from step 6b or `_<custom>` from --retrain_suffix) → lineage name.
+m = re.match(r"^(.+?)(?:_ft)?_dag\d+(?:_[A-Za-z][A-Za-z0-9_]*)?$", target_basename)
 if not m:
     sys.exit(f"ERROR: '{target_basename}' is not a recognizable round training dir name")
 lineage_name = m.group(1)
@@ -207,14 +247,19 @@ else:
     prefix = lineage_name
     k = 0
 
-# Sibling pattern: same prefix, same K, any blend digits.
+# Sibling pattern: same prefix, same K, any blend digits. Trailing
+# `_<suffix>` (e.g. `_nc` from step 6b, `_<retrain_suffix>`) is optional.
+# Required to detect siblings when the user is targeting an `_nc` round
+# AND the raw (non-_nc) sibling dirs aren't on disk (e.g. lineages built
+# with `--filter_blend_collisions` where only _nc training dirs persist).
+_SUFFIX = r"(?:_[A-Za-z][A-Za-z0-9_]*)?"
 if k > 0:
     pat = re.compile(
-        rf"^{re.escape(prefix)}_b\d{{3}}(?:_\d{{3}}){{{k - 1}}}((?:_ft)?_dag\d+)$"
+        rf"^{re.escape(prefix)}_b\d{{3}}(?:_\d{{3}}){{{k - 1}}}((?:_ft)?_dag\d+{_SUFFIX})$"
     )
 else:
     # K=0: lineages with no _b suffix and same prefix.
-    pat = re.compile(rf"^{re.escape(prefix)}((?:_ft)?_dag\d+)$")
+    pat = re.compile(rf"^{re.escape(prefix)}((?:_ft)?_dag\d+{_SUFFIX})$")
 
 # Group matching round-dir names by lineage; one cleanup invocation per
 # lineage is enough (the per-lineage cleanup wipes ALL rounds of that
@@ -241,6 +286,87 @@ for lin in sorted(by_lineage.keys()):
 PY
 }
 
+# Read the target's own run_tag + blends_tag from its sidecar (if present).
+# Used by detect_rerun_child_paths to match other lineages whose sidecars
+# point at THIS target as their rerun source. No sidecar → can't match,
+# rerun-child detection is silently skipped (pre-sidecar lineages).
+_TARGET_RUN_TAG=""
+_TARGET_BLENDS_TAG=""
+if [[ -f "$TRAIN_DIR/dagger/config.json" ]]; then
+    _tmp_naming="$(python3 -c "
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+naming = cfg.get('naming') or {}
+print(naming.get('run_tag') or '')
+print(naming.get('blends_tag') or '')
+" "$TRAIN_DIR/dagger/config.json" 2>/dev/null || true)"
+    _TARGET_RUN_TAG="$(printf '%s\n' "$_tmp_naming" | sed -n 1p)"
+    _TARGET_BLENDS_TAG="$(printf '%s\n' "$_tmp_naming" | sed -n 2p)"
+fi
+
+# Rerun-child detection: find lineages on disk whose sidecar
+# `rerun_mode.source_run_tag` (+ `source_blends_tag`) points at THIS target.
+# Catches the case where the target is a BASE lineage and one or more rerun
+# lineages (e.g. `_rr_b010 / _rr_b050 / _rr_b090`) were spawned from its
+# intervention data — those rerun lineages have a different prefix from the
+# target so K-sibling detection doesn't catch them, but they're orphaned by
+# the target's deletion (no source interventions to blend against) so they're
+# worth offering for cleanup. Echoes one canonical training-dir path per
+# rerun-child lineage to stdout. Empty output when target has no sidecar.
+detect_rerun_child_paths() {
+    [[ -z "$_TARGET_RUN_TAG" ]] && return 0
+    local training_root="$(dirname "$TRAIN_DIR")"
+    local target_basename="$(basename "$TRAIN_DIR")"
+    python3 - "$training_root" "$target_basename" "$_TARGET_RUN_TAG" "$_TARGET_BLENDS_TAG" <<'PY'
+import json, os, re, sys
+from collections import defaultdict
+
+training_root, target_basename, target_run_tag, target_blends_tag = sys.argv[1:5]
+target_blends_tag = target_blends_tag or ""
+
+by_lineage = defaultdict(list)
+for entry in sorted(os.listdir(training_root)):
+    full = os.path.join(training_root, entry)
+    if not os.path.isdir(full):
+        continue
+    # One sidecar per lineage is enough — pick round-1 dirs as canonical.
+    # Trailing `_<suffix>` (e.g. `_nc` from step 6b) is allowed so we still
+    # pick up rerun children whose only on-disk dirs are _nc variants.
+    if not re.search(r"(?:_ft)?_dag1(?:_[A-Za-z][A-Za-z0-9_]*)?$", entry):
+        continue
+    cfg_path = os.path.join(full, "dagger", "config.json")
+    if not os.path.isfile(cfg_path):
+        continue
+    try:
+        cfg = json.load(open(cfg_path))
+    except Exception:
+        continue
+    rr = cfg.get("rerun_mode") or {}
+    src_run = rr.get("source_run_tag") or ""
+    src_blends = rr.get("source_blends_tag") or ""
+    if src_run != target_run_tag:
+        continue
+    if src_blends != target_blends_tag:
+        continue
+    m = re.match(r"^(.+?)(?:_ft)?_dag\d+(?:_[A-Za-z][A-Za-z0-9_]*)?$", entry)
+    if not m:
+        continue
+    lineage = m.group(1)
+    # Don't include the target itself (shouldn't happen — target's own
+    # rerun_mode is null when it IS the source — but defensive).
+    if entry == target_basename:
+        continue
+    by_lineage[lineage].append(entry)
+
+for lineage in sorted(by_lineage.keys()):
+    rounds = sorted(by_lineage[lineage])
+    print(os.path.join(training_root, rounds[0]))
+PY
+}
+
 # Interactive sibling opt-in: when --detect_siblings was NOT explicitly
 # passed and the script is running interactively (not -y), run the detection
 # preemptively. If there are other lineages on disk that match the target's
@@ -253,32 +379,51 @@ if [[ "$DETECT_SIBLINGS" != true && "$AUTO_CONFIRM" != true ]]; then
     while IFS= read -r line; do
         _AUTO_SIBLINGS+=( "$line" )
     done < <(detect_sibling_paths)
-    # The detection always includes the target itself (the regex pattern
-    # matches it by construction). 1 sibling = just the target = nothing
-    # extra to offer. > 1 means there are real siblings worth flagging.
-    if (( ${#_AUTO_SIBLINGS[@]} > 1 )); then
-        _OTHER_SIBLINGS=()
-        _TARGET_BASE="$(basename "$TRAIN_DIR" | sed -E 's/(_ft)?_dag[0-9]+$//')"
-        for p in "${_AUTO_SIBLINGS[@]}"; do
-            _LIN="$(basename "$p" | sed -E 's/(_ft)?_dag[0-9]+$//')"
-            [[ "$_LIN" != "$_TARGET_BASE" ]] && _OTHER_SIBLINGS+=( "$_LIN" )
-        done
+    _AUTO_RERUN_CHILDREN=()
+    while IFS= read -r line; do
+        _AUTO_RERUN_CHILDREN+=( "$line" )
+    done < <(detect_rerun_child_paths)
+    # K-sibling detection includes the target itself (the regex matches it
+    # by construction); strip it from the offer list. Rerun-child detection
+    # explicitly excludes the target so its output is already clean.
+    _OTHER_SIBLINGS=()
+    _TARGET_BASE="$(basename "$TRAIN_DIR" | sed -E 's/(_ft)?_dag[0-9]+(_.*)?$//')"
+    for p in "${_AUTO_SIBLINGS[@]}"; do
+        _LIN="$(basename "$p" | sed -E 's/(_ft)?_dag[0-9]+(_.*)?$//')"
+        [[ "$_LIN" != "$_TARGET_BASE" ]] && _OTHER_SIBLINGS+=( "$_LIN" )
+    done
+    _OTHER_RERUN_CHILDREN=()
+    for p in "${_AUTO_RERUN_CHILDREN[@]}"; do
+        _LIN="$(basename "$p" | sed -E 's/(_ft)?_dag[0-9]+(_.*)?$//')"
+        _OTHER_RERUN_CHILDREN+=( "$_LIN" )
+    done
+    _TOTAL_OFFERED=$(( ${#_OTHER_SIBLINGS[@]} + ${#_OTHER_RERUN_CHILDREN[@]} ))
+    if (( _TOTAL_OFFERED > 0 )); then
         echo
-        echo "Heads up — found ${#_OTHER_SIBLINGS[@]} other lineage(s) on disk sharing the"
-        echo "target's prefix + blend-count (K=$(( ${#_OTHER_SIBLINGS[@]} > 0 ? 1 : 0 )) family):"
+        echo "Heads up — found $_TOTAL_OFFERED other lineage(s) on disk related to the target:"
         echo "  TARGET: $_TARGET_BASE"
-        for s in "${_OTHER_SIBLINGS[@]}"; do
-            echo "  SIBLING: $s"
-        done
+        if (( ${#_OTHER_SIBLINGS[@]} > 0 )); then
+            echo "  [K-siblings: same prefix + blend-count]"
+            for s in "${_OTHER_SIBLINGS[@]}"; do
+                echo "    SIBLING: $s"
+            done
+        fi
+        if (( ${#_OTHER_RERUN_CHILDREN[@]} > 0 )); then
+            echo "  [rerun children: sidecar's rerun_mode.source_run_tag points at target]"
+            for s in "${_OTHER_RERUN_CHILDREN[@]}"; do
+                echo "    RERUN_CHILD: $s"
+            done
+        fi
         echo
         echo "By default this script cleans up ONLY the target. If you're cleaning up a"
-        echo "sweep family, you can opt in to cleaning the siblings too (equivalent to"
-        echo "re-running with --detect_siblings)."
-        echo -n "Also clean up the ${#_OTHER_SIBLINGS[@]} sibling(s) above? [y/N]: "
+        echo "sweep family or want to nuke the target's downstream reruns too, you can"
+        echo "opt in to cleaning the related lineages above (equivalent to re-running"
+        echo "with --detect_siblings)."
+        echo -n "Also clean up the $_TOTAL_OFFERED related lineage(s) above? [y/N]: "
         read -r _SIBLING_REPLY
         if [[ "$_SIBLING_REPLY" =~ ^[Yy]$ ]]; then
             DETECT_SIBLINGS=true
-            echo "[cleanup] sibling cleanup ENABLED via interactive opt-in."
+            echo "[cleanup] related-lineage cleanup ENABLED via interactive opt-in."
         else
             echo "[cleanup] proceeding with target-only cleanup."
         fi
@@ -295,25 +440,67 @@ if [[ "$DETECT_SIBLINGS" == true ]]; then
     while IFS= read -r line; do
         SIBLING_PATHS+=( "$line" )
     done < <(detect_sibling_paths)
+    # Append rerun children. detect_rerun_child_paths excludes the target
+    # itself so there's no de-dup needed; detect_sibling_paths INCLUDES the
+    # target, so the union is just concatenation. Each rerun child lives
+    # under a different prefix, so it can't collide with a K-sibling entry.
+    while IFS= read -r line; do
+        SIBLING_PATHS+=( "$line" )
+    done < <(detect_rerun_child_paths)
 
     if (( ${#SIBLING_PATHS[@]} == 0 )); then
         echo "ERROR: --detect_siblings: no sibling lineages found." >&2
         echo "  Expected to find at least the target itself; nothing matched the" >&2
-        echo "  same-prefix + same-K pattern derived from:" >&2
-        echo "    $TARGET_BASENAME" >&2
+        echo "  same-prefix + same-K pattern (nor rerun-child sidecar pointer)" >&2
+        echo "  derived from:" >&2
+        echo "    $(basename "$TRAIN_DIR")" >&2
         exit 1
     fi
 
-    echo "[detect_siblings] Found ${#SIBLING_PATHS[@]} lineage(s) sharing target's prefix + blend-count K:"
+    echo "[detect_siblings] Found ${#SIBLING_PATHS[@]} lineage(s) related to target (K-siblings + rerun children):"
     for p in "${SIBLING_PATHS[@]}"; do
-        echo "  $(basename "$p" | sed -E 's/(_ft)?_dag[0-9]+$//')"
+        _lineage_name="$(basename "$p" | sed -E 's/(_ft)?_dag[0-9]+(_.*)?$//')"
+        _training_root="$(dirname "$p")"
+        # Count raw vs _nc training dirs per lineage so the user can see
+        # what'll actually be wiped (full cleanup deletes raw + _nc; the
+        # --nc_only mode deletes only _nc). Pipeline is `|| true`-wrapped
+        # because grep -Ev returns rc=1 on no-match, which trips
+        # `set -e + pipefail`.
+        _n_raw=$( { ls -d "$_training_root/${_lineage_name}_ft_dag"[0-9]* 2>/dev/null \
+            | grep -Ev '_[A-Za-z][A-Za-z0-9_]*$' | wc -l; } || true )
+        _n_nc=$( { ls -d "$_training_root/${_lineage_name}_ft_dag"[0-9]*_nc 2>/dev/null | wc -l; } || true )
+        # Strip any whitespace wc may emit.
+        _n_raw="${_n_raw// /}"
+        _n_nc="${_n_nc// /}"
+        _extras=""
+        if (( _n_nc > 0 )); then
+            _extras=" (raw rounds: $_n_raw, _nc siblings: $_n_nc)"
+        elif (( _n_raw > 0 )); then
+            _extras=" (raw rounds: $_n_raw)"
+        fi
+        echo "  ${_lineage_name}${_extras}"
     done
     echo
 
+    # Use a mode-specific confirmation token + message so the user knows
+    # exactly what scope this batch will wipe. nc_only is a SURGICAL mode
+    # (only step-6b/filter artifacts), so reusing the "delete-all" token
+    # from the legacy full-cleanup path would be misleading.
     if (( ${#DRY_RUN_FLAG[@]} == 0 )) && [[ "$AUTO_CONFIRM" != true ]]; then
-        echo -n "Type 'delete-all' to confirm cleanup of all ${#SIBLING_PATHS[@]} lineages above: "
-        read -r CONFIRM
-        [[ "$CONFIRM" == "delete-all" ]] || { echo "Aborted."; exit 1; }
+        if [[ "$NC_ONLY" == true ]]; then
+            echo "MODE: --nc_only — only step-6b / filter_blend_collisions artifacts will be deleted:"
+            echo "  * _ft_dag<N>_nc training dirs"
+            echo "  * dagger/blend_collision_filter/ audit subdirs"
+            echo "  * _blend<NNN>_nocoll datasets + stats sidecars"
+            echo "  Raw policies, raw blends, intervention/alias/merged datasets are PRESERVED."
+            echo -n "Type 'delete-nc-all' to confirm nc-only cleanup of all ${#SIBLING_PATHS[@]} lineages above: "
+            read -r CONFIRM
+            [[ "$CONFIRM" == "delete-nc-all" ]] || { echo "Aborted."; exit 1; }
+        else
+            echo -n "Type 'delete-all' to confirm cleanup of all ${#SIBLING_PATHS[@]} lineages above: "
+            read -r CONFIRM
+            [[ "$CONFIRM" == "delete-all" ]] || { echo "Aborted."; exit 1; }
+        fi
     fi
 
     # Recurse: per-lineage cleanup. -y at the inner level suppresses each
@@ -321,17 +508,166 @@ if [[ "$DETECT_SIBLINGS" == true ]]; then
     # the whole batch above. Don't let `set -e` abort the loop on a single
     # failure — keep going so a downstream sibling that still has artifacts
     # gets a chance to be cleaned up too.
+    NC_ONLY_FORWARD=()
+    [[ "$NC_ONLY" == true ]] && NC_ONLY_FORWARD=( --nc_only )
     overall_rc=0
     for p in "${SIBLING_PATHS[@]}"; do
         echo
-        echo "=== [detect_siblings] cleaning up: $(basename "$p" | sed -E 's/(_ft)?_dag[0-9]+$//') ==="
-        bash "$0" "$p" -y "${DRY_RUN_FLAG[@]}" "${ALSO_DELETE_BLENDS_FLAG[@]}" "${FILTER_BLEND_COLLISIONS_FLAG[@]}" "${KEEP_R1_FORWARD[@]}" && rc=0 || rc=$?
+        echo "=== [detect_siblings] cleaning up: $(basename "$p" | sed -E 's/(_ft)?_dag[0-9]+(_.*)?$//') ==="
+        bash "$0" "$p" -y "${DRY_RUN_FLAG[@]}" "${ALSO_DELETE_BLENDS_FLAG[@]}" "${FILTER_BLEND_COLLISIONS_FLAG[@]}" "${KEEP_R1_FORWARD[@]}" "${NC_ONLY_FORWARD[@]}" && rc=0 || rc=$?
         if (( rc != 0 )); then
             overall_rc="$rc"
             echo "[detect_siblings] WARN: cleanup failed for $p (rc=$rc); continuing." >&2
         fi
     done
     exit "$overall_rc"
+fi
+
+# ── --nc_only: surgical collision-filter cleanup ──────────────────────────────
+# Bypass the orchestrator delegate entirely. We only need to find and rm:
+#   1. `_ft_dag<N>_nc` training dirs under the lineage's TRAINING_ROOT.
+#   2. `dagger/blend_collision_filter/` audit subdirs under each raw round's
+#      training dir (sibling of the `_nc` dir).
+#   3. `_blend<NNN>_nocoll` datasets in the HF cache.
+#   4. `_blend<NNN>_nocoll` stats sidecars.
+# The lineage's blend ratios + source intervention prefix come from the
+# round-1 sidecar (every round writes the same one).
+if [[ "$NC_ONLY" == true ]]; then
+    LEROBOT_CACHE="${LEROBOT_CACHE:-$HOME/.cache/huggingface/lerobot}"
+    HF_USER="${HF_USER:-JennyWWW}"
+    STATS_BASE="$LEROBOT_ROOT/outputs/dataset_stats"
+    TRAINING_ROOT="$(dirname "$TRAIN_DIR")"
+    LINEAGE_BASE="$(basename "$TRAIN_DIR" | sed -E 's/(_ft)?_dag[0-9]+(_.*)?$//')"
+
+    # Derive blend ratios + source intervention-prefix from the sidecar so we
+    # know which `_nocoll` dataset names to glob in the cache / stats dirs.
+    CFG="$TRAIN_DIR/dagger/config.json"
+    if [[ ! -f "$CFG" ]]; then
+        echo "ERROR: --nc_only needs the round's dagger/config.json sidecar; not found at:" >&2
+        echo "  $CFG" >&2
+        echo "  (Pre-sidecar lineages aren't supported by --nc_only. Use the full delete-all" >&2
+        echo "   cleanup, or rm the _nc / _nocoll artifacts by hand.)" >&2
+        exit 1
+    fi
+    NC_META="$(python3 -c "
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+ratios = (cfg.get('config') or {}).get('blends') or []
+fmt = ((cfg.get('config') or {}).get('action_format') or 'rel').lower()
+infix = 'r' if fmt == 'rel' else 'a'
+rerun = cfg.get('rerun_mode') or {}
+# In rerun mode the nocoll dataset is named after the SOURCE lineage's
+# intervention prefix; in non-rerun mode it's named after the lineage's
+# own base_dataset_short. Both schemas yield <prefix>_<infix>_dag<N>_blend<NNN>.
+prefix = (rerun.get('source_int_short_prefix') or '').strip() \
+         or (cfg.get('naming') or {}).get('base_dataset_short') or ''
+print(infix)
+print(prefix)
+for r in ratios:
+    print(f'{int(round(float(r) * 100)):03d}')
+" "$CFG")"
+    ACTION_INFIX="$(printf '%s\n' "$NC_META" | sed -n 1p)"
+    SOURCE_INT_PREFIX="$(printf '%s\n' "$NC_META" | sed -n 2p)"
+    mapfile -t BLEND_TAGS < <(printf '%s\n' "$NC_META" | sed -n '3,$p')
+    if [[ -z "$SOURCE_INT_PREFIX" || "${#BLEND_TAGS[@]}" -eq 0 ]]; then
+        echo "ERROR: sidecar at $CFG didn't yield a usable source intervention prefix or blend list." >&2
+        echo "  Got: prefix='$SOURCE_INT_PREFIX', blend_tags=(${BLEND_TAGS[*]})" >&2
+        exit 1
+    fi
+
+    echo "[nc_only] target lineage: $LINEAGE_BASE"
+    echo "[nc_only] nocoll dataset prefix: $SOURCE_INT_PREFIX (action_infix=$ACTION_INFIX)"
+    echo "[nc_only] blend tags: ${BLEND_TAGS[*]}"
+
+    # 1. _nc training dirs (with optional _<suffix> for retrain variants).
+    declare -a NC_DIRS=()
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        NC_DIRS+=( "$p" )
+    done < <(ls -d "$TRAINING_ROOT/${LINEAGE_BASE}"_ft_dag[0-9]*_nc 2>/dev/null || true)
+
+    # 2. blend_collision_filter audit subdirs under each RAW round's dir
+    #    (skip the _nc round dirs from this list to avoid double-rm; the _nc
+    #    dirs themselves are wiped wholesale in step 1).
+    declare -a AUDIT_DIRS=()
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        AUDIT_DIRS+=( "$p" )
+    done < <(
+        for d in "$TRAINING_ROOT/${LINEAGE_BASE}"_ft_dag[0-9]*; do
+            [[ -d "$d" ]] || continue
+            # Skip the _nc dirs — those are dropped wholesale in step 1.
+            [[ "$d" == *_nc ]] && continue
+            audit="$d/dagger/blend_collision_filter"
+            [[ -d "$audit" ]] && echo "$audit"
+        done
+    )
+
+    # 3 + 4. nocoll blend datasets in the HF cache + stats sidecars. One pair
+    # per (round, ratio) combination; glob the round-number wildcard.
+    declare -a NOCOLL_DATASETS=()
+    declare -a NOCOLL_STATS=()
+    for tag in "${BLEND_TAGS[@]}"; do
+        pattern="${SOURCE_INT_PREFIX}_${ACTION_INFIX}_dag*_blend${tag}_nocoll"
+        while IFS= read -r p; do
+            [[ -z "$p" ]] && continue
+            NOCOLL_DATASETS+=( "$p" )
+        done < <(ls -d "$LEROBOT_CACHE/$HF_USER/"$pattern 2>/dev/null || true)
+        while IFS= read -r p; do
+            [[ -z "$p" ]] && continue
+            NOCOLL_STATS+=( "$p" )
+        done < <(ls -d "$STATS_BASE/"$pattern 2>/dev/null || true)
+    done
+
+    TOTAL=$(( ${#NC_DIRS[@]} + ${#AUDIT_DIRS[@]} + ${#NOCOLL_DATASETS[@]} + ${#NOCOLL_STATS[@]} ))
+    if (( TOTAL == 0 )); then
+        echo "[nc_only] nothing to delete — no _nc / _nocoll / audit artifacts found for this lineage."
+        exit 0
+    fi
+
+    echo
+    echo "Will DELETE (${TOTAL} item(s)):"
+    if (( ${#NC_DIRS[@]} > 0 )); then
+        echo "  [_nc training dirs] (${#NC_DIRS[@]}):"
+        printf '    %s\n' "${NC_DIRS[@]}"
+    fi
+    if (( ${#AUDIT_DIRS[@]} > 0 )); then
+        echo "  [blend_collision_filter audit subdirs] (${#AUDIT_DIRS[@]}):"
+        printf '    %s\n' "${AUDIT_DIRS[@]}"
+    fi
+    if (( ${#NOCOLL_DATASETS[@]} > 0 )); then
+        echo "  [_nocoll blend datasets] (${#NOCOLL_DATASETS[@]}):"
+        printf '    %s\n' "${NOCOLL_DATASETS[@]}"
+    fi
+    if (( ${#NOCOLL_STATS[@]} > 0 )); then
+        echo "  [_nocoll stats sidecars] (${#NOCOLL_STATS[@]}):"
+        printf '    %s\n' "${NOCOLL_STATS[@]}"
+    fi
+    echo
+    echo "PRESERVED: raw policies (_ft_dag<N>), raw blends (_blend<NNN>),"
+    echo "           intervention datasets, alias/merged datasets, R0 base policy."
+
+    if (( ${#DRY_RUN_FLAG[@]} > 0 )); then
+        echo
+        echo "[--dry-run] would rm -rf the items above."
+        exit 0
+    fi
+
+    if [[ "$AUTO_CONFIRM" != true ]]; then
+        echo
+        echo -n "Type 'delete-nc' to confirm: "
+        read -r CONFIRM
+        [[ "$CONFIRM" == "delete-nc" ]] || { echo "Aborted."; exit 1; }
+    fi
+
+    for p in "${NC_DIRS[@]}" "${AUDIT_DIRS[@]}" "${NOCOLL_DATASETS[@]}" "${NOCOLL_STATS[@]}"; do
+        rm -rf "$p"
+    done
+    echo "[nc_only] Deleted ${TOTAL} item(s)."
+    echo "[nc_only] Re-run dagger_orchestrate_sweep.sh with --filter_blend_collisions"
+    echo "[nc_only] to re-produce _nocoll datasets (step 2's filter sub-step) and"
+    echo "[nc_only] re-train _nc policies (step 6b)."
+    exit 0
 fi
 
 ORIG_ARGV=()
@@ -387,7 +723,7 @@ if (( ${#ORIG_ARGV[@]} == 0 )); then
     fi
 
     # Strip _ft_dag<N> / _dag<N> → BASE_POLICY_NAME for the normal-lineage path.
-    BASE_POLICY_NAME=$(echo "$TRAIN_BASENAME" | sed -E 's/(_ft)?_dag[0-9]+$//')
+    BASE_POLICY_NAME=$(echo "$TRAIN_BASENAME" | sed -E 's/(_ft)?_dag[0-9]+(_.*)?$//')
     if [[ "$BASE_POLICY_NAME" == "$TRAIN_BASENAME" ]]; then
         echo "ERROR: '$TRAIN_BASENAME' doesn't look like a DAgger round training dir." >&2
         echo "  Expected basename ending in '_ft_dag<N>' or '_dag<N>'." >&2

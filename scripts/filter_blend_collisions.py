@@ -51,6 +51,7 @@ import logging
 import sys
 import time
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -62,21 +63,35 @@ matplotlib.use("Agg")
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
+from PIL import Image as PILImage  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from lerobot.configs import parser  # noqa: E402
-from lerobot.envs.factory import make_env, make_env_config  # noqa: E402
-from lerobot.utils.import_utils import register_third_party_plugins  # noqa: E402
-from lerobot.utils.lerobot_dataset_utils import resolve_dataset_dir  # noqa: E402
-from lerobot.utils.utils import init_logging  # noqa: E402
-from my_scripts.visualize_shared_autonomy_DEPRECATED import (  # type: ignore[import-not-found]  # noqa: E402
+# `_HERE` (= my_scripts dir) is added to sys.path above, so import sibling
+# modules by their bare name. Note: do NOT add a ``my_scripts.`` package
+# prefix here — that only works when the lerobot repo root itself is on
+# sys.path (e.g. during ``pytest``), and the orchestrator launches this via
+# ``python /…/my_scripts/filter_blend_collisions.py`` without that.
+from lib_dataset_episode_io import (  # type: ignore[import-not-found]  # noqa: E402
     find_parquet_files,
     load_episode_frames,
 )
+
+from lerobot.configs import parser  # noqa: E402
+from lerobot.envs.factory import make_env, make_env_config  # noqa: E402
+from lerobot.utils.constants import DEFAULT_FEATURES  # noqa: E402
+from lerobot.utils.import_utils import register_third_party_plugins  # noqa: E402
+from lerobot.utils.lerobot_dataset_utils import resolve_dataset_dir  # noqa: E402
+from lerobot.utils.utils import init_logging  # noqa: E402
+
+# DEFAULT_FEATURES (timestamp, frame_index, episode_index, index, task_index)
+# are auto-populated by ``LeRobotDataset.add_frame`` and rejected by
+# ``validate_frame`` if the caller supplies them. We carry the keys in a frozen
+# set so the per-frame copy below can drop them efficiently.
+_DEFAULT_FEATURE_KEYS = frozenset(DEFAULT_FEATURES)
 
 logger = logging.getLogger(__name__)
 
@@ -179,21 +194,36 @@ def _find_first_collision_frame(
 ) -> int | None:
     """Reset env to `source_scenario_idx`, then step through `actions` until
     either the trajectory ends (return None) or `info["in_collision"]` is true
-    for the first time (return that frame index)."""
+    for the first time (return that frame index).
+
+    Termination handling: SplatSim envs default to ``terminate_on_success=True``,
+    so a blend episode that succeeded mid-rollout will trigger ``terminated``
+    here. On the NEXT ``step()`` Gymnasium's vec-env auto-resets the sub-env
+    to a *different* scenario, and any ``in_collision`` flag from that point
+    onward describes the wrong world. We break out of the loop the moment we
+    see ``terminated`` or ``truncated`` without an active collision — the
+    original episode is done from the env's point of view, anything past it
+    is replay noise.
+    """
     # env.reset(seed=[N]) → splatsim server loads scenario N's objects + robot.
     vec_env.reset(seed=[int(source_scenario_idx)])
     for t in range(len(actions)):
         # vec_env is a Gymnasium vector env wrapping a single sub-env, so
         # the action tensor needs a leading batch axis. info is also batched.
         action_batched = actions[t : t + 1]
-        _obs, _reward, _terminated, _truncated, info = vec_env.step(action_batched)
+        _obs, _reward, terminated, truncated, info = vec_env.step(action_batched)
         # SplatSim's check_metrics() records per-step collision in info_metrics
         # (see sim_robot_pybullet_small_engine.py). The Gymnasium vector
         # wrapper folds per-env info dicts into "final_info" (terminated/
         # truncated frames) or the parent info dict. Try both.
-        in_collision = _extract_in_collision_flag(info)
-        if in_collision:
+        if _extract_in_collision_flag(info):
             return t
+        # Stop on success / truncation — the next step() would auto-reset
+        # the sub-env into a different scenario and any future in_collision
+        # flag would be a false positive. terminated/truncated are batched
+        # like other vec-env outputs (np.ndarray, shape (1,)).
+        if bool(np.asarray(terminated).any()) or bool(np.asarray(truncated).any()):
+            return None
     return None
 
 
@@ -233,6 +263,52 @@ def _extract_in_collision_flag(info: dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 # Trim + drop policy. Encapsulated so it's unit-testable.
 # ---------------------------------------------------------------------------
+
+
+def _row_to_frame(
+    row: pd.Series,
+    target_features: dict,
+    task_for_index: dict[int, str],
+) -> dict:
+    """Convert one parquet row to a frame dict ``add_frame`` will accept.
+
+    Three transforms vs. the raw parquet row:
+      1. Drop columns in ``DEFAULT_FEATURES`` (``timestamp``, ``frame_index``,
+         ``episode_index``, ``index``, ``task_index``). ``add_frame`` computes
+         these and ``validate_frame`` rejects them as "extra features".
+      2. Decode columns with ``dtype == "image"`` from the parquet's
+         ``{'bytes': ...}`` encoding into ``PIL.Image`` objects (which
+         ``add_frame`` accepts directly per ``validate_feature_image_or_video``).
+      3. Look the task string up by ``task_index`` from the source dataset's
+         ``meta/tasks.parquet`` mapping. The blend parquet stores
+         ``task_index`` but not ``task``; ``add_frame`` requires ``task``.
+    """
+    out: dict[str, Any] = {}
+    for key, spec in target_features.items():
+        if key in _DEFAULT_FEATURE_KEYS:
+            continue
+        value = row[key]
+        if spec.get("dtype") == "image" and isinstance(value, dict) and "bytes" in value:
+            value = PILImage.open(BytesIO(value["bytes"])).convert("RGB")
+        out[key] = value
+    # add_frame pops the "task" key separately and resolves it to task_index
+    # on its own. Use the source row's task_index to look up the original
+    # task string so the new dataset's tasks.parquet stays aligned.
+    out["task"] = task_for_index[int(row["task_index"])]
+    return out
+
+
+def _load_task_mapping(source_root_dir: Path) -> dict[int, str]:
+    """Load the source dataset's ``task_index → task_string`` map from
+    ``meta/tasks.parquet``. Falls back to an empty dict if the file is
+    missing — callers can then default the task string at the call site."""
+    tasks_path = source_root_dir / "meta" / "tasks.parquet"
+    if not tasks_path.is_file():
+        return {}
+    df = pd.read_parquet(tasks_path)
+    # tasks.parquet stores the task STRING as the index and task_index as a
+    # column. Invert it for O(1) lookup.
+    return {int(ti): str(task) for task, ti in df["task_index"].items()}
 
 
 def decide_trim(
@@ -280,6 +356,11 @@ def _run(
 
     source_episodes_meta = _load_source_episodes_meta(source_root_dir)
     parquet_files = find_parquet_files(source_data_dir)
+    # `task_index → task_string` map for converting parquet rows into
+    # add_frame-friendly frames. Fall back to a single-entry default keyed by 0
+    # using cfg.env_task so single-task datasets without a tasks.parquet still
+    # work.
+    task_for_index = _load_task_mapping(source_root_dir) or {0: cfg.env_task}
 
     if "episode_index" not in source_episodes_meta.columns:
         raise ValueError(
@@ -437,9 +518,12 @@ def _run(
                 continue
 
             # KEPT: stream the first `trimmed_to` frames to the target dataset.
+            # ``_row_to_frame`` drops DEFAULT_FEATURES columns, decodes image
+            # bytes from the parquet's ``{'bytes': ...}`` encoding to PIL
+            # images, and looks up the task string by task_index — without
+            # those transforms, ``add_frame`` rejects the frame.
             for _, row in frames_df.iloc[:trimmed_to].iterrows():
-                frame = {k: row[k] for k in frames_df.columns if not k.startswith("__")}
-                target_ds.add_frame(dict(frame))
+                target_ds.add_frame(_row_to_frame(row, target_ds.meta.features, task_for_index))
             episode_metadata: dict[str, Any] = {
                 "source_episode_idx": source_episode_idx_meta,
                 "source_scenario_idx": source_scenario_idx,
@@ -498,6 +582,20 @@ def _run(
             logger.exception("vec_env.close() raised — ignoring during shutdown.")
 
     finalize_lerobot_dataset(target_ds)
+    # Optional Hub push. The orchestrator currently doesn't enable this for
+    # `_nocoll` siblings (they're consumed locally by step 6b's training), but
+    # leave the hook wired so standalone invocations can opt in.
+    if cfg.push_to_hub:
+        try:
+            logger.info("Pushing %s to the Hub …", cfg.target_repo_id)
+            target_ds.push_to_hub()
+            logger.info("Pushed %s successfully.", cfg.target_repo_id)
+        except Exception:
+            logger.exception(
+                "push_to_hub failed for %s — dataset is still saved locally at %s.",
+                cfg.target_repo_id,
+                target_ds.root,
+            )
     return results
 
 
@@ -516,7 +614,9 @@ def main(cfg: FilterCollisionsConfig) -> None:
 
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / f"{cfg.target_repo_id.split('/')[-1]}.csv"
+    target_short = cfg.target_repo_id.split("/")[-1]
+    csv_path = out_dir / f"{target_short}.csv"
+    summary_path = out_dir / f"{target_short}_summary.json"
 
     results = _run(cfg, csv_path=csv_path)
 
@@ -527,6 +627,26 @@ def main(cfg: FilterCollisionsConfig) -> None:
     n_full = n_kept - n_trimmed
     total_frames_in = sum(r.pre_filter_n_frames for r in results)
     total_frames_kept = sum(r.trimmed_to_n_frames for r in results if r.kept)
+
+    # JSON summary alongside the per-episode CSV so post-hoc analysis
+    # scripts (e.g. dagger_plot, audits) can pick up the aggregate without
+    # re-aggregating the per-episode rows. Mirrors what's printed below.
+    import json as _json
+
+    summary = {
+        "source_repo_id": cfg.source_repo_id,
+        "target_repo_id": cfg.target_repo_id,
+        "pre_collision_margin": cfg.pre_collision_margin,
+        "min_episode_length": cfg.min_episode_length,
+        "n_episodes_in": n_total,
+        "n_episodes_kept_full": n_full,
+        "n_episodes_kept_trimmed": n_trimmed,
+        "n_episodes_dropped": n_dropped,
+        "total_frames_in": total_frames_in,
+        "total_frames_kept": total_frames_kept,
+        "per_episode_csv": str(csv_path),
+    }
+    summary_path.write_text(_json.dumps(summary, indent=2) + "\n")
 
     print()
     print("=" * 70)
@@ -542,6 +662,7 @@ def main(cfg: FilterCollisionsConfig) -> None:
     print(f"  total_frames_in:                {total_frames_in}")
     print(f"  total_frames_kept:              {total_frames_kept}")
     print(f"  per-episode CSV:                {csv_path}")
+    print(f"  summary JSON:                   {summary_path}")
     print("=" * 70)
 
 

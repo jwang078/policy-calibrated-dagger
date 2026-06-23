@@ -92,6 +92,30 @@ if str(_HERE) not in sys.path:
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# Sibling-module imports. These previously came from
+# ``my_scripts.visualize_shared_autonomy_DEPRECATED``; they've been split into
+# topic-focused library modules so this script doesn't depend on a deprecated
+# file. Bare module names (no ``my_scripts.`` prefix) so they resolve when
+# this script is invoked directly via ``python my_scripts/…``.
+from lib_dataset_episode_io import (  # type: ignore[import-not-found]  # noqa: E402
+    find_parquet_files,
+    get_available_episodes,
+    load_episode_frames,
+    load_task_description,
+)
+from lib_ee_kinematics import (  # type: ignore[import-not-found]  # noqa: E402
+    absolute_positions_to_ee_deltas,
+    compute_ee_from_states,
+    compute_ee_trajectories,
+)
+from lib_sa_plotting import (  # type: ignore[import-not-found]  # noqa: E402
+    plot_ee_trajectories_3d,
+    plot_joint_angles,
+)
+from lib_sa_policy_loading import (  # type: ignore[import-not-found]  # noqa: E402
+    load_wrapped_policy,
+)
+
 from lerobot.envs import close_envs  # noqa: E402
 from lerobot.envs.factory import make_env, make_env_config, make_env_pre_post_processors  # noqa: E402
 from lerobot.envs.utils import preprocess_observation  # noqa: E402
@@ -102,18 +126,6 @@ from lerobot.policies.shared_autonomy_wrapper import (  # noqa: E402
 )
 from lerobot.utils.lerobot_dataset_utils import make_default_rename_map, resolve_dataset_dir  # noqa: E402
 from lerobot.utils.sim_seeding import seed_splatsim_env_to_state  # noqa: E402
-from my_scripts.visualize_shared_autonomy_DEPRECATED import (  # type: ignore[import-not-found]  # noqa: E402
-    absolute_positions_to_ee_deltas,
-    compute_ee_from_states,
-    compute_ee_trajectories,
-    find_parquet_files,
-    get_available_episodes,
-    load_episode_frames,
-    load_task_description,
-    load_wrapped_policy,
-    plot_ee_trajectories_3d,
-    plot_joint_angles,
-)
 
 # ── env construction ──────────────────────────────────────────────────────────
 

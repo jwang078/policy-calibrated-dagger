@@ -54,8 +54,103 @@ def parse_eval_dict(line: str) -> dict | None:
         return None
 
 
-def scan_round(dir_path: Path, round_n: int | None = None) -> dict | None:
-    """Pull (round, succ, pos_err, in_coll, trunc, eval_step, variant) from a training dir's wandb log.
+def _parse_reeval_eval_info(json_path: Path) -> dict | None:
+    """Parse a dagger_reeval_lineage.sh-written eval_info.json into the
+    {succ, pos_err, ori_err, in_coll, trunc, ep_len} dict the plotter expects.
+
+    Mirrors the same metric extraction `dagger_progress.sh:print_row` uses
+    when --prefer_reeval is on (the chart's default), so both the table AND
+    the plot pick up identical values from the re-eval.
+
+    Prefers the pre-aggregated `overall` / `per_group["splatsim"]` blocks
+    when present; falls back to averaging the per-task `info_metrics` arrays
+    for partial / older files where the aggregates weren't written.
+    """
+    try:
+        d = json.loads(json_path.read_text())
+    except Exception:
+        return None
+    o = d.get("overall") or {}
+    g = (d.get("per_group") or {}).get("splatsim") or {}
+    src = o or g
+    # Success/failure-conditioned aggregates — only computable from per_task
+    # data (the overall / per_group blocks only have unconditional means).
+    # Walk per_task regardless of which aggregate path we use so the
+    # conditional metrics are always populated when the file's complete
+    # enough to compute them.
+    #   succ_ep_len  = mean episode_length    on success
+    #   fail_pos_err = mean position error    on failure
+    #   fail_ori_err = mean orientation error on failure
+    succ_eplen_vals, fail_pos_vals, fail_ori_vals = [], [], []
+    for t in d.get("per_task") or []:
+        m = t.get("metrics") or {}
+        successes = m.get("successes") or []
+        info = m.get("info_metrics") or {}
+        eplen_task = info.get("episode_length") or []
+        pos_task = info.get("final_position_error_m") or []
+        ori_task = info.get("final_orientation_error_deg") or []
+        n = min(len(successes), len(eplen_task), len(pos_task), len(ori_task))
+        for s, L, P, O in zip(successes[:n], eplen_task[:n], pos_task[:n], ori_task[:n]):
+            if s:
+                succ_eplen_vals.append(L)
+            else:
+                fail_pos_vals.append(P)
+                fail_ori_vals.append(O)
+    succ_ep_len_val = (sum(succ_eplen_vals) / len(succ_eplen_vals)) if succ_eplen_vals else None
+    fail_pos_err_val = (sum(fail_pos_vals) / len(fail_pos_vals)) if fail_pos_vals else None
+    fail_ori_err_val = (sum(fail_ori_vals) / len(fail_ori_vals)) if fail_ori_vals else None
+
+    if src.get("pc_success") is not None:
+        return {
+            "succ": src.get("pc_success"),
+            "pos_err": src.get("avg_final_position_error_m"),
+            "ori_err": src.get("avg_final_orientation_error_deg"),
+            "in_coll": src.get("avg_in_collision"),
+            "trunc": src.get("avg_truncated"),
+            "ep_len": src.get("avg_episode_length"),
+            "succ_ep_len": succ_ep_len_val,
+            "fail_pos_err": fail_pos_err_val,
+            "fail_ori_err": fail_ori_err_val,
+        }
+    # Aggregate from per_task[].metrics.
+    succ_total, succ_n = 0, 0
+    pos, ori, coll, trunc, eplen = [], [], [], [], []
+    for t in d.get("per_task") or []:
+        m = t.get("metrics") or {}
+        successes = m.get("successes") or []
+        succ_total += sum(1 for s in successes if s)
+        succ_n += len(successes)
+        info = m.get("info_metrics") or {}
+        pos.extend(info.get("final_position_error_m") or [])
+        ori.extend(info.get("final_orientation_error_deg") or [])
+        coll.extend(info.get("in_collision") or [])
+        trunc.extend(info.get("truncated") or [])
+        eplen.extend(info.get("episode_length") or [])
+    if succ_n == 0:
+        return None
+    avg = lambda xs: (sum(xs) / len(xs)) if xs else None
+    return {
+        "succ": 100.0 * succ_total / succ_n,
+        "pos_err": avg(pos),
+        "ori_err": avg(ori),
+        "in_coll": avg(coll),
+        "trunc": avg(trunc),
+        "ep_len": avg(eplen),
+        "succ_ep_len": succ_ep_len_val,
+        "fail_pos_err": fail_pos_err_val,
+        "fail_ori_err": fail_ori_err_val,
+    }
+
+
+def scan_round(dir_path: Path, round_n: int | None = None, prefer_reeval: bool = True) -> dict | None:
+    """Pull (round, succ, pos_err, in_coll, trunc, ep_len, eval_step, variant) from a training dir.
+
+    Eval-metric source cascade (mirrors dagger_progress.sh):
+      1. With `prefer_reeval=True` (default), the most-recent
+         `<dir_path>/reevals/*/eval_info.json` — re-evaluation results
+         written by dagger_reeval_lineage.sh. Wandb-log eval_step is replaced
+         with `*<reeval_tag>` for provenance.
+      2. Fallback: the dir's wandb log's last "Suite overall aggregated" line.
 
     `round_n` overrides the auto-detected round number from the dir name suffix.
     Used for round 0 (base policy dir has no _dag${N} suffix to parse).
@@ -85,20 +180,65 @@ def scan_round(dir_path: Path, round_n: int | None = None) -> dict | None:
     log = logs[-1].read_text(errors="ignore")
 
     row: dict = {"round": round_n, "variant": variant, "retrain_suffix": retrain_suffix}
-    # Last eval block.
-    eval_lines = [ln for ln in log.splitlines() if "Suite overall aggregated" in ln]
-    if eval_lines:
-        d = parse_eval_dict(eval_lines[-1])
-        if d:
-            row["succ"] = d.get("pc_success")
-            row["pos_err"] = d.get("avg_final_position_error_m")
-            row["ori_err"] = d.get("avg_final_orientation_error_deg")
-            row["in_coll"] = d.get("avg_in_collision")
-            row["trunc"] = d.get("avg_truncated")
-    # Eval step (most recent).
-    step_matches = re.findall(r"Eval policy at step (\d+)", log)
-    if step_matches:
-        row["eval_step"] = int(step_matches[-1])
+
+    # Eval-metric source cascade. Same shape as dagger_progress.sh's print_row:
+    #   (1) prefer the most-recent reeval eval_info.json if present (and the
+    #       caller didn't pass prefer_reeval=False),
+    #   (2) training-time eval_info_step_*.json written by lerobot_train.py.
+    #       Same dict shape as reeval — lets the plot pick up succ_ep_len
+    #       and per-task info without needing a separate re-eval.
+    #   (3) fall back to the wandb log's last "Suite overall aggregated" line.
+    eval_filled_from_reeval = False
+    if prefer_reeval:
+        reeval_candidates = sorted(
+            dir_path.glob("reevals/*/eval_info.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for cand in reeval_candidates:
+            parsed = _parse_reeval_eval_info(cand)
+            if parsed and parsed.get("succ") is not None:
+                row.update(parsed)
+                row["reeval_tag"] = cand.parent.name
+                row["reeval_source"] = str(cand)
+                # eval_step column annotation matches the chart: `*<tag>`.
+                row["eval_step"] = f"*{cand.parent.name}"
+                eval_filled_from_reeval = True
+                break
+
+    if not eval_filled_from_reeval:
+        # Tier 2: training-time eval_info dump. Newest by mtime wins.
+        train_eval_candidates = sorted(
+            dir_path.glob("eval/eval_info_step_*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for cand in train_eval_candidates:
+            parsed = _parse_reeval_eval_info(cand)
+            if parsed and parsed.get("succ") is not None:
+                row.update(parsed)
+                row["reeval_tag"] = f"train-step{cand.stem.replace('eval_info_step_', '')}"
+                row["reeval_source"] = str(cand)
+                row["eval_step"] = f"*{row['reeval_tag']}"
+                eval_filled_from_reeval = True
+                break
+
+    if not eval_filled_from_reeval:
+        # Last eval block from the training-time wandb log.
+        eval_lines = [ln for ln in log.splitlines() if "Suite overall aggregated" in ln]
+        if eval_lines:
+            d = parse_eval_dict(eval_lines[-1])
+            if d:
+                row["succ"] = d.get("pc_success")
+                row["pos_err"] = d.get("avg_final_position_error_m")
+                row["ori_err"] = d.get("avg_final_orientation_error_deg")
+                row["in_coll"] = d.get("avg_in_collision")
+                row["trunc"] = d.get("avg_truncated")
+                row["ep_len"] = d.get("avg_episode_length")
+        # Eval step (most recent).
+        step_matches = re.findall(r"Eval policy at step (\d+)", log)
+        if step_matches:
+            row["eval_step"] = int(step_matches[-1])
     # Final training loss. Two sources, tried in order:
     #   (1) wandb-summary.json — wandb writes the final value of every
     #       logged scalar at run end. `train/loss` is the canonical key
@@ -221,7 +361,7 @@ def group_reruns_by_source(lineages: list[str], model: str) -> dict[str, list[st
     return grouped
 
 
-def collect_lineage_rows(lineage: str, model: str) -> list[dict]:
+def collect_lineage_rows(lineage: str, model: str, prefer_reeval: bool = True) -> list[dict]:
     """Return per-round dicts (succ, pos_err, ori_err, in_coll, trunc, variant) for a lineage.
 
     Same logic as plot_lineage's data-collection prelude, factored out so the
@@ -234,14 +374,14 @@ def collect_lineage_rows(lineage: str, model: str) -> list[dict]:
         if d.is_dir() and lineage_of(d.name, model) == lineage
     ]
     dirs.sort(key=lambda p: int(ROUND_SUFFIX_RE.search(p.name).group(1)))  # type: ignore[union-attr]
-    rows = [r for r in (scan_round(d) for d in dirs) if r is not None]
+    rows = [r for r in (scan_round(d, prefer_reeval=prefer_reeval) for d in dirs) if r is not None]
     if rows:
         base_dir = TRAINING_ROOT / f"{model}_{lineage}"
         if not base_dir.is_dir() and "_basewrist_" in lineage:
             untagged = lineage.rsplit("_basewrist_", 1)[0] + "_basewrist"
             base_dir = TRAINING_ROOT / f"{model}_{untagged}"
         if base_dir.is_dir():
-            row0 = scan_round(base_dir, round_n=0)
+            row0 = scan_round(base_dir, round_n=0, prefer_reeval=prefer_reeval)
             if row0 is not None:
                 rows = [row0] + rows
     return rows
@@ -255,6 +395,28 @@ COMPARISON_METRICS = [
     ("ori_err", "final orientation error (deg)", "↓ better"),
     ("in_coll", "in-collision steps", "↓ better"),
     ("trunc", "truncation rate", "↓ better"),
+    # Mean episode length (env.episode_length-capped for truncated episodes,
+    # so a high-trunc lineage can look artificially short — read alongside
+    # `trunc` for the full picture).
+    ("ep_len", "mean episode length (steps)", "↓ better"),
+    # Mean episode length conditioned on success — the average length of
+    # episodes the policy actually completed. Unlike `ep_len` this isn't
+    # diluted by truncated/failed-at-cap episodes, so it's a cleaner
+    # "how fast does the policy finish when it does finish?" signal.
+    # Lower = faster successful completions. Only populated from reeval
+    # data (training-time wandb log doesn't record per-episode lists).
+    ("succ_ep_len", "mean episode length on success (steps)", "↓ better"),
+    # Failure-conditional final pos / ori errors — analogous companions
+    # of succ_ep_len. Together with `succ` they describe BOTH outcomes:
+    # "how well does the policy do when it succeeds?" (succ_ep_len) and
+    # "how badly does it miss when it fails?" (fail_pos_err / fail_ori_err).
+    # The unconditional `pos_err` / `ori_err` average over BOTH successful
+    # and failed episodes — for high-success lineages they're pulled down
+    # by tiny errors on the successes and hide how badly the failures
+    # actually missed. fail_* surfaces that. Same data source / cascade
+    # as succ_ep_len.
+    ("fail_pos_err", "mean position error on failure (m)", "↓ better"),
+    ("fail_ori_err", "mean orientation error on failure (deg)", "↓ better"),
     # Final training loss (avg of last 20 logged steps). Direction is
     # "↓ better" for the comparison framing (lower training loss = better
     # fit to the round's training set), but note that "better fit" doesn't
@@ -298,9 +460,15 @@ def _per_rerun_avg_delta(
     model: str,
     metric: str,
     direction: str,
+    prefer_reeval: bool = True,
 ) -> tuple[dict[str, float | None], dict[str, float | None], dict[str, int]]:
     """Per-rerun mean, std, and N of (rerun-beats-source) delta across canonical
     ft rounds. Returns (mean_by_lineage, std_by_lineage, n_by_lineage).
+
+    Computes BOTH the canonical ``_ft_dag${N}`` rounds AND, when present, the
+    sibling ``_ft_dag${N}_nc`` rounds produced by step 6b. Nc entries get keys
+    formatted as ``"<rerun> (nc)"`` so the bar chart can show them as
+    distinct bars next to their parent rerun.
 
     For ↓-better metrics, delta is sign-flipped (source − rerun) so higher =
     rerun wins. Reruns with no overlapping rounds get None for mean/std and 0
@@ -313,7 +481,7 @@ def _per_rerun_avg_delta(
     import statistics
 
     is_lower_better = direction.startswith("↓")
-    source_rows = collect_lineage_rows(source_lineage, model)
+    source_rows = collect_lineage_rows(source_lineage, model, prefer_reeval=prefer_reeval)
     src_by_round: dict[int, float] = {}
     for r in source_rows:
         if r.get("variant", "ft") != "ft" or r["round"] <= 0:
@@ -324,10 +492,11 @@ def _per_rerun_avg_delta(
     mean_by: dict[str, float | None] = {}
     std_by: dict[str, float | None] = {}
     n_by: dict[str, int] = {}
-    for rerun in rerun_lineages:
+
+    def _accumulate(key: str, rows: list[dict], row_matches) -> None:
         ds: list[float] = []
-        for r in collect_lineage_rows(rerun, model):
-            if r.get("variant", "ft") != "ft" or r["round"] <= 0:
+        for r in rows:
+            if not row_matches(r) or r["round"] <= 0:
                 continue
             v = r.get(metric)
             if v is None:
@@ -337,13 +506,27 @@ def _per_rerun_avg_delta(
                 continue
             ds.append((src_v - v) if is_lower_better else (v - src_v))
         if ds:
-            mean_by[rerun] = sum(ds) / len(ds)
-            std_by[rerun] = statistics.stdev(ds) if len(ds) >= 2 else 0.0
-            n_by[rerun] = len(ds)
+            mean_by[key] = sum(ds) / len(ds)
+            std_by[key] = statistics.stdev(ds) if len(ds) >= 2 else 0.0
+            n_by[key] = len(ds)
         else:
-            mean_by[rerun] = None
-            std_by[rerun] = None
-            n_by[rerun] = 0
+            mean_by[key] = None
+            std_by[key] = None
+            n_by[key] = 0
+
+    def _is_ft(r: dict) -> bool:
+        return r.get("variant", "ft") == "ft"
+
+    def _is_nc(r: dict) -> bool:
+        return r.get("variant") == "retrain" and r.get("retrain_suffix") == "nc"
+
+    for rerun in rerun_lineages:
+        rows = collect_lineage_rows(rerun, model, prefer_reeval=prefer_reeval)
+        _accumulate(rerun, rows, _is_ft)
+        # Only emit a `(nc)` entry when there's actually a `_nc` policy on
+        # disk — otherwise the bar chart would render a None bar.
+        if any(_is_nc(r) for r in rows):
+            _accumulate(f"{rerun} (nc)", rows, _is_nc)
     return mean_by, std_by, n_by
 
 
@@ -355,6 +538,7 @@ def plot_comparison_metric(
     axis_label: str,
     direction: str,
     out_path: Path,
+    prefer_reeval: bool = True,
 ) -> int:
     """Plot ONE metric for source + all reruns on a single axis. Returns total lines drawn."""
     series: list[tuple[str, list[dict], dict]] = []
@@ -362,7 +546,7 @@ def plot_comparison_metric(
     series.append(
         (
             source_lineage,
-            collect_lineage_rows(source_lineage, model),
+            collect_lineage_rows(source_lineage, model, prefer_reeval=prefer_reeval),
             {"linestyle": "-", "linewidth": 2.5, "marker": "o", "color": "black", "zorder": 3},
         )
     )
@@ -373,25 +557,69 @@ def plot_comparison_metric(
     color_by_lineage = _name_rainbow_colors(rerun_lineages)
     rerun_markers = ["s", "^", "v", "D", "P", "X", "<", ">", "p", "h"]
     for i, rerun in enumerate(rerun_lineages):
+        rerun_rows = collect_lineage_rows(rerun, model, prefer_reeval=prefer_reeval)
         series.append(
             (
                 rerun,
-                collect_lineage_rows(rerun, model),
+                rerun_rows,
                 {
                     "linestyle": "--",
                     "linewidth": 1.8,
                     "marker": rerun_markers[i % len(rerun_markers)],
                     "color": color_by_lineage[rerun],
                     "zorder": 2,
+                    # "ft" branch of the per-series plotting logic below.
+                    "_series_variant": "ft",
                 },
             )
         )
+        # Collision-filtered (`_nc`) sibling policy. Trained by step 6b
+        # when --filter_blend_collisions is on; lives alongside the raw
+        # policy in the same training dir as `_ft_dag${N}_nc`. Plotted
+        # as its own series so it's directly comparable to the parent
+        # rerun. Same rainbow color (= same blend ratio); dotted
+        # linestyle and a hollow-marker variant make raw-vs-filtered
+        # visually distinct without burning a new color slot.
+        nc_rows_present = any(
+            r.get("variant") == "retrain" and r.get("retrain_suffix") == "nc" for r in rerun_rows
+        )
+        if nc_rows_present:
+            series.append(
+                (
+                    f"{rerun} (nc)",
+                    rerun_rows,
+                    {
+                        "linestyle": ":",
+                        "linewidth": 1.8,
+                        "marker": rerun_markers[i % len(rerun_markers)],
+                        "markerfacecolor": "white",
+                        "markeredgecolor": color_by_lineage[rerun],
+                        "color": color_by_lineage[rerun],
+                        "zorder": 2,
+                        # "nc" branch: filter to the `_nc` retrain rows only.
+                        "_series_variant": "nc",
+                    },
+                )
+            )
 
     fig, ax = plt.subplots(figsize=(13, 6))
     drew_anything = 0
     for lineage_key, rows, style in series:
-        ft_rows = [r for r in rows if r.get("variant", "ft") == "ft" and r.get(metric) is not None]
-        scratch_rows = [r for r in rows if r.get("variant") == "scratch" and r.get(metric) is not None]
+        # Pop the synthetic key (it's not a matplotlib kwarg) and use it to
+        # pick which subset of rows this series cares about.
+        series_variant = style.pop("_series_variant", "ft")
+        if series_variant == "nc":
+            ft_rows = [
+                r
+                for r in rows
+                if r.get("variant") == "retrain"
+                and r.get("retrain_suffix") == "nc"
+                and r.get(metric) is not None
+            ]
+            scratch_rows: list[dict] = []  # scratch stars only apply to the raw ft curve
+        else:
+            ft_rows = [r for r in rows if r.get("variant", "ft") == "ft" and r.get(metric) is not None]
+            scratch_rows = [r for r in rows if r.get("variant") == "scratch" and r.get(metric) is not None]
         if not ft_rows and not scratch_rows:
             continue
         xs = [r["round"] for r in ft_rows]
@@ -471,6 +699,7 @@ def plot_comparison_metric_avg_delta_bar(
     direction: str,
     out_path: Path,
     error_bar_type: str = "sem",
+    prefer_reeval: bool = True,
 ) -> int:
     """Bar chart: per-rerun "winning delta" averaged across canonical finetune
     DAgger rounds. Positive bars ALWAYS mean rerun beats source on average,
@@ -484,28 +713,42 @@ def plot_comparison_metric_avg_delta_bar(
     """
     color_by_lineage = _name_rainbow_colors(rerun_lineages)
     delta_by_lineage, std_by_lineage, n_rounds_by_lineage = _per_rerun_avg_delta(
-        source_lineage, rerun_lineages, model, metric, direction
+        source_lineage, rerun_lineages, model, metric, direction, prefer_reeval=prefer_reeval
     )
 
-    # Drop reruns with no overlap; alphabetical x-axis order matches the line
-    # plot's legend so the same color = same name across all 5 metric plots.
-    # Bar HEIGHT shows the rerun's improvement over source; bar COLOR is the
-    # lineage's stable identity tag.
-    valid_lineages = [r for r in rerun_lineages if delta_by_lineage[r] is not None]
-    if not valid_lineages:
+    # Build display order: each rerun, immediately followed by its `(nc)`
+    # sibling when present. Same rainbow color for both, distinguished by a
+    # hatch pattern on the nc bar. Reruns without overlap with source (delta
+    # is None) get dropped.
+    display_lineages: list[str] = []
+    for rerun in rerun_lineages:
+        if delta_by_lineage.get(rerun) is not None:
+            display_lineages.append(rerun)
+        nc_key = f"{rerun} (nc)"
+        if delta_by_lineage.get(nc_key) is not None:
+            display_lineages.append(nc_key)
+    if not display_lineages:
         return 0
 
+    def _parent_lineage(key: str) -> str:
+        # Strip the trailing ' (nc)' marker so the nc bar inherits its
+        # parent rerun's rainbow color slot.
+        return key[: -len(" (nc)")] if key.endswith(" (nc)") else key
+
     fig, ax = plt.subplots(figsize=(11, 6))
-    xs = list(range(len(valid_lineages)))
-    bar_means: list[float] = [float(delta_by_lineage[r] or 0.0) for r in valid_lineages]
-    bar_stds: list[float] = [float(std_by_lineage[r] or 0.0) for r in valid_lineages]
-    bar_colors = [color_by_lineage[r] for r in valid_lineages]
+    xs = list(range(len(display_lineages)))
+    bar_means: list[float] = [float(delta_by_lineage[r] or 0.0) for r in display_lineages]
+    bar_stds: list[float] = [float(std_by_lineage[r] or 0.0) for r in display_lineages]
+    bar_colors = [color_by_lineage[_parent_lineage(r)] for r in display_lineages]
+    # NC bars get a hatch pattern so they're visually distinct from their
+    # parent rerun bar (which is solid). Raw bars get no hatch.
+    bar_hatches = ["///" if r.endswith(" (nc)") else "" for r in display_lineages]
     bar_labels = [
         # Short tail after `_basewrist_` (e.g. `rerun_v1_b050`) so x-tick labels fit.
         r.split("_basewrist_", 1)[-1] if "_basewrist_" in r else r
-        for r in valid_lineages
+        for r in display_lineages
     ]
-    bar_n_rounds = [n_rounds_by_lineage[r] for r in valid_lineages]
+    bar_n_rounds = [n_rounds_by_lineage[r] for r in display_lineages]
 
     # Derive the actual error-bar values from the requested type. SEM = SD/√N
     # (uncertainty in the mean estimate). SD = sample std (round-to-round
@@ -535,6 +778,7 @@ def plot_comparison_metric_avg_delta_bar(
         edgecolor="black",
         linewidth=0.7,
         capsize=5,
+        hatch=bar_hatches,
         error_kw={"ecolor": "#333333", "elinewidth": 1.2, "capthick": 1.2, "zorder": 3},
     )
     ax.axhline(0, color="black", linewidth=1)
@@ -596,10 +840,10 @@ def plot_comparison_metric_avg_delta_bar(
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
-    return len(valid_lineages)
+    return len(display_lineages)
 
 
-def plot_lineage(lineage: str, model: str, out_path: Path) -> int:
+def plot_lineage(lineage: str, model: str, out_path: Path, prefer_reeval: bool = True) -> int:
     """Plot one lineage; returns number of rounds plotted (0 if nothing)."""
     dirs = [
         d
@@ -607,7 +851,7 @@ def plot_lineage(lineage: str, model: str, out_path: Path) -> int:
         if d.is_dir() and lineage_of(d.name, model) == lineage
     ]
     dirs.sort(key=lambda p: int(ROUND_SUFFIX_RE.search(p.name).group(1)))  # type: ignore[union-attr]
-    rows = [r for r in (scan_round(d) for d in dirs) if r is not None]
+    rows = [r for r in (scan_round(d, prefer_reeval=prefer_reeval) for d in dirs) if r is not None]
     # Prepend round 0 (base policy dir, no _dag suffix) only if at least one
     # dag round exists — otherwise a standalone base training would plot as
     # a single round-0 point.
@@ -621,7 +865,7 @@ def plot_lineage(lineage: str, model: str, out_path: Path) -> int:
             untagged = lineage.rsplit("_basewrist_", 1)[0] + "_basewrist"
             base_dir = TRAINING_ROOT / f"{model}_{untagged}"
         if base_dir.is_dir():
-            row0 = scan_round(base_dir, round_n=0)
+            row0 = scan_round(base_dir, round_n=0, prefer_reeval=prefer_reeval)
             if row0 is not None:
                 rows = [row0] + rows
     if not rows:
@@ -663,6 +907,10 @@ def plot_lineage(lineage: str, model: str, out_path: Path) -> int:
                 ("ori_err", "final orientation error (deg)", "tab:blue", "↓"),
                 ("in_coll", "in-collision steps", "tab:orange", "↓"),
                 ("trunc", "truncation rate", "tab:purple", "↓"),
+                ("ep_len", "mean episode length (steps)", "tab:gray", "↓"),
+                ("succ_ep_len", "mean episode length on success (steps)", "tab:brown", "↓"),
+                ("fail_pos_err", "mean position error on failure (m)", "tab:pink", "↓"),
+                ("fail_ori_err", "mean orientation error on failure (deg)", "tab:olive", "↓"),
             ],
         ),
         (
@@ -826,6 +1074,17 @@ def main():
         ),
     )
     ap.add_argument(
+        "--no_prefer_reeval",
+        action="store_true",
+        help=(
+            "Opt OUT of the default reeval cascade in plot data. By default, "
+            "each round's metrics come from the most-recent eval_info.json "
+            "under <train_dir>/reevals/*/ when present, matching what "
+            "dagger_progress.sh shows in its table. Pass this to force reading "
+            "from the training wandb log even when a reeval exists."
+        ),
+    )
+    ap.add_argument(
         "--filter",
         default=None,
         nargs="+",
@@ -864,12 +1123,13 @@ def main():
             sys.exit(1)
 
     out_dir = Path(args.out_dir)
+    prefer_reeval = not args.no_prefer_reeval
     n_plotted = 0
     for lin in lineages:
         # Path matches dagger_progress.sh's `plot_path` so the table's "Plot:"
         # line and the file dagger_plot.py writes resolve to the same PNG.
         out_path = out_dir / f"dagger_progress_{args.model}_{lin}.png"
-        if plot_lineage(lin, args.model, out_path) > 0:
+        if plot_lineage(lin, args.model, out_path, prefer_reeval=prefer_reeval) > 0:
             n_plotted += 1
 
     if n_plotted == 0:
@@ -911,6 +1171,7 @@ def main():
                     axis_label,
                     direction,
                     out_path,
+                    prefer_reeval=prefer_reeval,
                 )
                 if lines > 0:
                     print(f"  {out_path.resolve()}")
@@ -926,6 +1187,7 @@ def main():
                     direction,
                     bar_path,
                     error_bar_type=args.error_bar_type,
+                    prefer_reeval=prefer_reeval,
                 )
                 if bars > 0:
                     print(f"  {bar_path.resolve()}")

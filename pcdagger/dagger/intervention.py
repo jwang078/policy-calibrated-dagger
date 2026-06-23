@@ -109,6 +109,44 @@ def _extract_orientation_error_deg(info: dict) -> float | None:
     return _extract_float_metric(info, "orientation_error_deg")
 
 
+def _extract_collision_kind(info: dict) -> str | None:
+    """Pull the env's collision kind out of info: ``"self"``, ``"obstacle"``,
+    or None when not currently in collision (or the env doesn't surface a kind).
+
+    Tries two key conventions in this order:
+      1. ``collision_kind`` — direct string ("self" / "obstacle" / None).
+      2. ``collision_kind_code`` — integer code (0=none, 1=obstacle, 2=self)
+         used by the env's check_metrics. Mapped to the string form here so
+         downstream consumers don't have to know the numeric mapping.
+    Returns None for any other / missing combination.
+    """
+    payload = info.get("final_info") if "final_info" in info else info
+
+    def _scalar(val):
+        if val is None:
+            return None
+        if hasattr(val, "tolist"):
+            arr = val.tolist()
+            return arr[0] if arr else None
+        return val
+
+    raw = _scalar(payload.get("collision_kind"))
+    if raw in ("self", "obstacle"):
+        return str(raw)
+    code = _scalar(payload.get("collision_kind_code"))
+    if code is None:
+        return None
+    try:
+        c = int(code)
+    except (TypeError, ValueError):
+        return None
+    if c == 1:
+        return "obstacle"
+    if c == 2:
+        return "self"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Per-scenario result
 # ---------------------------------------------------------------------------
@@ -125,8 +163,13 @@ class ScenarioResult:
     plan_failures: int
     method: str = ""
     # Comma-separated chronological list of trigger reasons for each cycle
-    # that fired this scenario. Possible values: "time stall", "in_collision",
-    # "no_progress", "no_progress_ori". Empty string if no cycles fired
+    # that fired this scenario. Possible values: "time stall",
+    # "self_collision", "obstacle_collision", "no_progress",
+    # "no_progress_ori". The legacy "in_collision" label is still emitted
+    # as a fallback when the env doesn't surface a collision-kind signal
+    # (e.g., older envs that only publish `in_collision: bool`), so older
+    # CSVs and grep patterns expecting the bare "in_collision" remain
+    # interoperable. Empty string if no cycles fired
     # (e.g. instant success).
     triggers: str = ""
     # Comma-separated chronological list of scenario-relative step indices at
@@ -182,6 +225,36 @@ class InterventionController:
             self._cancel = wrapper._cancel_oracle_goal
         else:
             raise ValueError(f"InterventionConfig.method must be 'rrt' or 'oracle_goal', got {cfg.method!r}")
+        # SA wrapper's collision-detection mode drives which controller-side
+        # triggers use no-lookback:
+        #   "pre_jump_lookback" → NEVER no-lookback (all triggers rewind).
+        #   "future_chunk"      → ALWAYS no-lookback (no rewind for any trigger).
+        #   "hybrid"            → no-lookback ONLY for collision-related
+        #                         triggers (in_collision, self_collision,
+        #                         obstacle_collision); stall/no-progress
+        #                         triggers still rewind. This is the
+        #                         "best of both" mode: shield catches
+        #                         predicted collisions and they use no-
+        #                         lookback (current state is valid), while
+        #                         stall/no-progress triggers rewind to
+        #                         before the dead-stop so RRT plans from
+        #                         a moving state.
+        self._collision_detection_mode = getattr(wrapper, "_collision_detection_mode", "pre_jump_lookback")
+        # Reasons that are "collision-related" (the robot is in or about to
+        # be in collision). Hybrid mode dispatches these to no-lookback
+        # regardless of where they originated (controller-side or wrapper-
+        # side shield). Keep in sync with the trigger labels written into
+        # the per-scenario CSV.
+        self._collision_trigger_reasons: set[str] = {
+            "in_collision",  # legacy fallback when env doesn't surface a kind
+            "self_collision",
+            "obstacle_collision",
+            "future_chunk_coll",
+        }
+        # Remembers the most recently-passed trigger reason so retry
+        # invocations (which don't pass a fresh reason — they're retrying
+        # the same trigger) can re-use it for the no-lookback dispatch.
+        self._last_trigger_reason: str | None = None
         # Optional no-progress triggers. Both share the anchor-based algorithm
         # with last_mile's NoEEProgressDetector. None when disabled
         # (window_steps=0); otherwise update() is called each tick with the
@@ -244,11 +317,20 @@ class InterventionController:
         # scenario reset; advance the scenario when this hits the configured
         # cap (otherwise unbounded since cycles_used only counts executed cycles).
         self.backoff_rounds: int = 0
+        # One-shot latch for mid-RRT collisions. While True, further
+        # in_collision observations during the same EXECUTING chunk are
+        # ignored (we already requested a retry; the new path needs a few
+        # ticks to take effect). Cleared the moment in_collision flips
+        # back to False.
+        self._in_collision_during_rrt: bool = False
         self.last_status: str = "running"
         # Chronological list of trigger reasons for each intervention cycle
         # that fired this scenario. Same vocabulary as the "Triggering %s
-        # (%s)..." log line: "time stall", "in_collision", "no_progress",
-        # "no_progress_ori". Reset on scenario reset; appended on every fire.
+        # (%s)..." log line: "time stall", "self_collision",
+        # "obstacle_collision", "no_progress", "no_progress_ori". Legacy
+        # "in_collision" is still emitted as a fallback when the env
+        # doesn't surface a collision-kind signal. Reset on scenario reset;
+        # appended on every fire.
         self.trigger_reasons: list[str] = []
         # Parallel list of scenario-relative step indices at which each
         # trigger in ``trigger_reasons`` fired. Together these answer "what
@@ -272,6 +354,52 @@ class InterventionController:
         # Incremented at the top of every ``tick()`` call so it's monotonic
         # within a scenario regardless of which phase is active.
         self.total_step_count: int = 0
+
+    def _trigger_source(self, reason: str | None = None) -> None:
+        """Trigger the active guidance source, dispatching no_lookback per
+        the wrapper's collision-detection mode AND (for hybrid) the per-
+        trigger reason.
+
+        Args:
+            reason: the trigger reason being fired (e.g., "in_collision",
+                "time stall", "no_progress", "self_collision"). Optional —
+                when omitted (retry path), the last recorded reason is
+                reused so the retry uses the same dispatch policy as the
+                original trigger. Pass an explicit reason on the first
+                fire of every cycle to keep the mapping accurate.
+        """
+        if reason is not None:
+            self._last_trigger_reason = reason
+        effective_reason = reason or self._last_trigger_reason
+
+        use_no_lookback = False
+        if self._collision_detection_mode == "future_chunk":
+            use_no_lookback = True
+        elif self._collision_detection_mode == "hybrid":
+            # Only collision-related triggers go no-lookback; stall /
+            # no-progress triggers still rewind.
+            use_no_lookback = effective_reason in self._collision_trigger_reasons
+
+        # Rest-start triggers ("time stall", "no_progress", "no_progress_ori")
+        # will start RRT from a stopped (or near-stopped) state: the robot
+        # either timed out or stopped making progress, then lookback
+        # teleports back and ruckig defaults start_vel=0. Tell the teleop
+        # recorder to drop the first n_obs_steps - 1 frames of this RRT
+        # segment so the recorded dataset doesn't contain velocity-from-
+        # rest artifacts that mismatch the policy's observation history at
+        # training time.
+        if effective_reason in {"time stall", "no_progress", "no_progress_ori"} and not use_no_lookback:
+            from lerobot.policies.teleop_recording import TeleopRecordingContext
+
+            n_obs_steps = int(getattr(self.wrapper.inner_policy.config, "n_obs_steps", 1))
+            TeleopRecordingContext.get_instance().rrt_extra_leading_trim = max(0, n_obs_steps - 1)
+
+        # Only the RRT source accepts no_lookback; the oracle-goal source
+        # has no rewind concept, so omit the kwarg for it.
+        if self.cfg.method == "rrt" and use_no_lookback:
+            self._source.trigger(no_lookback=True)
+        else:
+            self._source.trigger()
 
     def reset_for_new_scenario(self) -> None:
         self.policy_step_count = 0
@@ -367,6 +495,7 @@ class InterventionController:
         self,
         success: bool,
         in_collision: bool = False,
+        collision_kind: str | None = None,
         position_error_m: float | None = None,
         orientation_error_deg: float | None = None,
     ) -> str:
@@ -409,10 +538,81 @@ class InterventionController:
         # whether or not this tick ends up doing real work.
         self.total_step_count += 1
 
+        # Detect externally-triggered RRT (e.g., the SA wrapper's future_chunk
+        # predictive shield called ``rrt_source.trigger()`` directly inside
+        # select_action). Without this branch, ``target_rrt_steps`` would
+        # stay at its reset_for_new_scenario default of 0, and the auto-
+        # cancel below would fire after a single chunk step — making
+        # shield-driven episodes look like back-to-back 1-step plans.
+        # Sample target_rrt_steps now and book-keep the cycle so the rest
+        # of tick() (and the per-scenario CSV) treats this like any other
+        # intervention.
+        if (
+            prev_mode == RRTMode.IDLE
+            and mode in (RRTMode.PLANNING, RRTMode.EXECUTING)
+            and not self.pending_rrt_trigger
+        ):
+            self.target_rrt_steps = random.randint(self.cfg.rrt_steps_min, self.cfg.rrt_steps_max)
+            self.pending_rrt_trigger = True
+            self.plan_failures = 0
+            self.rrt_step_count = 0
+            self.policy_step_count = 0
+            # Use a distinct trigger label so the per-scenario CSV makes
+            # it easy to count shield-driven vs controller-driven cycles.
+            self.trigger_reasons.append("future_chunk_coll")
+            self.trigger_steps.append(self.total_step_count)
+            self.rrt_steps_executed.append(0)
+            # Seed _last_trigger_reason so a same-cycle retry (e.g., plan
+            # failure → re-trigger) routes through the same no-lookback
+            # dispatch the shield used. Without this, the retry's
+            # implicit reason would be whatever the previous cycle had,
+            # potentially flipping the no-lookback decision in hybrid mode.
+            self._last_trigger_reason = "future_chunk_coll"
+            # Advertise the cancel point to the source so its "executing
+            # X / Y waypoints" log shows partial vs total.
+            self._source.state.target_steps = self.target_rrt_steps
+            logger.info(
+                "External RRT trigger detected (future_chunk shield) at "
+                "scenario step %d — sampled target_rrt_steps=%d (cycle %d/%d).",
+                self.total_step_count,
+                self.target_rrt_steps,
+                self.cycles_used + 1,
+                self.cfg.max_cycles_per_scenario,
+            )
+
         if success:
             self.last_status = "success"
             self._finalize_active_rrt_steps()
             return "advance"
+
+        # Mid-RRT-execution collision: the planned path collided when
+        # actually executed in sim — typically because ruckig smoothing
+        # curved the RRT-raw path through an obstacle the raw path
+        # avoided. Ask the source to abort the current chunk, add the
+        # offending IK goal to its exclusion list, and replan to a
+        # different IK branch (with fresh ruckig). The source runs the
+        # replan synchronously, so by the next tick the state will be
+        # EXECUTING with a new chunk (or IDLE on planner failure, which
+        # then flows through the existing plan-failed branch below).
+        # Use a one-shot latch so we don't spam retries while the
+        # collision persists across multiple ticks (the new path needs
+        # a few ticks to actually move the robot out).
+        if mode == RRTMode.EXECUTING and in_collision:
+            if not getattr(self, "_in_collision_during_rrt", False):
+                self._in_collision_during_rrt = True
+                logger.warning(
+                    "Collision detected mid-RRT (scenario step %d, chunk step %d) — "
+                    "asking source to replan to a different IK branch",
+                    self.total_step_count,
+                    self.rrt_step_count,
+                )
+                self._source.request_retry_after_collision()
+            return "continue"
+        # Collision cleared (either we're no longer EXECUTING or
+        # in_collision flipped back to False) — reset the latch so a
+        # future collision can trigger another retry.
+        if not in_collision:
+            self._in_collision_during_rrt = False
 
         # Pure teleop priority — no automated triggers while ratio==0. We do
         # NOT increment policy_step_count here (no "policy stall" to count
@@ -475,7 +675,7 @@ class InterventionController:
             )
             if self.plan_failures < self.cfg.max_plan_failures:
                 logger.info("Retrying RRT plan...")
-                self._source.trigger()
+                self._trigger_source()
                 self.pending_rrt_trigger = True
                 return "continue"
             self.backoff_rounds += 1
@@ -596,7 +796,19 @@ class InterventionController:
         ):
             self.target_rrt_steps = random.randint(self.cfg.rrt_steps_min, self.cfg.rrt_steps_max)
             if should_trigger_collision:
-                reason = "in_collision"
+                # Differentiate self-collision from obstacle-collision in the
+                # per-scenario CSV so downstream analysis can correlate trigger
+                # frequency with failure mode (e.g., is wrist-pretzel driving
+                # interventions vs. arm-into-wall?). When the env doesn't
+                # surface a kind (e.g., a legacy env that only publishes
+                # `in_collision` bool), fall back to the generic label so old
+                # CSVs stay parseable.
+                if collision_kind == "self":
+                    reason = "self_collision"
+                elif collision_kind == "obstacle":
+                    reason = "obstacle_collision"
+                else:
+                    reason = "in_collision"
             elif should_trigger_no_progress_pos:
                 reason = "no_progress"
             elif should_trigger_no_progress_ori:
@@ -632,7 +844,9 @@ class InterventionController:
             # Advertise our planned cancel point so the source's "executing
             # X / Y waypoints" log shows partial vs. total.
             self._source.state.target_steps = self.target_rrt_steps
-            self._source.trigger()
+            # Pass the trigger reason so hybrid mode can dispatch
+            # no-lookback only for collision-related reasons.
+            self._trigger_source(reason=reason)
             self.pending_rrt_trigger = True
         return "continue"
 

@@ -465,7 +465,18 @@ def enumerate_blend_paths_on_disk(
     each percent value out of the trailing `_blend<NNN>` suffix.
 
     Returns `[(pct, path), ...]` sorted by pct ascending. Empty list if no
-    blends exist on disk for this round."""
+    blends exist on disk for this round.
+
+    Partially-formed dataset dirs are silently skipped:
+      * dir tree present but `data/` has no parquet file at all (recording
+        not yet started — lerobot creates the meta/ + images/ + data/
+        skeleton up front)
+      * parquet file exists but its footer is missing / unreadable
+        (recording in progress — the file is being appended to and its
+        Parquet magic bytes haven't been written yet)
+    Including either kind here would break downstream loaders that assume
+    any returned path is a fully-formed dataset.
+    """
     int_dir = int_cache_path(lerobot_cache, hf_user, prefix, infix, round)
     parent = int_dir.parent
     if not parent.is_dir():
@@ -475,8 +486,25 @@ def enumerate_blend_paths_on_disk(
     pct_re = re.compile(r"_blend(\d{3})$")
     for m in matches:
         mm = pct_re.search(m.name)
-        if mm and m.is_dir():
-            out.append((int(mm.group(1)), m))
+        if not (mm and m.is_dir()):
+            continue
+        first_parquet = next(m.glob("data/chunk-*/file-*.parquet"), None)
+        if first_parquet is None:
+            continue
+        # Validate the first parquet's footer is readable. pyarrow's
+        # read_metadata only reads the footer (cheap — single seek to
+        # end of file). If the footer's missing the recording is still
+        # in progress; skip silently rather than crashing downstream.
+        # Imported lazily so callers that never reach the validation
+        # check (e.g. bash callers that just want naming) don't pay for
+        # the pyarrow import.
+        try:
+            import pyarrow.parquet as pq
+
+            pq.read_metadata(str(first_parquet))
+        except Exception:
+            continue
+        out.append((int(mm.group(1)), m))
     out.sort(key=lambda t: t[0])
     return out
 

@@ -166,6 +166,16 @@ DATASET_REPO_ID=""
 # in TrainPipelineConfig.validate). Non-empty → forward normally.
 DATASET_REPO_ID_EXPLICIT=false
 DATASET_STATS_PATH=""
+# Same tri-state as DATASET_REPO_ID above (see comment there). Needed so
+# weighted-sampling-mode finetune can pass `--dataset.stats_path=` (empty)
+# to CLEAR the value baked into the resumed train_config.json. Without this,
+# the inherited stats_path triggers `lerobot_train.py`'s
+# `Overriding dataset stats from ...` clobber AFTER the wrapper's
+# normalization mode has already exposed the right stats — silently
+# turning every "norm_mode=aggregated" run into effective "base_only".
+# Empty + explicit → forward as `--dataset.stats_path=`, which the
+# truthy check at lerobot_train.py:254 now treats as "don't override".
+DATASET_STATS_PATH_EXPLICIT=false
 ENV_EXTERNAL_PORT=""
 ENV_EVAL_BENCHMARK_REPO_ID=""
 ENV_EVAL_BENCHMARK_SUBSET=""
@@ -190,7 +200,7 @@ for arg in "$@"; do
         --scheduler_decay_lr=*)     SCHEDULER_DECAY_LR="${arg#*=}" ;;
         --scheduler.name=*)         SCHEDULER_NAME="${arg#*=}" ;;
         --dataset.repo_id=*)        DATASET_REPO_ID="${arg#*=}"; DATASET_REPO_ID_EXPLICIT=true ;;
-        --dataset.stats_path=*)     DATASET_STATS_PATH="${arg#*=}" ;;
+        --dataset.stats_path=*)     DATASET_STATS_PATH="${arg#*=}"; DATASET_STATS_PATH_EXPLICIT=true ;;
         --env.external_port=*)      ENV_EXTERNAL_PORT="${arg#*=}" ;;
         --env.eval_benchmark_repo_id=*) ENV_EVAL_BENCHMARK_REPO_ID="${arg#*=}" ;;
         --env.eval_benchmark_subset=*) ENV_EVAL_BENCHMARK_SUBSET="${arg#*=}" ;;
@@ -306,7 +316,7 @@ if [[ -n "$SCHEDULER_DECAY_LR" ]]; then
 fi
 [[ -n "$SCHEDULER_NAME" ]]             && CMD_ARGS+=( --scheduler.name="$SCHEDULER_NAME" )
 [[ "$DATASET_REPO_ID_EXPLICIT" == true ]] && CMD_ARGS+=( --dataset.repo_id="$DATASET_REPO_ID" )
-[[ -n "$DATASET_STATS_PATH" ]]         && CMD_ARGS+=( --dataset.stats_path="$DATASET_STATS_PATH" )
+[[ "$DATASET_STATS_PATH_EXPLICIT" == true ]] && CMD_ARGS+=( --dataset.stats_path="$DATASET_STATS_PATH" )
 [[ -n "$ENV_EXTERNAL_PORT" ]]          && CMD_ARGS+=( --env.external_port="$ENV_EXTERNAL_PORT" )
 [[ -n "$ENV_EVAL_BENCHMARK_REPO_ID" ]] && CMD_ARGS+=( --env.eval_benchmark_repo_id="$ENV_EVAL_BENCHMARK_REPO_ID" )
 [[ -n "$ENV_EVAL_BENCHMARK_SUBSET" ]]  && CMD_ARGS+=( --env.eval_benchmark_subset="$ENV_EVAL_BENCHMARK_SUBSET" )
@@ -335,8 +345,8 @@ fi
 [[ -n "$SCHEDULER_NAME" ]]     && echo "Override:      --scheduler.name=$SCHEDULER_NAME"
 [[ -n "$EVAL_FREQ" ]]          && echo "Override:      --eval_freq=$EVAL_FREQ"
 [[ -n "$SAVE_FREQ" ]]          && echo "Override:      --save_freq=$SAVE_FREQ"
-[[ -n "$DATASET_REPO_ID" ]]    && echo "Override:      --dataset.repo_id=$DATASET_REPO_ID"
-[[ -n "$DATASET_STATS_PATH" ]] && echo "Override:      --dataset.stats_path=$DATASET_STATS_PATH"
+[[ "$DATASET_REPO_ID_EXPLICIT" == true ]] && echo "Override:      --dataset.repo_id='$DATASET_REPO_ID'"
+[[ "$DATASET_STATS_PATH_EXPLICIT" == true ]] && echo "Override:      --dataset.stats_path='$DATASET_STATS_PATH'"
 [[ -n "$ENV_EXTERNAL_PORT" ]]  && echo "Override:      --env.external_port=$ENV_EXTERNAL_PORT"
 [[ -n "$ENV_EVAL_BENCHMARK_REPO_ID" ]] && echo "Override:      --env.eval_benchmark_repo_id=$ENV_EVAL_BENCHMARK_REPO_ID"
 [[ -n "$ENV_EVAL_BENCHMARK_SUBSET" ]] && echo "Override:      --env.eval_benchmark_subset=$ENV_EVAL_BENCHMARK_SUBSET"

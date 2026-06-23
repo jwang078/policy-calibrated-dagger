@@ -69,17 +69,62 @@ class RRTGuidanceSource:
         self,
         wrapper: SharedAutonomyPolicyWrapper,
         *,
-        pre_jump_lookback_steps: int = 5,
+        # Collision-detection mode (see SharedAutonomyConfig docstring).
+        # "pre_jump_lookback" → use the rewind/teleport flow, sample lookback
+        # from [steps_min, steps_max].
+        # "future_chunk" → no rewind. Trigger callers pass no_lookback=True
+        # to trigger(); _do_plan() reads q_start = wrapper._latest_actual_q.
+        collision_detection: str = "pre_jump_lookback",
+        # Tunables for pre_jump_lookback mode. Ignored when
+        # collision_detection == "future_chunk".
+        pre_jump_lookback_steps_min: int = 5,
+        pre_jump_lookback_steps_max: int | None = None,
         teleport_to_q_start: bool = True,
         blocking_plan: bool = True,
         auto_pause_on_finish: bool = True,
         path_selection: PathSelectionStrategy | str | None = None,
+        segment_at_sharp_corners: bool = True,
+        ik_goal_selection: str | None = None,
+        num_path_candidates_per_ik: int = 1,
+        max_path_attempts_per_ik: int = 5,
+        path_perturbation_scale: float = 0.001,
+        num_ik_candidates: int = 16,
+        obstacle_clearance: float | None = None,
+        self_collision_clearance: float | None = None,
+        self_collision_skip_pairs: list[list[int]] | None = None,
+        diagnostic_log_pairs: str = "off",
     ) -> None:
         self._wrapper = wrapper
         # Same dataclass that used to live on the wrapper as `_rrt`. The
         # _RRTBackCompatView proxies `wrapper._rrt.X` to `self.state.X`.
         self.state: RRTRuntimeState = RRTRuntimeState()
-        self.pre_jump_lookback_steps = int(pre_jump_lookback_steps)
+        if collision_detection not in ("pre_jump_lookback", "future_chunk", "hybrid"):
+            raise ValueError(
+                "collision_detection must be 'pre_jump_lookback', "
+                f"'future_chunk', or 'hybrid', got {collision_detection!r}"
+            )
+        self.collision_detection = collision_detection
+        # Lookback tunables — only consulted in pre_jump_lookback mode.
+        # In future_chunk mode these are stored but unused (the no-lookback
+        # path bypasses them).
+        self.pre_jump_lookback_steps_min = int(pre_jump_lookback_steps_min)
+        # Optional upper bound for per-trigger random lookback sampling. When
+        # None, behavior is deterministic at `pre_jump_lookback_steps_min`.
+        # When set, each `_do_plan` invocation samples a fresh lookback in
+        # the closed interval [_min, _max].
+        # The wrapper sizes its actual_q_history deque to fit the max so the
+        # sampled value can always be honored.
+        self.pre_jump_lookback_steps_min_max = (
+            int(pre_jump_lookback_steps_max) if pre_jump_lookback_steps_max is not None else None
+        )
+        if self.collision_detection in ("pre_jump_lookback", "hybrid") and (
+            self.pre_jump_lookback_steps_min_max is not None
+            and self.pre_jump_lookback_steps_min_max < self.pre_jump_lookback_steps_min
+        ):
+            raise ValueError(
+                f"pre_jump_lookback_steps_max ({self.pre_jump_lookback_steps_min_max}) "
+                f"must be >= pre_jump_lookback_steps_min ({self.pre_jump_lookback_steps_min})"
+            )
         self.teleport_to_q_start = bool(teleport_to_q_start)
         self.blocking_plan = bool(blocking_plan)
         # Stays as a source-level attribute; wrapper exposes a property shim.
@@ -96,6 +141,52 @@ class RRTGuidanceSource:
             self.path_selection = PathSelectionStrategy(path_selection)
         else:
             self.path_selection = path_selection
+        # Flag forwarded to ruckig parametrization. When True (default),
+        # ruckig splits the path at sharp-angle waypoints and forces zero
+        # velocity at each boundary — historical stop-and-go mode. When
+        # False, ruckig optimizes the full path in one call without forced
+        # internal stops. Empirically the two modes produce indistinguishable
+        # trajectories on typical manipulation RRT plans (which rarely have
+        # sharp internal corners), so True is the conservative default. See
+        # `splatsim.utils.rrt_path_utils.ruckig_parametrize_path`.
+        self.segment_at_sharp_corners = bool(segment_at_sharp_corners)
+        # Forwarded to the planner. When set, the planner picks IK
+        # candidates by goal-state geometry alone (no path scoring) and
+        # path_selection is unused. See IkGoalSelectionStrategy in
+        # `lerobot.policies.rrt_to_goal`. None = no IK pre-selection.
+        self.ik_goal_selection = ik_goal_selection
+        # Per-IK multi-path-candidate scoring knobs. See planner ctor for
+        # semantics. Default num=1 preserves single-attempt behavior.
+        self.num_path_candidates_per_ik = int(num_path_candidates_per_ik)
+        self.max_path_attempts_per_ik = int(max_path_attempts_per_ik)
+        self.path_perturbation_scale = float(path_perturbation_scale)
+        self.num_ik_candidates = int(num_ik_candidates)
+        # RRT-planner collision clearances. None = use SplatSim's defaults
+        # (_COLLISION_CLEARANCE = 0.01 m obstacle, self = 0.0 m). Override
+        # via the SA config to give the policy drift margin along the
+        # planned path — see SharedAutonomyConfig docstring for trade-offs.
+        # The planner stores these and threads them through every
+        # check_links_in_collision + get_path call.
+        self.obstacle_clearance = float(obstacle_clearance) if obstacle_clearance is not None else None
+        self.self_collision_clearance = (
+            float(self_collision_clearance) if self_collision_clearance is not None else None
+        )
+        # Normalized to list[tuple[int, int]] for the planner. None / empty
+        # → no skips. Order within each pair doesn't matter; the planner
+        # normalizes (a,b) and (b,a) to the same frozenset for lookup.
+        if self_collision_skip_pairs:
+            self.self_collision_skip_pairs = [
+                (int(pair[0]), int(pair[1])) for pair in self_collision_skip_pairs
+            ]
+        else:
+            self.self_collision_skip_pairs = None
+        # Validated upstream by SharedAutonomyConfig.__post_init__. Re-check
+        # here in case the source is constructed standalone (e.g. tests).
+        if diagnostic_log_pairs not in ("off", "first", "always"):
+            raise ValueError(
+                f"diagnostic_log_pairs must be one of 'off'/'first'/'always', got {diagnostic_log_pairs!r}"
+            )
+        self.diagnostic_log_pairs = diagnostic_log_pairs
         # Env handle for the pre-execution teleport. Set externally via the
         # wrapper's `set_env_for_teleport(env)`; None means teleport is a no-op.
         self._env_for_teleport: object | None = None
@@ -103,6 +194,11 @@ class RRTGuidanceSource:
         # hardcoded fallback obstacles (loaded in __init__ for no-oracle envs)
         # exactly once, when the first real oracle config arrives.
         self._oracle_replaced_static_obstacles = False
+        # Cached full-DOF q_start (joints + gripper) from the most recent
+        # plan(). Used by request_retry_after_collision() to teleport back
+        # to the SAME start the original plan used, rather than the current
+        # mid-execution pose where the collision happened.
+        self._last_q_start_full: np.ndarray | None = None
 
     # ── Public lifecycle API ────────────────────────────────────────────── #
 
@@ -122,7 +218,7 @@ class RRTGuidanceSource:
         """
         return self.state.mode in (GuidanceMode.PLANNING, GuidanceMode.EXECUTING)
 
-    def trigger(self, ctx: GuidanceCallCtx | None = None) -> None:
+    def trigger(self, ctx: GuidanceCallCtx | None = None, *, no_lookback: bool = False) -> None:
         """Toggle: start RRT-to-goal if idle, cancel if planning/executing.
 
         When `blocking_plan` is True (the default), this call blocks
@@ -133,6 +229,16 @@ class RRTGuidanceSource:
         When False (legacy / GUI mode), planning runs on a daemon worker
         thread and this method returns immediately; the source stays in
         PLANNING until the worker finishes.
+
+        Args:
+            ctx: unused for RRT (it reads from the wrapper back-ref).
+            no_lookback: when True, _do_plan skips the lookback sampling
+                and teleport entirely — q_start = wrapper._latest_actual_q
+                (the robot's current config) and ruckig's start_vel matches
+                the robot's recent joint velocity. Used by the wrapper's
+                future-chunk predictive shield (and by the controller when
+                operating in `collision_detection="future_chunk"` mode).
+                When False (default), the historical lookback flow runs.
         """
         del ctx  # RRT doesn't need ctx — it reads from the wrapper back-ref
         st = self.state
@@ -143,10 +249,78 @@ class RRTGuidanceSource:
                 return
             st.mode = GuidanceMode.PLANNING
             st.cancel_requested = False
+            # Stash the no_lookback flag on the runtime state so _do_plan
+            # (potentially running on a worker thread) can read it without
+            # touching the source object's ctor-time mode.
+            st.no_lookback = bool(no_lookback)
+            # Fresh user-initiated trigger → clear the collision-history
+            # filter so a brand-new RRT cycle isn't blocked by previous
+            # exclusions. Retries call _do_plan directly without going
+            # through trigger(), so the filter survives across retries
+            # within the same cycle.
+            st.excluded_q_goals = []
         if self.blocking_plan:
             self._do_plan()
         else:
             threading.Thread(target=self._do_plan, daemon=True, name="rrt-plan").start()
+
+    def request_retry_after_collision(self) -> bool:
+        """Abort the current EXECUTING chunk and replan with the offending
+        IK goal added to the exclusion list. Used when the controller
+        observes `info["in_collision"]` mid-execution — typically because
+        ruckig smoothing curved the RRT-raw path through an obstacle the
+        raw path avoided.
+
+        Sequence:
+          1. Add the chunk's chosen q_goal to `excluded_q_goals` so the
+             same IK branch won't be re-picked.
+          2. Force state back to PLANNING.
+          3. Call `_do_plan` synchronously. This re-runs the IK solver,
+             filters out excluded goals, runs RRT against remaining
+             candidates, and re-applies ruckig — same code path as the
+             original trigger. Teleport-to-q_start fires again with the
+             SAME pre-trigger pose (cached in `_last_q_start_full`).
+          4. On success → EXECUTING with the new chunk.
+             On failure (all IKs exhausted or all RRT attempts failed) →
+             planner raises, _do_plan catches and goes IDLE; the
+             controller's normal "plan failed" branch then handles the
+             rest (backoff / retrigger / mark scenario).
+
+        Returns True if a new plan was successfully started, False if
+        not (no chosen_q_goal cached, or planner failed). The caller
+        (controller) doesn't strictly need this — it'll see the source's
+        mode transition on the next tick — but it's useful for logging.
+        """
+        st = self.state
+        if st.mode != GuidanceMode.EXECUTING:
+            logger.warning(
+                "request_retry_after_collision called but source is %s, not EXECUTING; ignoring",
+                st.mode.value,
+            )
+            return False
+        if st.chosen_q_goal is None:
+            logger.warning(
+                "request_retry_after_collision: no cached chosen_q_goal; cannot exclude. Cancelling instead."
+            )
+            with st.lock:
+                st.cancel_requested = True
+            return False
+        with st.lock:
+            st.excluded_q_goals.append(np.asarray(st.chosen_q_goal, dtype=np.float64).copy())
+            logger.warning(
+                "Mid-execution collision: excluding IK goal %s and replanning (%d total excluded so far)",
+                np.array2string(np.asarray(st.chosen_q_goal), precision=3),
+                len(st.excluded_q_goals),
+            )
+            # Reset chunk state — _do_plan will overwrite if planning succeeds.
+            st.chunk = None
+            st.step = 0
+            st.mode = GuidanceMode.PLANNING
+            st.cancel_requested = False
+        # blocking_plan or not — for collision retry we run synchronously
+        # so the controller's next tick sees the new EXECUTING state.
+        self._do_plan()
+        return st.mode == GuidanceMode.EXECUTING
 
     def cancel(self) -> None:
         """Reset source state to IDLE.
@@ -249,6 +423,87 @@ class RRTGuidanceSource:
         except Exception:
             logger.exception("Failed to load oracle obstacles into pybullet client")
             return
+        # Pick up the env's URDF-known self-collision skip pairs (published
+        # via SplatSim's `get_env_config()` → ZMQ → here) so the SA-config
+        # override remains OPTIONAL: by default, the planner uses whatever
+        # the env's URDF declares (e.g. `[(0, 2)]` for the UR robot's
+        # base_link vs upper_arm_link). If the user explicitly set
+        # `rrt_self_collision_skip_pairs` on the SA config, THAT wins —
+        # treat the CLI as a per-run override (use case: add custom pairs
+        # beyond what the env publishes).
+        if self.self_collision_skip_pairs is None:
+            _oracle_pairs = cfg.get("self_collision_skip_pairs") or []
+            if _oracle_pairs:
+                normalized = [(int(p[0]), int(p[1])) for p in _oracle_pairs]
+                # Update both the source's view AND the planner's already-
+                # built kwargs dict. `_collision_kwargs` is the one the
+                # planner unpacks at every callsite, so this update is
+                # what actually changes behavior.
+                self.self_collision_skip_pairs = normalized
+                planner._collision_kwargs["self_collision_skip_pairs"] = normalized
+                logger.info(
+                    "RRTGuidanceSource: picked up self_collision_skip_pairs=%s "
+                    "from oracle env config (no SA-config override).",
+                    normalized,
+                )
+        # One-shot human-readable summary of the robot's URDF link layout
+        # AND the active self-collision skip set. Helps users sanity-check
+        # the skip list against the actual link indices (which depend on
+        # URDF order and can shift if the robot is swapped). Runs once per
+        # planner — guarded by an instance attr on self.
+        if not getattr(self, "_link_layout_logged", False):
+            self._link_layout_logged = True
+            wrapper = self._wrapper
+            n_joints = p.getNumJoints(wrapper._robot_id, physicsClientId=wrapper._pb_client)
+            jtype_str = {
+                p.JOINT_REVOLUTE: "rev",
+                p.JOINT_PRISMATIC: "pri",
+                p.JOINT_FIXED: "fix",
+                p.JOINT_SPHERICAL: "sph",
+                p.JOINT_PLANAR: "pla",
+            }
+            link_names: list[str] = ["base (WORLD)"]
+            logger.info("Robot URDF link layout (n_links=%d, incl. base at index -1):", n_joints + 1)
+            logger.info(
+                "  idx=%2d  name=%-28s  parent=%-3s  jtype=%s",
+                -1,
+                "base (WORLD)",
+                "—",
+                "—",
+            )
+            for j in range(n_joints):
+                info = p.getJointInfo(wrapper._robot_id, j, physicsClientId=wrapper._pb_client)
+                name = info[12].decode()
+                parent = info[16]
+                jt = jtype_str.get(info[2], "?")
+                link_names.append(name)
+                logger.info(
+                    "  idx=%2d  name=%-28s  parent=%-3d  jtype=%s",
+                    j,
+                    name,
+                    parent,
+                    jt,
+                )
+            # Resolved skip pairs (may come from SA config override OR
+            # the env's published list, whichever was set above).
+            active_pairs = self.self_collision_skip_pairs or []
+            if active_pairs:
+                logger.info(
+                    "Active SELF_COLLISION_SKIP_PAIRS (%d total):",
+                    len(active_pairs),
+                )
+                # Pretty-print each pair with the resolved link names so
+                # the user can audit which structural pair each idx tuple
+                # actually refers to.
+                for a, b in active_pairs:
+                    na = link_names[a + 1] if 0 <= a + 1 < len(link_names) else f"?(idx={a})"
+                    nb = link_names[b + 1] if 0 <= b + 1 < len(link_names) else f"?(idx={b})"
+                    logger.info("  (%2d, %2d)  %s  ⟷  %s", a, b, na, nb)
+            else:
+                logger.info(
+                    "Active SELF_COLLISION_SKIP_PAIRS: <none> — all non-adjacent "
+                    "pairs will be checked for self-collision.",
+                )
         # Replace the hardcoded fallback obstacles with the oracle set.
         # Idempotent — only runs once, the first time oracle info arrives.
         wrapper = self._wrapper
@@ -289,8 +544,17 @@ class RRTGuidanceSource:
                 fps=wrapper._fps,
                 lower_limits=np.asarray(wrapper.lower_limits, dtype=np.float64),
                 upper_limits=np.asarray(wrapper.upper_limits, dtype=np.float64),
-                num_ik_candidates=16,
+                num_ik_candidates=self.num_ik_candidates,
                 path_selection=self.path_selection,
+                segment_at_sharp_corners=self.segment_at_sharp_corners,
+                ik_goal_selection=self.ik_goal_selection,
+                num_path_candidates_per_ik=self.num_path_candidates_per_ik,
+                max_path_attempts_per_ik=self.max_path_attempts_per_ik,
+                path_perturbation_scale=self.path_perturbation_scale,
+                obstacle_clearance=self.obstacle_clearance,
+                self_collision_clearance=self.self_collision_clearance,
+                self_collision_skip_pairs=self.self_collision_skip_pairs,
+                diagnostic_log_pairs=self.diagnostic_log_pairs,
             )
         return self.state.planner
 
@@ -327,7 +591,7 @@ class RRTGuidanceSource:
             planner.load_obstacles(st.oracle_env_config)
             # Prefer a pre-jump pose from the rolling history of actual joint
             # observations. The OLDEST entry in the buffer is approximately
-            # `pre_jump_lookback_steps` steps before the trigger — usually
+            # `pre_jump_lookback_steps_min` steps before the trigger — usually
             # before the policy started commanding the bad chunk that led to
             # collision. Planning from this pose (rather than the current
             # post-collision actual_q) produces a clean trajectory, and the
@@ -336,12 +600,99 @@ class RRTGuidanceSource:
             #   1. oldest buffered actual_q (pre-jump)
             #   2. latest actual_q (current observation — used if buffer empty)
             #   3. _desired_q (commanded — used only if no obs ever processed)
-            if len(wrapper._actual_q_history) > 0:
-                q_start_full = wrapper._actual_q_history[0].reshape(-1).copy()
-            elif wrapper._latest_actual_q is not None:
-                q_start_full = wrapper._latest_actual_q.reshape(-1).copy()
+            # Branch on the per-trigger no_lookback flag (stashed by
+            # trigger() onto st before _do_plan started). Lookback path
+            # rewinds + teleports; no-lookback path plans from current q.
+            no_lookback = bool(st.no_lookback)
+            # Consume the flag so a subsequent retry inside the same cycle
+            # (request_retry_after_collision → _do_plan directly) doesn't
+            # carry over a stale True. Retries always use the same
+            # _last_q_start_full anyway via the teleport callsite below.
+            st.no_lookback = False
+            if no_lookback:
+                # Predictive-shield / future_chunk path: no rewind, no
+                # teleport. q_start = robot's CURRENT joint state. We're
+                # safe to plan from here by construction (the FK shield
+                # checked the chunk BEFORE letting it execute).
+                if wrapper._latest_actual_q is not None:
+                    q_start_full = wrapper._latest_actual_q.reshape(-1).copy()
+                else:
+                    q_start_full = wrapper._desired_q.reshape(-1).copy()
+                effective_lookback = 0
+                logger.info(
+                    "RRT plan (no-lookback): q_start = current robot state (skipping pre-jump teleport)."
+                )
             else:
-                q_start_full = wrapper._desired_q.reshape(-1).copy()
+                # Sample the per-trigger effective lookback. When max is
+                # None, this collapses to the fixed value (legacy
+                # behavior). When set, samples uniformly from the closed
+                # [min, max] interval — adds dataset diversity at
+                # recording time. Sampling uses Python's global RNG so it
+                # inherits whatever seed lerobot-eval set up.
+                if self.pre_jump_lookback_steps_min_max is not None:
+                    import random
+
+                    effective_lookback = random.randint(
+                        self.pre_jump_lookback_steps_min,
+                        self.pre_jump_lookback_steps_min_max,
+                    )
+                    logger.info(
+                        "Sampled lookback for this trigger: %d (range [%d, %d])",
+                        effective_lookback,
+                        self.pre_jump_lookback_steps_min,
+                        self.pre_jump_lookback_steps_min_max,
+                    )
+                else:
+                    effective_lookback = self.pre_jump_lookback_steps_min
+                # Cap lookback at the wrapper's "frames since last RRT cycle
+                # ended" counter so the rewind can't reach back into a prior
+                # cycle's trajectory. Sampling from that region would
+                # teleport the robot to a joint config that RRT itself put
+                # the robot at (not a config the POLICY drove to), and the
+                # env-teleport spike then leaks into the recorded teleop
+                # dataset as a 1+ rad single-frame discontinuity — exactly
+                # the bug we observed in lever_g0_d30_coll_03dag_diff_r_dag1
+                # episode 18. Cap is the simplest fix that preserves the
+                # "rewind to a moving state" benefit lookback was designed
+                # for: rewind as far as possible into POLICY-driven history,
+                # never into RRT-era frames.
+                post_rrt_frames = getattr(wrapper, "_frames_since_last_rrt_end", None)
+                if post_rrt_frames is not None and post_rrt_frames < effective_lookback:
+                    logger.info(
+                        "Capping lookback %d → %d (only %d policy-driven frames "
+                        "since the last RRT cycle ended; further rewind would "
+                        "land in a prior RRT chunk's trajectory).",
+                        effective_lookback,
+                        post_rrt_frames,
+                        post_rrt_frames,
+                    )
+                    effective_lookback = post_rrt_frames
+                # Walk back through `_actual_q_history` to find the joint
+                # state `effective_lookback` steps before now. deque
+                # indexing: [-1] = most recent (just pushed), [-(N+1)] =
+                # N steps ago. Fall back to the OLDEST entry if the
+                # buffer hasn't filled to the requested depth yet (e.g.
+                # trigger fires within the first few frames of a scenario).
+                _hist = wrapper._actual_q_history
+                if effective_lookback <= 0:
+                    # Cap collapsed to zero — typically because this trigger
+                    # fired the same tick a prior RRT cycle ended. There's
+                    # no policy-driven history to rewind into, so degenerate
+                    # to "use current state" (= the no-lookback path's
+                    # q_start choice). Subsequent escape-handling + ruckig
+                    # start_vel still apply; we just skip the teleport.
+                    if wrapper._latest_actual_q is not None:
+                        q_start_full = wrapper._latest_actual_q.reshape(-1).copy()
+                    else:
+                        q_start_full = wrapper._desired_q.reshape(-1).copy()
+                elif len(_hist) > effective_lookback:
+                    q_start_full = _hist[-(effective_lookback + 1)].reshape(-1).copy()
+                elif len(_hist) > 0:
+                    q_start_full = _hist[0].reshape(-1).copy()
+                elif wrapper._latest_actual_q is not None:
+                    q_start_full = wrapper._latest_actual_q.reshape(-1).copy()
+                else:
+                    q_start_full = wrapper._desired_q.reshape(-1).copy()
             q_start = q_start_full[: wrapper.num_dofs].copy()
 
             # Compute the robot's recent joint velocity from the trailing
@@ -353,18 +704,65 @@ class RRTGuidanceSource:
             # strategy needs it.
             recent_vel = self._compute_recent_joint_velocity(wrapper)
 
-            chunk = planner.plan(
+            # In no-lookback mode we want ruckig to begin at the robot's
+            # ACTUAL recent velocity instead of v=0 — otherwise the chunk
+            # produces a dead-stop onset that contradicts the continuous
+            # motion the robot is in. recent_vel may be None when the
+            # history hasn't accumulated enough samples; in that case we
+            # silently fall back to v=0 (same as the lookback path).
+            _ruckig_start_vel = recent_vel if no_lookback else None
+            chunk, escape_end_q = planner.plan(
                 q_start,
                 target_ee_pos,
                 target_ee_quat,
                 q_goal_bias,
                 recent_joint_velocity=recent_vel,
+                exclude_q_goals=list(self.state.excluded_q_goals),
+                ruckig_start_vel=_ruckig_start_vel,
             )
-            # Sim-only: teleport the env's robot to q_start so the first
-            # commanded RRT action is followed by physics without a multi-frame
-            # "catch up from wedged pose" interlude.
+            # Capture the chosen IK goal so request_retry_after_collision()
+            # can add it to the excluded list on retry. Set on planner state
+            # right before its return; copy out so source state is independent.
+            if planner._last_chosen_q_goal is not None:
+                self.state.chosen_q_goal = planner._last_chosen_q_goal.copy()
+            # Remember q_start_full for any retry — the retry must teleport
+            # back to the same start (the policy's pre-trigger pose, NOT the
+            # current pose mid-execution).
+            self._last_q_start_full = q_start_full.copy()
+            # Sim-only env teleport before chunk execution. Three cases:
+            #
+            #   (a) Escape happened (escape_end_q is not None): teleport
+            #       directly to the post-escape config. This REPLACES any
+            #       q_start_full teleport — teleporting to the wedged config
+            #       first is pointless (the planner already moved past it)
+            #       and would put the env robot in collision for one tick.
+            #       Why teleport rather than execute the escape waypoints in
+            #       the env: the escape segment used to be prepended to the
+            #       chunk and stepped via env.step() so the PD controller
+            #       could physically push the robot out of contact. That
+            #       worked, but recorded ~3% of intervention episodes with
+            #       10×-mean-delta outlier frames at onset (sim-PD artifact,
+            #       not a transferable skill). Now planner.plan() returns
+            #       chunk WITHOUT the escape, and we land the env robot at
+            #       the planner's escape end-state via a single teleport.
+            #       The recorded episode begins at the smooth ruckig start.
+            #
+            #   (b) No escape + lookback path (historical default): teleport
+            #       to q_start_full (the lookback-sampled config). Unchanged.
+            #
+            #   (c) No escape + no-lookback path (collision shield / future-
+            #       chunk): no teleport — the robot is already at q_start
+            #       by construction.
             if self.teleport_to_q_start:
-                self._teleport_env_to_q_start(q_start_full)
+                if escape_end_q is not None:
+                    # Build a full-state vector (joint + gripper if present)
+                    # by reusing q_start_full as the template and overwriting
+                    # the joint slots with escape_end_q.
+                    teleport_target = q_start_full.copy()
+                    teleport_target[: len(escape_end_q)] = escape_end_q
+                    self._teleport_env_to_q_start(teleport_target, 0)
+                elif not no_lookback:
+                    self._teleport_env_to_q_start(q_start_full, effective_lookback)
         except RRTPlanningError as e:
             logger.warning("RRT planning failed: %s", e)
             st.mode = GuidanceMode.IDLE
@@ -389,15 +787,25 @@ class RRTGuidanceSource:
             n_total = len(chunk)
             target = st.target_steps
             exec_str = f"{target}/{n_total}" if target is not None and target < n_total else f"{n_total}"
+            # NOTE: do NOT include `forward_flow_ratio` in this log — RRT
+            # chunks play VERBATIM (see shared_autonomy_wrapper.select_action
+            # line ~1105: `wp = rrt.chunk[rrt.step][: self.num_dofs]` with
+            # no ratio math). Including the wrapper's `forward_flow_ratio`
+            # here was previously misleading users into thinking RRT
+            # recordings were being blended at that ratio when in fact
+            # the ratio only governs obs-teleop blending (a different
+            # guidance source that isn't active during RRT execution).
             logger.info(
-                "RRT executing %s waypoints (current ratio=%.2f)", exec_str, wrapper.forward_flow_ratio
+                "RRT executing %s waypoints (verbatim playback — forward_flow_ratio not applied to RRT chunks)",
+                exec_str,
             )
 
     def _compute_recent_joint_velocity(self, wrapper: SharedAutonomyPolicyWrapper) -> np.ndarray | None:
         """Derive recent joint velocity from the wrapper's `_actual_q_history`.
 
         The history is a deque of recent actual_q observations sized to
-        `pre_jump_lookback_steps + 1` entries. We compute the mean per-step
+        `pre_jump_lookback_steps_min + 1` entries (or `_max + 1` when the
+        random-sampling mode is configured). We compute the mean per-step
         joint delta over the trailing samples — matches the planner's
         leading-edge averaging window so the two velocities are directly
         comparable.
@@ -417,7 +825,7 @@ class RRTGuidanceSource:
         avg_delta = deltas.mean(axis=0)
         return avg_delta[: wrapper.num_dofs]
 
-    def _teleport_env_to_q_start(self, q_start_full: np.ndarray) -> None:
+    def _teleport_env_to_q_start(self, q_start_full: np.ndarray, lookback_used: int) -> None:
         """Forward a joint-state teleport request to the gym env's robot
         server. Tolerant: silent no-op if no env handle has been provided or
         the env's robot_server doesn't expose teleport_joint_state (e.g. a
@@ -462,7 +870,7 @@ class RRTGuidanceSource:
             splatsim_robot = getattr(target, "splatsim_robot", None)
             logger.info(
                 "Teleporting sim to RRT q_start (lookback=%d): %s — via %s.teleport_joint_state",
-                self.pre_jump_lookback_steps,
+                lookback_used,
                 np.array2string(q_start_full[: wrapper.num_dofs], precision=3),
                 type(target).__name__,
             )

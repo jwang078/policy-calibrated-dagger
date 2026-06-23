@@ -44,6 +44,33 @@ set -euo pipefail
 DATASET_REPO="JennyWWW/splatsim_approach_lever_11_50failsrrtpi05"
 USE_RELATIVE_ACTIONS=true
 RATIO_SWEEP=false
+# Multi-dataset weighted-sampling mode passthroughs (all-or-nothing).
+# When the orchestrator's --use_weighted_sampling + --final_mode=scratch
+# need to train from scratch on the union of {base + every round's
+# intervention + every round's blends} — the same per-source mix that
+# the per-round step-6 finetune trains on — it forwards these four args
+# verbatim to lerobot-train as --dataset.repo_ids / --dataset.sample_weights
+# / --dataset.stats_paths / --dataset.norm_mode. The wrapper
+# (MultiSourceNormalizingDataset) then handles per-source loading +
+# stats aggregation; no merged dataset on disk is needed.
+#
+# Set ALL FOUR or NONE — half-set is rejected at validation. When set,
+# --dataset_repo is cleared (multi mode is mutually exclusive with the
+# single-dataset path via TrainPipelineConfig.validate), the
+# stats_rel{N}.json sidecar lookup is skipped (each sub-dataset's
+# sidecar is supplied directly in --multi_dataset_stats_paths), and
+# --run_name= must be passed explicitly (DATASET_SHORT-derived naming
+# has nothing meaningful to derive from).
+#
+# Format: JSON strings, same shape lerobot-train accepts:
+#   --multi_dataset_repo_ids='["JennyWWW/foo","JennyWWW/bar"]'
+#   --multi_dataset_sample_weights='[0.7,0.3]'
+#   --multi_dataset_stats_paths='["/abs/path/foo.json","/abs/path/bar.json"]'
+#   --multi_dataset_norm_mode='aggregated'  # or 'base_only'
+MULTI_DATASET_REPO_IDS=""
+MULTI_DATASET_SAMPLE_WEIGHTS=""
+MULTI_DATASET_STATS_PATHS=""
+MULTI_DATASET_NORM_MODE=""
 # --headless: route both --env.headless=true (in-process PybulletRobotServerBase
 # in p.DIRECT mode) and --policy.shared_autonomy_config.show_slider=false
 # (defensive; gates the Tkinter slider + SA wrapper's pybullet GUI client if
@@ -56,6 +83,15 @@ POLICY_PUSH_TO_HUB=""   # empty = use whatever the policy config default is
 RUN_NAME_OVERRIDE=""    # set to override the auto-derived run_name (training dir basename)
 MODEL="pi05"            # which policy to train: pi05 | diffusion | act
 DRY_RUN=false
+# Eval-scope passthroughs from the DAgger orchestrator (or other callers
+# that want to control inline eval scope). Both empty by default so
+# standalone train_sweep.sh uses its built-in SHARED_ARGS values:
+# `--eval.n_episodes=5` and NO --env.eval_benchmark_subset (uses full
+# benchmark). When the orchestrator passes them, they appear AFTER
+# SHARED_ARGS in the final command line and draccus's
+# last-occurrence-wins rule means the override applies.
+EVAL_N_EPISODES=""
+EVAL_BENCHMARK_SUBSET=""
 # ─────────────────────────────────────────────────────────────────────────────
 
 for arg in "$@"; do
@@ -70,9 +106,42 @@ for arg in "$@"; do
         --policy.push_to_hub=*) POLICY_PUSH_TO_HUB="${arg#*=}" ;;
         --run_name=*)           RUN_NAME_OVERRIDE="${arg#*=}" ;;
         --model=*)              MODEL="${arg#*=}" ;;
+        --eval_n_episodes=*)    EVAL_N_EPISODES="${arg#*=}" ;;
+        --eval_benchmark_subset=*) EVAL_BENCHMARK_SUBSET="${arg#*=}" ;;
+        --multi_dataset_repo_ids=*)      MULTI_DATASET_REPO_IDS="${arg#*=}" ;;
+        --multi_dataset_sample_weights=*) MULTI_DATASET_SAMPLE_WEIGHTS="${arg#*=}" ;;
+        --multi_dataset_stats_paths=*)   MULTI_DATASET_STATS_PATHS="${arg#*=}" ;;
+        --multi_dataset_norm_mode=*)     MULTI_DATASET_NORM_MODE="${arg#*=}" ;;
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
+
+# All-or-nothing validation for the multi-dataset passthroughs. Half-set
+# is almost certainly a caller bug (e.g. a missing JSON-encode in the
+# orchestrator) — fail loudly here rather than silently emitting a broken
+# lerobot-train command.
+_multi_count=0
+[[ -n "$MULTI_DATASET_REPO_IDS" ]]      && _multi_count=$((_multi_count + 1))
+[[ -n "$MULTI_DATASET_SAMPLE_WEIGHTS" ]] && _multi_count=$((_multi_count + 1))
+[[ -n "$MULTI_DATASET_STATS_PATHS" ]]   && _multi_count=$((_multi_count + 1))
+[[ -n "$MULTI_DATASET_NORM_MODE" ]]     && _multi_count=$((_multi_count + 1))
+if (( _multi_count > 0 && _multi_count < 4 )); then
+    echo "ERROR: --multi_dataset_* args are all-or-nothing. Set all four or none. Currently: $_multi_count/4." >&2
+    echo "  Got:" >&2
+    echo "    --multi_dataset_repo_ids='$MULTI_DATASET_REPO_IDS'" >&2
+    echo "    --multi_dataset_sample_weights='$MULTI_DATASET_SAMPLE_WEIGHTS'" >&2
+    echo "    --multi_dataset_stats_paths='$MULTI_DATASET_STATS_PATHS'" >&2
+    echo "    --multi_dataset_norm_mode='$MULTI_DATASET_NORM_MODE'" >&2
+    exit 1
+fi
+MULTI_DATASET_MODE=false
+if (( _multi_count == 4 )); then
+    MULTI_DATASET_MODE=true
+    if [[ -z "$RUN_NAME_OVERRIDE" ]]; then
+        echo "ERROR: --multi_dataset_* mode requires --run_name=... (no DATASET_SHORT to auto-derive from)." >&2
+        exit 1
+    fi
+fi
 
 case "$MODEL" in
     pi05|diffusion|act) ;;
@@ -208,7 +277,11 @@ validate_names() {
 
     echo "Validation passed: DATASET_REPO='$DATASET_REPO' (dataset name: ${#DATASET_REPO}/56 chars)"
 }
-validate_names
+if [[ "$MULTI_DATASET_MODE" != true ]]; then
+    validate_names
+else
+    echo "Multi-dataset mode: skipping single-dataset name validation (DATASET_REPO unused)."
+fi
 
 TRAIN_SCRIPT="lerobot-train"  # make sure this is in your PATH (e.g. via lerobot's install.sh)
 
@@ -371,26 +444,59 @@ run_job() {
 
     set_camera_args "$resize_mode" "$camera_suffix"
 
-    local full_cmd=(
-        $TRAIN_SCRIPT
-        --dataset.repo_id="$DATASET_REPO"
-        --output_dir="./outputs/training/${run_name}"
-        --job_name="${run_name}"
-        --policy.repo_id="${run_name}"
-        "${SHARED_ARGS[@]}"
-        "${policy_args[@]}"
-        "${CAMERA_ARGS[@]}"
-    )
+    local full_cmd
+    if [[ "$MULTI_DATASET_MODE" == true ]]; then
+        # Multi-dataset path: --dataset.repo_id MUST be empty (mutually
+        # exclusive with --dataset.repo_ids per TrainPipelineConfig.validate).
+        # --dataset.stats_path is also cleared so the wrapper's mode-
+        # appropriate stats stand (mirrors the orchestrator's per-round
+        # step-6 finetune logic — see the long comment around
+        # `--dataset.stats_path=` in dagger_orchestrate.sh).
+        full_cmd=(
+            $TRAIN_SCRIPT
+            --dataset.repo_id=
+            --dataset.repo_ids="$MULTI_DATASET_REPO_IDS"
+            --dataset.sample_weights="$MULTI_DATASET_SAMPLE_WEIGHTS"
+            --dataset.stats_paths="$MULTI_DATASET_STATS_PATHS"
+            --dataset.norm_mode="$MULTI_DATASET_NORM_MODE"
+            --dataset.stats_path=
+            --output_dir="./outputs/training/${run_name}"
+            --job_name="${run_name}"
+            --policy.repo_id="${run_name}"
+            "${SHARED_ARGS[@]}"
+            "${policy_args[@]}"
+            "${CAMERA_ARGS[@]}"
+        )
+        # In multi mode, relative-action flag is forwarded but the
+        # per-policy stats_rel{N}.json sidecar lookup is SKIPPED — each
+        # sub-dataset's sidecar comes through --dataset.stats_paths above,
+        # and the wrapper aggregates / picks-base depending on norm_mode.
+        if [[ "$USE_RELATIVE_ACTIONS" == true ]]; then
+            full_cmd+=(--policy.use_relative_actions=true)
+            full_cmd+=(--policy.relative_exclude_joints='["gripper"]')
+        fi
+    else
+        full_cmd=(
+            $TRAIN_SCRIPT
+            --dataset.repo_id="$DATASET_REPO"
+            --output_dir="./outputs/training/${run_name}"
+            --job_name="${run_name}"
+            --policy.repo_id="${run_name}"
+            "${SHARED_ARGS[@]}"
+            "${policy_args[@]}"
+            "${CAMERA_ARGS[@]}"
+        )
 
-    # Append relative-action flags if enabled, picking the stats sidecar by
-    # the policy's chunk size (stats_rel{N}.json).
-    if [[ "$USE_RELATIVE_ACTIONS" == true ]]; then
-        full_cmd+=(--policy.use_relative_actions=true)
-        full_cmd+=(--policy.relative_exclude_joints='["gripper"]')
-        local chunk_size
-        chunk_size="$(_chunk_size_for_job "$policy_prefix" "$3")"
-        if [[ -n "$chunk_size" ]]; then
-            full_cmd+=(--dataset.stats_path="${STATS_DIR}/stats_rel${chunk_size}.json")
+        # Append relative-action flags if enabled, picking the stats sidecar by
+        # the policy's chunk size (stats_rel{N}.json).
+        if [[ "$USE_RELATIVE_ACTIONS" == true ]]; then
+            full_cmd+=(--policy.use_relative_actions=true)
+            full_cmd+=(--policy.relative_exclude_joints='["gripper"]')
+            local chunk_size
+            chunk_size="$(_chunk_size_for_job "$policy_prefix" "$3")"
+            if [[ -n "$chunk_size" ]]; then
+                full_cmd+=(--dataset.stats_path="${STATS_DIR}/stats_rel${chunk_size}.json")
+            fi
         fi
     fi
 
@@ -398,6 +504,19 @@ run_job() {
     if [[ -n "$extra_args_ref" ]]; then
         local -n extra_args="$extra_args_ref"
         full_cmd+=("${extra_args[@]}")
+    fi
+
+    # Eval-scope overrides from --eval_n_episodes / --eval_benchmark_subset
+    # appended LAST so they win over SHARED_ARGS's --eval.n_episodes=5 default
+    # via draccus's last-occurrence-wins rule. Drives the inline eval scope
+    # for the final-scratch step to match the orchestrator's intervention
+    # subset (so per-round + final-scratch evals are directly comparable in
+    # dagger_progress).
+    if [[ -n "$EVAL_N_EPISODES" ]]; then
+        full_cmd+=( --eval.n_episodes="$EVAL_N_EPISODES" )
+    fi
+    if [[ -n "$EVAL_BENCHMARK_SUBSET" ]]; then
+        full_cmd+=( --env.eval_benchmark_subset="$EVAL_BENCHMARK_SUBSET" )
     fi
 
     echo "Running: ${env_prefix:+$env_prefix }${full_cmd[*]}"

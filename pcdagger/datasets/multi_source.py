@@ -2,43 +2,56 @@
 
 When training samples from N sub-datasets with potentially different stats
 (e.g., a base demo dataset plus several DAgger intervention datasets), the
-naive options are:
+caller picks a normalization strategy via the `norm_mode` arg (mirrored in
+`DatasetConfig.norm_mode`):
 
-  * Per-source normalization (each frame normalized via ITS source's stats),
-    saved as PRE-normalized so the policy's downstream normalize layer is a
-    no-op. This was the original design but has two problems:
-      1. Eval-time normalization is asymmetric — the saved policy still needs
-         SOME stats for live env observations, and there's no clean choice
-         (BASE clips intervention-territory obs; combined compresses base
-         obs). The per-source advantage gained at training is lost at eval.
+  * "aggregated" (default): aggregated stats over the union of sub-datasets
+    (min-of-mins, max-of-maxes, count-weighted mean/std, count-weighted
+    quantiles). Training, save, and eval all use the SAME aggregated stats —
+    one source of truth, no asymmetry, no bypass tricks needed.
+    Trade-off: as intervention rounds add data with wider raw range than
+    base, the aggregated min/max stretches, and base data gets COMPRESSED
+    into a narrower normalized range. If your base dataset is the majority
+    of the training mix, that compression can hurt training.
+
+  * "base_only": expose ONLY source[0]'s sidecar stats (the base dataset)
+    via `.meta.stats`. Both normalizer and unnormalizer use base stats.
+    Intervention data normalized by base stats may fall OUTSIDE [-1, 1] when
+    its raw range exceeds base's — the normalizer does not clip, so the
+    policy sees out-of-bounds normalized targets during training. Useful for
+    A/B testing whether aggregated-mode's base-compression is the problem;
+    the trade-off is that you instead hurt training via the out-of-bounds
+    targets on intervention rows.
+
+  * "per_source": NOT IMPLEMENTED. Old design (per-frame pre-normalize via
+    source's own stats; no-op the policy's normalizer; eval-time normalizer
+    uses base stats) was removed. Two reasons:
+      1. Eval-time normalization is asymmetric — the saved policy still
+         needs SOME stats for live env observations, and there's no clean
+         choice (BASE clips intervention-territory obs; combined compresses
+         base obs). The per-source advantage gained at training is lost at
+         eval.
       2. The "make the policy's normalizer a no-op" trick is fragile — the
-         saved processor's stats override doesn't stick across `load_state_dict`
-         (see `_stats_explicitly_provided` in
+         saved processor's stats override doesn't stick across
+         `load_state_dict` (see `_stats_explicitly_provided` in
          `lerobot.processor.normalize_processor`). Easy to silently double-
-         normalize.
+         normalize after a checkpoint reload.
+    Selecting this mode raises NotImplementedError at construction time.
 
-  * Single aggregated stats over the union of sub-datasets (what this wrapper
-    does now). Semantically equivalent to training on a manually-merged
-    dataset with weighted sampling on top, but without writing the merge to
-    disk. Training, save, and eval all use the SAME aggregated stats — one
-    source of truth, no asymmetry, no bypass tricks needed.
-
-This wrapper therefore does NOT normalize frames in `__getitem__`. It just:
+This wrapper does NOT normalize frames in `__getitem__` for the two
+supported modes. It just:
 
   * Wraps `MultiLeRobotDataset` (sample-weighting is provided externally by
     a `WeightedRandomSampler` built in `lerobot_train.py` over
     `cumulative_sizes`).
-  * Loads each sub-dataset's stats sidecar, validates consistency, aggregates
-    them via the existing `aggregate_stats()` (min-of-mins, max-of-maxes,
-    count-weighted mean/std, count-weighted quantiles when every source has
-    them), and exposes the aggregated result via `.meta.stats`. The policy's
-    preprocessor then normalizes exactly once, with stats that span the union
-    of source distributions.
+  * Loads each sub-dataset's stats sidecar, validates consistency, and
+    exposes the chosen-mode stats via `.meta.stats`. The policy's
+    preprocessor normalizes exactly once with those stats.
 
 See `src/lerobot/configs/default.py:DatasetConfig` for the
-`repo_ids`/`sample_weights`/`stats_paths` config surface that activates this
-code path, and `src/lerobot/scripts/lerobot_train.py` for how the aggregated
-stats reach the preprocessor.
+`repo_ids`/`sample_weights`/`stats_paths`/`norm_mode` config surface that
+activates this code path, and `src/lerobot/scripts/lerobot_train.py` for how
+those stats reach the preprocessor.
 """
 
 from __future__ import annotations
@@ -153,10 +166,24 @@ class MultiSourceNormalizingDataset(Dataset):
         stats_paths: list[str],
         features: dict | None = None,  # back-compat; unused
         norm_map: dict | None = None,  # back-compat; unused
+        norm_mode: str = "aggregated",
     ):
         super().__init__()
         del features, norm_map  # accepted for signature compat; not used here
 
+        # Validate norm_mode BEFORE touching multi_dataset so the error
+        # message is about the bad mode, not "NoneType has no repo_ids".
+        if norm_mode == "per_source":
+            raise NotImplementedError(
+                "norm_mode='per_source' is not currently implemented; see this "
+                "module's docstring for why. Use 'aggregated' (default) or "
+                "'base_only' instead."
+            )
+        if norm_mode not in {"aggregated", "base_only"}:
+            raise ValueError(
+                f"norm_mode must be 'aggregated' or 'base_only' (or "
+                f"'per_source' once implemented); got {norm_mode!r}."
+            )
         if len(stats_paths) != len(multi_dataset.repo_ids):
             raise ValueError(
                 f"stats_paths length ({len(stats_paths)}) must match the number "
@@ -164,6 +191,7 @@ class MultiSourceNormalizingDataset(Dataset):
             )
         self.multi_dataset = multi_dataset
         self.stats_paths = stats_paths
+        self.norm_mode = norm_mode
 
         # Cumulative sub-dataset sizes are still load-bearing for downstream
         # callers (the WeightedRandomSampler in `lerobot_train.py` builds
@@ -176,12 +204,21 @@ class MultiSourceNormalizingDataset(Dataset):
             per_source_stats_raw.append(self._load_stats_json(Path(path)))
         self._validate_consistency(per_source_stats_raw, multi_dataset.repo_ids, stats_paths)
 
+        per_source_stats = [_to_numpy_stats(s) for s in per_source_stats_raw]
         # Aggregate. `aggregate_stats` from `compute_stats.py` does the
         # math: min-of-mins, max-of-maxes, count-weighted mean/std (via the
         # parallel-variance algorithm), count-weighted quantiles (only when
         # every source has the same quantile keys — we validate this above).
-        per_source_stats = [_to_numpy_stats(s) for s in per_source_stats_raw]
+        # Computed even in base_only mode so callers can introspect what the
+        # aggregated stats WOULD have been (useful for debug logging).
         self._aggregated_stats: dict[str, dict[str, np.ndarray]] = aggregate_stats(per_source_stats)
+        self._base_stats: dict[str, dict[str, np.ndarray]] = per_source_stats[0]
+
+        if norm_mode == "aggregated":
+            self._exposed_stats = self._aggregated_stats
+        else:  # base_only
+            self._exposed_stats = self._base_stats
+
         for i, (repo, stats) in enumerate(zip(multi_dataset.repo_ids, per_source_stats, strict=True)):
             logger.info(
                 "MultiSourceNormalizingDataset: source[%d] %s contributes %d feature(s) with "
@@ -193,10 +230,12 @@ class MultiSourceNormalizingDataset(Dataset):
                 {k: int(np.asarray(v["count"]).reshape(-1)[0]) for k, v in stats.items() if "count" in v},
             )
         logger.info(
-            "MultiSourceNormalizingDataset: aggregated stats over %d source(s); "
+            "MultiSourceNormalizingDataset: norm_mode=%s; exposing %s stats over %d source(s); "
             "%d feature(s); total frames=%d.",
+            norm_mode,
+            "aggregated" if norm_mode == "aggregated" else f"base ({multi_dataset.repo_ids[0]})",
             len(per_source_stats),
-            len(self._aggregated_stats),
+            len(self._exposed_stats),
             len(multi_dataset),
         )
 
@@ -305,7 +344,11 @@ class MultiSourceNormalizingDataset(Dataset):
 
     @property
     def meta(self) -> _MetaProxy:
-        """Expose a meta proxy that serves AGGREGATED stats.
+        """Expose a meta proxy that serves the mode-appropriate stats.
+
+        The exact stats depend on `self.norm_mode`:
+          * "aggregated" → aggregated stats over all sources.
+          * "base_only" → source[0]'s stats (the base dataset).
 
         Other meta attributes (camera_keys, features, fps, etc.) are forwarded
         from the FIRST sub-dataset's metadata — by convention that's the base
@@ -317,7 +360,7 @@ class MultiSourceNormalizingDataset(Dataset):
         if not hasattr(self, "_meta_proxy"):
             self._meta_proxy = _MetaProxy(
                 self.multi_dataset._datasets[0].meta,
-                self._aggregated_stats,
+                self._exposed_stats,
             )
         return self._meta_proxy
 

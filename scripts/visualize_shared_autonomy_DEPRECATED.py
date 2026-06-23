@@ -60,6 +60,7 @@ def load_wrapped_policy(
     robot_name: str = "robot_iphone_w_engine_new",
     num_dofs: int = 6,
     device: str = "cpu",
+    action_names_dataset_hint: str | Path | None = None,
 ):
     """Load inner policy and wrap with SharedAutonomyPolicyWrapper (no slider).
 
@@ -105,8 +106,103 @@ def load_wrapped_policy(
         config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
     )
     _reconnect_relative_absolute_steps(obs_preprocessor, wrapper.postprocessor, policy=wrapper)
+    _backfill_rel_step_action_names(obs_preprocessor, policy_path, dataset_hint=action_names_dataset_hint)
 
     return wrapper, obs_preprocessor
+
+
+def _backfill_rel_step_action_names(
+    preprocessor, policy_path: Path, *, dataset_hint: str | Path | None = None
+) -> None:
+    """If the RelativeActionsProcessorStep in `preprocessor` has
+    `action_names=None`, look up the action feature names from any available
+    dataset and patch them in.
+
+    Source precedence:
+      1. `dataset_hint` (caller-supplied path or repo id — most reliable when
+         the train_config's dataset has since been deleted, e.g. orchestrator
+         merged datasets that get cleaned up after training).
+      2. `train_config.json` → `dataset.repo_id` → meta/info.json.
+
+    WHY: training-time `make_policy` only populates `cfg.action_feature_names`
+    when the policy config class declares the field. PI0 / PI0.5 / PI0FAST
+    configs declare it; DiffusionConfig does NOT (fixed in this commit for
+    new training, but existing checkpoints still have `action_names: null`).
+    Without this backfill, the rel-step's `_build_mask` falls back to
+    `[True] * action_dim` — `exclude_joints` is silently ignored, all dims
+    (including gripper) get converted to relative actions, and at
+    blend-recording time the paired AbsoluteActionsProcessorStep adds the
+    gripper STATE back to the policy's near-zero rel output, leaking
+    `gripper_state` into the recorded action. Backfilling here makes
+    `exclude_joints=['gripper']` actually apply.
+    """
+    from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
+
+    rel_step = next(
+        (s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep)),
+        None,
+    )
+    if rel_step is None or rel_step.action_names is not None or not rel_step.exclude_joints:
+        return
+
+    # Build candidate list of dataset locations to try.
+    candidates: list[tuple[str, Path]] = []
+    if dataset_hint is not None:
+        hint_p = Path(dataset_hint).expanduser()
+        if hint_p.is_dir():
+            candidates.append(("dataset_hint (path)", hint_p))
+        else:
+            # Treat as a repo id.
+            try:
+                candidates.append(("dataset_hint (repo_id)", Path(resolve_dataset_dir(str(dataset_hint)))))
+            except Exception:
+                pass
+    train_cfg_path = Path(policy_path) / "train_config.json"
+    if train_cfg_path.is_file():
+        try:
+            train_cfg = json.loads(train_cfg_path.read_text())
+            repo_id = (train_cfg.get("dataset") or {}).get("repo_id")
+            if repo_id:
+                try:
+                    candidates.append(("train_config.dataset.repo_id", Path(resolve_dataset_dir(repo_id))))
+                except Exception:
+                    pass
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    for label, ds_dir in candidates:
+        # `resolve_dataset_dir` returns the `data/` subdir; meta/ lives in the
+        # dataset ROOT. Look in `ds_dir/meta/` first (in case a caller passed
+        # the root directly), then in `ds_dir.parent/meta/` (the data-subdir case).
+        for meta_root in (ds_dir, ds_dir.parent):
+            info_path = meta_root / "meta" / "info.json"
+            if info_path.is_file():
+                break
+        else:
+            continue
+        try:
+            info = json.loads(info_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        names = (info.get("features", {}).get("action", {}) or {}).get("names")
+        if not names:
+            continue
+        rel_step.action_names = list(names)
+        print(
+            f"[load_wrapped_policy] backfilled rel-step.action_names = {list(names)} "
+            f"from {info_path}  [source={label}]  "
+            f"(exclude_joints={rel_step.exclude_joints} now actually applies)"
+        )
+        return
+
+    print(
+        f"[load_wrapped_policy] WARNING: rel-step has exclude_joints="
+        f"{rel_step.exclude_joints} but action_names=None and no source dataset "
+        f"could be resolved (tried: dataset_hint + train_config.json). "
+        f"exclude_joints will be IGNORED — all dims including gripper will be "
+        f"converted to relative actions, and recorded blend actions will leak "
+        f"the gripper state into the action column."
+    )
 
 
 # ── parquet data loading ──────────────────────────────────────────────────────

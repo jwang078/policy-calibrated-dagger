@@ -31,7 +31,7 @@ import collections
 import logging
 import threading
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import pybullet as p
@@ -42,6 +42,7 @@ from splatsim.utils.paths import resolve_splatsim_path
 from torch import Tensor, nn
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs.shared_autonomy import FutureChunkConfig, PreJumpLookbackConfig
 from lerobot.policies.guidance import GuidanceCallCtx
 from lerobot.policies.guidance.observation_teleop_source import ObservationTeleopGuidanceSource
 from lerobot.policies.guidance.oracle_goal_source import OracleGoalGuidanceSource
@@ -149,10 +150,22 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         guidance_blend_strategy: GuidanceBlendStrategy | str = GuidanceBlendStrategy.DENOISE,
         n_anchor_steps: int = 0,
         fps: int = 30,
-        rrt_pre_jump_lookback_steps: int = 5,
+        rrt_collision_detection: str = "pre_jump_lookback",
+        rrt_pre_jump_lookback: PreJumpLookbackConfig | None = None,
+        rrt_future_chunk: FutureChunkConfig | None = None,
         rrt_teleport_to_q_start: bool = True,
         rrt_blocking_plan: bool = True,
         rrt_path_selection: str | None = None,
+        rrt_segment_at_sharp_corners: bool = True,
+        rrt_ik_goal_selection: str | None = None,
+        rrt_num_path_candidates_per_ik: int = 1,
+        rrt_max_path_attempts_per_ik: int = 5,
+        rrt_path_perturbation_scale: float = 0.001,
+        rrt_num_ik_candidates: int = 16,
+        rrt_obstacle_clearance: float | None = None,
+        rrt_self_collision_clearance: float | None = None,
+        rrt_self_collision_skip_pairs: list[list[int]] | None = None,
+        rrt_diagnostic_log_pairs: str = "off",
     ):
         # Bypass PreTrainedPolicy.__init__ — we proxy the inner policy's config
         nn.Module.__init__(self)
@@ -184,12 +197,38 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # _maybe_teleport_to_q_start below, this makes the recorded RRT segment
         # begin at a clean pre-jump pose with no sim catch-up frames.
         # `_actual_q_history` is wrapper-owned (written every step from obs decode,
-        # read by the RRT source via the wrapper back-ref to derive q_start). Sized
-        # from rrt_pre_jump_lookback_steps so the OLDEST entry is approximately N
-        # steps before the most recent push.
+        # read by the RRT source via the wrapper back-ref to derive q_start).
+        # Sized to fit the MAX of (min, max) lookback values so the source can
+        # always reach as far back as the per-trigger random sample asks for.
+        # When the lookback's steps_max is None, this reduces to the historical
+        # behavior (sized for the single fixed lookback value).
+        # In future_chunk mode no lookback rewind happens, but we still need a
+        # tiny history (few samples) so _compute_recent_joint_velocity can
+        # derive `start_vel` for the ruckig parametrization.
+        if rrt_collision_detection == "future_chunk":
+            # No lookback ever. Just enough history for a 2-3 sample
+            # velocity estimate (for ruckig start_vel).
+            _effective_max_lookback = 4
+        else:
+            # pre_jump_lookback OR hybrid: stall/no-progress triggers
+            # still use lookback, so the deque must hold enough history
+            # for the per-trigger random sample.
+            _lb_cfg = rrt_pre_jump_lookback or PreJumpLookbackConfig()
+            _effective_max_lookback = max(
+                int(_lb_cfg.steps_min),
+                int(_lb_cfg.steps_max) if _lb_cfg.steps_max is not None else 0,
+            )
         self._actual_q_history: collections.deque[np.ndarray] = collections.deque(
-            maxlen=max(1, int(rrt_pre_jump_lookback_steps) + 1)
+            maxlen=max(1, _effective_max_lookback + 1)
         )
+        # Frames-since-last-RRT-cycle-end counter. Used to cap the RRT
+        # source's lookback so it never rewinds into a prior RRT cycle's
+        # trajectory (which would teleport the env's robot to a config the
+        # POLICY never actually drove through). Incremented in select_action
+        # whenever RRT is IDLE (policy driving); reset to 0 the moment RRT
+        # leaves IDLE (a new cycle started). Episode reset() also zeros it.
+        # See rrt_source._do_plan() lookback path for the cap site.
+        self._frames_since_last_rrt_end: int = 0
         self._teleop_context: TeleopRecordingContext | None = None  # set by policy factory
         self._start_paused = start_paused
         self._run_event = threading.Event()
@@ -221,16 +260,55 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # last_mile/helpers.py) access it via the back-compat `_rrt` property.
         # `auto_pause_on_rrt_finish` lives on the source; the wrapper exposes
         # it as a property shim further down.
+        # Mode + per-mode nested config — used at runtime by the FK shield
+        # (future_chunk mode) and threaded into the RRT source so it knows
+        # which q_start policy to follow on each trigger.
+        if rrt_collision_detection not in ("pre_jump_lookback", "future_chunk", "hybrid"):
+            raise ValueError(
+                "rrt_collision_detection must be 'pre_jump_lookback', "
+                f"'future_chunk', or 'hybrid', got {rrt_collision_detection!r}"
+            )
+        self._collision_detection_mode = rrt_collision_detection
+        self._future_chunk_config = rrt_future_chunk or FutureChunkConfig()
+        _lookback_cfg = rrt_pre_jump_lookback or PreJumpLookbackConfig()
         self._rrt_source = RRTGuidanceSource(
             self,
-            pre_jump_lookback_steps=int(rrt_pre_jump_lookback_steps),
+            collision_detection=rrt_collision_detection,
+            pre_jump_lookback_steps_min=int(_lookback_cfg.steps_min),
+            pre_jump_lookback_steps_max=(
+                int(_lookback_cfg.steps_max) if _lookback_cfg.steps_max is not None else None
+            ),
             teleport_to_q_start=bool(rrt_teleport_to_q_start),
             blocking_plan=bool(rrt_blocking_plan),
             auto_pause_on_finish=True,
             path_selection=rrt_path_selection,
+            segment_at_sharp_corners=rrt_segment_at_sharp_corners,
+            ik_goal_selection=rrt_ik_goal_selection,
+            num_path_candidates_per_ik=rrt_num_path_candidates_per_ik,
+            max_path_attempts_per_ik=rrt_max_path_attempts_per_ik,
+            path_perturbation_scale=rrt_path_perturbation_scale,
+            num_ik_candidates=rrt_num_ik_candidates,
+            obstacle_clearance=rrt_obstacle_clearance,
+            self_collision_clearance=rrt_self_collision_clearance,
+            self_collision_skip_pairs=rrt_self_collision_skip_pairs,
+            diagnostic_log_pairs=rrt_diagnostic_log_pairs,
         )
 
-        logger.info(f"SharedAutonomyPolicyWrapper: ratio={forward_flow_ratio}, robot={robot_name}")
+        # NOTE on `ratio` scope: forward_flow_ratio is applied ONLY to the
+        # obs-teleop blending path (when `observation.policy_guidance_chunk`
+        # arrives — typically from a keyboard teleop or live human source).
+        # The RRT-EXECUTING path (`_rrt.chunk` playback during DAgger
+        # intervention recording) and the oracle-goal path BYPASS this
+        # ratio entirely and play the planned waypoints verbatim. So
+        # `ratio=0.4` does NOT imply RRT recovery chunks are 40% policy /
+        # 60% plan — those are 100% plan. Confusion this caused has
+        # already burned us once.
+        logger.info(
+            f"SharedAutonomyPolicyWrapper: forward_flow_ratio={forward_flow_ratio} "
+            f"(obs-teleop blending only — RRT chunks play verbatim), "
+            f"robot={robot_name}, "
+            f"rrt_collision_detection={self._collision_detection_mode}"
+        )
 
         # Load pybullet DIRECT client for FK+IK (same pattern as KeyboardInterfaceAgent)
         robot_config = SplatObjectConfig(name="robot", splat_name=robot_name)
@@ -421,6 +499,187 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
     # the wrapper-level API before the source extraction (lerobot-eval --intervention,
     # last_mile/helpers.py, shared_autonomy_gui.py). New callers should prefer
     # `self._rrt_source.<...>` directly.
+
+    def _check_future_chunk_collision(self) -> tuple[bool, int | None, str | None]:
+        """Run the future-chunk predictive shield.
+
+        Peeks at the inner policy's already-cached action chunk (no extra
+        forward pass), denormalizes each step in policy-action space, and
+        FK-checks the cumulative future joint trajectory against the
+        wrapper's pybullet client (which holds the same obstacles RRT uses).
+
+        Returns ``(any_collides, first_step_idx, kind)`` mirroring
+        ``rrt_to_goal.check_chunk_collision``. When ``any_collides`` is
+        True, the caller should preempt the policy and trigger RRT from
+        the current state (no rewind / no teleport).
+
+        Pre-conditions: ``_latest_actual_q`` has been refreshed THIS tick
+        AND the pybullet client has been synced via ``_sync_joints``.
+        Reads action-format intent from the inner policy's config
+        (``use_relative_actions`` / ``relative_exclude_joints``).
+        """
+        # Lazy import — keep optional dependency surface contained.
+        from lerobot.policies.rrt_to_goal import check_chunk_collision
+
+        # Peek without consuming. Returns None if no chunk cached yet
+        # (e.g., very first tick before select_action populated the queue).
+        chunk = self.inner_policy.get_pending_action_chunk()
+        if chunk is None or chunk.shape[0] == 0:
+            return False, None, None
+
+        # Apply horizon_frames cap if configured.
+        horizon = self._future_chunk_config.horizon_frames
+        if horizon is not None and chunk.shape[0] > horizon:
+            chunk = chunk[:horizon]
+
+        # Determine action format from inner_policy.config. Diffusion / Pi0
+        # / Pi0.5 all expose `use_relative_actions: bool` on their config.
+        # Default to abs if the attribute isn't present (e.g., custom policies).
+        inner_cfg = self.inner_policy.config
+        action_format = "rel" if getattr(inner_cfg, "use_relative_actions", False) else "abs"
+
+        # Denormalize each chunk step through the postprocessor with the
+        # AbsoluteActionsProcessorStep state set to zero. This gives us the
+        # unnormalized rel-deltas (or abs targets) without the per-step
+        # last_state addition that would otherwise turn the chunk into N
+        # independent "from current state" actions rather than the
+        # cumulative trajectory we need.
+        chunk_raw = self._denormalize_chunk_to_raw(chunk)
+        if chunk_raw is None:
+            # Denormalization failed (e.g., postprocessor not configured for
+            # this codepath); skip the shield this tick rather than crashing.
+            return False, None, None
+
+        # Slice to the DOF arm dims — drop gripper. The wrapper conventionally
+        # uses joint indices 1..1+num_dofs for the planning pybullet client,
+        # so chunk_raw[:, :num_dofs] is the arm-only future trajectory.
+        chunk_dof = np.asarray(chunk_raw[:, : self.num_dofs], dtype=np.float64)
+
+        # IMPORTANT: the anchor we add to each chunk action must MATCH what
+        # inference adds when popping that action — otherwise we predict a
+        # different absolute position from where the robot will actually go.
+        # The relative_action_processor only refreshes its ``_last_state``
+        # when the policy's chunk queue is empty (i.e., on chunk regen);
+        # during the 8 ticks the chunk plays out, ``_last_state`` stays
+        # FIXED at the chunk-gen-time obs state. So inference does
+        # ``action[k] = chunk[k] + _last_state_chunk_gen`` for all k,
+        # NOT ``chunk[k] + obs_state_at_tick_k``.
+        #
+        # Read that anchor here, slice to the arm DOF. If it's not set
+        # yet (very first preprocessor call) fall back to the wrapper's
+        # current actual_q — at that single tick, they're the same value
+        # anyway (chunk WAS just generated).
+        q_current_dof = None
+        for _step in self.postprocessor.steps:
+            if isinstance(_step, AbsoluteActionsProcessorStep):
+                # Explicit cast — Pyright can't narrow dataclass attributes
+                # through the ProcessorStep base class even with isinstance,
+                # so spell out the concrete type for the attribute accesses.
+                abs_step = cast(AbsoluteActionsProcessorStep, _step)
+                if abs_step.enabled and abs_step.relative_step is not None:
+                    rel_step = abs_step.relative_step
+                    if rel_step._last_state is not None:
+                        anchor = rel_step._last_state.detach().cpu().numpy().reshape(-1)
+                        q_current_dof = np.asarray(anchor, dtype=np.float64)[: self.num_dofs]
+                break
+        if q_current_dof is None:
+            # No cached anchor (abs-mode policy or very-first-tick edge case)
+            # → use the wrapper's actual_q. For abs-mode, q_current_dof is
+            # unused anyway (action_format='abs' → future_qs = chunk_arr).
+            q_current = self._latest_actual_q
+            if q_current is None:
+                return False, None, None
+            q_current_dof = np.asarray(q_current, dtype=np.float64).reshape(-1)[: self.num_dofs]
+
+        # Inherit clearance / skip-pair config from the planner that the
+        # source already constructed (so the shield's contract matches RRT's).
+        planner = self._rrt_source.state.planner
+        skip_pairs = None
+        ob_clear = self._future_chunk_config.obstacle_clearance
+        self_clear = self._future_chunk_config.self_collision_clearance
+        if planner is not None:
+            if ob_clear is None:
+                ob_clear = planner._collision_kwargs.get("obstacle_clearance")
+            if self_clear is None:
+                self_clear = planner._collision_kwargs.get("self_collision_clearance")
+            skip_pairs = planner._collision_kwargs.get("self_collision_skip_pairs")
+
+        # Joint indices the planner uses for the arm DOFs in the wrapper's
+        # pybullet client. The wrapper convention is 1..1+num_dofs (see
+        # _sync_joints).
+        joint_indices = list(range(1, 1 + self.num_dofs))
+
+        return check_chunk_collision(
+            pb_client=self._pb_client,
+            robot_id=self._robot_id,
+            joint_indices=joint_indices,
+            q_current=q_current_dof,
+            chunk_dof_actions=chunk_dof,
+            action_format=action_format,
+            obstacle_ids=self._obstacle_ids,
+            obstacle_clearance=ob_clear,
+            self_collision_clearance=self_clear,
+            self_collision_skip_pairs=skip_pairs,
+        )
+
+    def _denormalize_chunk_to_raw(self, chunk: Tensor) -> np.ndarray | None:
+        """Denormalize a queued action chunk to raw policy-space actions.
+
+        The inner policy's action queue stores NORMALIZED actions of shape
+        ``(n_steps, B=1, action_dim)``. We need them in RAW units (radians
+        for joint dims) AND we need rel-format chunks to remain as rel
+        deltas (not as per-step "where to go from current state"), so we
+        bypass the AbsoluteActionsProcessorStep's add-last-state behavior
+        by temporarily zeroing its state during the postprocessor pass.
+
+        Returns ``(n_steps, action_dim)`` numpy array, or None if no
+        AbsoluteActionsProcessorStep was found in the pipeline (caller
+        should skip the shield in that case rather than guess at format).
+        """
+        # Find the AbsoluteActionsProcessorStep so we can snapshot + zero
+        # the relative_step._last_state.
+        abs_step = None
+        for _step in self.postprocessor.steps:
+            if isinstance(_step, AbsoluteActionsProcessorStep):
+                abs_step = _step
+                break
+        if abs_step is None or not abs_step.enabled or abs_step.relative_step is None:
+            # No add-state step → postprocessor output IS the denormalized
+            # action directly. Run it per-step and stack.
+            out_rows: list[np.ndarray] = []
+            for k in range(chunk.shape[0]):
+                # chunk[k] has shape (B=1, action_dim). The postprocessor
+                # expects a single tensor in that shape (it's how the
+                # wrapper already calls it via `self.postprocessor(inner_action)`).
+                row = self.postprocessor(chunk[k]).detach().cpu().numpy().reshape(-1)
+                out_rows.append(row)
+            return np.stack(out_rows, axis=0) if out_rows else None
+
+        rel_step = abs_step.relative_step
+        saved_state = rel_step._last_state
+        try:
+            # Zero out the cached state so AbsoluteActionsProcessorStep
+            # adds 0 to every action, leaving the unnormalized rel-delta
+            # (or unnormalized abs target if the policy is abs-mode).
+            if saved_state is not None:
+                rel_step._last_state = torch.zeros_like(saved_state)
+            else:
+                # If no state has been cached yet, fall back to skipping
+                # the abs step entirely (chunk denormalization still works
+                # via the other steps in the pipeline).
+                abs_step.enabled = False
+            out_rows = []
+            for k in range(chunk.shape[0]):
+                row = self.postprocessor(chunk[k]).detach().cpu().numpy().reshape(-1)
+                out_rows.append(row)
+            return np.stack(out_rows, axis=0) if out_rows else None
+        finally:
+            # Restore the original cached state (and the enabled flag if we
+            # touched it) so the next normal select_action call sees the
+            # right denormalization context.
+            rel_step._last_state = saved_state
+            if saved_state is None:
+                abs_step.enabled = True
 
     @property
     def _rrt(self):
@@ -846,6 +1105,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self._desired_q = None
         self._latest_actual_q = None
         self._actual_q_history.clear()
+        self._frames_since_last_rrt_end = 0
         self._prev_dq = None
         # Clear RRT chunk state on episode boundary; keep the planner instance
         # so its obstacle cache survives if the env config hash matches next episode.
@@ -1022,6 +1282,18 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             # Also push into the rolling history so RRT can pull q_start from
             # N steps ago (pre-jump pose), not just the current actual_q.
             self._actual_q_history.append(self._latest_actual_q.copy())
+            # Track post-intervention idle frames. Bumped on every policy-
+            # driven tick (RRT IDLE), zeroed the moment RRT leaves IDLE for
+            # a new cycle. rrt_source._do_plan() caps its lookback sample
+            # at this counter so it can't rewind into a prior RRT cycle's
+            # trajectory — see the comment on the ctor field for rationale.
+            # NOTE: this needs `self._rrt` (the back-compat view onto the
+            # RRT source's state), which exists from ctor regardless of
+            # whether RRT is the active guidance source.
+            if self._rrt.mode == RRTMode.IDLE:
+                self._frames_since_last_rrt_end += 1
+            else:
+                self._frames_since_last_rrt_end = 0
         elif self._desired_q is None:
             # Last-resort initial seed from the policy's postprocessed action.
             self._desired_q = self.postprocessor(inner_action).cpu().numpy().reshape(-1)
@@ -1031,6 +1303,31 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # pybullet client so RRT planning, IK, and collision projection all
         # see a pose matching the env's real robot.
         self._sync_joints(self._desired_q[: self.num_dofs])
+
+        # --- future_chunk predictive shield --------------------------------
+        # When `rrt_collision_detection="future_chunk"`, FK-check the inner
+        # policy's already-cached chunk against the obstacle world. If a
+        # future waypoint would collide AND RRT isn't already running,
+        # preempt the policy and trigger RRT from the CURRENT continuous-
+        # motion state (no_lookback=True). The recorded intervention episode
+        # therefore starts velocity-continuous, in-distribution.
+        if self._collision_detection_mode in ("future_chunk", "hybrid") and self._rrt.mode == RRTMode.IDLE:
+            shield_collides, shield_step, shield_kind = self._check_future_chunk_collision()
+            if shield_collides:
+                logger.info(
+                    "Future-chunk shield: predicted %s collision at chunk step %d — "
+                    "triggering RRT from current state (no rewind).",
+                    shield_kind or "unknown",
+                    shield_step if shield_step is not None else -1,
+                )
+                # Flush the colliding chunk so it doesn't drain in parallel
+                # with the RRT chunk execution about to start.
+                self._flush_inner_action_queue()
+                # Synchronous (blocking) RRT trigger from current state.
+                # In future_chunk mode the source's _do_plan reads
+                # q_start = wrapper._latest_actual_q and skips teleport.
+                self._rrt_source.trigger(no_lookback=True)
+                # Refresh local view so the EXECUTING branch picks up.
 
         # Capture q_prev BEFORE any action computation so velocity limiting sees the true
         # previous position. get_full_teleop_action pre-updates _desired_q internally,

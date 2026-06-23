@@ -156,11 +156,18 @@ set -euo pipefail
 #                                 --target_intervention_volume (raw × (N -
 #                                 n_blends) + each blend × 1). Empty/unset →
 #                                 disabled (only raw intervention in merge).
-#                                 Ratio=1.0 is silently dropped (= raw intervention,
-#                                 no blending needed). Ratio=0.0 errors out
-#                                 ("pure policy" needs separate handling we don't
-#                                 yet have). Brackets/commas tolerated:
-#                                 --blends='[0.9, 0.8]' is equivalent.
+#                                 Ratio=0.0 is silently dropped (= raw intervention
+#                                 = full guidance; no blending needed). Ratio=1.0
+#                                 IS ALLOWED (= pure policy = full noise / no
+#                                 guidance contribution per wrapper math); when
+#                                 it's the ONLY ratio in --blends the orchestrator
+#                                 enters PURE_POLICY_MODE: training skips merge /
+#                                 weighted-sampling and finetunes on the base
+#                                 dataset only via resume_training.sh, producing
+#                                 a matched-compute base-only baseline lineage
+#                                 with per-round _blend100 rollout datasets.
+#                                 Brackets/commas tolerated: --blends='[0.9, 0.8]'
+#                                 is equivalent.
 #   --blend_extra_args=STR        Raw passthrough to augment_dataset_with_blending.py
 #                                 for every per-ratio invocation. Useful to override
 #                                 blend_strategy / guidance_repr / blend_mode away
@@ -448,21 +455,56 @@ ENV_EXTERNAL_HOST="127.0.0.1"
 INTERMEDIATE_MODE="finetune"
 FINAL_MODE="scratch"
 INTERVENTION_N_EPISODES="100"
+# Eval episode count for ALL inline / final-scratch evals. Empty → default
+# to `$INTERVENTION_N_EPISODES` (single-source-of-truth ergonomic).
+# Auto-forwarded as:
+#   - `--eval.n_episodes=$EVAL_N_EPISODES` appended to the finetune step's
+#     lerobot-train invocation AFTER `$FINETUNE_EXTRA_ARGS` so it always wins
+#     over anything the user passed in finetune_extra_args (draccus uses
+#     the last occurrence).
+#   - `--eval_n_episodes=$EVAL_N_EPISODES` + `--eval_benchmark_subset=...`
+#     forwarded to train_sweep.sh's new passthroughs in the final-scratch
+#     step (previously hardcoded at 5, leaving final-scratch evals
+#     incomparable to per-round finetune evals).
+# Set explicitly only if you want a DIFFERENT eval count than the
+# intervention recording's count (rare; e.g. you record on 30 scenarios but
+# only want to eval on the first 5 for a quick sanity check).
+EVAL_N_EPISODES=""
 TARGET_INTERVENTION_VOLUME=""   # required; validated after BLENDS is parsed
 INTERVENTION_MAX_EPISODE_LENGTH="5000"
 INTERVENTION_SAMPLE_FROM_FIRST=""   # empty → run first N in order; set → random subset
 INTERVENTION_SAMPLE_SEED="0"
 EVAL_BENCHMARK_REPO_ID="JennyWWW/eval_splatsim_approach_lever_benchmark_1000"
 INTERVENTION_EXTRA_ARGS=""
+# RRT-planner collision clearances, in meters. Empty → use SplatSim's
+# defaults (_COLLISION_CLEARANCE = 0.01 m obstacle, self = 0.0 m).
+# Forwarded to intervention recording via
+# --policy.shared_autonomy_config.rrt_obstacle_clearance / .rrt_self_collision_clearance.
+# Increases give the policy drift margin along the planned path — but tight
+# scenarios may become unplannable. Start small (0.02-0.04 m / 0.01-0.02 m)
+# and watch for jumps in plan_failures / rrt_steps_executed=0 in the per-
+# scenario CSV.
+RRT_OBSTACLE_CLEARANCE=""
+RRT_SELF_COLLISION_CLEARANCE=""
+# Non-adjacent robot-link pairs to EXCLUDE from self-collision checks.
+# JSON-encoded list of pairs (e.g. '[[0,2]]' for the UR robot's
+# base_link(0) vs upper_arm_link(2)). Empty → no skips. Required
+# whenever --rrt_self_collision_clearance is non-zero on a robot whose
+# URDF has structurally-close non-adjacent links — without it the
+# planner rejects every IK solution. Forwarded to intervention recording
+# via --policy.shared_autonomy_config.rrt_self_collision_skip_pairs.
+RRT_SELF_COLLISION_SKIP_PAIRS=""
 # Blended-intervention data sources. Space-separated list of forward_flow_ratio
 # floats; for each ratio R in (0,1) the orchestrator creates an additional
 # per-round dataset alongside the raw intervention via
 # augment_dataset_with_blending.py — same policy that recorded the intervention
 # drives a closed-loop replay at SA-wrapper ratio=R. Each blend is then
 # included in the merge alongside the raw intervention (oversampled the same
-# way). Empty → disabled (back-compat). Ratio=1.0 is dropped with an info log
-# (raw intervention already covers it). Ratio=0.0 errors out (would require
-# separate "policy-only" handling we don't have yet).
+# way). Empty → disabled (back-compat). Ratio=0.0 is dropped with an info log
+# (= full guidance = raw intervention; nothing to record). Ratio=1.0 IS
+# ALLOWED (= pure policy; records _blend100). When ratio=1.0 is the ONLY
+# entry, the orchestrator enters PURE_POLICY_MODE and skips merge/weighted-
+# sampling at training time — see the BLENDS-parsing block below.
 BLENDS_STR=""
 BLEND_EXTRA_ARGS=""
 # Collision-free blend filtering. When true, each blend dataset produced in
@@ -500,6 +542,33 @@ FINETUNE_EXTRA_ARGS=""
 # startup (see mode-purity validation below).
 USE_WEIGHTED_SAMPLING=false
 DAGGER_DATA_FRACTION="0.3"
+# --norm_mode controls how MultiSourceNormalizingDataset exposes stats to the
+# policy in weighted-sampling mode. See
+# src/lerobot/datasets/multi_source_normalizing_dataset.py docstring + the
+# DatasetConfig.norm_mode docstring for the full trade-off explanation:
+#   * aggregated (default) — min-of-mins/max-of-maxes across base + every
+#     round's intervention + every blend. Both train and eval use the same.
+#     Base data gets compressed if interventions add extreme values.
+#   * base_only — expose source[0] (base) stats only. Intervention data
+#     may produce normalized targets OUTSIDE [-1, 1] when its raw range
+#     exceeds base's. Was the de-facto behavior before the `--dataset.stats_path`
+#     override was decoupled from aggregation; preserved as an explicit
+#     opt-in for A/B testing.
+#   * per_source — NOT IMPLEMENTED (wrapper raises NotImplementedError).
+# In merge mode (USE_WEIGHTED_SAMPLING=false), norm_mode is silently ignored
+# because there's only ONE dataset and stats come from the merged sidecar.
+NORM_MODE="aggregated"
+# Skip-already-succeeded mode. When true (default), the per-round intervention
+# recording on round R reads the previous round's training-time eval_info.json
+# and runs ONLY on the scenarios that failed there — the policy already passed
+# the others, so recording on them is wasted work + dilutes the per-scenario
+# DAgger signal. Falls back to the full subset when:
+#   * round == 1 (no prior eval data)
+#   * the helper can't find / parse eval_info_step_*.json
+#   * the prior eval was 100% success (no failures to target)
+# Set to false to record interventions on every scenario in
+# --env.eval_benchmark_subset every round (the historical behavior).
+DAGGER_SKIP_SUCCEEDED_IN_PREV_EVAL=true
 # Rerun-blends mode. When --rerun_blends_from=<source_run_tag>[:<source_blends_tag>]
 # is set, the orchestrator REUSES an existing lineage's intervention datasets
 # (skipping step 1's lerobot-eval recording) and trains a NEW lineage that
@@ -648,12 +717,16 @@ for arg in "$@"; do
         --intermediate_mode=*)        INTERMEDIATE_MODE="${arg#*=}" ;;
         --final_mode=*)               FINAL_MODE="${arg#*=}" ;;
         --intervention_n_episodes=*)         INTERVENTION_N_EPISODES="${arg#*=}" ;;
+        --eval_n_episodes=*)                 EVAL_N_EPISODES="${arg#*=}" ;;
         --target_intervention_volume=*)      TARGET_INTERVENTION_VOLUME="${arg#*=}" ;;
         --intervention_max_episode_length=*) INTERVENTION_MAX_EPISODE_LENGTH="${arg#*=}" ;;
         --intervention_sample_from_first=*)  INTERVENTION_SAMPLE_FROM_FIRST="${arg#*=}" ;;
         --intervention_sample_seed=*)        INTERVENTION_SAMPLE_SEED="${arg#*=}" ;;
         --eval_benchmark_repo_id=*)          EVAL_BENCHMARK_REPO_ID="${arg#*=}" ;;
         --intervention_extra_args=*)         INTERVENTION_EXTRA_ARGS="${arg#*=}" ;;
+        --rrt_obstacle_clearance=*)          RRT_OBSTACLE_CLEARANCE="${arg#*=}" ;;
+        --rrt_self_collision_clearance=*)    RRT_SELF_COLLISION_CLEARANCE="${arg#*=}" ;;
+        --rrt_self_collision_skip_pairs=*)   RRT_SELF_COLLISION_SKIP_PAIRS="${arg#*=}" ;;
         --blends=*)                          BLENDS_STR="${arg#*=}" ;;
         --blend_extra_args=*)                BLEND_EXTRA_ARGS="${arg#*=}" ;;
         --filter_blend_collisions)           FILTER_BLEND_COLLISIONS=true ;;
@@ -662,6 +735,8 @@ for arg in "$@"; do
         --finetune_extra_args=*)             FINETUNE_EXTRA_ARGS="${arg#*=}" ;;
         --use_weighted_sampling)             USE_WEIGHTED_SAMPLING=true ;;
         --dagger_data_fraction=*)            DAGGER_DATA_FRACTION="${arg#*=}" ;;
+        --norm_mode=*)                       NORM_MODE="${arg#*=}" ;;
+        --dagger_skip_succeeded_in_prev_eval=*) DAGGER_SKIP_SUCCEEDED_IN_PREV_EVAL="${arg#*=}" ;;
         --rerun_blends_from=*)               RERUN_BLENDS_FROM="${arg#*=}" ;;
         --reuse_intervention_from=*)         REUSE_INTERVENTION_FROM="${arg#*=}" ;;
         --reuse_policy_from=*)               REUSE_POLICY_FROM="${arg#*=}" ;;
@@ -746,6 +821,15 @@ if [[ -n "$INTERVENTION_SAMPLE_FROM_FIRST" ]]; then
     fi
 fi
 
+# Resolve EVAL_N_EPISODES default. Empty (user didn't pass --eval_n_episodes)
+# → default to the intervention count, so all three eval contexts
+# (intervention recording, per-round finetune inline eval, final-scratch
+# inline eval) use the same scope by default.
+[[ -z "$EVAL_N_EPISODES" ]] && EVAL_N_EPISODES="$INTERVENTION_N_EPISODES"
+if ! [[ "$EVAL_N_EPISODES" =~ ^[0-9]+$ ]] || (( EVAL_N_EPISODES < 1 )); then
+    echo "ERROR: --eval_n_episodes='$EVAL_N_EPISODES' must be a positive integer" >&2; exit 1
+fi
+
 # Retrain-mode validation. --retrain_round=N is mutually exclusive with
 # --start_round/--force_restart since it pins the start at round N step 6 and
 # uses a different code path that skips the resume-prompt entirely.
@@ -779,9 +863,93 @@ case "$FINAL_MODE"        in finetune|scratch) ;; *) echo "ERROR: --final_mode m
 case "$MODEL"             in pi|diff|act)      ;; *) echo "ERROR: --model must be one of pi/diff/act" >&2; exit 1;; esac
 case "$INTERVENTION_METHOD" in rrt|oracle_goal) ;; *) echo "ERROR: --intervention_method must be 'rrt' or 'oracle_goal'" >&2; exit 1;; esac
 
-# Parse --blends="0.9 0.8" into BLENDS bash array. Drop 1.0 (covered by raw
-# intervention dataset), error on 0.0 (would need separate "pure policy"
-# handling we don't support yet), validate each entry is in (0,1).
+# --rrt_*_clearance: must be a non-negative float. Empty (unset) = use
+# SplatSim defaults; allowed. Anything above ~0.1 m is suspicious (RRT
+# may fail to plan most paths) — warn but don't reject. Values that fail
+# the float parse are rejected hard.
+_validate_clearance() {
+    local _name="$1" _val="$2"
+    [[ -z "$_val" ]] && return 0
+    local _verdict
+    _verdict=$(python3 -c "
+import sys
+try:
+    v = float(sys.argv[1])
+except ValueError:
+    print('ERR_NOT_FLOAT'); sys.exit()
+if v < 0:
+    print('ERR_NEGATIVE')
+elif v > 0.1:
+    print('WARN_LARGE')
+else:
+    print('OK')
+" "$_val" 2>/dev/null || echo "ERR_NOT_FLOAT")
+    case "$_verdict" in
+        OK) ;;
+        WARN_LARGE)
+            echo "WARNING: --$_name=$_val is > 0.1 m. RRT may fail to find paths in tight scenarios." >&2
+            ;;
+        ERR_NEGATIVE)
+            echo "ERROR: --$_name=$_val must be non-negative." >&2; exit 1 ;;
+        *)
+            echo "ERROR: --$_name='$_val' is not a valid float." >&2; exit 1 ;;
+    esac
+}
+_validate_clearance rrt_obstacle_clearance         "$RRT_OBSTACLE_CLEARANCE"
+_validate_clearance rrt_self_collision_clearance   "$RRT_SELF_COLLISION_CLEARANCE"
+
+# --rrt_self_collision_skip_pairs: must be a JSON list of 2-element int
+# lists (e.g. '[[0,2]]') or empty. Validated via python3 — bash JSON
+# parsing is the wrong tool. Friendly hint emitted when the user sets a
+# non-zero self-collision clearance WITHOUT skip pairs on the
+# small-engine env (the UR URDF needs [[0,2]] to plan at all).
+if [[ -n "$RRT_SELF_COLLISION_SKIP_PAIRS" ]]; then
+    _skip_verdict=$(python3 -c "
+import sys, json
+try:
+    v = json.loads(sys.argv[1])
+except Exception:
+    print('ERR_NOT_JSON'); sys.exit()
+if not isinstance(v, list):
+    print('ERR_NOT_LIST'); sys.exit()
+for pair in v:
+    if not isinstance(pair, list) or len(pair) != 2:
+        print('ERR_BAD_PAIR'); sys.exit()
+    if not all(isinstance(x, int) for x in pair):
+        print('ERR_NOT_INT'); sys.exit()
+print('OK')
+" "$RRT_SELF_COLLISION_SKIP_PAIRS" 2>/dev/null || echo "ERR_NOT_JSON")
+    if [[ "$_skip_verdict" != "OK" ]]; then
+        echo "ERROR: --rrt_self_collision_skip_pairs='$RRT_SELF_COLLISION_SKIP_PAIRS' must be a JSON list of 2-element int lists, e.g. '[[0,2]]'." >&2
+        exit 1
+    fi
+fi
+# Soft warning: self-collision clearance > 0 with NO skip pairs is almost
+# certainly going to make every RRT IK fail on the UR URDF (base_link(0)
+# vs upper_arm_link(2) is naturally ~4 mm apart). Don't reject — other
+# robots might not have this issue — just nudge.
+if [[ -n "$RRT_SELF_COLLISION_CLEARANCE" && "$RRT_SELF_COLLISION_CLEARANCE" != "0" && "$RRT_SELF_COLLISION_CLEARANCE" != "0.0" ]] \
+   && [[ -z "$RRT_SELF_COLLISION_SKIP_PAIRS" ]]; then
+    echo "WARNING: --rrt_self_collision_clearance=$RRT_SELF_COLLISION_CLEARANCE is set but --rrt_self_collision_skip_pairs is empty." >&2
+    echo "  On the UR URDF (small-engine scene) this will reject every IK solution due to" >&2
+    echo "  base_link(0) vs upper_arm_link(2) being ~4 mm apart at all valid joint configs." >&2
+    echo "  Recommended: --rrt_self_collision_skip_pairs='[[0,2]]'" >&2
+fi
+
+# Parse --blends="0.9 0.8" into BLENDS bash array. Validates each entry is in
+# [0, 1] inclusive but with endpoint semantics fixed:
+#
+#   ratio = 0.0 → SILENTLY DROPPED. Per wrapper math (x_tsw = ratio*noise +
+#                 (1-ratio)*guidance), ratio=0.0 means full guidance = raw
+#                 intervention output. No blending happens, no useful dataset
+#                 produced beyond the existing raw intervention.
+#   ratio = 1.0 → ALLOWED. Means full noise / no guidance contribution = pure
+#                 policy. Produces a `_blend100` dataset per round. When the
+#                 ONLY ratio is 1.0, the orchestrator enters PURE_POLICY_MODE
+#                 (see below): training skips all DAgger data and just resumes
+#                 finetuning on the base dataset, giving a matched-compute
+#                 base-only baseline for comparison against DAgger lineages.
+#   0 < ratio < 1 → OK, normal blend.
 BLENDS=()
 if [[ -n "$BLENDS_STR" ]]; then
     # Allow optional brackets / commas for ergonomics: "[0.9, 0.8]" → "0.9 0.8".
@@ -789,7 +957,7 @@ if [[ -n "$BLENDS_STR" ]]; then
     # shellcheck disable=SC2206  # word-split is intentional here
     _blends_raw=( $_blends_clean )
     for r in "${_blends_raw[@]}"; do
-        # Validate numeric in (0,1). python3 used so we get float comparison.
+        # Validate numeric in [0,1]. python3 used so we get float comparison.
         _verdict=$(python3 -c "
 import sys
 try:
@@ -797,31 +965,47 @@ try:
 except ValueError:
     print('ERR_NOT_FLOAT'); sys.exit()
 if v == 0.0:
-    print('ERR_ZERO')
+    print('DROP_ZERO')
 elif v == 1.0:
-    print('DROP_ONE')
+    print('OK_ONE')
 elif 0.0 < v < 1.0:
     print('OK')
 else:
     print('ERR_OUT_OF_RANGE')
 " "$r" 2>/dev/null || echo "ERR_NOT_FLOAT")
         case "$_verdict" in
-            OK)
+            OK|OK_ONE)
                 BLENDS+=( "$r" )
                 ;;
-            DROP_ONE)
-                echo "[blends] dropping ratio=1.0 (= raw intervention dataset; no blending needed)."
-                ;;
-            ERR_ZERO)
-                echo "ERROR: --blends contains ratio=0.0 which would be 'pure policy'. This is not the raw intervention dataset and requires separate handling we don't yet support. Pick a ratio in (0, 1)." >&2
-                exit 1
+            DROP_ZERO)
+                echo "[blends] dropping ratio=0.0 (= raw intervention dataset; no blending needed)."
                 ;;
             ERR_OUT_OF_RANGE|ERR_NOT_FLOAT)
-                echo "ERROR: --blends entry '$r' is not a valid forward_flow_ratio. Each entry must be a float in (0.0, 1.0); 1.0 is silently dropped." >&2
+                echo "ERROR: --blends entry '$r' is not a valid forward_flow_ratio. Each entry must be a float in [0.0, 1.0]; 0.0 is silently dropped (= raw intervention)." >&2
                 exit 1
                 ;;
         esac
     done
+fi
+
+# Detect PURE_POLICY_MODE: when the only blend is ratio=1.0, this iteration is
+# a matched-compute base-only baseline. Training will skip DAgger data
+# (intervention/blend merge + weighted sampling) and just resume_training.sh
+# on the base dataset; per-round closed-loop rollout still runs at ratio=1.0
+# to produce the `_blend100` rollout datasets the PCA viz auto-discovers.
+#
+# Why this trigger: the user expressed pure-policy via --combination_pool=1.0
+# in the sweep wrapper; that surfaces here as --blends=1.0. Mixed iterations
+# like --blends="0.5 1.0" are NOT pure-policy (they're a normal blended
+# lineage that happens to also record _blend100 from the DAgger-trained
+# policy). See dagger_orchestrate_sweep.sh callers + the design doc.
+PURE_POLICY_MODE=false
+# Trigger on any string form that floats to 1.0 ("1", "1.0", "1.00", " 1 ").
+# The sweep wrapper formats ratios via f"{r:g}" so 1.0 arrives as the bare
+# string "1" — comparing literally against "1.0" would silently miss.
+if [[ "${#BLENDS[@]}" -eq 1 ]] && python3 -c "import sys; sys.exit(0 if abs(float(sys.argv[1]) - 1.0) < 1e-9 else 1)" "${BLENDS[0]}" 2>/dev/null; then
+    PURE_POLICY_MODE=true
+    echo "[pure_policy] --blends=${BLENDS[0]} (= 1.0) detected → PURE_POLICY_MODE: per-round training will use BASE DATASET ONLY (skipping merge / weighted-sampling sub-datasets); per-round _blend100 rollouts use the matched-compute pure-policy checkpoint."
 fi
 
 # Validate --target_intervention_volume now that BLENDS is built. Must be a
@@ -880,6 +1064,26 @@ else:
         echo "  (raw intervention + any blends). Base gets the remaining (1 - fraction)." >&2
         exit 1
     fi
+    # --norm_mode validation. per_source is rejected here (and again
+    # inside the wrapper) — the option is reserved as a placeholder so
+    # callers + sidecars know it exists, but the wrapper currently raises
+    # NotImplementedError for it. See multi_source_normalizing_dataset.py
+    # docstring for why.
+    case "$NORM_MODE" in
+        aggregated|base_only) ;;
+        per_source)
+            echo "ERROR: --norm_mode=per_source is reserved but not implemented." >&2
+            echo "  See src/lerobot/datasets/multi_source_normalizing_dataset.py docstring." >&2
+            echo "  Use 'aggregated' (default; min-of-mins/max-of-maxes across all sources) or" >&2
+            echo "  'base_only' (source[0] stats only; intervention rows may exceed [-1,1])." >&2
+            exit 1
+            ;;
+        *)
+            echo "ERROR: --norm_mode='$NORM_MODE' is not recognized." >&2
+            echo "  Valid: aggregated, base_only." >&2
+            exit 1
+            ;;
+    esac
 fi
 
 # Auto-detect ACTION_FORMAT from --initial_policy_path's train_config.json when
@@ -1255,32 +1459,42 @@ if [[ "$RERUN_MODE_ENABLED" == "true" ]]; then
     # Inline the path expansions here (int_repo_for_round +
     # source_train_output_dir_for_round are defined further down in the
     # helpers section; we run this validation block before those helpers).
-    for r in $(seq 1 "$NUM_ROUNDS"); do
-        _src_int_dir="$LEROBOT_CACHE/${HF_USER}/${SOURCE_INT_SHORT_PREFIX}_${ACTION_INFIX}_dag${r}"
-        if [[ ! -d "$_src_int_dir" ]]; then
-            echo "ERROR: source intervention missing on disk." >&2
-            echo "  Expected at: $_src_int_dir" >&2
-            exit 1
-        fi
-    done
-    for r in $(seq 2 "$NUM_ROUNDS"); do
-        _src_pol_dir="$LEROBOT_ROOT/outputs/training/${SOURCE_POLICY_BASENAME}_ft_dag$((r - 1))"
-        if [[ ! -d "$_src_pol_dir/checkpoints" ]]; then
-            echo "ERROR: source policy dir not found: $_src_pol_dir" >&2
-            echo "  Need source's _ft_dag$((r - 1)) for blending + training at round $r." >&2
-            exit 1
-        fi
-    done
+    #
+    # Skip the source-on-disk existence checks when --cleanup_only is set:
+    # in cleanup mode we're just rm-rfing the RERUN lineage's own artifacts,
+    # so the source not being there is fine (and is in fact the common case
+    # — you might be cleaning up rerun siblings AFTER deleting the source
+    # lineage, e.g. when nuking a sweep family).
+    if [[ "$CLEANUP_ONLY" != true ]]; then
+        for r in $(seq 1 "$NUM_ROUNDS"); do
+            _src_int_dir="$LEROBOT_CACHE/${HF_USER}/${SOURCE_INT_SHORT_PREFIX}_${ACTION_INFIX}_dag${r}"
+            if [[ ! -d "$_src_int_dir" ]]; then
+                echo "ERROR: source intervention missing on disk." >&2
+                echo "  Expected at: $_src_int_dir" >&2
+                exit 1
+            fi
+        done
+        for r in $(seq 2 "$NUM_ROUNDS"); do
+            _src_pol_dir="$LEROBOT_ROOT/outputs/training/${SOURCE_POLICY_BASENAME}_ft_dag$((r - 1))"
+            if [[ ! -d "$_src_pol_dir/checkpoints" ]]; then
+                echo "ERROR: source policy dir not found: $_src_pol_dir" >&2
+                echo "  Need source's _ft_dag$((r - 1)) for blending + training at round $r." >&2
+                exit 1
+            fi
+        done
+    fi
 fi
 
-# Derive the lineage tag dagger_progress.sh uses to filter training dirs. It
-# expects `${BASE_SHORT}_${ACTION_TAG}_basewrist` as a SUFFIX of training dirs.
-# When --initial_policy_path is set, our BASE_POLICY_NAME comes from its
-# basename and may include infixes (e.g. _grip0) that the user's --base_short
-# arg doesn't — so we extract the lineage out of BASE_POLICY_NAME instead of
-# the raw --base_short.
-PROGRESS_BASE_SHORT="${BASE_POLICY_NAME#${TRAIN_OUTPUT_MODEL_PREFIX}_}"
-PROGRESS_BASE_SHORT="${PROGRESS_BASE_SHORT%_${TRAIN_OUTPUT_ACTION_TAG}_basewrist}"
+# Substring filter for `dagger_progress.sh --filter` so each progress refresh
+# is scoped EXACTLY to this run's training dirs, not to every lineage that
+# shares the same base_short. The old approach computed PROGRESS_BASE_SHORT
+# by stripping prefix + `_${TAG}_basewrist` from BASE_POLICY_NAME, but for
+# sweep iterations where BASE_POLICY_NAME ends in `_${RUN_TAG}_${BLENDS_TAG}`
+# (not `_basewrist`) the strip silently fails and the query matches no dirs.
+# Using BASE_POLICY_NAME (minus the model prefix) as a substring filter
+# matches lineage names that dagger_progress.sh constructs by stripping the
+# model prefix and the `_dag<N>` suffix — i.e. exactly this run's lineage.
+PROGRESS_LINEAGE_FILTER="${BASE_POLICY_NAME#${TRAIN_OUTPUT_MODEL_PREFIX}_}"
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -1357,6 +1571,10 @@ write_dagger_config_sidecar() {
     DAG_CFG_BASE_REPO="${BASE_REPO:-}" \
     DAG_CFG_USE_WEIGHTED_SAMPLING="$USE_WEIGHTED_SAMPLING" \
     DAG_CFG_DAGGER_DATA_FRACTION="$DAGGER_DATA_FRACTION" \
+    DAG_CFG_NORM_MODE="$NORM_MODE" \
+    DAG_CFG_RRT_OBSTACLE_CLEARANCE="$RRT_OBSTACLE_CLEARANCE" \
+    DAG_CFG_RRT_SELF_COLLISION_CLEARANCE="$RRT_SELF_COLLISION_CLEARANCE" \
+    DAG_CFG_RRT_SELF_COLLISION_SKIP_PAIRS="$RRT_SELF_COLLISION_SKIP_PAIRS" \
     DAG_CFG_WEIGHTED_REPO_IDS_JSON="${DAG_CFG_WEIGHTED_REPO_IDS_JSON:-[]}" \
     DAG_CFG_WEIGHTED_WEIGHTS_JSON="${DAG_CFG_WEIGHTED_WEIGHTS_JSON:-[]}" \
     DAG_CFG_WEIGHTED_STATS_PATHS_JSON="${DAG_CFG_WEIGHTED_STATS_PATHS_JSON:-[]}" \
@@ -1404,13 +1622,26 @@ config = {
         "initial_policy_path":    os.environ["DAG_CFG_INITIAL_POLICY_PATH"],
         "use_weighted_sampling":  os.environ["DAG_CFG_USE_WEIGHTED_SAMPLING"] == "true",
         "dagger_data_fraction":   float(os.environ["DAG_CFG_DAGGER_DATA_FRACTION"]),
+        "norm_mode":              os.environ["DAG_CFG_NORM_MODE"],
+        "rrt_obstacle_clearance":      float(os.environ["DAG_CFG_RRT_OBSTACLE_CLEARANCE"]) if os.environ.get("DAG_CFG_RRT_OBSTACLE_CLEARANCE") else None,
+        "rrt_self_collision_clearance": float(os.environ["DAG_CFG_RRT_SELF_COLLISION_CLEARANCE"]) if os.environ.get("DAG_CFG_RRT_SELF_COLLISION_CLEARANCE") else None,
+        "rrt_self_collision_skip_pairs": json.loads(os.environ["DAG_CFG_RRT_SELF_COLLISION_SKIP_PAIRS"]) if os.environ.get("DAG_CFG_RRT_SELF_COLLISION_SKIP_PAIRS") else None,
         "weighted_repo_ids":      json.loads(os.environ["DAG_CFG_WEIGHTED_REPO_IDS_JSON"]),
         "weighted_sample_weights": json.loads(os.environ["DAG_CFG_WEIGHTED_WEIGHTS_JSON"]),
         "weighted_stats_paths":   json.loads(os.environ["DAG_CFG_WEIGHTED_STATS_PATHS_JSON"]),
         "headless":               os.environ["DAG_CFG_HEADLESS"] == "true",
     },
     "orchestrator_invocation": {
-        "argv": json.loads(os.environ["DAG_CFG_ARGV_JSON"]),
+        # Sort argv lexicographically so two sidecars whose user-side invocations
+        # differ only in flag ORDER produce IDENTICAL JSON — diffing two
+        # config.json files then surfaces only real differences (added/removed/
+        # changed flags), not order noise. All consumers (`_argv_get_flag`,
+        # `dagger_cleanup_lineage.sh`, the reeval script) look up by `--<key>=`
+        # prefix and are order-independent. The original invocation order isn't
+        # load-bearing for reproducibility either since the orchestrator's arg
+        # parser uses `--key=value` form throughout (no positional or
+        # order-dependent args).
+        "argv": sorted(json.loads(os.environ["DAG_CFG_ARGV_JSON"])),
     },
 }
 out_path = os.environ["DAG_CFG_OUT_PATH"]
@@ -1521,6 +1752,22 @@ train_output_dir_for_round() {
         suffix="_${RETRAIN_SUFFIX}"
     fi
     echo "$LEROBOT_ROOT/outputs/training/${BASE_POLICY_NAME}${infix}_dag${round_n}${suffix}"
+}
+# Sibling "collision-filtered" policy paths/names. Used by step 6b which only
+# runs when --filter_blend_collisions is on. The sibling policy is trained on
+# the same data mix as step 6 but with raw blends replaced by `_nocoll`
+# siblings. We append `_nc` so the name differs from the raw policy without
+# clobbering it; the raw policy at `train_output_dir_for_round` stays
+# untouched.
+nocoll_train_output_dir_for_round() {
+    local round_n="$1"
+    echo "$(train_output_dir_for_round "$round_n")_nc"
+}
+# Filename of nocoll_train_output_dir = the canonical policy.repo_id we use
+# for the sibling policy (kept consistent with how step 6 derives FT_RUN_NAME
+# from BASE_POLICY_NAME).
+nocoll_run_name_for_round() {
+    basename "$(nocoll_train_output_dir_for_round "$1")"
 }
 # Back-compat aliases. They both call through to the mode-aware function
 # so external scripts that referenced the old function names keep working.
@@ -1779,8 +2026,21 @@ start_sim() {
         echo "  Either kill it, change --env_external_port, or pass --no_manage_splatsim." >&2
         exit 1
     fi
-    mkdir -p "$LEROBOT_ROOT/outputs/dagger"
-    MANAGED_SIM_LOG="$LEROBOT_ROOT/outputs/dagger/splatsim_$(date +%Y%m%d_%H%M%S).log"
+    # Sim log lives inside the current round's training dir/dagger/ when a
+    # round number is in scope ($r set by the per-round loop), else falls
+    # back to the legacy shared location. Co-locating with the round
+    # artifacts means dagger_cleanup_lineage.sh wipes the log automatically
+    # when it rm's the round's training dir — no more 600+ orphan logs
+    # accumulating under outputs/dagger/.
+    local _log_dir=""
+    if [[ -n "${r:-}" ]] && declare -F train_output_dir_for_round >/dev/null; then
+        _log_dir="$(train_output_dir_for_round "$r")/dagger"
+    fi
+    if [[ -z "$_log_dir" ]]; then
+        _log_dir="$LEROBOT_ROOT/outputs/dagger"
+    fi
+    mkdir -p "$_log_dir"
+    MANAGED_SIM_LOG="$_log_dir/splatsim_$(date +%Y%m%d_%H%M%S).log"
     local launch_cmd=(
         python scripts/launch_nodes.py
         --robot              "$SPLATSIM_ROBOT"
@@ -1789,6 +2049,17 @@ start_sim() {
         --robot_name         "$SPLATSIM_ROBOT_NAME"
         --eval_benchmark_repo_id "$EVAL_BENCHMARK_REPO_ID"
     )
+    # When the orchestrator's skip-succeeded path computed a per-round
+    # failed-only subset, pass it through to launch_nodes.py so SplatSim's
+    # internal `_eval_benchmark_subset` matches what lerobot's
+    # --env.eval_benchmark_subset says. Empty = SplatSim defaults to the
+    # full subset (legacy behavior). The variable holds a comma-separated
+    # string ("3,7,10,23,25"); tyro expects each int as its own argv slot,
+    # so split on commas before appending.
+    if [[ -n "${EVAL_BENCHMARK_SUBSET_FOR_SIM:-}" ]]; then
+        IFS=',' read -ra _ebs_arr <<< "$EVAL_BENCHMARK_SUBSET_FOR_SIM"
+        launch_cmd+=( --eval_benchmark_subset "${_ebs_arr[@]}" )
+    fi
     # --headless connects pybullet via p.DIRECT instead of p.GUI — no
     # visualizer window, ~50% less GPU memory, faster startup. Mirrors what
     # start_filter_sim() does unconditionally for the collision-filter sim.
@@ -1883,9 +2154,22 @@ start_filter_sim() {
     fi
     if [[ "$DRY_RUN" == true ]]; then
         [[ "$MANAGED_FILTER_SIM_PID" == "DRYRUN" ]] && return 0
+        # Reuse the same clearance-scraping the live path does so the dry-run
+        # preview matches what would actually be invoked. `|| true` because
+        # grep exits non-zero when the flag is absent and `set -eo pipefail`
+        # would otherwise abort the dry-run.
+        local _dr_obs_clr _dr_self_clr
+        _dr_obs_clr="$({ printf '%s' "$INTERVENTION_EXTRA_ARGS" \
+            | grep -oE -- '--policy\.shared_autonomy_config\.rrt_obstacle_clearance=[0-9.eE+-]+' \
+            | tail -1 | sed -E 's/.*=//'; } || true)"
+        _dr_self_clr="$({ printf '%s' "$INTERVENTION_EXTRA_ARGS" \
+            | grep -oE -- '--policy\.shared_autonomy_config\.rrt_self_collision_clearance=[0-9.eE+-]+' \
+            | tail -1 | sed -E 's/.*=//'; } || true)"
+        : "${_dr_obs_clr:=0.0}"
+        : "${_dr_self_clr:=0.0}"
         echo "[DRY-RUN] would start HEADLESS SplatSim on port $FILTER_COLLISION_ENV_PORT_RESOLVED:"
         echo "[DRY-RUN]   cwd: $SPLATSIM_ROOT"
-        echo "[DRY-RUN]   cmd: python scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $FILTER_COLLISION_ENV_PORT_RESOLVED --hostname $ENV_EXTERNAL_HOST --robot_name $SPLATSIM_ROBOT_NAME --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID --headless"
+        echo "[DRY-RUN]   cmd: python scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $FILTER_COLLISION_ENV_PORT_RESOLVED --hostname $ENV_EXTERNAL_HOST --robot_name $SPLATSIM_ROBOT_NAME --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID --in_collision_obstacle_clearance $_dr_obs_clr --in_collision_self_collision_clearance $_dr_self_clr --headless"
         MANAGED_FILTER_SIM_PID="DRYRUN"
         return 0
     fi
@@ -1899,8 +2183,38 @@ start_filter_sim() {
         echo "  Either kill it, change --filter_collision_env_port, or skip the filter step." >&2
         exit 1
     fi
-    mkdir -p "$LEROBOT_ROOT/outputs/dagger"
-    MANAGED_FILTER_SIM_LOG="$LEROBOT_ROOT/outputs/dagger/splatsim_filter_$(date +%Y%m%d_%H%M%S).log"
+    # Same per-round-dir co-location as start_sim above. Filter sim is only
+    # invoked from step 2 (blend collision filtering), which always runs in
+    # a per-round context, so $r is reliably in scope here.
+    local _flog_dir=""
+    if [[ -n "${r:-}" ]] && declare -F train_output_dir_for_round >/dev/null; then
+        _flog_dir="$(train_output_dir_for_round "$r")/dagger"
+    fi
+    if [[ -z "$_flog_dir" ]]; then
+        _flog_dir="$LEROBOT_ROOT/outputs/dagger"
+    fi
+    mkdir -p "$_flog_dir"
+    MANAGED_FILTER_SIM_LOG="$_flog_dir/splatsim_filter_$(date +%Y%m%d_%H%M%S).log"
+    # Sync the filter sim's collision clearances with the SA wrapper's RRT
+    # clearances. Without this, the filter would judge a frame "collision"
+    # only on actual contact (0 m) while RRT plans treat anything within
+    # `rrt_*_clearance` as a collision — the filter's `_nocoll` survivors
+    # would still include trajectories RRT itself would reject.
+    # We scrape the two values from $INTERVENTION_EXTRA_ARGS so the
+    # filter follows whatever the user set on the wrapper. Defaults to 0
+    # when those flags aren't present (preserves the env's historical
+    # behavior).
+    local _filter_obs_clr _filter_self_clr
+    # `|| true` because grep exits non-zero when the flag is absent and
+    # `set -eo pipefail` would otherwise abort start_filter_sim.
+    _filter_obs_clr="$({ printf '%s' "$INTERVENTION_EXTRA_ARGS" \
+        | grep -oE -- '--policy\.shared_autonomy_config\.rrt_obstacle_clearance=[0-9.eE+-]+' \
+        | tail -1 | sed -E 's/.*=//'; } || true)"
+    _filter_self_clr="$({ printf '%s' "$INTERVENTION_EXTRA_ARGS" \
+        | grep -oE -- '--policy\.shared_autonomy_config\.rrt_self_collision_clearance=[0-9.eE+-]+' \
+        | tail -1 | sed -E 's/.*=//'; } || true)"
+    : "${_filter_obs_clr:=0.0}"
+    : "${_filter_self_clr:=0.0}"
     local launch_cmd=(
         python scripts/launch_nodes.py
         --robot              "$SPLATSIM_ROBOT"
@@ -1908,6 +2222,8 @@ start_filter_sim() {
         --hostname           "$ENV_EXTERNAL_HOST"
         --robot_name         "$SPLATSIM_ROBOT_NAME"
         --eval_benchmark_repo_id "$EVAL_BENCHMARK_REPO_ID"
+        --in_collision_obstacle_clearance "$_filter_obs_clr"
+        --in_collision_self_collision_clearance "$_filter_self_clr"
         --headless
     )
     echo "Starting HEADLESS SplatSim (for collision filter):"
@@ -1963,6 +2279,15 @@ stop_filter_sim() {
 trap 'stop_sim; stop_filter_sim' EXIT
 
 # ── pre-flight: validate every round's derived names ──────────────────────────
+# Skipped in --cleanup_only mode: that path only deletes already-existing
+# artifacts and never creates new datasets, so the 56-char HuggingFace
+# repo-name limit doesn't apply. Without this gate, cleanup of lineages built
+# before the limit was enforced (or with a longer-than-allowed --run_tag /
+# --blends combo) would error out at this step and the user would be unable
+# to delete them via dagger_cleanup_lineage.sh.
+if [[ "$CLEANUP_ONLY" == true ]]; then
+    echo "Pre-flight: SKIPPED (--cleanup_only — only deleting existing artifacts; their names don't need to satisfy the 56-char HF limit)."
+else
 echo "Pre-flight: validating derived repo names for $NUM_ROUNDS rounds..."
 ANY_NAME_TOO_LONG=false
 ALIAS_NAMES_OVERFLOW=false
@@ -1987,6 +2312,21 @@ for r in $(seq 1 "$NUM_ROUNDS"); do
             ALIAS_NAMES_OVERFLOW=true
         fi
     fi
+    # Step 6b (collision-filtered sibling policy): validate the policy.repo_id
+    # length. Used as --policy.repo_id (wandb run name + HF push target if
+    # push_to_hub=true). Wandb's run-name limit is 128 chars; HF Hub's
+    # repo-name limit is 96. We validate against 128 so non-push runs can
+    # still use long lineage names — the user will hit HF's 96 separately
+    # at push time if they enable that. Append `_nc` to the existing dir name.
+    if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
+        _nc_name="$(nocoll_run_name_for_round "$r")"
+        if (( ${#_nc_name} > 128 )); then
+            echo "ERROR: nocoll sibling policy name exceeds 128 chars (${#_nc_name}): '$_nc_name'" >&2
+            echo "  Step 6b (--filter_blend_collisions) appends '_nc' to each round's training dir." >&2
+            echo "  Shorten the lineage somewhere upstream (e.g. --run_tag, --base_short, or --dag_short_override)." >&2
+            ANY_NAME_TOO_LONG=true
+        fi
+    fi
 done
 if [[ "$ANY_NAME_TOO_LONG" == true ]]; then
     echo "ERROR: one or more derived repo names violate the 56-char limit or other rules." >&2
@@ -2005,6 +2345,7 @@ if [[ "$ANY_NAME_TOO_LONG" == true ]]; then
     exit 1
 fi
 echo "  ✓ all derived names valid (alias step: $([ "$SKIP_ALIAS_STEP" == true ] && echo SKIPPED || echo enabled))."
+fi  # end of `if [[ "$CLEANUP_ONLY" == true ]]; then ... else ...`
 echo
 
 # ── mode-purity validation ────────────────────────────────────────────────────
@@ -2068,6 +2409,59 @@ print('true' if v else 'false')
     fi
     echo "  ✓ no prior weighted-mode artifacts; safe to run in merge mode."
 fi
+# Second mode-purity check: within weighted mode, the chosen --norm_mode
+# must match any prior round's sidecar. Switching norm_mode mid-lineage
+# (e.g. r1..r3 were trained with norm_mode=aggregated, then r4 attempts
+# norm_mode=base_only) would silently change the normalization the policy
+# expects, producing a hard distribution shift at finetune. Reject so the
+# user picks a fresh --run_tag instead.
+#
+# Skipped in --cleanup_only mode: we're just rm-rf'ing existing artifacts,
+# so a norm_mode mismatch between the resumed-via-sidecar argv and the
+# prior rounds doesn't matter (no training happens). Same logic as the
+# rerun-mode source-existence guard above.
+if [[ "$USE_WEIGHTED_SAMPLING" == "true" && "$CLEANUP_ONLY" != true ]]; then
+    _norm_conflicting=()
+    for _r in $(seq 1 "$NUM_ROUNDS"); do
+        _train_dir="$(train_output_dir_for_round "$_r")"
+        _sidecar="$_train_dir/dagger/config.json"
+        if [[ -f "$_sidecar" ]]; then
+            _prior_norm=$(python3 -c "
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+except Exception:
+    print('')
+    sys.exit()
+v = (c.get('config') or {}).get('norm_mode')
+print(v if v else '')
+" "$_sidecar" 2>/dev/null || echo "")
+            # Pre-norm_mode sidecars have no 'norm_mode' key. Their
+            # effective behavior was base_only (the --dataset.stats_path
+            # override; see the long comment in the finetune block).
+            # Treat absent → base_only for back-compat: a lineage built
+            # before this flag existed can only be safely resumed with
+            # --norm_mode=base_only.
+            [[ -z "$_prior_norm" ]] && _prior_norm="base_only"
+            if [[ "$_prior_norm" != "$NORM_MODE" ]]; then
+                _norm_conflicting+=( "round $_r: $_sidecar (norm_mode=$_prior_norm)" )
+            fi
+        fi
+    done
+    if (( ${#_norm_conflicting[@]} > 0 )); then
+        echo "ERROR: lineage has prior rounds with norm_mode != '$NORM_MODE'." >&2
+        echo "  Switching normalization mid-lineage would silently shift the policy's" >&2
+        echo "  input distribution. Conflicting sidecars:" >&2
+        for _c in "${_norm_conflicting[@]}"; do echo "    $_c" >&2; done
+        echo "  Resolve by either:" >&2
+        echo "    (1) re-running with --norm_mode=$_prior_norm to match the prior rounds, OR" >&2
+        echo "    (2) starting a new lineage under a different --run_tag." >&2
+        echo "  NOTE: pre-existing lineages without a recorded norm_mode are treated as" >&2
+        echo "        norm_mode=base_only for back-compat (the prior accidental behavior)." >&2
+        exit 1
+    fi
+    echo "  ✓ norm_mode='$NORM_MODE' is consistent with prior rounds (or no prior rounds)."
+fi
 echo
 
 # ── headless-mode banner ──────────────────────────────────────────────────────
@@ -2089,13 +2483,12 @@ fi
 declare -a ROUND_COMPLETED_STEPS  # parallel array indexed 1..N
 ROUND_COMPLETED_STEPS[0]=0  # unused
 
-# Per-round blend completion check. Step 2 is "all blend datasets (one per
-# ratio in $BLENDS) exist AND their stats sidecars exist". Empty $BLENDS →
-# vacuously true (step 2 is a no-op when no blends are configured).
-all_blends_complete_for_round() {
+# Per-round raw-blend completion check. Required for step 6 (the un-filtered
+# policy training). Empty $BLENDS → vacuously true.
+raw_blends_complete_for_round() {
     local r="$1"
     (( ${#BLENDS[@]} == 0 )) && return 0
-    local R blend_repo blend_short nocoll_repo nocoll_short
+    local R blend_repo blend_short
     for R in "${BLENDS[@]}"; do
         blend_repo="$(blend_repo_for_round "$r" "$R")"
         blend_short="$(blend_short_for_round "$r" "$R")"
@@ -2103,19 +2496,37 @@ all_blends_complete_for_round() {
         if [[ "$ACTION_FORMAT" == "rel" ]]; then
             stats_exists "$blend_short" || return 1
         fi
-        # When collision filtering is on, step 2 isn't complete until each
-        # blend has a `_nocoll` sibling on disk too (with its own stats
-        # sidecar for rel mode). The filter step is idempotent — if these
-        # exist, step 2 short-circuits and goes straight to step 3.
-        if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
-            nocoll_repo="$(nocoll_repo_for_round "$r" "$R")"
-            nocoll_short="$(nocoll_short_for_round "$r" "$R")"
-            dataset_exists "$nocoll_repo" || return 1
-            if [[ "$ACTION_FORMAT" == "rel" ]]; then
-                stats_exists "$nocoll_short" || return 1
-            fi
+    done
+    return 0
+}
+
+# Per-round `_nocoll`-sibling completion check. Required for step 6b (the
+# collision-filtered sibling policy). Only meaningful when
+# --filter_blend_collisions is on; empty $BLENDS → vacuously true.
+nocoll_blends_complete_for_round() {
+    local r="$1"
+    (( ${#BLENDS[@]} == 0 )) && return 0
+    local R nocoll_repo nocoll_short
+    for R in "${BLENDS[@]}"; do
+        nocoll_repo="$(nocoll_repo_for_round "$r" "$R")"
+        nocoll_short="$(nocoll_short_for_round "$r" "$R")"
+        dataset_exists "$nocoll_repo" || return 1
+        if [[ "$ACTION_FORMAT" == "rel" ]]; then
+            stats_exists "$nocoll_short" || return 1
         fi
     done
+    return 0
+}
+
+# Per-round step-2 completion = raw blends always; nocoll siblings additionally
+# when --filter_blend_collisions is on. The execution side (step 2 in the
+# round loop) is idempotent: short-circuits if these already exist.
+all_blends_complete_for_round() {
+    local r="$1"
+    raw_blends_complete_for_round "$r" || return 1
+    if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
+        nocoll_blends_complete_for_round "$r" || return 1
+    fi
     return 0
 }
 
@@ -2134,9 +2545,28 @@ for r in $(seq 1 "$NUM_ROUNDS"); do
     # its stats sidecar may have been legitimately deleted by step 7 cleanup
     # in the next round). Without this short-circuit, a sequential counter
     # would mark a fully-completed round as PARTIAL whenever cleanup ran.
+    #
+    # Note on --filter_blend_collisions: blends + _nocoll siblings are NEVER
+    # cleaned (step 7 only touches the merged dataset). When the flag is on,
+    # step 6 still trains the un-filtered (raw blend) policy with its
+    # existing name — the filter produces an ADDITIONAL sibling policy
+    # in a new step (6b) named with a _nocoll suffix. That step has its
+    # own completeness check; it doesn't affect step 6's resume detection.
     if dataset_exists "$int_repo" \
-       && { training_exists "$ft_dir" || training_exists "$scratch_dir"; }; then
+       && { training_exists "$ft_dir" || training_exists "$scratch_dir"; } \
+       && all_blends_complete_for_round "$r"; then
         step=6
+        # Step 6b — collision-filtered sibling policy. Only meaningful when
+        # --filter_blend_collisions is on. If its training output doesn't
+        # exist yet, demote to step=5 so the orchestrator re-enters this
+        # round at step 6+. Step 6 will no-op (raw policy already at target
+        # step, lerobot-train detects that), then step 6b will run and
+        # produce the nocoll sibling.
+        if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]] && (( ${#BLENDS[@]} > 0 )); then
+            if ! training_exists "$(nocoll_train_output_dir_for_round "$r")"; then
+                step=5
+            fi
+        fi
     else
         # Step 1 = record + stats-on-int (folded). Requires BOTH the dataset
         # AND its rel-action stats sidecar (when ACTION_FORMAT=rel). When the
@@ -2284,6 +2714,14 @@ if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
     echo "  5. (SKIPPED — --use_weighted_sampling) Merged-dataset rel-action stats"
     echo "  6. Train policy ($INTERMEDIATE_MODE) on weighted union of {base + every round's intervention + every round's blends}"
     echo "     → per-source DataLoader weights: base=$(python3 -c "print(round(1-float('$DAGGER_DATA_FRACTION'), 4))"), DAgger=${DAGGER_DATA_FRACTION} split equally across DAgger sub-datasets"
+    case "$NORM_MODE" in
+        aggregated)
+            echo "     → norm_mode=aggregated: policy normalizer/unnormalizer use min-of-mins / max-of-maxes / count-weighted mean+std over ALL sub-datasets."
+            ;;
+        base_only)
+            echo "     → norm_mode=base_only: policy normalizer/unnormalizer use ONLY source[0] (base) stats; intervention rows may normalize OUTSIDE [-1,1]."
+            ;;
+    esac
 else
     echo "  4. Cumulative merge: base + dag1[..dag${NUM_ROUNDS}] → training dataset"
     echo "  5. Compute sidecar relative-action stats for the merged dataset"
@@ -2351,6 +2789,11 @@ restart_from_scratch() {
         RESTART_PATHS+=( "$LEROBOT_CACHE/$(merged_repo_for_round "$r")" )
         RESTART_PATHS+=( "$STATS_BASE/$(merged_short_for_round "$r")" )
         RESTART_PATHS+=( "$(train_output_dir_for_round "$r")" )
+        # Collision-filtered sibling policy dir (step 6b). rm -rf is
+        # idempotent on missing paths, so safe to include even for
+        # lineages built without --filter_blend_collisions. Use the
+        # _DIR_ variant (full path), not _RUN_NAME (basename only).
+        RESTART_PATHS+=( "$(nocoll_train_output_dir_for_round "$r")" )
         # Blended-intervention datasets + their rel-action stats sidecars,
         # one per ratio in $BLENDS. No-op when $BLENDS is empty.
         # In rerun mode blends are cross-rerun-cacheable (see comment on
@@ -2538,6 +2981,29 @@ elif [[ "$FORCE_RESTART" == true ]]; then
                 run_or_echo rm -rf "$LEROBOT_CACHE/$(nocoll_repo_for_round "$r" "$R")"
                 run_or_echo rm -rf "$STATS_BASE/$(nocoll_short_for_round "$r" "$R")"
             done
+            # Glob-based sweep of orphaned blends. The explicit BLENDS loop
+            # above only catches blends THIS lineage was launched with —
+            # but blends use SOURCE'S naming (per CLAUDE.md, deterministic
+            # cross-rerun cache reuse), so when cleaning up a SOURCE
+            # lineage, BLENDS is empty (source never used them) and the
+            # orphan blends created by rerun lineages survive. Without
+            # this sweep, source cleanup leaves 40+ orphaned `_blend*` and
+            # `_blend*_nocoll` datasets that get reused as stale cache by
+            # the next rerun. Bash globbing wrapped in `|| true` to keep
+            # `set -e` happy when no files match.
+            # Cache path uses the full repo id (HF_USER/<int_short>); stats
+            # uses just the short. Mirror the explicit-loop paths above so
+            # we glob the right directories.
+            _BLEND_GLOB_BASE="$LEROBOT_CACHE/$(int_repo_for_round "$r")_blend"
+            for orphan in "$_BLEND_GLOB_BASE"*; do
+                [[ -e "$orphan" ]] || continue
+                run_or_echo rm -rf "$orphan"
+            done
+            _BLEND_STATS_GLOB_BASE="$STATS_BASE/$(int_short_for_round "$r")_blend"
+            for orphan in "$_BLEND_STATS_GLOB_BASE"*; do
+                [[ -e "$orphan" ]] || continue
+                run_or_echo rm -rf "$orphan"
+            done
         fi
         # New layout nests interventions under the training dir
         # (<train>/dagger/...), so this rm already takes them out.
@@ -2545,6 +3011,15 @@ elif [[ "$FORCE_RESTART" == true ]]; then
         # Legacy intervention layouts kept here for back-compat:
         run_or_echo rm -rf "$LEROBOT_ROOT/outputs/dagger/$(basename "$(train_output_dir_for_round "$r")")"
         run_or_echo rm -rf "$LEROBOT_ROOT/outputs/dagger/round_${r}"
+        # Collision-filtered sibling policy dir (step 6b, --filter_blend_collisions).
+        # Always attempted; rm -rf is a no-op when the dir doesn't exist, so
+        # this is safe for lineages built without --filter_blend_collisions.
+        # Without this, full cleanup leaves orphan _nc training dirs that
+        # the user then has to clean up via a second --nc_only pass. Use
+        # the _DIR_ variant (full path); _RUN_NAME returns basename only.
+        _NC_TRAIN_DIR="$(nocoll_train_output_dir_for_round "$r")"
+        run_or_echo rm -rf "$_NC_TRAIN_DIR"
+        run_or_echo rm -rf "$LEROBOT_ROOT/outputs/dagger/$(basename "$_NC_TRAIN_DIR")"
     done
     do_final_scratch && run_or_echo rm -rf "$(train_output_dir_final_scratch)"
     if [[ "$CLEANUP_ONLY" == true ]]; then
@@ -2886,6 +3361,16 @@ fi
 # checkpoint to source as input). Otherwise it runs through round $NUM_ROUNDS.
 EFFECTIVE_END_ROUND="$NUM_ROUNDS"
 [[ -n "$RETRAIN_ROUND" ]] && EFFECTIVE_END_ROUND="$RETRAIN_ROUND"
+
+# Track which subset the long-running SplatSim is currently configured for.
+# Initialized ONCE here (before the round loop) so per-round comparisons
+# in the round body correctly detect "subset changed across rounds" instead
+# of re-resetting to empty every round (which would force a useless restart
+# every time the user happens to want the same failed subset two rounds
+# in a row). Updated at the actual start_sim call site (search
+# EVAL_BENCHMARK_SUBSET_FOR_SIM below).
+EVAL_BENCHMARK_SUBSET_CURRENT_SIM=""
+
 for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
     INT_SHORT="$(int_short_for_round "$r")"
     INT_REPO="$(int_repo_for_round "$r")"
@@ -2953,7 +3438,67 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
     # gate including step 2, blending would race against a possibly-dead
     # sim from a prior run.
     if (( STEP <= 2 )); then
+        # Compute the per-round failed-only subset BEFORE start_sim so the
+        # initial launch uses the correct subset directly. (Putting this
+        # AFTER start_sim caused a wasteful stop+restart on every round
+        # that needed a non-default subset.) The block also sets the
+        # downstream SUBSET_ARG and EFFECTIVE_N_EPISODES_FOR_INT used by
+        # the step-1 lerobot-eval call below, so we need to run it
+        # whether or not we end up launching/restarting the sim here.
+        EVAL_BENCHMARK_SUBSET_FOR_SIM=""
+        SUBSET_ARG=()
+        if [[ -n "$INTERVENTION_SUBSET_JSON" ]]; then
+            SUBSET_ARG+=( "--env.eval_benchmark_subset=$INTERVENTION_SUBSET_JSON" )
+        fi
+        EFFECTIVE_N_EPISODES_FOR_INT="$INTERVENTION_N_EPISODES"
+        if [[ "$DAGGER_SKIP_SUCCEEDED_IN_PREV_EVAL" == "true" && "$r" -gt 1 ]]; then
+            PREV_TRAIN_OUTPUT_DIR=$(train_output_dir_for_round "$((r - 1))")
+            FAILED_JSON=""
+            FAILED_RC=0
+            FAILED_JSON=$(python3 "$SCRIPT_DIR/dagger_failed_scenarios.py" \
+                --prev_train_dir="$PREV_TRAIN_OUTPUT_DIR" 2>&1) || FAILED_RC=$?
+            if (( FAILED_RC == 0 )); then
+                FAILED_CSV=$(echo "$FAILED_JSON" | python3 -c \
+                    "import sys,json; d=json.load(sys.stdin); print(','.join(str(x) for x in d['failed']))")
+                N_FAILED=$(echo "$FAILED_JSON" | python3 -c \
+                    "import sys,json; print(json.load(sys.stdin)['n_failed'])")
+                N_TOTAL_PRIOR=$(echo "$FAILED_JSON" | python3 -c \
+                    "import sys,json; print(json.load(sys.stdin)['n_total'])")
+                if (( N_FAILED > 0 )); then
+                    SUBSET_ARG=( "--env.eval_benchmark_subset=[$FAILED_CSV]" )
+                    EFFECTIVE_N_EPISODES_FOR_INT="$N_FAILED"
+                    EVAL_BENCHMARK_SUBSET_FOR_SIM="$FAILED_CSV"
+                    echo "  [skip_succeeded] round $r targeting $N_FAILED/$N_TOTAL_PRIOR scenarios "\
+"that failed in round $((r - 1))'s training-time eval: [$FAILED_CSV]"
+                else
+                    echo "  [skip_succeeded] round $((r - 1)) had 100% success "\
+"($N_TOTAL_PRIOR/$N_TOTAL_PRIOR); falling back to full subset for round $r"
+                fi
+            else
+                echo "  [skip_succeeded] no usable prior eval data under "\
+"$PREV_TRAIN_OUTPUT_DIR (rc=$FAILED_RC); falling back to full subset for round $r"
+                echo "$FAILED_JSON" | sed 's/^/    /' | head -3
+            fi
+        elif [[ "$DAGGER_SKIP_SUCCEEDED_IN_PREV_EVAL" != "true" ]]; then
+            echo "  [skip_succeeded] disabled — running interventions on full subset"
+        fi
+        # Restart-if-subset-changed: when SplatSim is already running with
+        # a DIFFERENT subset from a prior round, tear it down first so the
+        # next start_sim launches fresh with the correct one. start_sim
+        # is a no-op when sim is still running, so without this stop_sim
+        # the relaunch wouldn't happen.
+        if [[ "$MANAGE_SPLATSIM" == "true" \
+              && -n "${MANAGED_SIM_PID:-}" \
+              && "${MANAGED_SIM_PID:-}" != "DRYRUN" ]] \
+           && kill -0 "${MANAGED_SIM_PID:-}" 2>/dev/null \
+           && [[ "$EVAL_BENCHMARK_SUBSET_FOR_SIM" != "$EVAL_BENCHMARK_SUBSET_CURRENT_SIM" ]]; then
+            _from="${EVAL_BENCHMARK_SUBSET_CURRENT_SIM:-<default>}"
+            _to="${EVAL_BENCHMARK_SUBSET_FOR_SIM:-<default>}"
+            echo "  [splat-restart] subset changed: '$_from' → '$_to'; tearing down + relaunching SplatSim"
+            stop_sim
+        fi
         start_sim
+        EVAL_BENCHMARK_SUBSET_CURRENT_SIM="$EVAL_BENCHMARK_SUBSET_FOR_SIM"
     fi
 
     # Step 1: Record interventions (or in rerun mode, validate source).
@@ -3019,12 +3564,12 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
     fi
     if (( STEP <= 1 )) && [[ "${STEP_1_REUSED:-false}" != "true" ]] && [[ "${STEP_1_PRESERVED:-false}" != "true" ]]; then
         echo "--- Round $r, Step 1: record interventions ---"
-        # Optional --env.eval_benchmark_subset for random-sample mode. When
-        # empty, lerobot-eval defaults to the first N scenarios.
-        SUBSET_ARG=()
-        if [[ -n "$INTERVENTION_SUBSET_JSON" ]]; then
-            SUBSET_ARG+=( "--env.eval_benchmark_subset=$INTERVENTION_SUBSET_JSON" )
-        fi
+        # SUBSET_ARG, EFFECTIVE_N_EPISODES_FOR_INT, and SplatSim's launch
+        # subset are all decided earlier in this iteration (before the
+        # round's first start_sim) — see the EVAL_BENCHMARK_SUBSET_FOR_SIM
+        # block above. By the time we reach here, SplatSim is already
+        # running with the right subset for this round.
+        #
         # Offline-mode flag: skip the TeleopRecording dataset push when
         # --push_to_hub is NOT set on the orchestrator (the default). When
         # the user opts in with --push_to_hub, omit this flag so the
@@ -3062,6 +3607,23 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
         if [[ "$HEADLESS" == true ]]; then
             HEADLESS_EVAL_ARG=( --policy.shared_autonomy_config.show_slider=false )
         fi
+        # Dedicated RRT-clearance args forwarded as SA-config fields. Kept
+        # separate from --intervention_extra_args so they're individually
+        # discoverable in --help, validated at parse time, and recorded in
+        # the sidecar's `config` block as their own fields rather than
+        # buried in a free-form string. Empty → omit, letting
+        # RRTToGoalPlanner fall through to SplatSim's defaults
+        # (_COLLISION_CLEARANCE = 0.01 m, self = 0.0 m).
+        RRT_CLEARANCE_ARGS=()
+        if [[ -n "$RRT_OBSTACLE_CLEARANCE" ]]; then
+            RRT_CLEARANCE_ARGS+=( "--policy.shared_autonomy_config.rrt_obstacle_clearance=$RRT_OBSTACLE_CLEARANCE" )
+        fi
+        if [[ -n "$RRT_SELF_COLLISION_CLEARANCE" ]]; then
+            RRT_CLEARANCE_ARGS+=( "--policy.shared_autonomy_config.rrt_self_collision_clearance=$RRT_SELF_COLLISION_CLEARANCE" )
+        fi
+        if [[ -n "$RRT_SELF_COLLISION_SKIP_PAIRS" ]]; then
+            RRT_CLEARANCE_ARGS+=( "--policy.shared_autonomy_config.rrt_self_collision_skip_pairs=$RRT_SELF_COLLISION_SKIP_PAIRS" )
+        fi
         # shellcheck disable=SC2086  # INTERVENTION_EXTRA_ARGS may contain multiple flags
         run_or_echo lerobot-eval \
             --policy.path="$CURRENT_POLICY" \
@@ -3075,7 +3637,7 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             --env.episode_length="$INTERVENTION_MAX_EPISODE_LENGTH" \
             --env.eval_benchmark_repo_id="$EVAL_BENCHMARK_REPO_ID" \
             --env.teleop_dataset_repo_id="$INT_REPO" \
-            --eval.n_episodes="$INTERVENTION_N_EPISODES" \
+            --eval.n_episodes="$EFFECTIVE_N_EPISODES_FOR_INT" \
             --eval.batch_size=1 \
             --eval.use_async_envs=false \
             --seed=0 \
@@ -3085,6 +3647,7 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             "${SUBSET_ARG[@]}" \
             "${OFFLINE_DATASET_ARG[@]}" \
             "${HEADLESS_EVAL_ARG[@]}" \
+            "${RRT_CLEARANCE_ARGS[@]}" \
             $INTERVENTION_EXTRA_ARGS
 
         # Stats on the intervention dataset (relative-action sidecar).
@@ -3180,6 +3743,12 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
                     echo "  ratio=$R → $NOCOLL_REPO already on disk (with stats); skipping filter."
                 else
                     echo "  ratio=$R → producing $NOCOLL_REPO via filter_blend_collisions.py (headless sim)"
+                    # Per-episode CSV with the filter's kept/dropped decisions
+                    # lands under <train_dir>/dagger/blend_collision_filter/ so
+                    # the audit trail travels with the lineage's other dagger
+                    # sidecars. One CSV per ratio per round; filename is
+                    # <NOCOLL_SHORT>.csv (matches the target dataset).
+                    FILTER_OUTPUT_DIR="$TRAIN_OUTPUT_DIR/dagger/blend_collision_filter"
                     start_filter_sim
                     # shellcheck disable=SC2086  # FILTER_COLLISION_EXTRA_ARGS may contain multiple flags
                     run_or_echo python "$SCRIPT_DIR/filter_blend_collisions.py" \
@@ -3190,6 +3759,7 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
                         --env_external_port="$FILTER_COLLISION_ENV_PORT_RESOLVED" \
                         --env_external_host="$ENV_EXTERNAL_HOST" \
                         --env_eval_benchmark_repo_id="$EVAL_BENCHMARK_REPO_ID" \
+                        --output_dir="$FILTER_OUTPUT_DIR" \
                         $FILTER_COLLISION_EXTRA_ARGS
                     # Stats sidecar for the filtered dataset.
                     if [[ "$ACTION_FORMAT" == "rel" ]]; then
@@ -3207,8 +3777,18 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
     # dataset ops (alias / merge / stats); step 6 spawns its own in-process
     # sim for inline eval. Idempotent + gated to mirror the start_sim above,
     # so a resume at STEP>=3 (sim never started) is a clean no-op.
+    # Also stop the auxiliary collision-filter sim. It runs with STRICTER
+    # collision clearances than the main sim (forwarded from the SA wrapper's
+    # rrt_*_clearance values via start_filter_sim) — and the only consumer is
+    # step 2's `filter_blend_collisions.py` invocation, which has already
+    # completed by here. Stopping it now (rather than waiting for the EXIT
+    # trap) prevents the filter sim from sitting idle through steps 3-6 /
+    # step 6b and rules out any chance of a later step accidentally
+    # connecting to its port and inheriting the stricter semantics.
+    # Idempotent — no-op when MANAGED_FILTER_SIM_PID is empty.
     if (( STEP <= 2 )); then
         stop_sim
+        stop_filter_sim
     fi
 
     # Step 3: Hardlink-alias via augment_ratios_sweep.sh ratio=0 branch.
@@ -3232,7 +3812,9 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
     # multi-dataset path (--dataset.repo_ids + sample_weights + stats_paths)
     # and the DataLoader's WeightedRandomSampler picks per-source frames at
     # the target ratio; no on-disk merged dataset is needed.
-    if (( STEP <= 4 )) && [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
+    if (( STEP <= 4 )) && [[ "$PURE_POLICY_MODE" == "true" ]]; then
+        echo "--- Round $r, Step 4: SKIPPED (PURE_POLICY_MODE; training uses base dataset only, no merge needed) ---"
+    elif (( STEP <= 4 )) && [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
         echo "--- Round $r, Step 4: SKIPPED (--use_weighted_sampling; no merged dataset needed) ---"
     elif (( STEP <= 4 )); then
         echo "--- Round $r, Step 4: cumulative merge → $MERGED_REPO ---"
@@ -3357,7 +3939,9 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
     # ACTION_FORMAT=rel — see Step 2 comment). SKIPPED in weighted mode (no
     # merged dataset exists; per-source sidecars from step 1b/2b are what
     # step 6 consumes via --dataset.stats_paths).
-    if (( STEP <= 5 )) && [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
+    if (( STEP <= 5 )) && [[ "$PURE_POLICY_MODE" == "true" ]]; then
+        echo "--- Round $r, Step 5: SKIPPED (PURE_POLICY_MODE; no merged dataset to compute stats for) ---"
+    elif (( STEP <= 5 )) && [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
         echo "--- Round $r, Step 5: SKIPPED (--use_weighted_sampling; per-source stats sidecars already on disk from steps 1b/2b) ---"
     elif (( STEP <= 5 )); then
         if [[ "$ACTION_FORMAT" == "rel" ]]; then
@@ -3663,39 +4247,86 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                 # 1 raw + n_blends entries each (in that order).
                 W_REPO_IDS=( "$BASE_REPO" )
                 W_STATS_PATHS=( "$STATS_BASE/$BASE_REPO_DATASET_SHORT/stats_rel${FT_CHUNK}.json" )
+                # Step 6 always trains on RAW blends. Step 6b (the sibling
+                # nocoll policy, gated on --filter_blend_collisions) builds
+                # its own NC variants below.
                 for _p in $(seq 1 "$r"); do
                     _p_int_repo="$(int_repo_for_round "$_p")"
                     _p_int_short="$(int_short_for_round "$_p")"
                     W_REPO_IDS+=( "$_p_int_repo" )
                     W_STATS_PATHS+=( "$STATS_BASE/$_p_int_short/stats_rel${FT_CHUNK}.json" )
                     for _R in "${BLENDS[@]}"; do
-                        if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
-                            _b_repo="$(nocoll_repo_for_round "$_p" "$_R")"
-                            _b_short="$(nocoll_short_for_round "$_p" "$_R")"
-                        else
-                            _b_repo="$(blend_repo_for_round "$_p" "$_R")"
-                            _b_short="$(blend_short_for_round "$_p" "$_R")"
-                        fi
+                        _b_repo="$(blend_repo_for_round "$_p" "$_R")"
+                        _b_short="$(blend_short_for_round "$_p" "$_R")"
                         W_REPO_IDS+=( "$_b_repo" )
                         W_STATS_PATHS+=( "$STATS_BASE/$_b_short/stats_rel${FT_CHUNK}.json" )
                     done
                 done
-                # Equal-share semantics: base gets (1 - f); the remaining f is
-                # split equally across every DAgger sub-dataset. Use python3
-                # for the float math (last weight absorbs rounding so the sum
-                # matches 1.0 exactly within the validator's ±0.001 epsilon).
+                # Two-level allotment:
+                #   * Base gets a fixed (1 - f) share regardless of frame counts.
+                #   * The remaining f is split EQUALLY across the R DAgger
+                #     rounds (each round gets f / R).
+                #   * Within each round, the round's allotment is split across
+                #     its sub-datasets (raw intervention + each blend variant)
+                #     PROPORTIONAL to their frame counts. This matters when
+                #     --filter_blend_collisions trims some blend datasets so
+                #     they're smaller than their raw sibling — without the
+                #     proportional split, an empty/tiny blend would still get
+                #     the same per-sub share as the much-larger raw intervention.
+                #
+                # Frame counts are read from the LeRobot dataset cache at
+                # ~/.cache/huggingface/lerobot/<repo>/meta/info.json. By the
+                # time this runs (orchestrator step 6), step 5 has already
+                # computed stats over every sub-dataset, so they're all on
+                # disk locally.
                 _n_dag=$(( ${#W_REPO_IDS[@]} - 1 ))
+                _n_blends=${#BLENDS[@]}
                 read -ra W_WEIGHTS <<< "$(python3 -c "
-import sys
+import os, sys, json
+
 f = float(sys.argv[1])
-n = int(sys.argv[2])
-base = 1.0 - f
-per = f / n
-weights = [base] + [per] * n
-# Force exact sum=1 by absorbing accumulated FP error into the LAST weight.
-weights[-1] = 1.0 - sum(weights[:-1])
+R = int(sys.argv[2])           # current round number (1..NUM_ROUNDS)
+group_size = 1 + int(sys.argv[3])  # 1 raw int + n_blends sub-datasets per round
+# In dry-run mode, datasets that step 2 would produce aren't actually on disk.
+# Fall back to equal-share weights so the printed command preview is still
+# usable. The real run re-derives proportional weights once step 2 has
+# materialized every nocoll sibling on disk.
+dry_run = sys.argv[4] == 'true'
+repo_ids = sys.argv[5:]
+# Layout: [base, r1_int, r1_blend_0, ..., r1_blend_(b-1), r2_int, ..., rR_blend_(b-1)]
+assert len(repo_ids) == 1 + R * group_size, (
+    f'repo_ids layout mismatch: got {len(repo_ids)}, expected 1 + {R}*{group_size}'
+)
+
+CACHE = os.path.expanduser('~/.cache/huggingface/lerobot')
+def frames_for(repo):
+    p = os.path.join(CACHE, repo, 'meta', 'info.json')
+    if not os.path.isfile(p):
+        if dry_run:
+            return 1  # placeholder so dry-run can still print a sample_weights list
+        raise FileNotFoundError(f'meta/info.json not found for {repo} at {p}')
+    return int(json.load(open(p))['total_frames'])
+
+per_round = f / R
+weights = [1.0 - f]
+for r_i in range(R):
+    group = repo_ids[1 + r_i*group_size : 1 + (r_i+1)*group_size]
+    counts = [frames_for(rep) for rep in group]
+    total = sum(counts)
+    if total <= 0:
+        raise ValueError(f'round {r_i+1}: all sub-datasets are empty ({list(zip(group, counts))})')
+    for c in counts:
+        weights.append(per_round * c / total)
+# Force exact sum=1 by absorbing FP error into the last non-zero weight
+# (avoid the last position if it's a 0-frame sub-dataset — the validator
+# would still accept it but the log would show a weird non-zero weight
+# on what's logically an empty source).
+for i in range(len(weights) - 1, -1, -1):
+    if weights[i] > 0:
+        weights[i] = 1.0 - sum(weights[:i]) - sum(weights[i+1:])
+        break
 print(' '.join(f'{w:.10f}' for w in weights))
-" "$DAGGER_DATA_FRACTION" "$_n_dag")"
+" "$DAGGER_DATA_FRACTION" "$r" "$_n_blends" "$DRY_RUN" "${W_REPO_IDS[@]}")"
                 # Format draccus list strings as JSON arrays — draccus accepts
                 # both [a,b,c] and ['a','b','c']; we go with quoted/JSON so paths
                 # with slashes (which draccus might otherwise mishandle) round-trip
@@ -3710,33 +4341,52 @@ print(' '.join(f'{w:.10f}' for w in weights))
                 DAG_CFG_WEIGHTED_REPO_IDS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${W_REPO_IDS[@]}")
                 DAG_CFG_WEIGHTED_STATS_PATHS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${W_STATS_PATHS[@]}")
                 DAG_CFG_WEIGHTED_WEIGHTS_JSON=$(python3 -c "import json,sys; print(json.dumps([float(x) for x in sys.argv[1:]], separators=(',', ':')))" "${W_WEIGHTS[@]}")
-                # IMPORTANT: pin --dataset.stats_path to the BASE sidecar
-                # for finetune. The policy was trained against BASE's stats,
-                # so its NormalizerProcessorStep / UnnormalizerProcessorStep
-                # buffers and the downstream Linear layers are all tuned to
-                # that mean/std (and min/max). Letting
-                # `MultiSourceNormalizingDataset` aggregate over base + every
-                # round's intervention + every blend would shift the input
-                # distribution on the first finetune step and create a
-                # normalization shock — empirically this caused catastrophic
-                # dag1 drops (b010: 20% succ, b050: 13% vs source: 43% at
-                # same compute). `lerobot_train.py:254-259` reads
-                # `--dataset.stats_path` and overrides `dataset.meta.stats`
-                # AFTER `MultiSourceNormalizingDataset.__init__` aggregates,
-                # so the per-source `_normalizers` (which apply per-frame in
-                # `_getitems_with_normalization`) still use each sub-dataset's
-                # OWN sidecar — sub-datasets get normalized to a consistent
-                # BASE-shaped distribution from the policy's perspective.
-                # (Train-from-scratch would prefer aggregated stats here,
-                # but the per-round scratch path uses train_sweep.sh +
-                # $MERGED_REPO and never reaches this block.)
+                # Build the weighted-mode dataset args. The wrapper
+                # (MultiSourceNormalizingDataset) handles all stats selection
+                # internally via --dataset.norm_mode; we deliberately DO NOT
+                # also pass --dataset.stats_path here.
+                #
+                # CONTEXT (was a silent footgun): before --norm_mode existed,
+                # this code unconditionally passed --dataset.stats_path=<BASE
+                # sidecar>, which lerobot_train.py:254-259 applies AFTER the
+                # wrapper finishes — clobbering the wrapper's aggregated
+                # stats with base-only. The surrounding comment claimed
+                # per-source _normalizers were still applied per-frame inside
+                # the wrapper, but the wrapper was refactored to single-pass
+                # aggregation and the per-source normalizers were removed.
+                # Net effect: effective behavior was always "base_only" by
+                # accident regardless of intent. That made intervention rows
+                # with raw range > base's normalize to values WAY outside
+                # [-1, 1] (e.g. +7.5 on int_dag2 dim 2), almost certainly
+                # destabilizing finetune. The fix: stop passing
+                # --dataset.stats_path here, let the wrapper expose
+                # mode-appropriate stats:
+                #   * norm_mode=aggregated → wrapper exposes
+                #     min-of-mins / max-of-maxes across all sources.
+                #   * norm_mode=base_only → wrapper exposes source[0] (base)
+                #     stats only. Equivalent to the prior accidental
+                #     behavior, but now an explicit opt-in.
+                # IMPORTANT: pass --dataset.stats_path= (EMPTY STRING) to
+                # CLEAR the value baked into the resumed train_config.json.
+                # The base policy was trained against a single dataset with
+                # `dataset.stats_path` pointing at the base sidecar — that
+                # value persists across `--config_path=...` loads and
+                # triggers `lerobot_train.py:254-259`'s override of
+                # `dataset.meta.stats` AFTER the wrapper finishes. Even
+                # though we no longer EXPLICITLY pass --dataset.stats_path=...
+                # here, draccus still uses the inherited config value if we
+                # don't override it. The fix is the same idiom we use for
+                # `--dataset.repo_id=` (cleared so it doesn't conflict with
+                # `--dataset.repo_ids`): pass empty to disable the override
+                # and let the wrapper's mode-appropriate stats stand.
                 FT_MULTI_DATASET_ARGS=(
                     --dataset.repo_ids="$DAG_CFG_WEIGHTED_REPO_IDS_JSON"
                     --dataset.sample_weights="$DAG_CFG_WEIGHTED_WEIGHTS_JSON"
                     --dataset.stats_paths="$DAG_CFG_WEIGHTED_STATS_PATHS_JSON"
-                    --dataset.stats_path="$STATS_BASE/$BASE_REPO_DATASET_SHORT/stats_rel${FT_CHUNK}.json"
+                    --dataset.norm_mode="$NORM_MODE"
+                    --dataset.stats_path=
                 )
-                echo "Weighted sampling: ${#W_REPO_IDS[@]} sub-datasets (1 base + $_n_dag DAgger); weights=${W_WEIGHTS[*]}"
+                echo "Weighted sampling: ${#W_REPO_IDS[@]} sub-datasets (1 base + $_n_dag DAgger); per-round share=$(python3 -c "print(f'{float(\"$DAGGER_DATA_FRACTION\")/$r:.4f}')") (frame-proportional within round); weights=${W_WEIGHTS[*]}; norm_mode=$NORM_MODE"
             elif [[ "$ACTION_FORMAT" == "rel" ]]; then
                 # Merge-mode rel: point at the merged-dataset sidecar (default
                 # legacy behavior).
@@ -3769,7 +4419,48 @@ print(' '.join(f'{w:.10f}' for w in weights))
             else
                 FT_REPO_ID_ARG=( --dataset.repo_id="$MERGED_REPO" )
             fi
+            # PURE_POLICY_MODE override: trumps the merge / weighted-sampling
+            # data setup above. Resume training on the BASE dataset ONLY
+            # (no intervention/blend merge, no multi-dataset weighted sampling)
+            # so the resulting checkpoint is the matched-compute base-only
+            # baseline for round r. All other args (target_steps, eval
+            # benchmark + subset, scheduler / batch / port wiring) stay
+            # identical to a normal finetune round so the comparison against
+            # the DAgger lineages is apples-to-apples in compute terms.
+            if [[ "$PURE_POLICY_MODE" == "true" ]]; then
+                FT_REPO_ID_ARG=( --dataset.repo_id="$BASE_REPO" )
+                FT_MULTI_DATASET_ARGS=()
+                if [[ "$ACTION_FORMAT" == "rel" ]]; then
+                    FT_STATS_PATH_ARG=( --dataset.stats_path="$STATS_BASE/$BASE_REPO_DATASET_SHORT/stats_rel${FT_CHUNK}.json" )
+                else
+                    FT_STATS_PATH_ARG=()
+                fi
+                echo "  [pure_policy] training data: $BASE_REPO (base only)"
+            fi
+            # Skip-if-already-at-target check: if TRAIN_OUTPUT_DIR's latest
+            # checkpoint step >= TARGET_STEPS, lerobot-train would no-op
+            # anyway (cfg.steps <= current_step exits at iteration 0). We
+            # still pay the orchestrator overhead (sim start/stop, sidecar
+            # mkdir, wandb init, etc.). Detect and skip the whole step 6
+            # body so we proceed straight to step 6b. Common when the user
+            # flipped on --filter_blend_collisions for an already-trained
+            # lineage — resume detection demoted step=6 → 5 to force step 6b,
+            # but step 6 itself has nothing to do.
+            _skip_step_6=false
+            if [[ -d "$TRAIN_OUTPUT_DIR" ]]; then
+                _existing_ckpt="$(resolve_latest_checkpoint "$TRAIN_OUTPUT_DIR" 2>/dev/null || true)"
+                if [[ -n "$_existing_ckpt" ]]; then
+                    _existing_step="$(readlink -f "$_existing_ckpt" 2>/dev/null \
+                        | grep -oE 'checkpoints/[0-9]+/' | head -1 \
+                        | grep -oE '[0-9]+' || true)"
+                    if [[ -n "$_existing_step" ]] && (( 10#$_existing_step >= TARGET_STEPS )); then
+                        echo "  [step 6 skip] $TRAIN_OUTPUT_DIR already at step $_existing_step >= target $TARGET_STEPS; skipping the resume_training.sh invocation (would no-op anyway)."
+                        _skip_step_6=true
+                    fi
+                fi
+            fi
             # shellcheck disable=SC2086  # FINETUNE_EXTRA_ARGS is word-split intentionally
+            if [[ "$_skip_step_6" != true ]]; then
             run_training_step bash "$SCRIPT_DIR/resume_training.sh" "$CURRENT_POLICY" \
                 "${FT_REPO_ID_ARG[@]}" \
                 "${FT_MULTI_DATASET_ARGS[@]}" \
@@ -3787,15 +4478,126 @@ print(' '.join(f'{w:.10f}' for w in weights))
                 "${FT_EVAL_BENCHMARK_ARG[@]}" \
                 "${HEADLESS_TRAIN_ARGS[@]}" \
                 "${OFFLINE_POLICY_ARG[@]}" \
-                $FINETUNE_EXTRA_ARGS
+                $FINETUNE_EXTRA_ARGS \
+                --eval.n_episodes="$EVAL_N_EPISODES"
+            fi  # end of _skip_step_6 != true
         fi
-        # Write the per-round config sidecar AFTER training succeeds. We
-        # intentionally don't write it before training: the scratch path
-        # invokes lerobot-train without --resume, and lerobot-train errors
-        # if the output dir already exists (which an early mkdir would
-        # create). Writing post-success means the sidecar marks "this round
-        # completed", which is also when dagger_plot.py wants to read it.
+        # Write the per-round config sidecar AFTER training succeeds (or
+        # was skipped because already at target). The sidecar reflects the
+        # CURRENT orchestrator invocation, not training-time history, so
+        # writing it on a skip is correct.
         write_dagger_config_sidecar "$r" "$TRAIN_OUTPUT_DIR/dagger/config.json" "$TRAIN_OUTPUT_DIR"
+        # ── Step 6b: collision-filtered sibling policy ──────────────────
+        # When --filter_blend_collisions is on, train a SECOND policy this
+        # round using `_nocoll` siblings in place of raw blends. Output goes
+        # to <TRAIN_OUTPUT_DIR>_nc so the raw policy stays untouched.
+        # Both policies finetune from the SAME starting checkpoint
+        # (CURRENT_POLICY at this point in the loop = round r's input —
+        # CURRENT_POLICY isn't bumped until after this block), so the two
+        # outputs are a clean per-round A/B test. Gated on:
+        #   * --filter_blend_collisions   (the user opted in)
+        #   * --use_weighted_sampling      (multi-dataset arg shape required)
+        #   * non-empty BLENDS             (nothing to filter otherwise)
+        #   * MODE=finetune                (we only wire the finetune path;
+        #                                   scratch mode for the sibling
+        #                                   would need train_sweep.sh
+        #                                   plumbing that isn't needed yet)
+        #   * non-PURE_POLICY_MODE         (no DAgger data in pure mode)
+        if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]] && \
+           [[ "$USE_WEIGHTED_SAMPLING" == "true" ]] && \
+           [[ "$MODE" == "finetune" ]] && \
+           [[ "$PURE_POLICY_MODE" != "true" ]] && \
+           (( ${#BLENDS[@]} > 0 )); then
+            NOCOLL_TRAIN_OUTPUT_DIR="$(nocoll_train_output_dir_for_round "$r")"
+            NOCOLL_RUN_NAME="$(nocoll_run_name_for_round "$r")"
+            if training_exists "$NOCOLL_TRAIN_OUTPUT_DIR"; then
+                echo "--- Round $r, Step 6b: nocoll sibling policy already exists at $NOCOLL_TRAIN_OUTPUT_DIR; skipping ---"
+            else
+                echo "--- Round $r, Step 6b: train collision-filtered sibling policy (finetune) → $NOCOLL_TRAIN_OUTPUT_DIR ---"
+                # Build NC variants of the multi-dataset arrays. Same layout
+                # as step 6's W_REPO_IDS, but raw blend repos are replaced by
+                # their `_nocoll` siblings.
+                NC_REPO_IDS=( "$BASE_REPO" )
+                NC_STATS_PATHS=( "$STATS_BASE/$BASE_REPO_DATASET_SHORT/stats_rel${FT_CHUNK}.json" )
+                for _p in $(seq 1 "$r"); do
+                    _p_int_repo="$(int_repo_for_round "$_p")"
+                    _p_int_short="$(int_short_for_round "$_p")"
+                    NC_REPO_IDS+=( "$_p_int_repo" )
+                    NC_STATS_PATHS+=( "$STATS_BASE/$_p_int_short/stats_rel${FT_CHUNK}.json" )
+                    for _R in "${BLENDS[@]}"; do
+                        _nc_repo="$(nocoll_repo_for_round "$_p" "$_R")"
+                        _nc_short="$(nocoll_short_for_round "$_p" "$_R")"
+                        NC_REPO_IDS+=( "$_nc_repo" )
+                        NC_STATS_PATHS+=( "$STATS_BASE/$_nc_short/stats_rel${FT_CHUNK}.json" )
+                    done
+                done
+                _nc_n_blends=${#BLENDS[@]}
+                # Reuse step 6's proportional-weight algorithm — same
+                # python script, just fed the NC arrays.
+                read -ra NC_WEIGHTS <<< "$(python3 -c "
+import os, sys, json
+f = float(sys.argv[1])
+R = int(sys.argv[2])
+group_size = 1 + int(sys.argv[3])
+dry_run = sys.argv[4] == 'true'
+repo_ids = sys.argv[5:]
+assert len(repo_ids) == 1 + R * group_size, (
+    f'repo_ids layout mismatch: got {len(repo_ids)}, expected 1 + {R}*{group_size}'
+)
+CACHE = os.path.expanduser('~/.cache/huggingface/lerobot')
+def frames_for(repo):
+    p = os.path.join(CACHE, repo, 'meta', 'info.json')
+    if not os.path.isfile(p):
+        if dry_run:
+            return 1
+        raise FileNotFoundError(f'meta/info.json not found for {repo} at {p}')
+    return int(json.load(open(p))['total_frames'])
+per_round = f / R
+weights = [1.0 - f]
+for r_i in range(R):
+    group = repo_ids[1 + r_i*group_size : 1 + (r_i+1)*group_size]
+    counts = [frames_for(rep) for rep in group]
+    total = sum(counts)
+    if total <= 0:
+        raise ValueError(f'round {r_i+1}: all sub-datasets are empty ({list(zip(group, counts))})')
+    for c in counts:
+        weights.append(per_round * c / total)
+for i in range(len(weights) - 1, -1, -1):
+    if weights[i] > 0:
+        weights[i] = 1.0 - sum(weights[:i]) - sum(weights[i+1:])
+        break
+print(' '.join(f'{w:.10f}' for w in weights))
+" "$DAGGER_DATA_FRACTION" "$r" "$_nc_n_blends" "$DRY_RUN" "${NC_REPO_IDS[@]}")"
+                NC_REPO_IDS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${NC_REPO_IDS[@]}")
+                NC_STATS_PATHS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${NC_STATS_PATHS[@]}")
+                NC_WEIGHTS_JSON=$(python3 -c "import json,sys; print(json.dumps([float(x) for x in sys.argv[1:]], separators=(',', ':')))" "${NC_WEIGHTS[@]}")
+                echo "  [step 6b] Weighted sampling (nocoll): ${#NC_REPO_IDS[@]} sub-datasets; per-round share=$(python3 -c "print(f'{float(\"$DAGGER_DATA_FRACTION\")/$r:.4f}')"); weights=${NC_WEIGHTS[*]}"
+                # shellcheck disable=SC2086  # FINETUNE_EXTRA_ARGS is word-split intentionally
+                run_training_step bash "$SCRIPT_DIR/resume_training.sh" "$CURRENT_POLICY" \
+                    --dataset.repo_id= \
+                    --dataset.repo_ids="$NC_REPO_IDS_JSON" \
+                    --dataset.sample_weights="$NC_WEIGHTS_JSON" \
+                    --dataset.stats_paths="$NC_STATS_PATHS_JSON" \
+                    --dataset.norm_mode="$NORM_MODE" \
+                    --dataset.stats_path= \
+                    --policy.repo_id="$NOCOLL_RUN_NAME" \
+                    --output_dir="$NOCOLL_TRAIN_OUTPUT_DIR" \
+                    --job_name="$NOCOLL_RUN_NAME" \
+                    --steps="$TARGET_STEPS" \
+                    --eval_freq="$FINETUNE_EVAL_FREQ" \
+                    --save_freq="$FINETUNE_SAVE_FREQ" \
+                    "${TRAIN_EXT_PORT_RESUME[@]}" \
+                    "${FT_BATCH_SIZE_ARG[@]}" \
+                    "${FT_DECAY_LR_ARG[@]}" \
+                    "${FT_SCHEDULER_NAME_ARG[@]}" \
+                    "${FT_EVAL_BENCHMARK_ARG[@]}" \
+                    "${HEADLESS_TRAIN_ARGS[@]}" \
+                    "${OFFLINE_POLICY_ARG[@]}" \
+                    $FINETUNE_EXTRA_ARGS \
+                    --eval.n_episodes="$EVAL_N_EPISODES"
+                write_dagger_config_sidecar "$r" "$NOCOLL_TRAIN_OUTPUT_DIR/dagger/config.json" "$NOCOLL_TRAIN_OUTPUT_DIR"
+            fi
+        fi
         # Relaunch the external sim now that training has freed the GPU,
         # so the next round's intervention recording can use it. Gated on
         # EFFECTIVE_END_ROUND (not NUM_ROUNDS) so retrain mode — where the
@@ -3844,8 +4646,7 @@ print(' '.join(f'{w:.10f}' for w in weights))
     if [[ "$DRY_RUN" != true ]]; then
         echo "--- Round $r, Step 7c: refresh dagger_progress table + plot ---"
         bash "$SCRIPT_DIR/dagger_progress.sh" \
-            --base_short="$PROGRESS_BASE_SHORT" \
-            --action="$TRAIN_OUTPUT_ACTION_TAG" \
+            --filter="$PROGRESS_LINEAGE_FILTER" \
             --model="$TRAIN_OUTPUT_MODEL_PREFIX" 2>&1 | sed 's/^/  /' || true
     fi
 done
@@ -3883,9 +4684,14 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
     else
         echo
         echo "════════════════════════════════════════════════════════════════"
-        echo "POST-LOOP FINAL SCRATCH: train from scratch on round $NUM_ROUNDS's merged data"
-        echo "  Dataset:         $LAST_MERGED_REPO"
-        echo "  Training output: $FINAL_SCRATCH_DIR"
+        if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
+            echo "POST-LOOP FINAL SCRATCH: train from scratch on weighted union of {base + every round's intervention + every round's blends}"
+            echo "  Training output: $FINAL_SCRATCH_DIR"
+        else
+            echo "POST-LOOP FINAL SCRATCH: train from scratch on round $NUM_ROUNDS's merged data"
+            echo "  Dataset:         $LAST_MERGED_REPO"
+            echo "  Training output: $FINAL_SCRATCH_DIR"
+        fi
         echo "════════════════════════════════════════════════════════════════"
 
         # train_sweep.sh manages its own sim if --no_manage_splatsim is set;
@@ -3898,11 +4704,17 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
         # keeps round NUM_ROUNDS's merged when EFFECTIVE_START_ROUND > NUM_ROUNDS,
         # but if the user manually deleted it the final-scratch step would silently
         # operate on a missing dataset — bail with a clear message instead.
-        if [[ "$DRY_RUN" != true && ! -f "$LEROBOT_CACHE/$LAST_MERGED_REPO/meta/info.json" ]]; then
-            echo "ERROR: final-scratch step needs $LAST_MERGED_REPO but it's not on disk." >&2
-            echo "  Path checked: $LEROBOT_CACHE/$LAST_MERGED_REPO" >&2
-            echo "  Re-run round $NUM_ROUNDS's step 4 (merge) to regenerate it." >&2
-            exit 1
+        # Skipped entirely in weighted-sampling mode: there's no per-round
+        # merged dataset (step 4 is unconditionally skipped); the final-scratch
+        # train consumes the per-source union via --multi_dataset_* passthrough
+        # args directly.
+        if [[ "$USE_WEIGHTED_SAMPLING" != "true" ]]; then
+            if [[ "$DRY_RUN" != true && ! -f "$LEROBOT_CACHE/$LAST_MERGED_REPO/meta/info.json" ]]; then
+                echo "ERROR: final-scratch step needs $LAST_MERGED_REPO but it's not on disk." >&2
+                echo "  Path checked: $LEROBOT_CACHE/$LAST_MERGED_REPO" >&2
+                echo "  Re-run round $NUM_ROUNDS's step 4 (merge) to regenerate it." >&2
+                exit 1
+            fi
         fi
 
         ABS_ACTION_ARG=()
@@ -3910,16 +4722,112 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
             ABS_ACTION_ARG=( --no_relative )
         fi
 
+        # Weighted mode: build the per-source W_* arrays (mirrors the per-round
+        # step-6 finetune logic, but with round=NUM_ROUNDS so every round's
+        # interventions + blends are included) and pass them to train_sweep.sh
+        # via the --multi_dataset_* passthrough flags. The single-dataset
+        # --dataset_repo flag is dropped in this branch (train_sweep.sh
+        # ignores it when in multi-dataset mode and requires --run_name= to
+        # be explicit).
+        MULTI_DATASET_ARGS=()
+        if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
+            if [[ "$ACTION_FORMAT" != "rel" ]]; then
+                echo "ERROR: --use_weighted_sampling + --final_mode=scratch currently requires --action_format=rel" >&2
+                echo "  (per-source sidecars are stats_rel{N}.json; abs path isn't wired)." >&2
+                exit 1
+            fi
+            # FT_CHUNK source-of-truth for the from-scratch case: read off the
+            # base policy's n_action_steps (the policy we're comparing against
+            # was trained with this chunk; the from-scratch run will use the
+            # same). For finetune rounds, FT_CHUNK is read from the resumed
+            # policy — that's not available here, so go to the base directly.
+            FS_CHUNK="$(n_action_steps_from_policy_path "$INITIAL_POLICY_PATH")"
+            if [[ -z "$FS_CHUNK" ]]; then
+                if [[ "$DRY_RUN" == true ]]; then
+                    FS_CHUNK="<unknown-in-dry-run>"
+                else
+                    echo "ERROR: could not read policy.n_action_steps from $INITIAL_POLICY_PATH/train_config.json" >&2
+                    echo "  Needed to pick the right stats_rel{N}.json sidecar for the multi-source training." >&2
+                    exit 1
+                fi
+            fi
+            FS_W_REPO_IDS=( "$BASE_REPO" )
+            FS_W_STATS_PATHS=( "$STATS_BASE/$BASE_REPO_DATASET_SHORT/stats_rel${FS_CHUNK}.json" )
+            for _p in $(seq 1 "$NUM_ROUNDS"); do
+                _p_int_repo="$(int_repo_for_round "$_p")"
+                _p_int_short="$(int_short_for_round "$_p")"
+                FS_W_REPO_IDS+=( "$_p_int_repo" )
+                FS_W_STATS_PATHS+=( "$STATS_BASE/$_p_int_short/stats_rel${FS_CHUNK}.json" )
+                for _R in "${BLENDS[@]}"; do
+                    if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
+                        _b_repo="$(nocoll_repo_for_round "$_p" "$_R")"
+                        _b_short="$(nocoll_short_for_round "$_p" "$_R")"
+                    else
+                        _b_repo="$(blend_repo_for_round "$_p" "$_R")"
+                        _b_short="$(blend_short_for_round "$_p" "$_R")"
+                    fi
+                    FS_W_REPO_IDS+=( "$_b_repo" )
+                    FS_W_STATS_PATHS+=( "$STATS_BASE/$_b_short/stats_rel${FS_CHUNK}.json" )
+                done
+            done
+            _fs_n_dag=$(( ${#FS_W_REPO_IDS[@]} - 1 ))
+            read -ra FS_W_WEIGHTS <<< "$(python3 -c "
+import sys
+f = float(sys.argv[1])
+n = int(sys.argv[2])
+base = 1.0 - f
+per = f / n
+weights = [base] + [per] * n
+weights[-1] = 1.0 - sum(weights[:-1])
+print(' '.join(f'{w:.10f}' for w in weights))
+" "$DAGGER_DATA_FRACTION" "$_fs_n_dag")"
+            FS_REPO_IDS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${FS_W_REPO_IDS[@]}")
+            FS_STATS_PATHS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${FS_W_STATS_PATHS[@]}")
+            FS_WEIGHTS_JSON=$(python3 -c "import json,sys; print(json.dumps([float(x) for x in sys.argv[1:]], separators=(',', ':')))" "${FS_W_WEIGHTS[@]}")
+            MULTI_DATASET_ARGS=(
+                --multi_dataset_repo_ids="$FS_REPO_IDS_JSON"
+                --multi_dataset_sample_weights="$FS_WEIGHTS_JSON"
+                --multi_dataset_stats_paths="$FS_STATS_PATHS_JSON"
+                --multi_dataset_norm_mode="$NORM_MODE"
+            )
+            echo "Final-scratch weighted sampling: ${#FS_W_REPO_IDS[@]} sub-datasets (1 base + $_fs_n_dag DAgger); weights=${FS_W_WEIGHTS[*]}; norm_mode=$NORM_MODE"
+        fi
+
         TRAIN_OUTPUT_DIR="$FINAL_SCRATCH_DIR"   # consumed by run_training_step
         cleanup_pre_train_partial "$TRAIN_OUTPUT_DIR"
-        run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
-            --dataset_repo="$LAST_MERGED_REPO" \
-            --run_name="$FINAL_SCRATCH_RUN_NAME" \
-            --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
-            "${ABS_ACTION_ARG[@]}" \
-            "${TRAIN_EXT_PORT_SWEEP[@]}" \
-            "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
-            "${OFFLINE_POLICY_ARG[@]}"
+        # Forward eval scope + subset to the from-scratch step so its inline
+        # eval covers the SAME scenarios at the SAME count as the per-round
+        # finetune evals — previously hardcoded at 5 in train_sweep.sh, making
+        # final-scratch + finetune rounds non-comparable in `dagger_progress`.
+        FS_EVAL_ARGS=( --eval_n_episodes="$EVAL_N_EPISODES" )
+        if [[ -n "$INTERVENTION_SUBSET_JSON" ]]; then
+            FS_EVAL_ARGS+=( --eval_benchmark_subset="$INTERVENTION_SUBSET_JSON" )
+        fi
+        if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
+            # --dataset_repo intentionally OMITTED — train_sweep.sh defaults
+            # it to the long-since-unused placeholder when multi-dataset args
+            # are set, and the multi-mode validation in train_sweep.sh
+            # ignores its value anyway.
+            run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
+                --run_name="$FINAL_SCRATCH_RUN_NAME" \
+                --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
+                "${ABS_ACTION_ARG[@]}" \
+                "${TRAIN_EXT_PORT_SWEEP[@]}" \
+                "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
+                "${OFFLINE_POLICY_ARG[@]}" \
+                "${MULTI_DATASET_ARGS[@]}" \
+                "${FS_EVAL_ARGS[@]}"
+        else
+            run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
+                --dataset_repo="$LAST_MERGED_REPO" \
+                --run_name="$FINAL_SCRATCH_RUN_NAME" \
+                --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
+                "${ABS_ACTION_ARG[@]}" \
+                "${TRAIN_EXT_PORT_SWEEP[@]}" \
+                "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
+                "${OFFLINE_POLICY_ARG[@]}" \
+                "${FS_EVAL_ARGS[@]}"
+        fi
         # Sidecar written AFTER training (not before) — train_sweep.sh
         # invokes lerobot-train without --resume, which errors on any
         # pre-existing output dir; pre-mkdir would induce the failure.
@@ -3934,9 +4842,14 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
         # Post-final-scratch cleanup: round N's merged dataset is no longer
         # needed (final-scratch consumed it, no further training will). Mirrors
         # the per-round pre-train cleanup that deletes dag{r-1}_m.
-        echo "--- Post-loop cleanup: remove round $NUM_ROUNDS's merged dataset ---"
-        run_or_echo rm -rf "$LEROBOT_CACHE/$LAST_MERGED_REPO"
-        run_or_echo rm -rf "$STATS_BASE/$(merged_short_for_round "$NUM_ROUNDS")"
+        # No-op in weighted-sampling mode: there's no merged dataset to clean
+        # (step 4 was skipped on every round; final-scratch consumed the
+        # per-source union directly via --multi_dataset_* passthroughs).
+        if [[ "$USE_WEIGHTED_SAMPLING" != "true" ]]; then
+            echo "--- Post-loop cleanup: remove round $NUM_ROUNDS's merged dataset ---"
+            run_or_echo rm -rf "$LEROBOT_CACHE/$LAST_MERGED_REPO"
+            run_or_echo rm -rf "$STATS_BASE/$(merged_short_for_round "$NUM_ROUNDS")"
+        fi
 
         if [[ "$DRY_RUN" != true ]] && command -v wandb >/dev/null 2>&1; then
             echo "--- Post-loop: wandb artifact cache cleanup (cap 5GB) ---"
@@ -3946,8 +4859,7 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
         if [[ "$DRY_RUN" != true ]]; then
             echo "--- Post-loop: refresh dagger_progress table + plot ---"
             bash "$SCRIPT_DIR/dagger_progress.sh" \
-                --base_short="$BASE_SHORT" \
-                --action="$TRAIN_OUTPUT_ACTION_TAG" \
+                --filter="$PROGRESS_LINEAGE_FILTER" \
                 --model="$TRAIN_OUTPUT_MODEL_PREFIX" 2>&1 | sed 's/^/  /' || true
         fi
     fi

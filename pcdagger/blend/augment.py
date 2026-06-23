@@ -81,6 +81,21 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+# Sibling-module imports. These previously came from
+# ``my_scripts.visualize_shared_autonomy_DEPRECATED`` (which only resolved by
+# accident as a side effect of the sim visualizer's sys.path manipulation);
+# they've been split into topic-focused library modules so this script doesn't
+# depend on a deprecated file. Bare module names (no ``my_scripts.`` prefix)
+# so they resolve when this script is invoked via
+# ``python my_scripts/augment_dataset_with_blending.py``.
+from lib_dataset_episode_io import (  # type: ignore[import-not-found]  # noqa: E402
+    find_parquet_files,
+    load_episode_frames,
+    load_task_description,
+)
+from lib_sa_policy_loading import (  # type: ignore[import-not-found]  # noqa: E402
+    load_wrapped_policy,
+)
 from visualize_shared_autonomy_sim import (  # type: ignore[import-not-found]  # noqa: E402
     _build_sim_batch,
     _run_filler_phase,
@@ -103,12 +118,6 @@ from lerobot.utils.lerobot_dataset_utils import make_default_rename_map, resolve
 from lerobot.utils.random_utils import set_seed  # noqa: E402
 from lerobot.utils.sim_seeding import seed_splatsim_env_to_state  # noqa: E402
 from lerobot.utils.utils import init_logging  # noqa: E402
-from my_scripts.visualize_shared_autonomy_DEPRECATED import (  # type: ignore[import-not-found]  # noqa: E402
-    find_parquet_files,
-    load_episode_frames,
-    load_task_description,
-    load_wrapped_policy,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -600,9 +609,18 @@ def run_augmentation(
 
     # ── Build wrapped policy (acquires its own pybullet GUI in parent) ────
     logger.info("Loading wrapped policy from %s …", cfg.policy_path)
+    # `action_names_dataset_hint=cfg.dataset_repo_id` ensures the
+    # RelativeActionsProcessorStep's `action_names` gets backfilled from a
+    # dataset we KNOW is on disk (the blend source intervention dataset),
+    # rather than the policy's training dataset which may have been deleted
+    # by the orchestrator after training (e.g. per-round merged datasets).
+    # Without this, `exclude_joints=['gripper']` is silently ignored and the
+    # recorded blend gripper column leaks the gripper STATE into the action
+    # column — see _backfill_rel_step_action_names docstring.
     wrapper, obs_preprocessor = load_wrapped_policy(
         policy_path=cfg.policy_path,
         device=cfg.device,
+        action_names_dataset_hint=cfg.dataset_repo_id,
     )
     wrapper.guidance_blend_strategy = GuidanceBlendStrategy(cfg.blend_strategy)
     wrapper.policy_guidance_representation = PolicyGuidanceRepresentation(cfg.guidance_repr)

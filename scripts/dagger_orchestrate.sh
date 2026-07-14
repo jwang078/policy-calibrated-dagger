@@ -15,7 +15,7 @@ set -euo pipefail
 #   * Requires a SHARED EXTERNAL SplatSim ZMQ server running at --env_external_port
 #     BEFORE this script is invoked. GPU memory can't host multiple SplatSim
 #     instances plus training simultaneously. Launch with e.g.:
-#       cd ~/code/SplatSim && python scripts/launch_nodes.py \
+#       cd ~/code/SplatSim && python -u scripts/launch_nodes.py \
 #         --robot sim_ur_pybullet_small_engine_new_interactive \
 #         --robot_port 6001 --robot_name robot_iphone_w_engine_new \
 #         --eval_benchmark_repo_id JennyWWW/eval_splatsim_approach_lever_benchmark_1000
@@ -222,10 +222,23 @@ set -euo pipefail
 #                                 cannot be resumed in weighted mode (and vice
 #                                 versa). Use a fresh --run_tag to start a new
 #                                 lineage in the desired mode.
-#   --dagger_data_fraction=F      Share of every batch sampled from DAgger
-#                                 sub-datasets (raw intervention + any blends),
-#                                 equal-split across them. Base gets the
-#                                 remaining (1 - F). F must be in (0.0, 1.0).
+#   --dagger_data_fraction=F      MAXIMUM share of every batch sampled from
+#                                 DAgger sub-datasets (raw intervention + any
+#                                 blends). Acts as a CEILING, not a fixed
+#                                 target:
+#                                   * If the DAgger sub-datasets' NATURAL
+#                                     frame share is BELOW F, the WeightedRandom-
+#                                     Sampler falls back to fully proportional
+#                                     weights (every frame equally likely). No
+#                                     upsampling — DAgger contributes only its
+#                                     true fraction of the corpus.
+#                                   * If the NATURAL DAgger share is ABOVE F,
+#                                     DAgger is capped at F and its allotment
+#                                     is split across sub-datasets proportional
+#                                     to frame counts. Base gets 1 - F.
+#                                 F must be a float in (0.0, 1.0); F=0 is
+#                                 rejected (defeats the purpose — for base-only
+#                                 use --combination_pool=1.0).
 #                                 Only meaningful with --use_weighted_sampling.
 #                                 Default: 0.3.
 #
@@ -328,6 +341,18 @@ set -euo pipefail
 #   --force_restart               Skip resume-prompt; restart from round 1, deleting
 #                                 any existing dag1..dag{num_rounds} artifacts. Asks
 #                                 for confirmation token.
+#   --from_round=N                Restrict --force_restart (and its --cleanup_only
+#                                 sibling) to rounds N..NUM_ROUNDS. Rounds 1..(N-1)
+#                                 keep their on-disk artifacts; only round N onward
+#                                 is wiped. Without --cleanup_only, the orchestrator
+#                                 then resumes from round N step 1 (re-records the
+#                                 intervention for round N branching off round
+#                                 (N-1)'s preserved policy). Default N=1
+#                                 (= wipe all rounds, the historical behavior).
+#                                 Errors if N < 1 or N > NUM_ROUNDS, or if used
+#                                 without --force_restart. Forwarded by
+#                                 dagger_cleanup_lineage.sh's identically-named
+#                                 flag.
 #   --also_delete_blends          Opt-in modifier for --force_restart in rerun mode.
 #                                 By default rerun-mode cleanup PRESERVES blend
 #                                 datasets (<src_int>_dagN_blendXXX) since they're
@@ -537,7 +562,11 @@ FINETUNE_EXTRA_ARGS=""
 # / stats_paths multi-dataset path. Per-source normalization happens inside
 # the DataLoader; the policy's normalize layer is a no-op (see
 # src/lerobot/datasets/multi_source_normalizing_dataset.py + lerobot_train.py).
-# Equal share among all DAgger sub-datasets, BASE gets (1 - DAGGER_DATA_FRACTION).
+# DAGGER_DATA_FRACTION is a CEILING on the DAgger share (see the --help block
+# above for the full semantics): if the sub-datasets' natural frame fraction is
+# below F, weights fall back to fully proportional (every frame equally likely,
+# no upsampling); above F, DAgger is capped at F and split proportional to
+# frame counts within DAgger.
 # A lineage runs entirely in one mode — switching mid-lineage is rejected at
 # startup (see mode-purity validation below).
 USE_WEIGHTED_SAMPLING=false
@@ -596,6 +625,13 @@ FINETUNE_SAVE_FREQ="2000"
 FINETUNE_BATCH_SIZE=""
 FINETUNE_DECAY_LR=""
 START_ROUND=""    # empty → auto-detect
+# --from_round=N: clamp --force_restart deletion to rounds N..NUM_ROUNDS. Empty
+# means N=1 (= wipe all rounds — historical behavior). Use case: data anomaly
+# detected in round N (e.g. via dagger_detect_dataset_anomalies.py) means
+# rounds N..NUM_ROUNDS are polluted and need re-recording, but rounds
+# 1..(N-1) are clean and the user wants to keep their (expensive) intervention
+# datasets + trained policies. Validated post-NUM_ROUNDS-derivation below.
+FROM_ROUND=""
 FORCE_RESTART=false
 # --resume: auto-confirm the resume prompt (default Y). Useful for batch /
 # sweep invocations that shouldn't block on stdin. When prior work is fully
@@ -619,11 +655,13 @@ CLEANUP_ONLY=false
 # non-rerun lineage owns its own blends, so they're always deleted).
 ALSO_DELETE_BLENDS=false
 # --preserve_round_1_intervention: when set, --force_restart's cleanup leaves
-# round 1's raw intervention dataset + alias + int-stats sidecar in place
-# (the expensive human-in-the-loop recording). Everything else — round 1's
-# merged dataset, training dir, blends, plus rounds 2..N entirely — still
-# gets deleted, so the lineage restarts from "round 1 step 4 (merge)" rather
-# than "round 1 step 1 (record interventions)". No-op in rerun mode where
+# the FIRST-cleaned round's raw intervention dataset + alias + int-stats
+# sidecar in place (the expensive human-in-the-loop recording). The first
+# cleaned round is --from_round (round 1 by default), so with --from_round=N
+# this preserves round N's intervention. Everything else — that round's merged
+# dataset, training dir, blends, plus all later rounds entirely — still gets
+# deleted, so the lineage restarts from "round <from_round> step 4 (merge)"
+# rather than "step 1 (record interventions)". No-op in rerun mode where
 # intervention paths are source-owned and never touched.
 PRESERVE_ROUND_1_INTERVENTION=false
 # --extend_last_round: when set, the orchestrator re-runs step 6 for the
@@ -675,7 +713,13 @@ MANAGE_SPLATSIM=true
 HEADLESS=false
 SPLATSIM_ROOT="$HOME/code/SplatSim"
 SPLATSIM_ROBOT="sim_ur_pybullet_small_engine_new_interactive"
-SPLATSIM_ROBOT_NAME="robot_iphone_w_engine_new"
+# Empty by default — the sim launch script (`launch_nodes.py`) will fall
+# back to the SplatSim server class's `DEFAULT_ROBOT_NAME` (e.g.
+# `robot_iphone_w_engine_curtain` for small_engine). Only pass
+# `--splatsim_robot_name=...` here when overriding per-run. Removing the
+# hardcoded literal from this script keeps SplatSim as the single source
+# of truth for the env's canonical splat/URDF identifier.
+SPLATSIM_ROBOT_NAME=""
 DRY_RUN=false
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -691,6 +735,82 @@ STATS_BASE="$LEROBOT_ROOT/outputs/dataset_stats"
 # the module docstring for available subcommands.
 _py_dagger_name() {
     python3 "$SCRIPT_DIR/dagger_naming.py" "$@"
+}
+
+# ── weighted-sampling weight computation ─────────────────────────────────────
+# Given the DAgger cap F, round count R, blend count per round, dry-run flag,
+# and the parallel repo_ids list [base, r1_int, r1_blend0..., r2_int, ...],
+# emit a space-separated list of WeightedRandomSampler weights (one per
+# sub-dataset, summing to exactly 1.0). Frame counts are read from the local
+# LeRobot dataset cache; dry-run substitutes 1 for missing datasets so the
+# printed command preview is still usable.
+#
+# Algorithm (see --dagger_data_fraction help block):
+#   natural = sum(dag_counts) / sum(all_counts)
+#   f_eff   = min(F, natural)
+#   base    = 1 - f_eff
+#   dag[i]  = f_eff * (counts[i] / sum(dag_counts))
+# Below-cap case (natural ≤ F): f_eff = natural, so every weight equals
+# counts[i] / total_frames — the sampler becomes a no-op (uniform sampling).
+# Above-cap case (natural > F): DAgger is capped at F and split proportional
+# to frame counts within DAgger.
+_py_weighted_sample_weights() {
+    # args: F R n_blends dry_run base_repo r1_int r1_blend0... rR_blend_last
+    python3 - "$@" <<'PY'
+import os, sys, json
+
+f       = float(sys.argv[1])
+R       = int(sys.argv[2])
+group_size = 1 + int(sys.argv[3])   # 1 raw int + n_blends sub-datasets per round
+dry_run = sys.argv[4] == 'true'
+repo_ids = sys.argv[5:]
+assert len(repo_ids) == 1 + R * group_size, (
+    f'repo_ids layout mismatch: got {len(repo_ids)}, expected 1 + {R}*{group_size}'
+)
+
+CACHE = os.path.expanduser('~/.cache/huggingface/lerobot')
+def frames_for(repo):
+    p = os.path.join(CACHE, repo, 'meta', 'info.json')
+    if not os.path.isfile(p):
+        if dry_run:
+            return 1  # placeholder so dry-run can still print a sample_weights list
+        raise FileNotFoundError(f'meta/info.json not found for {repo} at {p}')
+    return int(json.load(open(p))['total_frames'])
+
+counts = [frames_for(r) for r in repo_ids]
+base_count = counts[0]
+dag_counts = counts[1:]
+dag_sum    = sum(dag_counts)
+total      = base_count + dag_sum
+if total <= 0:
+    raise ValueError(f'all sub-datasets are empty ({list(zip(repo_ids, counts))})')
+if dag_sum <= 0:
+    raise ValueError(f'all DAgger sub-datasets are empty ({list(zip(repo_ids[1:], dag_counts))})')
+
+natural = dag_sum / total
+f_eff   = min(f, natural)
+
+weights = [1.0 - f_eff] + [f_eff * (c / dag_sum) for c in dag_counts]
+
+# Force exact sum=1 by absorbing FP error into the last non-zero weight
+# (avoid pinning the fix onto a 0-frame sub-dataset — the validator would
+# accept it but the log would show a weird non-zero weight on an empty source).
+for i in range(len(weights) - 1, -1, -1):
+    if weights[i] > 0:
+        weights[i] = 1.0 - sum(weights[:i]) - sum(weights[i+1:])
+        break
+
+# Emit weights + a diagnostic line to stderr so the caller's log records what
+# happened (cap engaged vs fell back to natural). stderr keeps stdout clean for
+# `read -ra ...` parsing.
+mode = 'CAP@F' if natural > f else 'NATURAL<F'
+print(
+    f'  [weighted-weights] natural_dagger_share={natural:.4f}  '
+    f'F={f:.4f}  f_eff={f_eff:.4f}  mode={mode}',
+    file=sys.stderr,
+)
+print(' '.join(f'{w:.10f}' for w in weights))
+PY
 }
 
 # Computed at the end of arg parsing (see "intervention scenario subset" block):
@@ -723,6 +843,7 @@ for arg in "$@"; do
         --intervention_sample_from_first=*)  INTERVENTION_SAMPLE_FROM_FIRST="${arg#*=}" ;;
         --intervention_sample_seed=*)        INTERVENTION_SAMPLE_SEED="${arg#*=}" ;;
         --eval_benchmark_repo_id=*)          EVAL_BENCHMARK_REPO_ID="${arg#*=}" ;;
+        --eval_benchmark=*)                  EVAL_BENCHMARK_REPO_ID="${arg#*=}" ;;  # short alias for the sweep wrapper
         --intervention_extra_args=*)         INTERVENTION_EXTRA_ARGS="${arg#*=}" ;;
         --rrt_obstacle_clearance=*)          RRT_OBSTACLE_CLEARANCE="${arg#*=}" ;;
         --rrt_self_collision_clearance=*)    RRT_SELF_COLLISION_CLEARANCE="${arg#*=}" ;;
@@ -750,6 +871,7 @@ for arg in "$@"; do
         --finetune_batch_size=*)      FINETUNE_BATCH_SIZE="${arg#*=}" ;;
         --finetune_decay_lr=*)        FINETUNE_DECAY_LR="${arg#*=}" ;;
         --start_round=*)              START_ROUND="${arg#*=}" ;;
+        --from_round=*)               FROM_ROUND="${arg#*=}" ;;
         --force_restart)              FORCE_RESTART=true ;;
         --resume)                     RESUME=true ;;
         --cleanup_only)               CLEANUP_ONLY=true ;;
@@ -856,6 +978,19 @@ fi
 # --resume is the inverse of --force_restart; setting both is a user error.
 if [[ "$RESUME" == true && "$FORCE_RESTART" == true ]]; then
     echo "ERROR: --resume and --force_restart are mutually exclusive." >&2; exit 1
+fi
+
+# --from_round=N partial-cleanup validation. NUM_ROUNDS upper bound is checked
+# later in rerun mode after auto-detection; here we only enforce the lower
+# bound + non-empty-only-with-force-restart contract. Final upper-bound check
+# happens just before the cleanup loop (where NUM_ROUNDS is guaranteed set).
+if [[ -n "$FROM_ROUND" ]]; then
+    if ! [[ "$FROM_ROUND" =~ ^[0-9]+$ ]] || (( FROM_ROUND < 1 )); then
+        echo "ERROR: --from_round=$FROM_ROUND must be a positive integer >= 1" >&2; exit 1
+    fi
+    if [[ "$FORCE_RESTART" != true ]]; then
+        echo "ERROR: --from_round=$FROM_ROUND requires --force_restart (it modifies the cleanup loop bounds)." >&2; exit 1
+    fi
 fi
 
 case "$INTERMEDIATE_MODE" in finetune|scratch) ;; *) echo "ERROR: --intermediate_mode must be 'finetune' or 'scratch'" >&2; exit 1;; esac
@@ -1060,8 +1195,11 @@ else:
 " "$DAGGER_DATA_FRACTION" 2>/dev/null || echo "ERR_NOT_FLOAT")
     if [[ "$_frac_verdict" != "OK" ]]; then
         echo "ERROR: --dagger_data_fraction='$DAGGER_DATA_FRACTION' must be a float in (0.0, 1.0)." >&2
-        echo "  This is the share of every batch that comes from DAgger sub-datasets" >&2
-        echo "  (raw intervention + any blends). Base gets the remaining (1 - fraction)." >&2
+        echo "  This is the MAXIMUM share of every batch that comes from DAgger sub-datasets" >&2
+        echo "  (raw intervention + any blends). If natural DAgger frame share is below F," >&2
+        echo "  weights fall back to fully proportional. Base gets 1 - min(F, natural)." >&2
+        echo "  F=0 hides DAgger entirely (equivalent to base-only); for a base-only run" >&2
+        echo "  use --combination_pool=1.0 (pure-policy mode) instead." >&2
         exit 1
     fi
     # --norm_mode validation. per_source is rejected here (and again
@@ -1579,6 +1717,8 @@ write_dagger_config_sidecar() {
     DAG_CFG_WEIGHTED_WEIGHTS_JSON="${DAG_CFG_WEIGHTED_WEIGHTS_JSON:-[]}" \
     DAG_CFG_WEIGHTED_STATS_PATHS_JSON="${DAG_CFG_WEIGHTED_STATS_PATHS_JSON:-[]}" \
     DAG_CFG_HEADLESS="$HEADLESS" \
+    DAG_CFG_SWEEP_INVOCATION_ARGV_JSON="${DAGGER_SWEEP_INVOCATION_ARGV_JSON:-}" \
+    DAG_CFG_SWEEP_INVOCATION_WRAPPER="${DAGGER_SWEEP_INVOCATION_WRAPPER:-}" \
     python3 - <<'PY'
 import json, os, datetime, socket, getpass
 rerun_mode = None
@@ -1644,6 +1784,25 @@ config = {
         "argv": sorted(json.loads(os.environ["DAG_CFG_ARGV_JSON"])),
     },
 }
+# When invoked via dagger_orchestrate_sweep.sh, the wrapper exports its own
+# argv via DAGGER_SWEEP_INVOCATION_ARGV_JSON so we can record it here. Lets
+# downstream tools (dagger_detect_dataset_anomalies, etc.) recover the
+# full sweep-level command — `orchestrator_invocation.argv` only captures the
+# per-iteration call with --blends=<combo>, which loses the sweep spec
+# (--sweep_blends / --combination_pool / --sweep_combinations_of) entirely.
+# Same lexicographic sort + reproducibility-via-key=value rationale as above.
+_sweep_argv_json = os.environ.get("DAG_CFG_SWEEP_INVOCATION_ARGV_JSON") or ""
+if _sweep_argv_json:
+    try:
+        _sweep_argv = sorted(json.loads(_sweep_argv_json))
+    except json.JSONDecodeError:
+        _sweep_argv = []
+    config["sweep_invocation"] = {
+        "wrapper": os.environ.get("DAG_CFG_SWEEP_INVOCATION_WRAPPER", ""),
+        "argv":    _sweep_argv,
+    }
+else:
+    config["sweep_invocation"] = None
 out_path = os.environ["DAG_CFG_OUT_PATH"]
 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 tmp_path = out_path + ".tmp"
@@ -1948,11 +2107,36 @@ resolve_latest_checkpoint() {
 }
 
 # Dry-run helper.
+# Per-arg shell-quoting for [DRY-RUN] / trace output. Args that contain
+# whitespace, brackets, JSON braces, quotes, or shell metacharacters get
+# wrapped in single quotes (with embedded single quotes escaped via the
+# standard '\'' idiom); everything else prints as-is. Result: the emitted
+# line can be copy-pasted straight back into a shell and re-execute
+# with the same argv structure — no words re-split on internal spaces,
+# no JSON blobs truncated mid-value. Same rule as train_sweep.sh's
+# `_shell_quote_one`; kept here as a local helper so the orchestrator
+# doesn't need to source train_sweep.sh.
+_quote_argv() {
+    local out=""
+    local s
+    for s in "$@"; do
+        if [[ "$s" =~ [[:space:]\{\}\[\]\|\;\&\<\>\(\)\$\`\"\\] ]]; then
+            printf -v s "'%s'" "${s//\'/\'\\\'\'}"
+        fi
+        if [[ -z "$out" ]]; then
+            out="$s"
+        else
+            out+=" $s"
+        fi
+    done
+    printf '%s' "$out"
+}
+
 run_or_echo() {
     if [[ "$DRY_RUN" == true ]]; then
-        echo "[DRY-RUN] $*"
+        echo "[DRY-RUN] $(_quote_argv "$@")"
     else
-        echo "+ $*"
+        echo "+ $(_quote_argv "$@")"
         "$@"
     fi
 }
@@ -2008,9 +2192,11 @@ start_sim() {
         [[ "$MANAGED_SIM_PID" == "DRYRUN" ]] && return 0
         local _hl=""
         [[ "$HEADLESS" == true ]] && _hl=" --headless"
+        local _rn=""
+        [[ -n "$SPLATSIM_ROBOT_NAME" ]] && _rn=" --robot_name $SPLATSIM_ROBOT_NAME"
         echo "[DRY-RUN] would start SplatSim on port $ENV_EXTERNAL_PORT:"
         echo "[DRY-RUN]   cwd: $SPLATSIM_ROOT"
-        echo "[DRY-RUN]   cmd: python scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $ENV_EXTERNAL_PORT --hostname $ENV_EXTERNAL_HOST --robot_name $SPLATSIM_ROBOT_NAME --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID$_hl"
+        echo "[DRY-RUN]   cmd: python -u scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $ENV_EXTERNAL_PORT --hostname $ENV_EXTERNAL_HOST$_rn --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID$_hl"
         MANAGED_SIM_PID="DRYRUN"
         return 0
     fi
@@ -2042,13 +2228,16 @@ start_sim() {
     mkdir -p "$_log_dir"
     MANAGED_SIM_LOG="$_log_dir/splatsim_$(date +%Y%m%d_%H%M%S).log"
     local launch_cmd=(
-        python scripts/launch_nodes.py
+        python -u scripts/launch_nodes.py
         --robot              "$SPLATSIM_ROBOT"
         --robot_port         "$ENV_EXTERNAL_PORT"
         --hostname           "$ENV_EXTERNAL_HOST"
-        --robot_name         "$SPLATSIM_ROBOT_NAME"
         --eval_benchmark_repo_id "$EVAL_BENCHMARK_REPO_ID"
     )
+    # Only pass --robot_name when the caller overrode it — otherwise
+    # launch_nodes.py resolves it to the robot server class's
+    # DEFAULT_ROBOT_NAME (single source of truth for the env's splat).
+    [[ -n "$SPLATSIM_ROBOT_NAME" ]] && launch_cmd+=( --robot_name "$SPLATSIM_ROBOT_NAME" )
     # When the orchestrator's skip-succeeded path computed a per-round
     # failed-only subset, pass it through to launch_nodes.py so SplatSim's
     # internal `_eval_benchmark_subset` matches what lerobot's
@@ -2167,9 +2356,11 @@ start_filter_sim() {
             | tail -1 | sed -E 's/.*=//'; } || true)"
         : "${_dr_obs_clr:=0.0}"
         : "${_dr_self_clr:=0.0}"
+        local _dr_rn=""
+        [[ -n "$SPLATSIM_ROBOT_NAME" ]] && _dr_rn=" --robot_name $SPLATSIM_ROBOT_NAME"
         echo "[DRY-RUN] would start HEADLESS SplatSim on port $FILTER_COLLISION_ENV_PORT_RESOLVED:"
         echo "[DRY-RUN]   cwd: $SPLATSIM_ROOT"
-        echo "[DRY-RUN]   cmd: python scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $FILTER_COLLISION_ENV_PORT_RESOLVED --hostname $ENV_EXTERNAL_HOST --robot_name $SPLATSIM_ROBOT_NAME --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID --in_collision_obstacle_clearance $_dr_obs_clr --in_collision_self_collision_clearance $_dr_self_clr --headless"
+        echo "[DRY-RUN]   cmd: python -u scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $FILTER_COLLISION_ENV_PORT_RESOLVED --hostname $ENV_EXTERNAL_HOST$_dr_rn --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID --in_collision_obstacle_clearance $_dr_obs_clr --in_collision_self_collision_clearance $_dr_self_clr --headless"
         MANAGED_FILTER_SIM_PID="DRYRUN"
         return 0
     fi
@@ -2216,16 +2407,19 @@ start_filter_sim() {
     : "${_filter_obs_clr:=0.0}"
     : "${_filter_self_clr:=0.0}"
     local launch_cmd=(
-        python scripts/launch_nodes.py
+        python -u scripts/launch_nodes.py
         --robot              "$SPLATSIM_ROBOT"
         --robot_port         "$FILTER_COLLISION_ENV_PORT_RESOLVED"
         --hostname           "$ENV_EXTERNAL_HOST"
-        --robot_name         "$SPLATSIM_ROBOT_NAME"
         --eval_benchmark_repo_id "$EVAL_BENCHMARK_REPO_ID"
         --in_collision_obstacle_clearance "$_filter_obs_clr"
         --in_collision_self_collision_clearance "$_filter_self_clr"
         --headless
     )
+    # Only pass --robot_name when overridden — mirror the pattern used at
+    # the main sim launch site above so class DEFAULT_ROBOT_NAME flows
+    # through for the collision-filter sim too.
+    [[ -n "$SPLATSIM_ROBOT_NAME" ]] && launch_cmd+=( --robot_name "$SPLATSIM_ROBOT_NAME" )
     echo "Starting HEADLESS SplatSim (for collision filter):"
     echo "  cwd:     $SPLATSIM_ROOT"
     echo "  cmd:     ${launch_cmd[*]}"
@@ -2713,7 +2907,7 @@ if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
     echo "  4. (SKIPPED — --use_weighted_sampling) Cumulative merge"
     echo "  5. (SKIPPED — --use_weighted_sampling) Merged-dataset rel-action stats"
     echo "  6. Train policy ($INTERMEDIATE_MODE) on weighted union of {base + every round's intervention + every round's blends}"
-    echo "     → per-source DataLoader weights: base=$(python3 -c "print(round(1-float('$DAGGER_DATA_FRACTION'), 4))"), DAgger=${DAGGER_DATA_FRACTION} split equally across DAgger sub-datasets"
+    echo "     → DataLoader weights: DAgger CAPPED at ${DAGGER_DATA_FRACTION}, else natural frame share; below cap → fully proportional (no upsampling)"
     case "$NORM_MODE" in
         aggregated)
             echo "     → norm_mode=aggregated: policy normalizer/unnormalizer use min-of-mins / max-of-maxes / count-weighted mean+std over ALL sub-datasets."
@@ -2762,23 +2956,30 @@ echo
 # every dag artifact on disk. Sets EFFECTIVE_START_ROUND=1, EFFECTIVE_START_STEP=1
 # on success. Exits the script on abort.
 restart_from_scratch() {
+    # --from_round=N narrows the deletion to rounds N..NUM_ROUNDS, leaving
+    # 1..(N-1) intact. Defaults to 1 (= full wipe, the historical behavior).
+    local _from="${FROM_ROUND:-1}"
+    if (( _from > NUM_ROUNDS )); then
+        echo "ERROR: --from_round=$_from exceeds NUM_ROUNDS=$NUM_ROUNDS" >&2; exit 1
+    fi
     RESTART_PATHS=()
-    for r in $(seq 1 "$NUM_ROUNDS"); do
+    for r in $(seq "$_from" "$NUM_ROUNDS"); do
         # In rerun-blends mode, the intervention + alias + int-stats artifacts
         # belong to the SOURCE lineage (read-only). The new lineage we're
         # building owns the merged + training + blend artifacts only. Never
         # delete source artifacts on --force_restart.
         #
-        # --preserve_round_1_intervention skips round 1's int/alias/int-stats
-        # too, since those represent the (expensive) human-recorded intervention
-        # that the user often wants to keep across "restart all finetuning from
-        # scratch" runs. Rounds 2..N still get cleaned because their
-        # intervention recordings depend on (and would be inconsistent with)
-        # the new fresh-policy chain.
+        # --preserve_round_1_intervention skips the FIRST-cleaned round's
+        # int/alias/int-stats too, since those represent the (expensive)
+        # human-recorded intervention that the user often wants to keep across
+        # "restart finetuning from scratch" runs. The first cleaned round is
+        # $_from (= --from_round; round 1 by default). Later rounds still get
+        # cleaned because their intervention recordings depend on (and would be
+        # inconsistent with) the new fresh-policy chain.
         _skip_int_for_this_round=false
         if [[ "$RERUN_MODE_ENABLED" == "true" ]]; then
             _skip_int_for_this_round=true
-        elif [[ "$PRESERVE_ROUND_1_INTERVENTION" == "true" && "$r" == "1" ]]; then
+        elif [[ "$PRESERVE_ROUND_1_INTERVENTION" == "true" && "$r" == "$_from" ]]; then
             _skip_int_for_this_round=true
         fi
         if [[ "$_skip_int_for_this_round" != "true" ]]; then
@@ -2840,7 +3041,7 @@ restart_from_scratch() {
     for p in "${EXISTING_PATHS[@]}"; do
         run_or_echo rm -rf "$p"
     done
-    EFFECTIVE_START_ROUND=1
+    EFFECTIVE_START_ROUND="$_from"
     EFFECTIVE_START_STEP=1
 }
 
@@ -2915,25 +3116,38 @@ elif [[ -n "$START_ROUND" ]]; then
     EFFECTIVE_START_STEP=1
     echo "Using explicit --start_round=$START_ROUND (begins at step 1)."
 elif [[ "$FORCE_RESTART" == true ]]; then
-    EFFECTIVE_START_ROUND=1
+    # --from_round=N restricts the cleanup loop to rounds N..NUM_ROUNDS,
+    # leaving 1..(N-1) intact (their intervention + merged + policy +
+    # blend artifacts all stay on disk). Default 1 = wipe all rounds.
+    _FROM="${FROM_ROUND:-1}"
+    if (( _FROM > NUM_ROUNDS )); then
+        echo "ERROR: --from_round=$_FROM exceeds NUM_ROUNDS=$NUM_ROUNDS" >&2; exit 1
+    fi
+    EFFECTIVE_START_ROUND="$_FROM"
     EFFECTIVE_START_STEP=1
+    _RANGE_DESC="dag${_FROM}..dag${NUM_ROUNDS}"
+    if (( _FROM == 1 )); then
+        _RANGE_DESC="dag1..dag${NUM_ROUNDS}"
+    else
+        _RANGE_DESC="dag${_FROM}..dag${NUM_ROUNDS} (--from_round=$_FROM; rounds 1..$((_FROM - 1)) PRESERVED)"
+    fi
     if [[ "$DRY_RUN" != true ]]; then
         if [[ "$RERUN_MODE_ENABLED" == "true" ]]; then
             echo "--force_restart (rerun mode): this will rm -rf the NEW lineage's"
             if [[ "$ALSO_DELETE_BLENDS" == "true" ]]; then
-                echo "  merged datasets + training dirs + blend datasets for dag1..dag${NUM_ROUNDS}."
+                echo "  merged datasets + training dirs + blend datasets for ${_RANGE_DESC}."
                 echo "  (--also_delete_blends set; blend datasets will be deleted too)"
             else
-                echo "  merged datasets + training dirs for dag1..dag${NUM_ROUNDS}."
+                echo "  merged datasets + training dirs for ${_RANGE_DESC}."
                 echo "  Blend datasets (<src_int>_dagN_blendXXX) will be PRESERVED for cross-rerun"
                 echo "  cache reuse — pass --also_delete_blends to delete them too."
             fi
             echo "  SOURCE intervention/alias/int-stats artifacts will be PRESERVED."
         else
-            echo "--force_restart: this will rm -rf all dag1..dag${NUM_ROUNDS} datasets,"
+            echo "--force_restart: this will rm -rf all ${_RANGE_DESC} datasets,"
             echo "  their stats sidecars, and per-round training output dirs."
             if [[ "$PRESERVE_ROUND_1_INTERVENTION" == "true" ]]; then
-                echo "  --preserve_round_1_intervention set: round 1's raw intervention dataset,"
+                echo "  --preserve_round_1_intervention set: round $_FROM's raw intervention dataset,"
                 echo "  alias, and int-stats sidecar will be PRESERVED (everything else is wiped)."
             fi
         fi
@@ -2942,20 +3156,21 @@ elif [[ "$FORCE_RESTART" == true ]]; then
         [[ "$CONFIRM" == "restart" ]] || { echo "Aborted."; exit 1; }
     fi
     echo "--force_restart: clearing prior dag artifacts..."
-    for r in $(seq 1 "$NUM_ROUNDS"); do
+    for r in $(seq "$_FROM" "$NUM_ROUNDS"); do
         # In rerun-blends mode, source intervention/alias/int-stats artifacts
         # are read-only and MUST be preserved. Only the new lineage's merged
         # datasets + training dirs + blends get nuked. Mirrors the gate in
         # restart_from_scratch() above.
         #
-        # --preserve_round_1_intervention extends the same skip to round 1
-        # only — the human-recorded intervention dataset is preserved so the
-        # lineage restarts from "round 1 step 4 (merge)" instead of replaying
+        # --preserve_round_1_intervention extends the same skip to the
+        # first-cleaned round ($_FROM = --from_round; round 1 by default) — its
+        # human-recorded intervention dataset is preserved so the lineage
+        # restarts from "round $_FROM step 4 (merge)" instead of replaying
         # step 1's expensive lerobot-eval recording.
         _skip_int_for_this_round=false
         if [[ "$RERUN_MODE_ENABLED" == "true" ]]; then
             _skip_int_for_this_round=true
-        elif [[ "$PRESERVE_ROUND_1_INTERVENTION" == "true" && "$r" == "1" ]]; then
+        elif [[ "$PRESERVE_ROUND_1_INTERVENTION" == "true" && "$r" == "$_FROM" ]]; then
             _skip_int_for_this_round=true
         fi
         if [[ "$_skip_int_for_this_round" != "true" ]]; then
@@ -3226,10 +3441,10 @@ fi
 # TRAIN_OUTPUT_DIR from the caller's scope.
 run_training_step() {
     if [[ "$DRY_RUN" == true ]]; then
-        echo "[DRY-RUN] $*"
+        echo "[DRY-RUN] $(_quote_argv "$@")"
         return 0
     fi
-    echo "+ $*"
+    echo "+ $(_quote_argv "$@")"
     local rc=0
     "$@" || rc=$?
     if (( rc == 0 )); then
@@ -3289,21 +3504,90 @@ print_gpu_state() {
 if (( EFFECTIVE_START_ROUND == 1 )); then
     BASE_TRAINING_DIR="$LEROBOT_ROOT/outputs/training/${TRAIN_OUTPUT_MODEL_PREFIX}_${BASE_SHORT}_${TRAIN_OUTPUT_ACTION_TAG}_basewrist"
 
+    # CURRENT_POLICY unset = "no valid base checkpoint yet — need to train".
+    # We set it in the INITIAL_POLICY_PATH sub-branches below when the path
+    # resolves to an actual pretrained_model dir. If it doesn't (either the
+    # path is missing or `resolve_latest_checkpoint` can't walk into it), we
+    # retarget `BASE_TRAINING_DIR` to the user's chosen path and fall through
+    # to the `training_exists` / `EFFECTIVE_START_STEP == 1` branches below
+    # so the base is trained AT that path.
+    CURRENT_POLICY=""
+
     if [[ -n "$INITIAL_POLICY_PATH" ]]; then
-        # Resolve the user-supplied path to a pretrained_model dir.
         if [[ -d "$INITIAL_POLICY_PATH/checkpoints/last/pretrained_model" ]]; then
             CURRENT_POLICY="$INITIAL_POLICY_PATH/checkpoints/last/pretrained_model"
         elif [[ -d "$INITIAL_POLICY_PATH/pretrained_model" ]]; then
             CURRENT_POLICY="$INITIAL_POLICY_PATH/pretrained_model"
         elif [[ -d "$INITIAL_POLICY_PATH" && -f "$INITIAL_POLICY_PATH/train_config.json" ]]; then
             CURRENT_POLICY="$INITIAL_POLICY_PATH"
-        else
+        elif [[ -d "$INITIAL_POLICY_PATH" ]]; then
+            # Path exists but its layout isn't one of the recognized
+            # checkpoint shapes — walk-up search inside it.
             CURRENT_POLICY="$(resolve_latest_checkpoint "$INITIAL_POLICY_PATH")"
+        else
+            # Path does NOT exist on disk yet. Interpret as "train the base
+            # policy AT this path" — the user is naming the output dir up
+            # front. Retarget BASE_TRAINING_DIR and let the branches below
+            # invoke train_sweep.sh (same as if --initial_policy_path was
+            # omitted, but with the user's chosen output dir instead of the
+            # auto-derived one).
+            #
+            # SAFETY CHECK: train_sweep.sh always writes to
+            #   outputs/training/<model_prefix>_<dataset_short>_<delta|abs>_basewrist
+            # (basewrist because the diffusion/pi05/act dispatch is hardcoded
+            # to the basewrist camera setup in train_sweep.sh:_run_all_jobs,
+            # which forces --policy.input_features to include BOTH
+            # observation.images.base_rgb and observation.images.wrist_rgb —
+            # so `_basewrist` in the derived name always faithfully reflects
+            # the model's actual input modality set). If the user's
+            # --initial_policy_path basename doesn't match that derived
+            # basename, train_sweep will write to the derived path and the
+            # orchestrator will keep looking for `INITIAL_POLICY_PATH` after
+            # training — infinite mismatch. Fail loudly up front with a
+            # concrete correction the user can paste.
+            _expected_basename="${TRAIN_OUTPUT_MODEL_PREFIX}_${BASE_SHORT}_${TRAIN_OUTPUT_ACTION_TAG}_basewrist"
+            _actual_basename="$(basename "$INITIAL_POLICY_PATH")"
+            if [[ "$_actual_basename" != "$_expected_basename" ]]; then
+                echo "ERROR: --initial_policy_path doesn't match the round-0 output name that" >&2
+                echo "  train_sweep.sh would produce from your other flags." >&2
+                echo "" >&2
+                echo "  --initial_policy_path basename : $_actual_basename" >&2
+                echo "  train_sweep.sh would write to  : $_expected_basename" >&2
+                echo "                                   (= <model_prefix>_<base_short>_<action_tag>_basewrist)" >&2
+                echo "" >&2
+                echo "  Derived from:" >&2
+                echo "    --model=$MODEL             → model_prefix=$TRAIN_OUTPUT_MODEL_PREFIX" >&2
+                echo "    --base_short=$BASE_SHORT" >&2
+                echo "    --action_format=$ACTION_FORMAT → action_tag=$TRAIN_OUTPUT_ACTION_TAG" >&2
+                echo "    (basewrist = hardcoded camera dispatch in train_sweep.sh — locks" >&2
+                echo "     policy.input_features to base_rgb + wrist_rgb + observation.state)" >&2
+                echo "" >&2
+                echo "  Fix — either:" >&2
+                echo "    (a) point --initial_policy_path at the derived name:" >&2
+                echo "        --initial_policy_path=outputs/training/$_expected_basename" >&2
+                echo "    (b) or adjust --base_short/--model/--action_format so the derived" >&2
+                echo "        name matches your existing path." >&2
+                exit 1
+            fi
+            echo "Round 0: --initial_policy_path='$INITIAL_POLICY_PATH' does not exist on disk yet."
+            echo "  → basename matches the train_sweep.sh derived name; will train base policy here."
+            BASE_TRAINING_DIR="$INITIAL_POLICY_PATH"
         fi
+    fi
+
+    if [[ -n "$CURRENT_POLICY" ]]; then
         echo "Round 0: skipped (using --initial_policy_path=$CURRENT_POLICY)."
     elif training_exists "$BASE_TRAINING_DIR"; then
         CURRENT_POLICY="$(resolve_latest_checkpoint "$BASE_TRAINING_DIR")"
         echo "Round 0: skipped (found existing base training at $BASE_TRAINING_DIR)."
+        # Write a round-0 sidecar so this base is discoverable as
+        # "trained/managed by this sweep" — dagger_plot.py and analysis
+        # tooling can then pair the base with its per-round descendants
+        # even when the base pre-existed on disk. Overwrites any prior
+        # sidecar there (a shared base used by several sweeps will
+        # reflect the LATEST sweep's invocation; the argv it captures
+        # is what matters for reproducibility).
+        write_dagger_config_sidecar 0 "$BASE_TRAINING_DIR/dagger/config.json" "$BASE_TRAINING_DIR"
     elif (( EFFECTIVE_START_STEP == 1 )); then
         # Starting fresh and no prior base — train it now. The orchestrator
         # has not started its managed sim yet (start_sim happens inside the
@@ -3328,9 +3612,35 @@ if (( EFFECTIVE_START_ROUND == 1 )); then
         # TRAIN_OUTPUT_DIR from this scope.
         TRAIN_OUTPUT_DIR="$BASE_TRAINING_DIR"
         cleanup_pre_train_partial "$TRAIN_OUTPUT_DIR"
+        # `--cameras=basewrist` matches the assumption baked into
+        # `BASE_TRAINING_DIR` / `BASE_POLICY_NAME` (both end with
+        # `_basewrist`) so train_sweep.sh writes to exactly the path the
+        # orchestrator is expecting. Also documents the input-modality
+        # choice inline: base_rgb + wrist_rgb + observation.state.
+        # Forward the sweep-configured eval benchmark + subset so round-0's
+        # inline eval runs on EXACTLY the same scenarios as every per-round
+        # intervention record and finetune eval. The eval count + other eval
+        # knobs (--eval.n_episodes, --env.terminate_on_collision,
+        # --env.episode_length, --seed, ...) come from FINETUNE_EXTRA_ARGS
+        # via --extra_args below — that way the caller defines them ONCE at
+        # the sweep level and both round 0 base training AND every DAgger
+        # round's finetune training pick them up.
+        ROUND0_EVAL_ARGS=(
+            --eval_benchmark_repo_id="$EVAL_BENCHMARK_REPO_ID"
+        )
+        if [[ -n "$INTERVENTION_SUBSET_JSON" ]]; then
+            ROUND0_EVAL_ARGS+=( --eval_benchmark_subset="$INTERVENTION_SUBSET_JSON" )
+        fi
+        ROUND0_EXTRA_ARGS=()
+        if [[ -n "$FINETUNE_EXTRA_ARGS" ]]; then
+            ROUND0_EXTRA_ARGS=( --extra_args="$FINETUNE_EXTRA_ARGS" )
+        fi
         run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
             --dataset_repo="$BASE_REPO" \
             --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
+            --cameras=basewrist \
+            "${ROUND0_EVAL_ARGS[@]}" \
+            "${ROUND0_EXTRA_ARGS[@]}" \
             "${ROUND0_ABS_ACTION_ARG[@]}" \
             "${TRAIN_EXT_PORT_SWEEP[@]}" \
             "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
@@ -3340,6 +3650,11 @@ if (( EFFECTIVE_START_ROUND == 1 )); then
         else
             CURRENT_POLICY="$BASE_TRAINING_DIR/checkpoints/last/pretrained_model"
         fi
+        # Round-0 sidecar for the base we just trained. Captures the same
+        # orchestrator + sweep invocation the per-round sidecars capture,
+        # so dagger_plot.py can pair this base with its downstream
+        # _ft_dag<N> rounds instead of falling back to a synthetic anchor.
+        write_dagger_config_sidecar 0 "$BASE_TRAINING_DIR/dagger/config.json" "$BASE_TRAINING_DIR"
     else
         # Resuming mid-round-1 with no initial_policy_path AND no base training
         # dir. We have no way to source a round-1 input policy. Abort.
@@ -3426,6 +3741,17 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
     echo "  Current policy:       $CURRENT_POLICY"
     echo "════════════════════════════════════════════════════════════════"
 
+    # Write the dagger config sidecar EARLY — before any step runs — so a
+    # crash during steps 1-5 still leaves an identifiable lineage breadcrumb
+    # on disk (orchestrator argv, naming, rerun pointers, branching policy).
+    # The end-of-step-6 write below re-runs after step 5 to populate the
+    # weighted_repo_ids / weighted_sample_weights / weighted_stats_paths
+    # fields that aren't known until then. Sidecar writes are atomic
+    # (tmp→rename), so a partial overwrite never leaves a corrupt JSON.
+    # The DAG_CFG_WEIGHTED_*_JSON env vars default to '[]' here (see the
+    # function body) so the early write is well-formed even before step 5.
+    write_dagger_config_sidecar "$r" "$TRAIN_OUTPUT_DIR/dagger/config.json" "$TRAIN_OUTPUT_DIR"
+
     # Ensure the external SplatSim is running before any sim-using step.
     # Step 1 (intervention recording) and step 2 (blending) both need it;
     # steps 3-5 are pure data ops (alias, merge, stats) that don't touch
@@ -3445,10 +3771,21 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
         # downstream SUBSET_ARG and EFFECTIVE_N_EPISODES_FOR_INT used by
         # the step-1 lerobot-eval call below, so we need to run it
         # whether or not we end up launching/restarting the sim here.
+        # Default the sim-side subset to match the client-side intervention
+        # subset. Previously EVAL_BENCHMARK_SUBSET_FOR_SIM was left empty
+        # unless --skip_succeeded fired, so the server defaulted to
+        # `list(range(total))` while lerobot's --env.eval_benchmark_subset
+        # said `[0..N-1]`. When N < total, "subset[k]" meant different
+        # scenarios on each side and rounds could disagree on which
+        # scenario each rollout was — see PR that made
+        # benchmark_start_index per-reset the primary correctness mechanism;
+        # this line is the belt-and-suspenders match at launch.
         EVAL_BENCHMARK_SUBSET_FOR_SIM=""
         SUBSET_ARG=()
         if [[ -n "$INTERVENTION_SUBSET_JSON" ]]; then
             SUBSET_ARG+=( "--env.eval_benchmark_subset=$INTERVENTION_SUBSET_JSON" )
+            # Convert JSON `[0,1,2,...]` to CSV `0,1,2,...` for launch_nodes.py.
+            EVAL_BENCHMARK_SUBSET_FOR_SIM=$(python3 -c "import json,sys; print(','.join(str(x) for x in json.loads(sys.argv[1])))" "$INTERVENTION_SUBSET_JSON")
         fi
         EFFECTIVE_N_EPISODES_FOR_INT="$INTERVENTION_N_EPISODES"
         if [[ "$DAGGER_SKIP_SUCCEEDED_IN_PREV_EVAL" == "true" && "$r" -gt 1 ]]; then
@@ -3624,6 +3961,22 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
         if [[ -n "$RRT_SELF_COLLISION_SKIP_PAIRS" ]]; then
             RRT_CLEARANCE_ARGS+=( "--policy.shared_autonomy_config.rrt_self_collision_skip_pairs=$RRT_SELF_COLLISION_SKIP_PAIRS" )
         fi
+        # Persist the lerobot-eval output (the lerobot PROCESS — distinct from
+        # the sim subprocess's splatsim_<ts>.log) to a per-recording file right
+        # next to it, so the SA-wrapper / RRT drift + teleport-landing
+        # diagnostics survive past terminal scrollback. Python `logging` writes
+        # to STDERR, so 2>&1 must be folded into the pipe to capture them. In
+        # dry-run we tee to /dev/null (no file created). `set -o pipefail` (top
+        # of script) makes the pipeline surface lerobot-eval's non-zero exit
+        # despite tee being the last stage, so a failed recording still aborts
+        # the round under set -e (matching the pre-tee behavior).
+        if [[ "$DRY_RUN" != true ]]; then
+            mkdir -p "$TRAIN_OUTPUT_DIR/dagger"
+            EVAL_LOG="$TRAIN_OUTPUT_DIR/dagger/eval_$(date +%Y%m%d_%H%M%S).log"
+            echo "  eval log (lerobot side): $EVAL_LOG"
+        else
+            EVAL_LOG=/dev/null
+        fi
         # shellcheck disable=SC2086  # INTERVENTION_EXTRA_ARGS may contain multiple flags
         run_or_echo lerobot-eval \
             --policy.path="$CURRENT_POLICY" \
@@ -3648,7 +4001,7 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             "${OFFLINE_DATASET_ARG[@]}" \
             "${HEADLESS_EVAL_ARG[@]}" \
             "${RRT_CLEARANCE_ARGS[@]}" \
-            $INTERVENTION_EXTRA_ARGS
+            $INTERVENTION_EXTRA_ARGS 2>&1 | tee "$EVAL_LOG"
 
         # Stats on the intervention dataset (relative-action sidecar).
         # Folded into step 1 — completion of step 1 requires BOTH the recording
@@ -3997,10 +4350,20 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
                 ABS_ACTION_ARG=( --no_relative )
             fi
             cleanup_pre_train_partial "$TRAIN_OUTPUT_DIR"
+            # See the round-0 site above for why `--cameras=basewrist` is
+            # explicit — it locks the input modality set and keeps the
+            # output dir under `_basewrist`, matching `SCRATCH_RUN_NAME`.
+            _PER_ROUND_SCRATCH_EXTRA_ARGS=()
+            if [[ -n "$FINETUNE_EXTRA_ARGS" ]]; then
+                _PER_ROUND_SCRATCH_EXTRA_ARGS=( --extra_args="$FINETUNE_EXTRA_ARGS" )
+            fi
             run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
                 --dataset_repo="$MERGED_REPO" \
                 --run_name="$SCRATCH_RUN_NAME" \
                 --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
+                --cameras=basewrist \
+                --eval_benchmark_repo_id="$EVAL_BENCHMARK_REPO_ID" \
+                "${_PER_ROUND_SCRATCH_EXTRA_ARGS[@]}" \
                 "${ABS_ACTION_ARG[@]}" \
                 "${TRAIN_EXT_PORT_SWEEP[@]}" \
                 "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
@@ -4262,18 +4625,12 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                         W_STATS_PATHS+=( "$STATS_BASE/$_b_short/stats_rel${FT_CHUNK}.json" )
                     done
                 done
-                # Two-level allotment:
-                #   * Base gets a fixed (1 - f) share regardless of frame counts.
-                #   * The remaining f is split EQUALLY across the R DAgger
-                #     rounds (each round gets f / R).
-                #   * Within each round, the round's allotment is split across
-                #     its sub-datasets (raw intervention + each blend variant)
-                #     PROPORTIONAL to their frame counts. This matters when
-                #     --filter_blend_collisions trims some blend datasets so
-                #     they're smaller than their raw sibling — without the
-                #     proportional split, an empty/tiny blend would still get
-                #     the same per-sub share as the much-larger raw intervention.
-                #
+                # DAgger cap allotment (see --dagger_data_fraction help + the
+                # _py_weighted_sample_weights helper docstring):
+                #   * natural = sum(dag_counts) / total_frames
+                #   * f_eff   = min(F, natural)
+                #   * base    = 1 - f_eff
+                #   * dag[i]  = f_eff * (counts[i] / sum(dag_counts))
                 # Frame counts are read from the LeRobot dataset cache at
                 # ~/.cache/huggingface/lerobot/<repo>/meta/info.json. By the
                 # time this runs (orchestrator step 6), step 5 has already
@@ -4281,52 +4638,7 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                 # disk locally.
                 _n_dag=$(( ${#W_REPO_IDS[@]} - 1 ))
                 _n_blends=${#BLENDS[@]}
-                read -ra W_WEIGHTS <<< "$(python3 -c "
-import os, sys, json
-
-f = float(sys.argv[1])
-R = int(sys.argv[2])           # current round number (1..NUM_ROUNDS)
-group_size = 1 + int(sys.argv[3])  # 1 raw int + n_blends sub-datasets per round
-# In dry-run mode, datasets that step 2 would produce aren't actually on disk.
-# Fall back to equal-share weights so the printed command preview is still
-# usable. The real run re-derives proportional weights once step 2 has
-# materialized every nocoll sibling on disk.
-dry_run = sys.argv[4] == 'true'
-repo_ids = sys.argv[5:]
-# Layout: [base, r1_int, r1_blend_0, ..., r1_blend_(b-1), r2_int, ..., rR_blend_(b-1)]
-assert len(repo_ids) == 1 + R * group_size, (
-    f'repo_ids layout mismatch: got {len(repo_ids)}, expected 1 + {R}*{group_size}'
-)
-
-CACHE = os.path.expanduser('~/.cache/huggingface/lerobot')
-def frames_for(repo):
-    p = os.path.join(CACHE, repo, 'meta', 'info.json')
-    if not os.path.isfile(p):
-        if dry_run:
-            return 1  # placeholder so dry-run can still print a sample_weights list
-        raise FileNotFoundError(f'meta/info.json not found for {repo} at {p}')
-    return int(json.load(open(p))['total_frames'])
-
-per_round = f / R
-weights = [1.0 - f]
-for r_i in range(R):
-    group = repo_ids[1 + r_i*group_size : 1 + (r_i+1)*group_size]
-    counts = [frames_for(rep) for rep in group]
-    total = sum(counts)
-    if total <= 0:
-        raise ValueError(f'round {r_i+1}: all sub-datasets are empty ({list(zip(group, counts))})')
-    for c in counts:
-        weights.append(per_round * c / total)
-# Force exact sum=1 by absorbing FP error into the last non-zero weight
-# (avoid the last position if it's a 0-frame sub-dataset — the validator
-# would still accept it but the log would show a weird non-zero weight
-# on what's logically an empty source).
-for i in range(len(weights) - 1, -1, -1):
-    if weights[i] > 0:
-        weights[i] = 1.0 - sum(weights[:i]) - sum(weights[i+1:])
-        break
-print(' '.join(f'{w:.10f}' for w in weights))
-" "$DAGGER_DATA_FRACTION" "$r" "$_n_blends" "$DRY_RUN" "${W_REPO_IDS[@]}")"
+                read -ra W_WEIGHTS <<< "$(_py_weighted_sample_weights "$DAGGER_DATA_FRACTION" "$r" "$_n_blends" "$DRY_RUN" "${W_REPO_IDS[@]}")"
                 # Format draccus list strings as JSON arrays — draccus accepts
                 # both [a,b,c] and ['a','b','c']; we go with quoted/JSON so paths
                 # with slashes (which draccus might otherwise mishandle) round-trip
@@ -4386,7 +4698,7 @@ print(' '.join(f'{w:.10f}' for w in weights))
                     --dataset.norm_mode="$NORM_MODE"
                     --dataset.stats_path=
                 )
-                echo "Weighted sampling: ${#W_REPO_IDS[@]} sub-datasets (1 base + $_n_dag DAgger); per-round share=$(python3 -c "print(f'{float(\"$DAGGER_DATA_FRACTION\")/$r:.4f}')") (frame-proportional within round); weights=${W_WEIGHTS[*]}; norm_mode=$NORM_MODE"
+                echo "Weighted sampling: ${#W_REPO_IDS[@]} sub-datasets (1 base + $_n_dag DAgger); cap=${DAGGER_DATA_FRACTION} (per-frame proportional below cap; see [weighted-weights] diagnostic above); weights=${W_WEIGHTS[*]}; norm_mode=$NORM_MODE"
             elif [[ "$ACTION_FORMAT" == "rel" ]]; then
                 # Merge-mode rel: point at the merged-dataset sidecar (default
                 # legacy behavior).
@@ -4482,10 +4794,14 @@ print(' '.join(f'{w:.10f}' for w in weights))
                 --eval.n_episodes="$EVAL_N_EPISODES"
             fi  # end of _skip_step_6 != true
         fi
-        # Write the per-round config sidecar AFTER training succeeds (or
-        # was skipped because already at target). The sidecar reflects the
-        # CURRENT orchestrator invocation, not training-time history, so
-        # writing it on a skip is correct.
+        # Refresh the per-round config sidecar AFTER training succeeds (or
+        # was skipped). An early write fires at start-of-round (see the
+        # top of the loop) so the lineage is identifiable even if a crash
+        # happens before this point; this refresh adds the per-round
+        # weighted_repo_ids / weighted_sample_weights / weighted_stats_paths
+        # fields that aren't known until after step 5. Atomic tmp→rename
+        # in the helper means a crash mid-refresh leaves the start-of-round
+        # sidecar intact.
         write_dagger_config_sidecar "$r" "$TRAIN_OUTPUT_DIR/dagger/config.json" "$TRAIN_OUTPUT_DIR"
         # ── Step 6b: collision-filtered sibling policy ──────────────────
         # When --filter_blend_collisions is on, train a SECOND policy this
@@ -4532,46 +4848,12 @@ print(' '.join(f'{w:.10f}' for w in weights))
                     done
                 done
                 _nc_n_blends=${#BLENDS[@]}
-                # Reuse step 6's proportional-weight algorithm — same
-                # python script, just fed the NC arrays.
-                read -ra NC_WEIGHTS <<< "$(python3 -c "
-import os, sys, json
-f = float(sys.argv[1])
-R = int(sys.argv[2])
-group_size = 1 + int(sys.argv[3])
-dry_run = sys.argv[4] == 'true'
-repo_ids = sys.argv[5:]
-assert len(repo_ids) == 1 + R * group_size, (
-    f'repo_ids layout mismatch: got {len(repo_ids)}, expected 1 + {R}*{group_size}'
-)
-CACHE = os.path.expanduser('~/.cache/huggingface/lerobot')
-def frames_for(repo):
-    p = os.path.join(CACHE, repo, 'meta', 'info.json')
-    if not os.path.isfile(p):
-        if dry_run:
-            return 1
-        raise FileNotFoundError(f'meta/info.json not found for {repo} at {p}')
-    return int(json.load(open(p))['total_frames'])
-per_round = f / R
-weights = [1.0 - f]
-for r_i in range(R):
-    group = repo_ids[1 + r_i*group_size : 1 + (r_i+1)*group_size]
-    counts = [frames_for(rep) for rep in group]
-    total = sum(counts)
-    if total <= 0:
-        raise ValueError(f'round {r_i+1}: all sub-datasets are empty ({list(zip(group, counts))})')
-    for c in counts:
-        weights.append(per_round * c / total)
-for i in range(len(weights) - 1, -1, -1):
-    if weights[i] > 0:
-        weights[i] = 1.0 - sum(weights[:i]) - sum(weights[i+1:])
-        break
-print(' '.join(f'{w:.10f}' for w in weights))
-" "$DAGGER_DATA_FRACTION" "$r" "$_nc_n_blends" "$DRY_RUN" "${NC_REPO_IDS[@]}")"
+                # Reuse step 6's algorithm via the shared helper.
+                read -ra NC_WEIGHTS <<< "$(_py_weighted_sample_weights "$DAGGER_DATA_FRACTION" "$r" "$_nc_n_blends" "$DRY_RUN" "${NC_REPO_IDS[@]}")"
                 NC_REPO_IDS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${NC_REPO_IDS[@]}")
                 NC_STATS_PATHS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${NC_STATS_PATHS[@]}")
                 NC_WEIGHTS_JSON=$(python3 -c "import json,sys; print(json.dumps([float(x) for x in sys.argv[1:]], separators=(',', ':')))" "${NC_WEIGHTS[@]}")
-                echo "  [step 6b] Weighted sampling (nocoll): ${#NC_REPO_IDS[@]} sub-datasets; per-round share=$(python3 -c "print(f'{float(\"$DAGGER_DATA_FRACTION\")/$r:.4f}')"); weights=${NC_WEIGHTS[*]}"
+                echo "  [step 6b] Weighted sampling (nocoll): ${#NC_REPO_IDS[@]} sub-datasets; cap=${DAGGER_DATA_FRACTION} (per-frame proportional below cap; see [weighted-weights] diagnostic above); weights=${NC_WEIGHTS[*]}"
                 # shellcheck disable=SC2086  # FINETUNE_EXTRA_ARGS is word-split intentionally
                 run_training_step bash "$SCRIPT_DIR/resume_training.sh" "$CURRENT_POLICY" \
                     --dataset.repo_id= \
@@ -4771,16 +5053,11 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
                 done
             done
             _fs_n_dag=$(( ${#FS_W_REPO_IDS[@]} - 1 ))
-            read -ra FS_W_WEIGHTS <<< "$(python3 -c "
-import sys
-f = float(sys.argv[1])
-n = int(sys.argv[2])
-base = 1.0 - f
-per = f / n
-weights = [base] + [per] * n
-weights[-1] = 1.0 - sum(weights[:-1])
-print(' '.join(f'{w:.10f}' for w in weights))
-" "$DAGGER_DATA_FRACTION" "$_fs_n_dag")"
+            # Frame-proportional, cap-at-F weights via the shared helper —
+            # identical algorithm to the per-round finetune step (step 6)
+            # so the from-scratch run composes its training mix the SAME way
+            # the finetune rounds do.
+            read -ra FS_W_WEIGHTS <<< "$(_py_weighted_sample_weights "$DAGGER_DATA_FRACTION" "$NUM_ROUNDS" "${#BLENDS[@]}" "$DRY_RUN" "${FS_W_REPO_IDS[@]}")"
             FS_REPO_IDS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${FS_W_REPO_IDS[@]}")
             FS_STATS_PATHS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${FS_W_STATS_PATHS[@]}")
             FS_WEIGHTS_JSON=$(python3 -c "import json,sys; print(json.dumps([float(x) for x in sys.argv[1:]], separators=(',', ':')))" "${FS_W_WEIGHTS[@]}")
@@ -4795,22 +5072,34 @@ print(' '.join(f'{w:.10f}' for w in weights))
 
         TRAIN_OUTPUT_DIR="$FINAL_SCRATCH_DIR"   # consumed by run_training_step
         cleanup_pre_train_partial "$TRAIN_OUTPUT_DIR"
-        # Forward eval scope + subset to the from-scratch step so its inline
-        # eval covers the SAME scenarios at the SAME count as the per-round
-        # finetune evals — previously hardcoded at 5 in train_sweep.sh, making
-        # final-scratch + finetune rounds non-comparable in `dagger_progress`.
-        FS_EVAL_ARGS=( --eval_n_episodes="$EVAL_N_EPISODES" )
+        # Forward eval benchmark + subset to the from-scratch step so its
+        # inline eval covers the SAME benchmark, same scenarios as the
+        # per-round finetune evals — previously hardcoded at 5 (and locked
+        # to the default benchmark) in train_sweep.sh, making final-scratch
+        # + finetune rounds non-comparable in `dagger_progress`. Eval count
+        # + other eval knobs (--eval.n_episodes, --env.episode_length, etc.)
+        # come from --extra_args below (from FINETUNE_EXTRA_ARGS).
+        FS_EVAL_ARGS=(
+            --eval_benchmark_repo_id="$EVAL_BENCHMARK_REPO_ID"
+        )
         if [[ -n "$INTERVENTION_SUBSET_JSON" ]]; then
             FS_EVAL_ARGS+=( --eval_benchmark_subset="$INTERVENTION_SUBSET_JSON" )
+        fi
+        if [[ -n "$FINETUNE_EXTRA_ARGS" ]]; then
+            FS_EVAL_ARGS+=( --extra_args="$FINETUNE_EXTRA_ARGS" )
         fi
         if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
             # --dataset_repo intentionally OMITTED — train_sweep.sh defaults
             # it to the long-since-unused placeholder when multi-dataset args
             # are set, and the multi-mode validation in train_sweep.sh
             # ignores its value anyway.
+            # `--cameras=basewrist` is explicit for the same reason as
+            # the two train_sweep sites above — pins the input modality
+            # set and keeps the output dir under `_basewrist`.
             run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
                 --run_name="$FINAL_SCRATCH_RUN_NAME" \
                 --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
+                --cameras=basewrist \
                 "${ABS_ACTION_ARG[@]}" \
                 "${TRAIN_EXT_PORT_SWEEP[@]}" \
                 "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
@@ -4822,6 +5111,7 @@ print(' '.join(f'{w:.10f}' for w in weights))
                 --dataset_repo="$LAST_MERGED_REPO" \
                 --run_name="$FINAL_SCRATCH_RUN_NAME" \
                 --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
+                --cameras=basewrist \
                 "${ABS_ACTION_ARG[@]}" \
                 "${TRAIN_EXT_PORT_SWEEP[@]}" \
                 "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \

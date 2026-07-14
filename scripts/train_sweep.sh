@@ -26,6 +26,19 @@ set -euo pipefail
 #                           is used, and which chunk size the relative-action
 #                           stats sidecar is keyed off (pi05/pi0 → 50, diffusion
 #                           → 8, act → none — uses absolute actions).
+#   --cameras=NAME          Which camera set to train against:
+#                           "basewrist" (default) | "base" | "wrist".
+#                           basewrist → policy.input_features includes BOTH
+#                             observation.images.base_rgb AND
+#                             observation.images.wrist_rgb + observation.state.
+#                           base / wrist → only that camera + observation.state.
+#                           Also appears as the `_<cameras>` suffix on the
+#                           auto-derived run_name (training-dir basename), so
+#                           swapping this changes the output path. Downstream
+#                           callers that construct expected names (e.g.
+#                           dagger_orchestrate.sh's round-0 safety check) must
+#                           either mirror the default or thread this value
+#                           through.
 #   --env_external_port=N   Connect lerobot-train's inline eval to an external
 #                           SplatSim ZMQ server at this port (e.g. 6001) instead
 #                           of spawning a new one. Required when training has to
@@ -82,6 +95,19 @@ ENV_EXTERNAL_PORT=""
 POLICY_PUSH_TO_HUB=""   # empty = use whatever the policy config default is
 RUN_NAME_OVERRIDE=""    # set to override the auto-derived run_name (training dir basename)
 MODEL="pi05"            # which policy to train: pi05 | diffusion | act
+# Which camera set to train against. Drives BOTH the run's naming
+# (`_${CAMERAS}` suffix on the run_name) and the actual
+# `--policy.input_features` map (`set_camera_args` at the top of the
+# file). Values:
+#   basewrist (default) — both base_rgb + wrist_rgb + observation.state
+#   base                — base_rgb + observation.state only
+#   wrist               — wrist_rgb + observation.state only
+# Historically hardcoded in _run_all_jobs; exposed here as a CLI knob
+# so callers (e.g. dagger_orchestrate.sh) can pick base-only / wrist-only
+# training without editing this file. Downstream users of the
+# orchestrator-derived name (like dagger_orchestrate.sh's round-0 safety
+# check) must mirror this default or thread the value through.
+CAMERAS="basewrist"
 DRY_RUN=false
 # Eval-scope passthroughs from the DAgger orchestrator (or other callers
 # that want to control inline eval scope). Both empty by default so
@@ -92,6 +118,24 @@ DRY_RUN=false
 # last-occurrence-wins rule means the override applies.
 EVAL_N_EPISODES=""
 EVAL_BENCHMARK_SUBSET=""
+# Eval benchmark dataset used by the inline eval phase. Empty = keep the
+# built-in default baked into SHARED_ARGS below. Any non-empty value is
+# forwarded as `--env.eval_benchmark_repo_id=` at the END of the command
+# line so draccus's last-occurrence-wins rule silently replaces the
+# SHARED_ARGS default. Wired up so the DAgger orchestrator can force
+# every downstream training round (including round 0) to eval against
+# the same benchmark the intervention + finetune eval steps use.
+EVAL_BENCHMARK_REPO_ID=""
+# Raw passthrough: whatever the caller wants appended VERBATIM to the
+# lerobot-train command line. Word-split, so multi-flag strings work:
+# --extra_args='--eval.n_episodes=30 --seed=0 --env.terminate_on_collision=true'.
+# Appended AFTER SHARED_ARGS + per-job EXTRA arrays, so draccus's
+# last-wins rule means any conflicting flag here overrides the earlier
+# defaults. Matches the DAgger orchestrator's --finetune_extra_args
+# passthrough (which now feeds this arg for round-0 / per-round-scratch /
+# final-scratch training so the user defines eval knobs ONCE at the sweep
+# level, not once per training path).
+EXTRA_ARGS_STR=""
 # ─────────────────────────────────────────────────────────────────────────────
 
 for arg in "$@"; do
@@ -106,8 +150,12 @@ for arg in "$@"; do
         --policy.push_to_hub=*) POLICY_PUSH_TO_HUB="${arg#*=}" ;;
         --run_name=*)           RUN_NAME_OVERRIDE="${arg#*=}" ;;
         --model=*)              MODEL="${arg#*=}" ;;
+        --cameras=*)            CAMERAS="${arg#*=}" ;;
         --eval_n_episodes=*)    EVAL_N_EPISODES="${arg#*=}" ;;
         --eval_benchmark_subset=*) EVAL_BENCHMARK_SUBSET="${arg#*=}" ;;
+        --eval_benchmark_repo_id=*) EVAL_BENCHMARK_REPO_ID="${arg#*=}" ;;
+        --eval_benchmark=*)         EVAL_BENCHMARK_REPO_ID="${arg#*=}" ;;  # short alias
+        --extra_args=*)             EXTRA_ARGS_STR="${arg#*=}" ;;
         --multi_dataset_repo_ids=*)      MULTI_DATASET_REPO_IDS="${arg#*=}" ;;
         --multi_dataset_sample_weights=*) MULTI_DATASET_SAMPLE_WEIGHTS="${arg#*=}" ;;
         --multi_dataset_stats_paths=*)   MULTI_DATASET_STATS_PATHS="${arg#*=}" ;;
@@ -115,6 +163,18 @@ for arg in "$@"; do
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
+
+# --cameras validation. Only three variants are wired through
+# `set_camera_args`; a bad value would silently produce an empty
+# CAMERA_ARGS and lerobot-train would then complain about missing input
+# features far downstream. Fail loudly here.
+case "$CAMERAS" in
+    basewrist|base|wrist) ;;
+    *)
+        echo "ERROR: --cameras='$CAMERAS' is not valid. Expected one of: basewrist, base, wrist." >&2
+        exit 1
+        ;;
+esac
 
 # All-or-nothing validation for the multi-dataset passthroughs. Half-set
 # is almost certainly a caller bug (e.g. a missing JSON-encode in the
@@ -286,18 +346,33 @@ fi
 TRAIN_SCRIPT="lerobot-train"  # make sure this is in your PATH (e.g. via lerobot's install.sh)
 
 # ── Shared env/eval args (same for every run) ────────────────
+# Resolve eval-related overrides UP FRONT so SHARED_ARGS carries the final
+# value directly. Previously these were hardcoded here (--eval.n_episodes=5,
+# a fixed benchmark repo) and the CLI overrides appended at the END of the
+# command, producing duplicate flags and relying on draccus's last-wins
+# rule. That worked but was confusing to read in the emitted `Running: ...`
+# line ("wait, I see =5 first — is that what's being used?"). Now each flag
+# appears exactly once, at the resolved value.
+_EVAL_N_EPISODES_ARG="${EVAL_N_EPISODES:-5}"
+_EVAL_BENCHMARK_REPO_ID_ARG="${EVAL_BENCHMARK_REPO_ID:-JennyWWW/eval_splatsim_approach_lever_benchmark_1000}"
 SHARED_ARGS=(
     --wandb.enable=true
     --policy.device=cuda
     --env.type=splatsim
     --env.task=upright_small_engine_new
     --env.fps=30
-    --env.eval_benchmark_repo_id=JennyWWW/eval_splatsim_approach_lever_benchmark_1000
-    --eval.n_episodes=5
+    --env.eval_benchmark_repo_id="$_EVAL_BENCHMARK_REPO_ID_ARG"
+    --eval.n_episodes="$_EVAL_N_EPISODES_ARG"
     --eval.batch_size=1
     --eval.use_async_envs=false
     --dataset.image_transforms.enable=true
 )
+# Conditional: eval_benchmark_subset is only meaningful when the caller
+# passes it. Adding an empty string would confuse draccus, so keep it out
+# of SHARED_ARGS when unset.
+if [[ -n "$EVAL_BENCHMARK_SUBSET" ]]; then
+    SHARED_ARGS+=( --env.eval_benchmark_subset="$EVAL_BENCHMARK_SUBSET" )
+fi
 
 # When --env_external_port is set, route lerobot-train's inline eval to that
 # port so it shares a single SplatSim ZMQ server with the rest of the pipeline.
@@ -506,20 +581,48 @@ run_job() {
         full_cmd+=("${extra_args[@]}")
     fi
 
-    # Eval-scope overrides from --eval_n_episodes / --eval_benchmark_subset
-    # appended LAST so they win over SHARED_ARGS's --eval.n_episodes=5 default
-    # via draccus's last-occurrence-wins rule. Drives the inline eval scope
-    # for the final-scratch step to match the orchestrator's intervention
-    # subset (so per-round + final-scratch evals are directly comparable in
-    # dagger_progress).
-    if [[ -n "$EVAL_N_EPISODES" ]]; then
-        full_cmd+=( --eval.n_episodes="$EVAL_N_EPISODES" )
-    fi
-    if [[ -n "$EVAL_BENCHMARK_SUBSET" ]]; then
-        full_cmd+=( --env.eval_benchmark_subset="$EVAL_BENCHMARK_SUBSET" )
+    # Append caller-supplied raw passthrough (--extra_args=STR). Word-split
+    # into individual argv tokens so multi-flag strings behave correctly.
+    # Draccus last-wins → any flag here overrides same-key flags earlier
+    # in the command (e.g. --eval.n_episodes=30 from finetune_extra_args
+    # overrides SHARED_ARGS's default 5).
+    if [[ -n "$EXTRA_ARGS_STR" ]]; then
+        # shellcheck disable=SC2206  # intentional word-split of user-supplied string
+        local -a _extra_split=( $EXTRA_ARGS_STR )
+        full_cmd+=("${_extra_split[@]}")
     fi
 
-    echo "Running: ${env_prefix:+$env_prefix }${full_cmd[*]}"
+    # Eval-scope overrides (--eval_n_episodes / --eval_benchmark_subset /
+    # --eval_benchmark_repo_id) are handled UP FRONT in SHARED_ARGS above,
+    # so each flag appears exactly once in the emitted command line at its
+    # resolved value. No need to re-append here.
+
+    # Print with per-arg single-quoting so args containing spaces,
+    # brackets, or JSON (--policy.input_features={...},
+    # --env.camera_names=["base_rgb", "wrist_rgb"], etc.) survive a
+    # copy-paste back into a shell. Previously used ${full_cmd[*]} which
+    # joins with bare spaces — copy-pasting re-split at every internal
+    # space and truncated the JSON blobs mid-value.
+    #
+    # Per-arg rule:
+    #   * no whitespace / metachar → print as-is (readable)
+    #   * anything else → wrap in single quotes and escape any embedded
+    #     single quote as '\'' (standard bash quote-escape idiom)
+    _shell_quote_one() {
+        local s="$1"
+        if [[ "$s" =~ [[:space:]\{\}\[\]\|\;\&\<\>\(\)\$\`\"\\] ]]; then
+            printf "'%s'" "${s//\'/\'\\\'\'}"
+        else
+            printf '%s' "$s"
+        fi
+    }
+    printf 'Running:'
+    [[ -n "$env_prefix" ]] && printf ' %s' "$env_prefix"
+    for _arg in "${full_cmd[@]}"; do
+        printf ' '
+        _shell_quote_one "$_arg"
+    done
+    printf '\n'
     if [[ "$DRY_RUN" == false ]]; then
         ${env_prefix:+env $env_prefix} "${full_cmd[@]}"
     fi
@@ -565,30 +668,32 @@ maybe_sleep() { [[ "$DRY_RUN" == false ]] && sleep 10; }
 
 # All training jobs live here.  Wrapped in a function so the ratio sweep loop
 # can call it once per merged dataset, then clean up before the next iteration.
-# Dispatches by $MODEL — only the selected model's basewrist job runs. Other
-# camera variants (base/wrist-only) remain commented out — uncomment to enable.
+# Dispatches by $MODEL + $CAMERAS. Only the selected model's selected-camera
+# job runs. Per-model env/extra arrays are name-suffixed by camera setup
+# (e.g. `PI05_BASEWRIST_ENV`, `PI05_BASE_ENV`, `PI05_WRIST_ENV`), so we
+# uppercase $CAMERAS and use it to index the right pair via bash namerefs.
 _run_all_jobs() {
+    # Uppercase camera key for env/extra variable-name lookup.
+    local cam_upper
+    cam_upper="$(echo "$CAMERAS" | tr '[:lower:]' '[:upper:]')"
     case "$MODEL" in
         pi05)
-            run_job "pi05" "basewrist" PI05_ARGS "$PI05_RESIZE_MODE" "$PI05_BASEWRIST_ENV" PI05_BASEWRIST_EXTRA
+            local -n _pi_env="PI05_${cam_upper}_ENV"
+            local -n _pi_extra="PI05_${cam_upper}_EXTRA"
+            run_job "pi05" "$CAMERAS" PI05_ARGS "$PI05_RESIZE_MODE" "$_pi_env" _pi_extra
             maybe_sleep
-            # run_job "pi05" "base"  PI05_ARGS "$PI05_RESIZE_MODE" "$PI05_BASE_ENV"  PI05_BASE_EXTRA
-            # maybe_sleep
-            # run_job "pi05" "wrist" PI05_ARGS "$PI05_RESIZE_MODE" "$PI05_WRIST_ENV" PI05_WRIST_EXTRA
             ;;
         diffusion)
-            run_job "diffusion" "basewrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$DIFFUSION_BASEWRIST_ENV" DIFFUSION_BASEWRIST_EXTRA
+            local -n _df_env="DIFFUSION_${cam_upper}_ENV"
+            local -n _df_extra="DIFFUSION_${cam_upper}_EXTRA"
+            run_job "diffusion" "$CAMERAS" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$_df_env" _df_extra
             maybe_sleep
-            # run_job "diffusion" "base"  DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$DIFFUSION_BASE_ENV"  DIFFUSION_BASE_EXTRA
-            # maybe_sleep
-            # run_job "diffusion" "wrist" DIFFUSION_ARGS "$DIFFUSION_RESIZE_MODE" "$DIFFUSION_WRIST_ENV" DIFFUSION_WRIST_EXTRA
             ;;
         act)
-            run_job "act" "basewrist" ACT_ARGS "$ACT_RESIZE_MODE" "$ACT_BASEWRIST_ENV" ACT_BASEWRIST_EXTRA
+            local -n _act_env="ACT_${cam_upper}_ENV"
+            local -n _act_extra="ACT_${cam_upper}_EXTRA"
+            run_job "act" "$CAMERAS" ACT_ARGS "$ACT_RESIZE_MODE" "$_act_env" _act_extra
             maybe_sleep
-            # run_job "act" "base"  ACT_ARGS "$ACT_RESIZE_MODE" "$ACT_BASE_ENV"  ACT_BASE_EXTRA
-            # maybe_sleep
-            # run_job "act" "wrist" ACT_ARGS "$ACT_RESIZE_MODE" "$ACT_WRIST_ENV" ACT_WRIST_EXTRA
             ;;
     esac
 }

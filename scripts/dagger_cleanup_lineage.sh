@@ -25,7 +25,8 @@
 #
 # Usage:
 #   bash my_scripts/dagger_cleanup_lineage.sh <training_dir_path> \
-#       [--dry-run] [-y|--yes] [--detect_siblings]
+#       [--dry-run] [-y|--yes] [--detect_siblings] \
+#       [--delete_episodes='[N1,N2,...]'] [--skip_dataset_edit]
 #
 # Options:
 #   --dry-run   Pass --dry-run through to dagger_orchestrate.sh (lists what
@@ -33,6 +34,37 @@
 #   -y, --yes   Pipe "restart" into the orchestrator's confirmation prompt so
 #               the deletion runs unattended. Without this, the orchestrator
 #               will prompt for confirmation interactively.
+#   --delete_episodes='[N1,N2,...]'
+#               SURGICAL episode-level cleanup. Removes the listed episode
+#               indices from round R's intervention dataset (R = the round
+#               number parsed from the training dir name), refreshes the
+#               round's rel-action stats sidecar, then rm -rf's training
+#               dirs and blend datasets for rounds R..NUM_ROUNDS so they
+#               retrain on the cleaned data. The intervention dataset
+#               itself is PRESERVED — only the listed episodes are removed
+#               in place. After running, re-invoke dagger_orchestrate.sh
+#               (or dagger_orchestrate_sweep.sh) with --resume to retrain
+#               rounds R..NUM_ROUNDS against the cleaned dataset.
+#               Indices are LeRobot dataset episode_index values
+#               (0-indexed). Example after dagger_detect_dataset_anomalies
+#               flagged bad episodes in round 2:
+#                 --delete_episodes='[0, 5, 9, 10, 13, 17, 22, 27, 29, 30, 34, 36, 38]'
+#               Bypasses the orchestrator entirely (deletions run inline).
+#               Skips the keep-round-1-intervention prompt (round-1
+#               intervention is touched only if the target round IS 1).
+#               Composes with --detect_siblings: the sibling recursion
+#               auto-adds --skip_dataset_edit so the dataset edit runs
+#               exactly once (the first sibling) but every sibling's
+#               downstream training dirs / blends still get nuked.
+#   --skip_dataset_edit
+#               In --delete_episodes mode, SKIP the lerobot-edit-dataset
+#               call and the stats-sidecar refresh — only nuke training
+#               dirs and blend datasets for rounds R..NUM_ROUNDS. Used
+#               internally by --detect_siblings recursion when multiple
+#               rerun-sibling lineages share the same source intervention
+#               dataset (the edit must run once, not per-sibling). Safe
+#               to pass manually too if the dataset has already been
+#               cleaned by another invocation.
 #   --also_delete_blends
 #               Forwarded to dagger_orchestrate.sh. In rerun-blends mode,
 #               blend datasets are by default PRESERVED on cleanup since
@@ -68,14 +100,30 @@
 #               touched). Skips the orchestrator delegation entirely
 #               (deletions run inline). Composes with --detect_siblings.
 #   --keep_round_1_intervention
-#               PRESERVE round 1's raw intervention dataset + alias +
-#               int-stats sidecar. Round 1's merged dataset + training dir,
-#               all blends, and every round 2..N artifact are still wiped.
-#               Useful for "restart all the finetuning from scratch but keep
-#               the expensive round-1 human recording" workflows. Without
-#               this flag (and without -y), the script prompts y/n
-#               interactively. With -y but without this flag, defaults to
-#               DELETE round 1 (the legacy behavior). No-op in rerun mode.
+#               PRESERVE the first-cleaned round's raw intervention dataset +
+#               alias + int-stats sidecar. The first cleaned round is round 1
+#               by default, or --from_round=N when that's set (so this then
+#               preserves round N's intervention). That round's merged dataset
+#               + training dir, all blends, and every later-round artifact are
+#               still wiped. Useful for "restart the finetuning from scratch
+#               but keep the expensive human recording" workflows. Without this
+#               flag (and without -y), the script prompts y/n interactively.
+#               With -y but without this flag, defaults to DELETE the round's
+#               intervention (the legacy behavior). No-op in rerun mode.
+#   --from_round=N
+#               Restrict cleanup to rounds N..NUM_ROUNDS, leaving rounds
+#               1..(N-1) intact. Use when a data anomaly is detected in
+#               round N (e.g. via dagger_detect_dataset_anomalies.py
+#               flagging a polluted intervention dataset) and you want to
+#               re-record from round N onwards without losing the clean
+#               1..(N-1) artifacts. Round (N-1)'s trained policy survives
+#               and becomes the branching point for the next round-N
+#               recording. Default N=1 (= wipe all rounds — the historical
+#               behavior). Errors if N > NUM_ROUNDS. Forwarded as-is to
+#               dagger_orchestrate.sh's identically-named flag, which
+#               narrows the for-loops in both restart_from_scratch() and
+#               the --force_restart path. Composes with --detect_siblings
+#               (every sibling lineage's cleanup honors the same N).
 #   --detect_siblings
 #               Auto-detect related lineages on disk and clean them up too.
 #               Two flavors are detected and unioned:
@@ -132,6 +180,17 @@ FILTER_BLEND_COLLISIONS_FLAG=()
 # dirs, nocoll blend datasets + stats, blend_collision_filter audit subdirs).
 # Raw policies and raw blends are preserved. See the docstring above.
 NC_ONLY=false
+# --from_round=N: forwarded to dagger_orchestrate.sh's --from_round (the
+# orchestrator owns the per-round cleanup loop, so it owns the bounds).
+# Validated downstream; here we just pass through. Default empty = no
+# restriction (orchestrator treats it as N=1, the historical behavior).
+FROM_ROUND=""
+# --delete_episodes='[N1,N2,...]': surgical episode-level cleanup. Triggers
+# the inline (orchestrator-bypassing) delete-episodes mode below. Empty =
+# regular whole-round cleanup. Format: JSON-style list of ints, e.g.
+# '[0, 5, 9, 13]'. Validated as JSON before use.
+DELETE_EPISODES=""
+SKIP_DATASET_EDIT=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -141,6 +200,9 @@ for arg in "$@"; do
         --also_delete_blends) ALSO_DELETE_BLENDS_FLAG=( --also_delete_blends ) ;;
         --filter_blend_collisions) FILTER_BLEND_COLLISIONS_FLAG=( --filter_blend_collisions ) ;;
         --nc_only)   NC_ONLY=true ;;
+        --from_round=*) FROM_ROUND="${arg#*=}" ;;
+        --delete_episodes=*) DELETE_EPISODES="${arg#*=}" ;;
+        --skip_dataset_edit) SKIP_DATASET_EDIT=true ;;
         --keep_round_1_intervention) KEEP_ROUND_1=explicit_yes ;;
         -h|--help)
             sed -n '1,/^set -euo pipefail/p' "$0" | grep '^#' | sed 's/^# \?//'
@@ -160,6 +222,54 @@ if [[ -z "$TRAIN_DIR" ]]; then
     echo "ERROR: training dir path required (run with --help for usage)" >&2; exit 1
 fi
 
+# --from_round validation. Lower-bound only; the orchestrator does the
+# NUM_ROUNDS upper-bound check after lineage auto-detection.
+if [[ -n "$FROM_ROUND" ]]; then
+    if ! [[ "$FROM_ROUND" =~ ^[0-9]+$ ]] || (( FROM_ROUND < 1 )); then
+        echo "ERROR: --from_round=$FROM_ROUND must be a positive integer >= 1" >&2; exit 1
+    fi
+    if [[ "$NC_ONLY" == true ]]; then
+        echo "ERROR: --from_round is incompatible with --nc_only (nc-only mode wipes all rounds' _nc artifacts unconditionally)." >&2; exit 1
+    fi
+fi
+FROM_ROUND_FLAG=()
+[[ -n "$FROM_ROUND" ]] && FROM_ROUND_FLAG=( "--from_round=$FROM_ROUND" )
+
+# --delete_episodes validation. Must be parseable as a JSON array of
+# non-negative integers. Done up-front (before any cleanup runs) so a
+# typo fails immediately instead of partway through deletion.
+if [[ -n "$DELETE_EPISODES" ]]; then
+    if [[ "$NC_ONLY" == true ]]; then
+        echo "ERROR: --delete_episodes is incompatible with --nc_only (they target different artifact categories)." >&2; exit 1
+    fi
+    if [[ -n "$FROM_ROUND" ]]; then
+        echo "ERROR: --delete_episodes is incompatible with --from_round (the round number is inferred from the training dir name)." >&2; exit 1
+    fi
+    # Normalize + validate (allow spaces, trailing commas, etc.). Echoes
+    # the canonicalized "[N1, N2, ...]" form on success; non-zero exit on
+    # parse failure or non-int / negative elements.
+    DELETE_EPISODES_CANON="$(python3 -c "
+import json, sys
+raw = sys.argv[1]
+try:
+    eps = json.loads(raw)
+except json.JSONDecodeError as e:
+    sys.exit(f'ERROR: --delete_episodes is not valid JSON: {e}')
+if not isinstance(eps, list):
+    sys.exit('ERROR: --delete_episodes must be a JSON list (e.g. [0, 5, 9]).')
+if not eps:
+    sys.exit('ERROR: --delete_episodes must contain at least one episode index.')
+clean = []
+for x in eps:
+    if not isinstance(x, int) or isinstance(x, bool) or x < 0:
+        sys.exit(f'ERROR: each --delete_episodes element must be a non-negative int; got {x!r}.')
+    clean.append(x)
+clean = sorted(set(clean))
+print(json.dumps(clean))
+" "$DELETE_EPISODES")" || exit 1
+    DELETE_EPISODES="$DELETE_EPISODES_CANON"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LEROBOT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -170,10 +280,33 @@ if [[ ! "$TRAIN_DIR" =~ ^/ ]]; then
         TRAIN_DIR="$(cd "$TRAIN_DIR" && pwd)"
     elif [[ -d "$LEROBOT_ROOT/outputs/training/$TRAIN_DIR" ]]; then
         TRAIN_DIR="$LEROBOT_ROOT/outputs/training/$TRAIN_DIR"
+    elif [[ -d "$LEROBOT_ROOT/$TRAIN_DIR" ]]; then
+        TRAIN_DIR="$LEROBOT_ROOT/$TRAIN_DIR"
+    else
+        # Path doesn't exist on disk. That's legal in --delete_episodes mode,
+        # where the target round's training dir may not have been created yet
+        # (intervention recorded, training not started). Make it absolute so
+        # dirname/basename are stable: a bare basename resolves under
+        # outputs/training, an `outputs/...`-style relative path under the repo.
+        if [[ "$TRAIN_DIR" == */* ]]; then
+            TRAIN_DIR="$LEROBOT_ROOT/$TRAIN_DIR"
+        else
+            TRAIN_DIR="$LEROBOT_ROOT/outputs/training/$TRAIN_DIR"
+        fi
     fi
 fi
 if [[ ! -d "$TRAIN_DIR" ]]; then
-    echo "ERROR: training dir not found: $TRAIN_DIR" >&2; exit 1
+    if [[ -n "$DELETE_EPISODES" ]]; then
+        # --delete_episodes operates on the round's intervention dataset, which
+        # exists independently of (and before) the round's training dir. Allow
+        # a not-yet-trained round here; the dataset resolution below falls back
+        # to an earlier round's sidecar when this round's is absent.
+        echo "[cleanup] note: training dir does not exist yet (round not trained):"
+        echo "  $TRAIN_DIR"
+        echo "[cleanup] --delete_episodes continues against the round's intervention dataset."
+    else
+        echo "ERROR: training dir not found: $TRAIN_DIR" >&2; exit 1
+    fi
 fi
 
 # Prompt the user (once, up-front) whether to preserve round 1's intervention
@@ -185,28 +318,38 @@ fi
 #   neither set                                 → prompt y/N (default no, i.e.
 #       delete-all, matching the prior behavior of this script).
 # The choice propagates to --detect_siblings recursion below.
+#
+# The round being asked about is the FIRST round cleanup will touch: round 1
+# by default, or --from_round=N when that's set (cleanup spans rounds N..end,
+# so round N's intervention is the first one at risk — rounds 1..(N-1) are
+# untouched regardless). Preserving means that round restarts from its merge
+# step instead of re-recording; deleting means re-record it from scratch.
+KEEP_ROUND_NUM="${FROM_ROUND:-1}"
 PRESERVE_R1_FLAG=()
 if [[ "$NC_ONLY" == true ]]; then
-    : # nc-only mode doesn't touch R1 intervention; the prompt is irrelevant.
+    : # nc-only mode doesn't touch intervention data; the prompt is irrelevant.
+elif [[ -n "$DELETE_EPISODES" ]]; then
+    : # surgical delete_episodes mode operates on a specific round; the
+      # keep-intervention prompt is only meaningful for whole-lineage cleanups.
 elif [[ "$KEEP_ROUND_1" == "explicit_yes" ]]; then
     PRESERVE_R1_FLAG=( --preserve_round_1_intervention )
-    echo "[cleanup] --keep_round_1_intervention set: round 1's raw intervention will be PRESERVED."
+    echo "[cleanup] --keep_round_1_intervention set: round $KEEP_ROUND_NUM's raw intervention will be PRESERVED."
 elif [[ "$AUTO_CONFIRM" == true ]]; then
     : # headless; legacy delete-all behavior
 else
     echo
-    echo "Round 1's raw intervention recording is the expensive human-in-the-loop data."
-    echo "If you preserve it, the lineage restarts from 'round 1 step 4 (merge)' instead"
-    echo "of re-recording from scratch. Round 1's merged dataset + training dir + blends"
-    echo "and all of rounds 2..N are still wiped either way."
-    echo -n "Keep round 1's raw intervention dataset? [y/N]: "
+    echo "Round $KEEP_ROUND_NUM's raw intervention recording is the expensive human-in-the-loop data."
+    echo "If you preserve it, the lineage restarts from 'round $KEEP_ROUND_NUM step 4 (merge)' instead"
+    echo "of re-recording from scratch. Round $KEEP_ROUND_NUM's merged dataset + training dir + blends"
+    echo "and all later rounds are still wiped either way."
+    echo -n "Keep round $KEEP_ROUND_NUM's raw intervention dataset? [y/N]: "
     read -r KEEP_R1_REPLY
     if [[ "$KEEP_R1_REPLY" =~ ^[Yy]$ ]]; then
         PRESERVE_R1_FLAG=( --preserve_round_1_intervention )
         KEEP_ROUND_1=explicit_yes  # propagate to --detect_siblings recursion
-        echo "[cleanup] round 1's raw intervention will be PRESERVED."
+        echo "[cleanup] round $KEEP_ROUND_NUM's raw intervention will be PRESERVED."
     else
-        echo "[cleanup] round 1's raw intervention WILL be deleted (legacy behavior)."
+        echo "[cleanup] round $KEEP_ROUND_NUM's raw intervention WILL be deleted (legacy behavior)."
     fi
 fi
 
@@ -461,24 +604,61 @@ if [[ "$DETECT_SIBLINGS" == true ]]; then
     for p in "${SIBLING_PATHS[@]}"; do
         _lineage_name="$(basename "$p" | sed -E 's/(_ft)?_dag[0-9]+(_.*)?$//')"
         _training_root="$(dirname "$p")"
-        # Count raw vs _nc training dirs per lineage so the user can see
-        # what'll actually be wiped (full cleanup deletes raw + _nc; the
-        # --nc_only mode deletes only _nc). Pipeline is `|| true`-wrapped
-        # because grep -Ev returns rc=1 on no-match, which trips
-        # `set -e + pipefail`.
-        _n_raw=$( { ls -d "$_training_root/${_lineage_name}_ft_dag"[0-9]* 2>/dev/null \
-            | grep -Ev '_[A-Za-z][A-Za-z0-9_]*$' | wc -l; } || true )
-        _n_nc=$( { ls -d "$_training_root/${_lineage_name}_ft_dag"[0-9]*_nc 2>/dev/null | wc -l; } || true )
-        # Strip any whitespace wc may emit.
-        _n_raw="${_n_raw// /}"
-        _n_nc="${_n_nc// /}"
-        _extras=""
-        if (( _n_nc > 0 )); then
-            _extras=" (raw rounds: $_n_raw, _nc siblings: $_n_nc)"
-        elif (( _n_raw > 0 )); then
-            _extras=" (raw rounds: $_n_raw)"
+        # Enumerate every round training dir under this lineage — both
+        # `_dag<N>` (scratch mode) and `_ft_dag<N>` (finetune mode), with
+        # optional trailing `_<suffix>` variants (e.g. `_nc` from step 6b).
+        # Group into three buckets so the user sees exactly which rounds
+        # will be wiped instead of just a count:
+        #   raw_rounds  = `_ft_dag<N>` (canonical finetune) OR `_dag<N>`
+        #                 (scratch). Numeric list, sorted, deduped.
+        #   nc_rounds   = `_ft_dag<N>_nc` (step-6b nocoll retrain).
+        #   other_rounds = `_ft_dag<N>_<suffix>` with any other suffix
+        #                  (--retrain_suffix variants, etc). Rare; shown
+        #                  with the suffix name so the user notices them.
+        # bash-y set: use `printf | sort -un` to dedup + sort numeric.
+        declare -a _raw_list=() _nc_list=() _other_list=()
+        for d in "$_training_root/${_lineage_name}"_dag[0-9]* \
+                 "$_training_root/${_lineage_name}"_ft_dag[0-9]*; do
+            [[ -d "$d" ]] || continue
+            _bn="$(basename "$d")"
+            _rn=$(echo "$_bn" | grep -oE 'dag[0-9]+' | head -1 | grep -oE '[0-9]+')
+            [[ -z "$_rn" ]] && continue
+            # Suffix after `_dag<N>` — empty for canonical, non-empty for
+            # variants like `_nc`. Extracted by stripping the shared prefix.
+            _suffix=$(echo "$_bn" | sed -E "s/^${_lineage_name}(_ft)?_dag${_rn}//; s/^_//")
+            if [[ -z "$_suffix" ]]; then
+                _raw_list+=( "$_rn" )
+            elif [[ "$_suffix" == "nc" ]]; then
+                _nc_list+=( "$_rn" )
+            else
+                _other_list+=( "${_rn}_${_suffix}" )
+            fi
+        done
+        # Dedup + sort each bucket. Filter out empty strings from
+        # `${_arr[@]:-}` expansion — under bash's `set -u`, an empty
+        # array `_arr=()` interpolates as one empty string via `:-`,
+        # making `$#` read as 1 instead of 0. Skip empties explicitly
+        # so we don't render `"1 round(s) []"` for empty buckets.
+        _fmt_rounds() {
+            local _name="$1"; shift
+            local _nonempty=() _v
+            for _v in "$@"; do
+                [[ -n "$_v" ]] && _nonempty+=( "$_v" )
+            done
+            (( ${#_nonempty[@]} == 0 )) && return
+            local _sorted _count
+            _sorted=$(printf '%s\n' "${_nonempty[@]}" | sort -un | paste -sd,)
+            _count=$(printf '%s\n' "${_nonempty[@]}" | sort -un | wc -l)
+            _count="${_count// /}"
+            echo "    → ${_name}: ${_count} round(s) [${_sorted}]"
+        }
+        echo "  ${_lineage_name}"
+        _fmt_rounds "raw"   "${_raw_list[@]:-}"
+        _fmt_rounds "_nc"   "${_nc_list[@]:-}"
+        _fmt_rounds "other" "${_other_list[@]:-}"
+        if (( ${#_raw_list[@]} == 0 && ${#_nc_list[@]} == 0 && ${#_other_list[@]} == 0 )); then
+            echo "    → (no on-disk round dirs found for this lineage)"
         fi
-        echo "  ${_lineage_name}${_extras}"
     done
     echo
 
@@ -510,15 +690,28 @@ if [[ "$DETECT_SIBLINGS" == true ]]; then
     # gets a chance to be cleaned up too.
     NC_ONLY_FORWARD=()
     [[ "$NC_ONLY" == true ]] && NC_ONLY_FORWARD=( --nc_only )
+    # --delete_episodes recursion: forward the episode list to every
+    # sibling, but the lerobot-edit-dataset call must run exactly ONCE
+    # (the source intervention dataset is shared across rerun siblings).
+    # First sibling runs the edit; the rest get --skip_dataset_edit so
+    # they only nuke their own downstream training dirs and blends.
+    DELETE_EPISODES_FORWARD=()
+    [[ -n "$DELETE_EPISODES" ]] && DELETE_EPISODES_FORWARD=( "--delete_episodes=$DELETE_EPISODES" )
     overall_rc=0
+    _is_first_sibling=true
     for p in "${SIBLING_PATHS[@]}"; do
         echo
         echo "=== [detect_siblings] cleaning up: $(basename "$p" | sed -E 's/(_ft)?_dag[0-9]+(_.*)?$//') ==="
-        bash "$0" "$p" -y "${DRY_RUN_FLAG[@]}" "${ALSO_DELETE_BLENDS_FLAG[@]}" "${FILTER_BLEND_COLLISIONS_FLAG[@]}" "${KEEP_R1_FORWARD[@]}" "${NC_ONLY_FORWARD[@]}" && rc=0 || rc=$?
+        SKIP_EDIT_FORWARD=()
+        if [[ -n "$DELETE_EPISODES" && "$_is_first_sibling" != true ]]; then
+            SKIP_EDIT_FORWARD=( --skip_dataset_edit )
+        fi
+        bash "$0" "$p" -y "${DRY_RUN_FLAG[@]}" "${ALSO_DELETE_BLENDS_FLAG[@]}" "${FILTER_BLEND_COLLISIONS_FLAG[@]}" "${KEEP_R1_FORWARD[@]}" "${NC_ONLY_FORWARD[@]}" "${FROM_ROUND_FLAG[@]}" "${DELETE_EPISODES_FORWARD[@]}" "${SKIP_EDIT_FORWARD[@]}" && rc=0 || rc=$?
         if (( rc != 0 )); then
             overall_rc="$rc"
             echo "[detect_siblings] WARN: cleanup failed for $p (rc=$rc); continuing." >&2
         fi
+        _is_first_sibling=false
     done
     exit "$overall_rc"
 fi
@@ -670,20 +863,317 @@ for r in ratios:
     exit 0
 fi
 
+# ── --delete_episodes: surgical episode-level cleanup ─────────────────────────
+# Workflow (bypasses orchestrator):
+#   1. Parse round number R from training dir name.
+#   2. Read sidecar's `config.weighted_repo_ids[R]` to find round R's
+#      intervention dataset repo id (fall back to dagger_naming derivation
+#      if the sidecar predates weighted_sampling — rare; warns then asks
+#      user to supply --skip_dataset_edit if they want to proceed).
+#   3. lerobot-edit-dataset --operation.type delete_episodes (skipped
+#      when --skip_dataset_edit set).
+#   4. compute_relative_stats.sh to refresh rel-action stats sidecar
+#      (skipped when --skip_dataset_edit set; the sidecar would be stale
+#      after the dataset edit and downstream training would normalize
+#      against the wrong range).
+#   5. rm -rf training dirs for rounds R..NUM_ROUNDS (so they retrain on
+#      cleaned data).
+#   6. rm -rf blend datasets + sidecars for rounds R..NUM_ROUNDS (blends
+#      derive from round-R intervention; stale after the edit).
+# Intervention datasets for rounds 1..(R-1) and the cleaned round-R
+# intervention itself are PRESERVED.
+if [[ -n "$DELETE_EPISODES" ]]; then
+    LEROBOT_CACHE="${LEROBOT_CACHE:-$HOME/.cache/huggingface/lerobot}"
+    STATS_BASE="$LEROBOT_ROOT/outputs/dataset_stats"
+    TRAINING_ROOT="$(dirname "$TRAIN_DIR")"
+    TRAIN_BASENAME="$(basename "$TRAIN_DIR")"
+
+    # Parse round number from `<...>{_ft,}_dag<N>{_<suffix>}` basename.
+    if [[ "$TRAIN_BASENAME" =~ _dag([0-9]+)(_.*)?$ ]]; then
+        TARGET_ROUND="${BASH_REMATCH[1]}"
+    else
+        echo "ERROR: training dir name doesn't end in _dag<N>: $TRAIN_BASENAME" >&2; exit 1
+    fi
+    # Lineage base for globbing sibling round dirs / blend datasets.
+    LINEAGE_BASE="$(basename "$TRAIN_DIR" | sed -E 's/(_ft)?_dag[0-9]+(_.*)?$//')"
+
+    # Sidecar provides the exact intervention repo id for round R AND the
+    # final NUM_ROUNDS for the lineage. The target round's own sidecar is
+    # preferred, but it may not exist yet (intervention recorded, training
+    # not started). In that case fall back to the HIGHEST existing round's
+    # sidecar in the same lineage and derive round R's intervention repo by
+    # round-number substitution (the canonical name pattern is
+    # `<user>/<prefix>_dag<N>`). Pre-sidecar lineages remain unsupported.
+    CFG="$TRAIN_DIR/dagger/config.json"
+    if [[ ! -f "$CFG" ]]; then
+        CFG=""
+        _best_round=-1
+        for d in "$TRAINING_ROOT/${LINEAGE_BASE}"_ft_dag[0-9]* \
+                 "$TRAINING_ROOT/${LINEAGE_BASE}"_dag[0-9]*; do
+            [[ -f "$d/dagger/config.json" ]] || continue
+            n=$(basename "$d" | grep -oE 'dag[0-9]+' | head -1 | grep -oE '[0-9]+')
+            if (( n > _best_round )); then _best_round=$n; CFG="$d/dagger/config.json"; fi
+        done
+        if [[ -z "$CFG" ]]; then
+            echo "ERROR: --delete_episodes needs a dagger/config.json sidecar to resolve the" >&2
+            echo "  intervention dataset path, and none was found — neither in the target round's" >&2
+            echo "  training dir nor any earlier round's dir for lineage '$LINEAGE_BASE'." >&2
+            echo "  Pre-sidecar lineages aren't supported by this surgical mode. For those, use" >&2
+            echo "  the legacy whole-round path:  --from_round=$TARGET_ROUND  (re-records the round)." >&2
+            exit 1
+        fi
+        echo "[delete_episodes] round $TARGET_ROUND not trained yet; deriving its intervention"
+        echo "[delete_episodes] dataset name from round $_best_round's sidecar: $CFG"
+    fi
+    META="$(python3 -c "
+import json, re, sys
+cfg = json.load(open(sys.argv[1]))
+cf = cfg.get('config') or {}
+target_round = int(sys.argv[2])
+# weighted_repo_ids[0] = base; [1..N] = round 1..N intervention repos.
+wri = cf.get('weighted_repo_ids') or []
+wsp = cf.get('weighted_stats_paths') or []
+if not wri:
+    sys.exit('ERROR: sidecar has no weighted_repo_ids.')
+if len(wri) > target_round:
+    repo = wri[target_round]
+    stats = wsp[target_round] if target_round < len(wsp) else ''
+else:
+    # Target round not represented in this (earlier) sidecar — derive its
+    # name by substituting the round number into the highest known
+    # intervention repo (entries [1..] are round 1..k; [0] is base).
+    src = wri[-1]
+    repo = re.sub(r'_dag[0-9]+$', f'_dag{target_round}', src)
+    if repo == src:
+        sys.exit(f'ERROR: could not derive round-{target_round} intervention name from {src!r} '
+                 '(no _dag<N> suffix to substitute).')
+    stats = ''  # refreshed downstream by compute_relative_stats.sh
+print(repo)
+print(stats)
+print((cf.get('action_format') or 'rel').lower())
+" "$CFG" "$TARGET_ROUND")" || exit 1
+    INT_REPO_ID="$(printf '%s\n' "$META" | sed -n 1p)"
+    STATS_PATH="$(printf '%s\n' "$META" | sed -n 2p)"
+    ACTION_FORMAT="$(printf '%s\n' "$META" | sed -n 3p)"
+    INT_DATASET_PATH="$LEROBOT_CACHE/$INT_REPO_ID"
+    INT_DATASET_SHORT="${INT_REPO_ID#*/}"
+    INT_REPO_USER="${INT_REPO_ID%/*}"
+    ACTION_INFIX="r"; [[ "$ACTION_FORMAT" == "abs" ]] && ACTION_INFIX="a"
+
+    # Derive NUM_ROUNDS from a DISK scan, not the sidecar — the sidecar
+    # only reflects rounds trained UP TO that point. If the target's
+    # sidecar is from dag<TARGET> but rounds dag<TARGET+1>..dag<N> have
+    # been trained since (their training used dag<TARGET>'s polluted
+    # data and also needs to be re-run), they must be nuked too.
+    NUM_ROUNDS=0
+    for d in "$TRAINING_ROOT/${LINEAGE_BASE}"_ft_dag[0-9]* \
+             "$TRAINING_ROOT/${LINEAGE_BASE}"_dag[0-9]*; do
+        [[ -d "$d" ]] || continue
+        n=$(basename "$d" | grep -oE 'dag[0-9]+' | head -1 | grep -oE '[0-9]+')
+        (( n > NUM_ROUNDS )) && NUM_ROUNDS=$n
+    done
+    # The target round's own training dir may not exist yet (intervention
+    # recorded, training not started), so it won't appear in the disk scan.
+    # Clamp up to TARGET_ROUND so the round-range seq below includes it (the
+    # rm globs are all `[[ -d ]]`-guarded, so missing downstream dirs no-op).
+    (( TARGET_ROUND > NUM_ROUNDS )) && NUM_ROUNDS=$TARGET_ROUND
+
+    if [[ "$SKIP_DATASET_EDIT" != true && ! -d "$INT_DATASET_PATH" ]]; then
+        echo "ERROR: intervention dataset not found on disk: $INT_DATASET_PATH" >&2
+        echo "  (parsed from sidecar weighted_repo_ids[$TARGET_ROUND] = $INT_REPO_ID)" >&2; exit 1
+    fi
+
+    # Build the cleanup list: training dirs + blend datasets + blend
+    # sidecars for rounds R..NUM_ROUNDS.
+    # Blend dataset naming: <round-N int-dataset-short>_blend<NNN>[_nocoll].
+    # The round number lives in the int_short itself (e.g.
+    # `lever_g0_d30_fast_03dag_diff_r_dag4`), so we need to derive each
+    # round's int_short to glob its blends — not just a `*_dagN_blend*`
+    # glob which would match other lineages' blends. Reuse the sidecar's
+    # weighted_repo_ids[r] for each round.
+    declare -a NUKE_TRAIN_DIRS=() NUKE_BLENDS=() NUKE_BLEND_STATS=()
+    for r in $(seq "$TARGET_ROUND" "$NUM_ROUNDS"); do
+        # Training dirs: include both `_ft_dag<N>` and `_dag<N>` (scratch
+        # mode) and any `_<suffix>` variants (e.g. `_nc` from step 6b).
+        for d in "$TRAINING_ROOT/${LINEAGE_BASE}"_ft_dag${r} \
+                 "$TRAINING_ROOT/${LINEAGE_BASE}"_ft_dag${r}_* \
+                 "$TRAINING_ROOT/${LINEAGE_BASE}"_dag${r} \
+                 "$TRAINING_ROOT/${LINEAGE_BASE}"_dag${r}_*; do
+            [[ -d "$d" ]] && NUKE_TRAIN_DIRS+=( "$d" )
+        done
+        # Per-round int_short for blend globbing. The sidecar's
+        # weighted_repo_ids only goes up to the target round's knowledge,
+        # so for rounds > TARGET_ROUND we derive the name by substituting
+        # the round number in the target's int_repo_id (canonical pattern:
+        # `<user>/<prefix>_dag<N>`). Same for the stats sidecar dir name.
+        ROUND_R_INT_SHORT="$(echo "$INT_DATASET_SHORT" | sed -E "s/_dag[0-9]+$/_dag${r}/")"
+        ROUND_R_INT_USER="$INT_REPO_USER"
+        # Blend datasets: <round-r int_short>_blend<NNN>[_nocoll].
+        for bd in "$LEROBOT_CACHE/$ROUND_R_INT_USER/${ROUND_R_INT_SHORT}_blend"[0-9]*; do
+            [[ -d "$bd" ]] && NUKE_BLENDS+=( "$bd" )
+        done
+        # Blend stats sidecars under outputs/dataset_stats.
+        for bs in "$STATS_BASE/${ROUND_R_INT_SHORT}_blend"[0-9]*; do
+            [[ -d "$bs" ]] && NUKE_BLEND_STATS+=( "$bs" )
+        done
+    done
+
+    # Sanity: dedup (the glob expansion can produce duplicates for the
+    # `_*` variant matching the same dir).
+    declare -A _seen=()
+    declare -a NUKE_TRAIN_DIRS_DEDUP=()
+    for d in "${NUKE_TRAIN_DIRS[@]:-}"; do
+        [[ -z "$d" ]] && continue
+        [[ -n "${_seen[$d]:-}" ]] && continue
+        _seen[$d]=1; NUKE_TRAIN_DIRS_DEDUP+=( "$d" )
+    done
+    # Reassign without the `[@]:-` idiom — on an empty array that injects a
+    # spurious empty element, which would inflate the "training dirs" count to
+    # 1 (and print a blank line) when the target round isn't trained yet.
+    NUKE_TRAIN_DIRS=()
+    (( ${#NUKE_TRAIN_DIRS_DEDUP[@]} )) && NUKE_TRAIN_DIRS=( "${NUKE_TRAIN_DIRS_DEDUP[@]}" )
+
+    echo
+    echo "[delete_episodes] target lineage: $LINEAGE_BASE"
+    echo "[delete_episodes] target round:   $TARGET_ROUND (of $NUM_ROUNDS)"
+    echo "[delete_episodes] intervention:   $INT_REPO_ID"
+    echo "[delete_episodes] stats sidecar:  ${STATS_PATH:-<derived>}"
+    echo "[delete_episodes] episode indices to remove: $DELETE_EPISODES"
+    echo
+    if [[ "$SKIP_DATASET_EDIT" == true ]]; then
+        echo "  EDIT STEPS:    SKIPPED (--skip_dataset_edit set)"
+    else
+        echo "  EDIT STEPS:"
+        echo "    1. lerobot-edit-dataset --repo_id $INT_REPO_ID \\"
+        echo "         --operation.type delete_episodes \\"
+        echo "         --operation.episode_indices '$DELETE_EPISODES'"
+        echo "    2. bash my_scripts/compute_relative_stats.sh --dataset_repo=$INT_REPO_ID"
+    fi
+    n_train="${#NUKE_TRAIN_DIRS[@]}"
+    n_blends="${#NUKE_BLENDS[@]}"
+    n_blend_stats="${#NUKE_BLEND_STATS[@]}"
+    echo "  RM -RF (rounds ${TARGET_ROUND}..${NUM_ROUNDS}):"
+    echo "    training dirs    : $n_train"
+    [[ $n_train -gt 0 ]] && printf "      %s\n" "${NUKE_TRAIN_DIRS[@]}"
+    echo "    blend datasets   : $n_blends"
+    [[ $n_blends -gt 0 ]] && printf "      %s\n" "${NUKE_BLENDS[@]}"
+    echo "    blend sidecars   : $n_blend_stats"
+    [[ $n_blend_stats -gt 0 ]] && printf "      %s\n" "${NUKE_BLEND_STATS[@]}"
+    echo
+    echo "  PRESERVED: round 1..$((TARGET_ROUND - 1)) artifacts, cleaned round-${TARGET_ROUND}"
+    echo "             intervention dataset, base policy."
+
+    if (( ${#DRY_RUN_FLAG[@]} > 0 )); then
+        echo
+        echo "[--dry-run] would run the edit steps + rm -rf the items above."
+        exit 0
+    fi
+
+    if [[ "$AUTO_CONFIRM" != true ]]; then
+        echo
+        echo -n "Type 'delete-episodes' to confirm: "
+        read -r CONFIRM
+        [[ "$CONFIRM" == "delete-episodes" ]] || { echo "Aborted."; exit 1; }
+    fi
+
+    if [[ "$SKIP_DATASET_EDIT" != true ]]; then
+        echo
+        echo "[delete_episodes] Step 1/2: removing $(python3 -c "import json,sys;print(len(json.loads(sys.argv[1])))" "$DELETE_EPISODES") episode(s) via lerobot-edit-dataset..."
+        # Call lerobot-edit-dataset directly (it's installed as a CLI entry
+        # point at python -m lerobot.scripts.lerobot_edit_dataset:main).
+        # `--repo_id` is REQUIRED for delete_episodes (the script validates
+        # this — `--root` alone isn't enough since it needs the canonical
+        # repo identifier for metadata updates). We omit `--root` and let
+        # the script resolve `~/.cache/huggingface/lerobot/<repo_id>`
+        # automatically; that's where the dataset actually lives.
+        # Don't use `uv run` — `lerobot-edit-dataset` is installed as a
+        # CLI in the active conda/pip env, and uv isn't always in PATH.
+        lerobot-edit-dataset \
+            --repo_id "$INT_REPO_ID" \
+            --operation.type delete_episodes \
+            --operation.episode_indices "$DELETE_EPISODES"
+        echo
+        echo "[delete_episodes] Step 2/2: refreshing rel-action stats sidecar..."
+        bash "$SCRIPT_DIR/compute_relative_stats.sh" --dataset_repo="$INT_REPO_ID"
+    fi
+
+    echo
+    echo "[delete_episodes] rm -rf downstream artifacts..."
+    total_rm=$(( n_train + n_blends + n_blend_stats ))
+    for p in "${NUKE_TRAIN_DIRS[@]:-}" "${NUKE_BLENDS[@]:-}" "${NUKE_BLEND_STATS[@]:-}"; do
+        [[ -z "$p" ]] && continue
+        rm -rf "$p"
+    done
+    echo "[delete_episodes] Deleted $total_rm downstream item(s)."
+    echo
+    echo "[delete_episodes] DONE. Next steps:"
+    echo "  1. Verify with: python3 my_scripts/dagger_detect_dataset_anomalies.py \\"
+    echo "       --dataset_root $INT_DATASET_PATH --no_expand_to_lineage"
+    echo "  2. Re-run the orchestrator (or sweep wrapper) with --resume to retrain"
+    echo "     rounds ${TARGET_ROUND}..${NUM_ROUNDS} against the cleaned dataset."
+    exit 0
+fi
+
 ORIG_ARGV=()
 CFG="$TRAIN_DIR/dagger/config.json"
 if [[ -f "$CFG" ]]; then
     # Resolution path 1: sidecar exists → use recorded argv (exact).
-    mapfile -t ORIG_ARGV < <(python3 -c "
+    # NUL-delimited reading: a sidecar argv value can legitimately contain
+    # embedded newlines (e.g. when the user's original shell command had a
+    # line-break inside a quoted `--intervention_extra_args='...'` value;
+    # bash preserves it, the orchestrator records it verbatim, and the
+    # JSON encoder round-trips it as `\n`). Reading line-by-line via
+    # `mapfile -t` would split that one argv element into multiple bash
+    # array entries, then re-passing them to the orchestrator surfaces as
+    # `Unknown argument: ...` on whatever fragment the split produced.
+    # `\0` is illegal in argv strings (Linux exec contract), so it's a
+    # safe delimiter that survives any in-value whitespace.
+    mapfile -t -d '' ORIG_ARGV < <(python3 -c "
 import json, sys
 cfg = json.load(open(sys.argv[1]))
 for a in cfg.get('orchestrator_invocation', {}).get('argv', []):
-    print(a)
+    sys.stdout.write(a)
+    sys.stdout.write('\0')
 " "$CFG")
     if (( ${#ORIG_ARGV[@]} == 0 )); then
         echo "[cleanup] $CFG exists but has no orchestrator_invocation.argv; falling back to auto-detect." >&2
     else
         echo "[cleanup] reusing original argv from sidecar: $CFG"
+        # The sidecar's --num_rounds reflects the round count WHEN THIS SIDECAR
+        # WAS WRITTEN, which can be SMALLER than the number of round training
+        # dirs now on disk (the lineage was extended afterwards, or this sidecar
+        # is from an earlier round). Cleaning with the stale value leaves the
+        # higher rounds' training dirs (and datasets) behind — e.g. sidecar
+        # says 10 but dag11..dag17 exist. Disk-scan the lineage for the true max
+        # round and bump --num_rounds up to it so all rounds get cleaned. The
+        # orchestrator's cleanup rm globs are `[[ -d ]]`-guarded, so
+        # over-counting is a safe no-op. Mirrors the --delete_episodes path.
+        _clean_lineage_base="$(basename "$TRAIN_DIR" | sed -E 's/(_ft)?_dag[0-9]+(_.*)?$//')"
+        _clean_training_root="$(dirname "$TRAIN_DIR")"
+        _disk_max_round=0
+        for _d in "$_clean_training_root/${_clean_lineage_base}"_ft_dag[0-9]* \
+                  "$_clean_training_root/${_clean_lineage_base}"_dag[0-9]*; do
+            [[ -d "$_d" ]] || continue
+            _rn=$(basename "$_d" | grep -oE 'dag[0-9]+' | head -1 | grep -oE '[0-9]+')
+            [[ -n "$_rn" ]] && (( _rn > _disk_max_round )) && _disk_max_round=$_rn
+        done
+        if (( _disk_max_round > 0 )); then
+            _sidecar_nr=""
+            for _a in "${ORIG_ARGV[@]}"; do
+                [[ "$_a" == --num_rounds=* ]] && _sidecar_nr="${_a#*=}"
+            done
+            if [[ -z "$_sidecar_nr" ]] || (( _disk_max_round > _sidecar_nr )); then
+                echo "[cleanup] disk has round dirs up to dag${_disk_max_round}; overriding" \
+                     "--num_rounds (sidecar said '${_sidecar_nr:-unset}') so ALL rounds are cleaned."
+                _new_argv=()
+                for _a in "${ORIG_ARGV[@]}"; do
+                    [[ "$_a" == --num_rounds=* ]] && continue
+                    _new_argv+=( "$_a" )
+                done
+                _new_argv+=( "--num_rounds=$_disk_max_round" )
+                ORIG_ARGV=( "${_new_argv[@]}" )
+            fi
+        fi
     fi
 fi
 
@@ -917,13 +1407,13 @@ fi
 
 ORCH="$SCRIPT_DIR/dagger_orchestrate.sh"
 echo "[cleanup] invoking:"
-echo "  bash $ORCH ${FILTERED_ARGV[*]} --force_restart --cleanup_only ${ALSO_DELETE_BLENDS_FLAG[*]} ${FILTER_BLEND_COLLISIONS_FLAG[*]} ${PRESERVE_R1_FLAG[*]} ${DRY_RUN_FLAG[*]}"
+echo "  bash $ORCH ${FILTERED_ARGV[*]} --force_restart --cleanup_only ${ALSO_DELETE_BLENDS_FLAG[*]} ${FILTER_BLEND_COLLISIONS_FLAG[*]} ${PRESERVE_R1_FLAG[*]} ${FROM_ROUND_FLAG[*]} ${DRY_RUN_FLAG[*]}"
 echo
 
 if [[ "$AUTO_CONFIRM" == true ]]; then
     # Pipe the confirmation token. dagger_orchestrate.sh's --force_restart
     # block reads exactly one line, so a single "restart\n" is enough.
-    printf 'restart\n' | bash "$ORCH" "${FILTERED_ARGV[@]}" --force_restart --cleanup_only "${ALSO_DELETE_BLENDS_FLAG[@]}" "${FILTER_BLEND_COLLISIONS_FLAG[@]}" "${PRESERVE_R1_FLAG[@]}" "${DRY_RUN_FLAG[@]}"
+    printf 'restart\n' | bash "$ORCH" "${FILTERED_ARGV[@]}" --force_restart --cleanup_only "${ALSO_DELETE_BLENDS_FLAG[@]}" "${FILTER_BLEND_COLLISIONS_FLAG[@]}" "${PRESERVE_R1_FLAG[@]}" "${FROM_ROUND_FLAG[@]}" "${DRY_RUN_FLAG[@]}"
 else
-    bash "$ORCH" "${FILTERED_ARGV[@]}" --force_restart --cleanup_only "${ALSO_DELETE_BLENDS_FLAG[@]}" "${FILTER_BLEND_COLLISIONS_FLAG[@]}" "${PRESERVE_R1_FLAG[@]}" "${DRY_RUN_FLAG[@]}"
+    bash "$ORCH" "${FILTERED_ARGV[@]}" --force_restart --cleanup_only "${ALSO_DELETE_BLENDS_FLAG[@]}" "${FILTER_BLEND_COLLISIONS_FLAG[@]}" "${PRESERVE_R1_FLAG[@]}" "${FROM_ROUND_FLAG[@]}" "${DRY_RUN_FLAG[@]}"
 fi

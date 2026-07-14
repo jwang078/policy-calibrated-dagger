@@ -486,10 +486,11 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
 
         # Dataset #7 (approach_lever_7_lowres_5path) was generated before the
         # fisheye wrist-camera change, so eval must also render the wrist cam
-        # as pinhole (wrist_cam_ver=0) to match training distribution.
+        # with the ver=2 recalibrated fisheye (matches everything else in the
+        # sweep and the new SplatSim/LeRobot default).
         if [[ "$exp_name" == *"approach_lever_7_lowres_5path"* ]]; then
             eval_cmd="$eval_cmd \\
-            --env.wrist_cam_ver=0"
+            --env.wrist_cam_ver=2"
         fi
 
         # Temporal ensembling: applies the TemporalEnsemblePolicyWrapper at eval

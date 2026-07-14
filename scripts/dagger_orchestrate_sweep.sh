@@ -127,6 +127,18 @@ AUTO_RERUN_TAG_SUFFIX="_rr"   # appended to source's run_tag when sweep tag is m
 INTERLEAVE_ROUNDS=false
 ORCHESTRATOR_ARGS=()
 
+# Capture the wrapper's argv before parsing so the per-iteration orchestrator
+# invocation can record it into the dagger sidecar (alongside its own argv).
+# This lets dagger_detect_dataset_anomalies.py (and any other reverse-lookup
+# tool) reconstruct the EXACT sweep-level command used to spawn the lineage,
+# not just the orchestrator-level command. JSON-encoded so the orchestrator
+# can pass it through to the sidecar without shell-quoting headaches.
+# NOT exported here — the env var is set INLINE on each per-iteration orchestrator
+# invocation (see the inner sweep loop below). Inline-only avoids tagging the
+# --auto_create_source preamble's orchestrator call (which builds the SOURCE
+# lineage independent of this sweep) with this sweep's argv.
+SWEEP_ARGV_JSON_FOR_SIDECAR="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@")"
+
 for arg in "$@"; do
     case "$arg" in
         --sweep_blends=*)            SWEEP_BLENDS="${arg#*=}" ;;
@@ -678,7 +690,15 @@ if [[ "$AUTO_CREATE_SOURCE" == "true" ]]; then
     echo "    bash $ORCH ${CREATE_ARGS[*]}"
     echo "  (Idempotent: if the source is already fully complete, this exits 0 in seconds.)"
     echo "════════════════════════════════════════════════════════════════════════════════"
-    if ! bash "$ORCH" "${CREATE_ARGS[@]}" "${ROUND_ARGS[@]}"; then
+    # Pass the sweep-level invocation so the SOURCE lineage's per-round sidecars
+    # (including round 1) record `sweep_invocation` too. The source is created by
+    # calling the orchestrator DIRECTLY here, so without this its rounds'
+    # config.json would have sweep_invocation: null (only the rerun iterations
+    # below carried it). This puts the full, reproducible sweep command right
+    # next to round 1's dagger sidecar.
+    if ! DAGGER_SWEEP_INVOCATION_ARGV_JSON="$SWEEP_ARGV_JSON_FOR_SIDECAR" \
+         DAGGER_SWEEP_INVOCATION_WRAPPER="my_scripts/dagger_orchestrate_sweep.sh" \
+         bash "$ORCH" "${CREATE_ARGS[@]}" "${ROUND_ARGS[@]}"; then
         echo "Auto-create source step FAILED. Aborting sweep before any blend iteration." >&2
         exit 1
     fi
@@ -704,7 +724,13 @@ for i in "${!RATIO_LISTS_ARR[@]}"; do
     echo "Sweep iteration $((i + 1)) / $total: K=$iter_k --blends=\"$combo\""
     echo "  (elapsed sweep time so far: $(( iter_start - sweep_start ))s)"
     echo "════════════════════════════════════════════════════════════════════════════════"
-    if bash "$ORCH" --blends="$combo" "${ORCHESTRATOR_ARGS[@]}" "${ROUND_ARGS[@]}"; then
+    # DAGGER_SWEEP_INVOCATION_* tells the orchestrator's write_dagger_config_sidecar
+    # to include `sweep_invocation: {argv, wrapper}` in the per-round sidecar so
+    # downstream tools (dagger_detect_dataset_anomalies, etc.) can recover the
+    # full sweep-level command, not just this iteration's orchestrator-level one.
+    if DAGGER_SWEEP_INVOCATION_ARGV_JSON="$SWEEP_ARGV_JSON_FOR_SIDECAR" \
+       DAGGER_SWEEP_INVOCATION_WRAPPER="my_scripts/dagger_orchestrate_sweep.sh" \
+       bash "$ORCH" --blends="$combo" "${ORCHESTRATOR_ARGS[@]}" "${ROUND_ARGS[@]}"; then
         n_succ=$((n_succ + 1))
         echo "Sweep iteration --blends=\"$combo\" SUCCEEDED ($(( $(date +%s) - iter_start ))s)."
     else

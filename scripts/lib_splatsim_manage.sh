@@ -17,7 +17,7 @@
 #   ENV_EXTERNAL_PORT      TCP port for the sim to bind (default: 6001)
 #   ENV_EXTERNAL_HOST      hostname (default: 127.0.0.1)
 #   SPLATSIM_ROBOT         --robot arg (default: sim_ur_pybullet_small_engine_new_interactive)
-#   SPLATSIM_ROBOT_NAME    --robot_name arg (default: robot_iphone_w_engine_new)
+#   SPLATSIM_ROBOT_NAME    --robot_name arg (default: robot_iphone_w_engine_curtain)
 #   EVAL_BENCHMARK_REPO_ID --eval_benchmark_repo_id (REQUIRED — no default)
 #   HEADLESS               "true"/"false" — if true, adds --headless (p.DIRECT)
 #   LEROBOT_ROOT           where to write the sim log under outputs/dagger/
@@ -49,7 +49,11 @@ _LIB_SPLATSIM_MANAGE_LOADED=1
 : "${ENV_EXTERNAL_PORT:=6001}"
 : "${ENV_EXTERNAL_HOST:=127.0.0.1}"
 : "${SPLATSIM_ROBOT:=sim_ur_pybullet_small_engine_new_interactive}"
-: "${SPLATSIM_ROBOT_NAME:=robot_iphone_w_engine_new}"
+# Empty by default — `launch_nodes.py` resolves to the robot server
+# class's `DEFAULT_ROBOT_NAME` when `--robot_name` isn't passed. Only
+# set this when overriding per-run; keeps SplatSim as the single source
+# of truth for the canonical splat/URDF name.
+: "${SPLATSIM_ROBOT_NAME:=}"
 : "${HEADLESS:=false}"
 : "${DRY_RUN:=false}"
 # Where to write the per-launch sim log. Callers should set this to a path
@@ -113,9 +117,11 @@ splat_start_sim() {
         [[ "$HEADLESS" == "true" ]] && _hl=" --headless"
         local _subset_str=""
         [[ -n "${EVAL_BENCHMARK_SUBSET:-}" ]] && _subset_str=" --eval_benchmark_subset $EVAL_BENCHMARK_SUBSET"
+        local _rn=""
+        [[ -n "$SPLATSIM_ROBOT_NAME" ]] && _rn=" --robot_name $SPLATSIM_ROBOT_NAME"
         echo "[DRY-RUN] would start SplatSim on port $ENV_EXTERNAL_PORT:"
         echo "[DRY-RUN]   cwd: $SPLATSIM_ROOT"
-        echo "[DRY-RUN]   cmd: python scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $ENV_EXTERNAL_PORT --hostname $ENV_EXTERNAL_HOST --robot_name $SPLATSIM_ROBOT_NAME --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID$_subset_str$_hl"
+        echo "[DRY-RUN]   cmd: python -u scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $ENV_EXTERNAL_PORT --hostname $ENV_EXTERNAL_HOST$_rn --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID$_subset_str$_hl"
         MANAGED_SIM_PID="DRYRUN"
         return 0
     fi
@@ -144,13 +150,17 @@ splat_start_sim() {
     mkdir -p "$_log_dir"
     MANAGED_SIM_LOG="$_log_dir/splatsim_$(date +%Y%m%d_%H%M%S).log"
     local launch_cmd=(
-        python scripts/launch_nodes.py
+        python -u scripts/launch_nodes.py
         --robot              "$SPLATSIM_ROBOT"
         --robot_port         "$ENV_EXTERNAL_PORT"
         --hostname           "$ENV_EXTERNAL_HOST"
-        --robot_name         "$SPLATSIM_ROBOT_NAME"
         --eval_benchmark_repo_id "$EVAL_BENCHMARK_REPO_ID"
     )
+    # Only pass --robot_name when the caller set a non-empty override.
+    # Otherwise let launch_nodes.py resolve the class-level
+    # DEFAULT_ROBOT_NAME so the env's canonical splat/URDF flows through
+    # from a single source of truth on the SplatSim side.
+    [[ -n "$SPLATSIM_ROBOT_NAME" ]] && launch_cmd+=( --robot_name "$SPLATSIM_ROBOT_NAME" )
     [[ "${#_subset_arg[@]}" -gt 0 ]] && launch_cmd+=( "${_subset_arg[@]}" )
     [[ "$HEADLESS" == "true" ]] && launch_cmd+=( --headless )
     echo "Starting SplatSim:"

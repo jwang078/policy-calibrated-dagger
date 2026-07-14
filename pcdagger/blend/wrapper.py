@@ -142,7 +142,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         forward_flow_ratio: float,
         show_slider: bool = True,
         start_paused: bool = False,
-        robot_name: str = "robot_iphone_w_engine_new",
+        robot_name: str = "robot_iphone_w_engine_curtain",
         max_joint_delta: float = 0.016,
         num_dofs: int = 6,
         policy_guidance_representation: PolicyGuidanceRepresentation = PolicyGuidanceRepresentation.DELTA,
@@ -164,8 +164,16 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         rrt_num_ik_candidates: int = 16,
         rrt_obstacle_clearance: float | None = None,
         rrt_self_collision_clearance: float | None = None,
+        rrt_in_progress_obstacle_clearance: float | None = None,
+        rrt_in_progress_self_collision_clearance: float | None = None,
         rrt_self_collision_skip_pairs: list[list[int]] | None = None,
         rrt_diagnostic_log_pairs: str = "off",
+        rrt_ik_skip_gripper_obstacle_pairs: bool = False,
+        rrt_escape_clearance_factor: float = 1.5,
+        rrt_rewind_clearance_factor: float | None = None,
+        rrt_abort_on_drift_rad: float = 0.15,
+        rrt_abort_on_drift_ticks: int = 8,
+        rrt_drift_trigger: str = "lookback",
     ):
         # Bypass PreTrainedPolicy.__init__ — we proxy the inner policy's config
         nn.Module.__init__(self)
@@ -221,6 +229,15 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self._actual_q_history: collections.deque[np.ndarray] = collections.deque(
             maxlen=max(1, _effective_max_lookback + 1)
         )
+        # Diagnostic: set by the RRT source's _teleport_env_to_q_start to the
+        # arm-joint pose the robot was teleported to (= the planned chunk
+        # start). On the NEXT real obs decode we measure how far the robot
+        # ACTUALLY landed from it and log the error, then clear. ~0 = clean
+        # landing; large = the rewind pose was invalid (physics ejected the
+        # robot) or the teleport didn't take over ZMQ — in which case the
+        # open-loop chunk runs away from the real robot (the divergence we're
+        # chasing). None = no teleport pending a landing check.
+        self._pending_teleport_landing: np.ndarray | None = None
         # Frames-since-last-RRT-cycle-end counter. Used to cap the RRT
         # source's lookback so it never rewinds into a prior RRT cycle's
         # trajectory (which would teleport the env's robot to a config the
@@ -229,6 +246,12 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # leaves IDLE (a new cycle started). Episode reset() also zeros it.
         # See rrt_source._do_plan() lookback path for the cap site.
         self._frames_since_last_rrt_end: int = 0
+        # Cached previous-tick RRT mode for the off-by-one fix in select_action's
+        # counter update (see comment there). Initialized to IDLE so the very
+        # first scenario tick's "was_idle" check is True (no prior RRT cycle,
+        # so we're trivially "still IDLE" from the implicit pre-scenario IDLE
+        # state) and the counter increments from frame 1 onward.
+        self._prev_rrt_mode: RRTMode = RRTMode.IDLE
         self._teleop_context: TeleopRecordingContext | None = None  # set by policy factory
         self._start_paused = start_paused
         self._run_event = threading.Event()
@@ -269,6 +292,20 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 f"'future_chunk', or 'hybrid', got {rrt_collision_detection!r}"
             )
         self._collision_detection_mode = rrt_collision_detection
+        # Drift-abort guard: cancel an RRT chunk when the robot stops tracking
+        # it (drift > rad for N consecutive ticks). `_rrt_drift_streak` counts
+        # consecutive high-drift playback ticks; reset on a fresh chunk and on
+        # any below-threshold tick. rad <= 0 disables the guard.
+        self._rrt_abort_on_drift_rad = float(rrt_abort_on_drift_rad)
+        self._rrt_abort_on_drift_ticks = int(rrt_abort_on_drift_ticks)
+        self._rrt_drift_streak = 0
+        # What to do after a drift stall (see SharedAutonomyConfig.rrt_drift_trigger).
+        self._rrt_drift_trigger = str(rrt_drift_trigger)
+        # Set by the drift-abort to request a controller-side re-plan once the
+        # cancelled chunk reaches IDLE. None = no re-plan ("discard" mode);
+        # otherwise the no_lookback flag to pass to _trigger_source. The
+        # InterventionController consumes + clears this in its tick().
+        self._rrt_drift_replan_no_lookback: bool | None = None
         self._future_chunk_config = rrt_future_chunk or FutureChunkConfig()
         _lookback_cfg = rrt_pre_jump_lookback or PreJumpLookbackConfig()
         self._rrt_source = RRTGuidanceSource(
@@ -290,8 +327,13 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             num_ik_candidates=rrt_num_ik_candidates,
             obstacle_clearance=rrt_obstacle_clearance,
             self_collision_clearance=rrt_self_collision_clearance,
+            in_progress_obstacle_clearance=rrt_in_progress_obstacle_clearance,
+            in_progress_self_collision_clearance=rrt_in_progress_self_collision_clearance,
             self_collision_skip_pairs=rrt_self_collision_skip_pairs,
             diagnostic_log_pairs=rrt_diagnostic_log_pairs,
+            ik_skip_gripper_obstacle_pairs=rrt_ik_skip_gripper_obstacle_pairs,
+            escape_clearance_factor=rrt_escape_clearance_factor,
+            rewind_clearance_factor=rrt_rewind_clearance_factor,
         )
 
         # NOTE on `ratio` scope: forward_flow_ratio is applied ONLY to the
@@ -500,7 +542,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
     # last_mile/helpers.py, shared_autonomy_gui.py). New callers should prefer
     # `self._rrt_source.<...>` directly.
 
-    def _check_future_chunk_collision(self) -> tuple[bool, int | None, str | None]:
+    def _check_future_chunk_collision(self) -> tuple[bool, int | None, str | None, np.ndarray | None]:
         """Run the future-chunk predictive shield.
 
         Peeks at the inner policy's already-cached action chunk (no extra
@@ -525,7 +567,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # (e.g., very first tick before select_action populated the queue).
         chunk = self.inner_policy.get_pending_action_chunk()
         if chunk is None or chunk.shape[0] == 0:
-            return False, None, None
+            return False, None, None, None
 
         # Apply horizon_frames cap if configured.
         horizon = self._future_chunk_config.horizon_frames
@@ -548,7 +590,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         if chunk_raw is None:
             # Denormalization failed (e.g., postprocessor not configured for
             # this codepath); skip the shield this tick rather than crashing.
-            return False, None, None
+            return False, None, None, None
 
         # Slice to the DOF arm dims — drop gripper. The wrapper conventionally
         # uses joint indices 1..1+num_dofs for the planning pybullet client,
@@ -588,13 +630,14 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             # unused anyway (action_format='abs' → future_qs = chunk_arr).
             q_current = self._latest_actual_q
             if q_current is None:
-                return False, None, None
+                return False, None, None, None
             q_current_dof = np.asarray(q_current, dtype=np.float64).reshape(-1)[: self.num_dofs]
 
         # Inherit clearance / skip-pair config from the planner that the
         # source already constructed (so the shield's contract matches RRT's).
         planner = self._rrt_source.state.planner
-        skip_pairs = None
+        self_skip_pairs = None
+        obstacle_skip_pairs: set[tuple[int, int]] | None = None
         ob_clear = self._future_chunk_config.obstacle_clearance
         self_clear = self._future_chunk_config.self_collision_clearance
         if planner is not None:
@@ -602,14 +645,32 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 ob_clear = planner._collision_kwargs.get("obstacle_clearance")
             if self_clear is None:
                 self_clear = planner._collision_kwargs.get("self_collision_clearance")
-            skip_pairs = planner._collision_kwargs.get("self_collision_skip_pairs")
+            self_skip_pairs = planner._collision_kwargs.get("self_collision_skip_pairs")
+            # Forward env-declared (robot_link, obstacle_body_id) skips
+            # (e.g. base_link ⟷ table) so the shield uses the same skip
+            # contract as RRT planning / is_in_collision_at.
+            obstacle_skip_pairs = planner._skip_pairs if planner._skip_pairs else None
 
         # Joint indices the planner uses for the arm DOFs in the wrapper's
         # pybullet client. The wrapper convention is 1..1+num_dofs (see
         # _sync_joints).
         joint_indices = list(range(1, 1 + self.num_dofs))
 
-        return check_chunk_collision(
+        # Pass the env's actual gripper config so the shield's FK projection
+        # checks the geometry the env ACTUALLY has, not the URDF default
+        # OPEN-gripper that `check_links_in_collision(q=...)` would otherwise
+        # force via its internal `set_robot_joint_positions → open_gripper`.
+        # Without this, for grasp tasks where the policy progressively closes
+        # the gripper, the shield false-fires `obstacle_collision` whenever
+        # the policy's predicted chunk takes the EE near the goal — the
+        # OPEN fingers overlap the goal object even though the CLOSED fingers
+        # in the actual env wouldn't. Mirrors the gripper-snap fix in
+        # `RRTToGoalPlanner.is_q_in_collision` (controller-side check).
+        actual_gripper_q: float | None = None
+        if self._latest_actual_q is not None and self._latest_actual_q.size > self.num_dofs:
+            actual_gripper_q = float(self._latest_actual_q[self.num_dofs])
+
+        collides, step, kind = check_chunk_collision(
             pb_client=self._pb_client,
             robot_id=self._robot_id,
             joint_indices=joint_indices,
@@ -619,8 +680,26 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             obstacle_ids=self._obstacle_ids,
             obstacle_clearance=ob_clear,
             self_collision_clearance=self_clear,
-            self_collision_skip_pairs=skip_pairs,
+            self_collision_skip_pairs=self_skip_pairs,
+            skip_pairs=obstacle_skip_pairs,
+            actual_gripper_q=actual_gripper_q,
         )
+        # Re-derive the offending future joint config so the caller can
+        # probe `planner.describe_collision_at(future_q)` to identify the
+        # violating link pair. Mirrors the math `check_chunk_collision`
+        # uses internally — `rel` = anchor + chunk[k], `abs` = chunk[k].
+        # Append actual gripper config (when known) so describe's gripper
+        # snap matches the shield's check geometry.
+        offending_q: np.ndarray | None = None
+        if collides and step is not None:
+            base_q = q_current_dof + chunk_dof[step] if action_format == "rel" else chunk_dof[step]
+            if actual_gripper_q is not None:
+                offending_q = np.concatenate(
+                    [np.asarray(base_q, dtype=np.float64), np.asarray([actual_gripper_q], dtype=np.float64)]
+                )
+            else:
+                offending_q = np.asarray(base_q, dtype=np.float64)
+        return collides, step, kind, offending_q
 
     def _denormalize_chunk_to_raw(self, chunk: Tensor) -> np.ndarray | None:
         """Denormalize a queued action chunk to raw policy-space actions.
@@ -860,6 +939,27 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             logger.info("RRT goal reached; auto-paused. Resume to continue.")
         else:
             logger.info("RRT goal reached; auto-pause disabled (running headless).")
+
+    def _log_rrt_drift_summary(self, reason: str) -> None:
+        """One-line per-chunk drift rollup at chunk end. Pairs with the
+        per-tick `RRT drift @ step` logs from the playback loop: those show the
+        shape, this gives the verdict. `drift@step1` is the teleport landing
+        error (robot vs chunk start); `drift_max` is the worst over the chunk.
+        Both ~0 ⇒ clean execution; large step1 ⇒ teleport didn't land / scene
+        ejection; small step1 but large max ⇒ open-loop runaway (clean start,
+        robot fell behind). Called from the wrapper's RRT playback exits."""
+        rrt = self._rrt
+        d1 = getattr(self, "_rrt_drift_at_step1", None)
+        dmax = getattr(self, "_rrt_drift_max", 0.0)
+        n = len(rrt.chunk) if rrt.chunk is not None else 0
+        logger.info(
+            "RRT chunk drift summary (%s): steps=%d/%d  drift@step1=%s rad  drift_max=%.4f rad",
+            reason,
+            rrt.step,
+            n,
+            f"{d1:.4f}" if d1 is not None else "n/a",
+            dmax,
+        )
 
     def _project_delta_for_collision(
         self,
@@ -1106,6 +1206,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self._latest_actual_q = None
         self._actual_q_history.clear()
         self._frames_since_last_rrt_end = 0
+        self._prev_rrt_mode = RRTMode.IDLE
         self._prev_dq = None
         # Clear RRT chunk state on episode boundary; keep the planner instance
         # so its obstacle cache survives if the env config hash matches next episode.
@@ -1282,6 +1383,25 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             # Also push into the rolling history so RRT can pull q_start from
             # N steps ago (pre-jump pose), not just the current actual_q.
             self._actual_q_history.append(self._latest_actual_q.copy())
+            # Teleport landing check. If a teleport fired on a previous tick,
+            # `_pending_teleport_landing` holds the arm pose the robot was
+            # teleported to (= the planned chunk start). This is the FIRST
+            # real obs decode since, so `_latest_actual_q` is where the robot
+            # actually ended up. A clean landing reads ~0; a large error means
+            # the rewind pose was invalid (physics ejected the robot) or the
+            # teleport didn't take over ZMQ, so the open-loop chunk now runs
+            # away from the real robot. Log it, then clear the pending flag.
+            if self._pending_teleport_landing is not None:
+                land_err = float(
+                    np.linalg.norm(self._latest_actual_q[: self.num_dofs] - self._pending_teleport_landing)
+                )
+                logger.info(
+                    "RRT teleport landing error: %.4f rad "
+                    "(actual robot pose one tick later vs planned chunk start; "
+                    "~0 = clean, large = ejected/teleport-missed → chunk will run away)",
+                    land_err,
+                )
+                self._pending_teleport_landing = None
             # Track post-intervention idle frames. Bumped on every policy-
             # driven tick (RRT IDLE), zeroed the moment RRT leaves IDLE for
             # a new cycle. rrt_source._do_plan() caps its lookback sample
@@ -1290,10 +1410,33 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             # NOTE: this needs `self._rrt` (the back-compat view onto the
             # RRT source's state), which exists from ctor regardless of
             # whether RRT is the active guidance source.
+            #
+            # Off-by-one detail: this check runs at the TOP of select_action,
+            # BEFORE the RRT chunk is consumed for this tick. On the very
+            # last RRT-EXECUTING frame R, mode is still EXECUTING here,
+            # then the chunk's last waypoint pops and mode flips to IDLE
+            # for frame R+1's check. We want the counter to represent
+            # "number of POLICY-driven frames we can rewind into" — i.e.,
+            # 0 at frame R+1 (the first post-RRT frame; rewinding 0 frames
+            # leaves us at the post-RRT config), 1 at R+2, ... NOT 1 at
+            # R+1. Without this off-by-one fix, rrt_source._do_plan's
+            # lookback cap lands on the state at frame R (DURING the last
+            # RRT waypoint) instead of R+1 (where RRT left the robot),
+            # producing the "rewinds to a frame before RRT ended" artifact.
+            # Fix: only increment after the SECOND consecutive IDLE
+            # observation, using a prev-mode latch.
+            _was_idle = self._prev_rrt_mode == RRTMode.IDLE
             if self._rrt.mode == RRTMode.IDLE:
-                self._frames_since_last_rrt_end += 1
+                if _was_idle:
+                    self._frames_since_last_rrt_end += 1
+                else:
+                    # Just transitioned EXECUTING/PLANNING -> IDLE this
+                    # tick. The post-RRT state IS this tick's _actual_q,
+                    # so "0 frames back" already lands on it.
+                    self._frames_since_last_rrt_end = 0
             else:
                 self._frames_since_last_rrt_end = 0
+            self._prev_rrt_mode = self._rrt.mode
         elif self._desired_q is None:
             # Last-resort initial seed from the policy's postprocessed action.
             self._desired_q = self.postprocessor(inner_action).cpu().numpy().reshape(-1)
@@ -1312,13 +1455,38 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # motion state (no_lookback=True). The recorded intervention episode
         # therefore starts velocity-continuous, in-distribution.
         if self._collision_detection_mode in ("future_chunk", "hybrid") and self._rrt.mode == RRTMode.IDLE:
-            shield_collides, shield_step, shield_kind = self._check_future_chunk_collision()
+            shield_collides, shield_step, shield_kind, shield_offending_q = (
+                self._check_future_chunk_collision()
+            )
             if shield_collides:
+                # Debug telemetry: surface which link pair tripped the shield
+                # so we can tell whether grasp-finger ⟷ target-object proximity
+                # is firing (false-positive for grasp tasks) vs a real
+                # arm-vs-obstacle collision. `shield_offending_q` is the predicted
+                # future joint config at the offending chunk step (computed inside
+                # `_check_future_chunk_collision` via the same anchor+chunk math
+                # the shield uses, with actual gripper snapped on).
+                pair_str = ""
+                planner = self._rrt_source.state.planner
+                if planner is not None and shield_offending_q is not None:
+                    info = planner.describe_collision_at(
+                        shield_offending_q,
+                        obstacle_clearance=self._future_chunk_config.obstacle_clearance,
+                        self_collision_clearance=self._future_chunk_config.self_collision_clearance,
+                    )
+                    if info is not None:
+                        flag = "VIOLATION" if info["in_violation"] else "ok"
+                        pair_str = (
+                            f" [debug] pair={info['kind']} {info['link_a_name']} ⟷ "
+                            f"{info['link_b_name']} (dist={info['distance_m'] * 1000:.2f}mm, "
+                            f"threshold={info['threshold_m'] * 1000:.2f}mm) [{flag}]"
+                        )
                 logger.info(
                     "Future-chunk shield: predicted %s collision at chunk step %d — "
-                    "triggering RRT from current state (no rewind).",
+                    "triggering RRT from current state (no rewind).%s",
                     shield_kind or "unknown",
                     shield_step if shield_step is not None else -1,
+                    pair_str,
                 )
                 # Flush the colliding chunk so it doesn't drain in parallel
                 # with the RRT chunk execution about to start.
@@ -1340,6 +1508,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         if rrt.mode == RRTMode.EXECUTING and rrt.chunk is not None:
             if has_guidance or rrt.cancel_requested:
                 # print("cancel rrt")
+                self._log_rrt_drift_summary("cancelled")
                 self._cancel_rrt()
                 # _cancel_rrt cleared stale inner-policy + obs-blend caches.
                 # Return a hold action for this tick; next tick falls through
@@ -1348,6 +1517,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             elif rrt.step >= len(rrt.chunk):
                 # print('finish rrt: chunk exhausted (step %d >= chunk length %d)' % (rrt.step, len(rrt.chunk)))
                 # Goal reached: restore prior ratio, auto-pause for the next step.
+                self._log_rrt_drift_summary("completed")
                 self._finish_rrt()
                 action = self.get_hold_action(inner_action)
                 # Skip the existing branches below; jump to _desired_q update.
@@ -1356,6 +1526,130 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 return action
             else:
                 # print("rrt executing: step %d / %d" % (rrt.step, len(rrt.chunk)))
+                # ── Drift diagnostic (this is the LIVE RRT playback path —
+                # the wrapper drives the chunk directly here; the source's
+                # next_action() is NOT used for RRT). Each tick the robot
+                # should have reached the PREVIOUS waypoint (commanded last
+                # tick). `_latest_actual_q` was refreshed from this tick's obs
+                # above. step-1 drift = the teleport landing error (robot vs
+                # chunk start); drift that GROWS step-over-step = open-loop
+                # runaway (robot can't track while the command marches on).
+                if rrt.step == 0:
+                    self._rrt_drift_max = 0.0
+                    self._rrt_drift_at_step1 = None
+                    self._rrt_drift_streak = 0
+                if rrt.step >= 1 and self._latest_actual_q is not None:
+                    prev_wp = np.asarray(rrt.chunk[rrt.step - 1][: self.num_dofs], dtype=np.float64)
+                    actual = self._latest_actual_q.reshape(-1)[: self.num_dofs].astype(np.float64)
+                    drift_vec = actual - prev_wp
+                    drift = float(np.linalg.norm(drift_vec))
+                    self._rrt_drift_max = max(getattr(self, "_rrt_drift_max", 0.0), drift)
+                    if rrt.step == 1:
+                        self._rrt_drift_at_step1 = drift
+                    # Drift-abort guard: the robot has stopped following the
+                    # command (wedged on contact the env's penetration-only
+                    # in_collision check misses; happens with OR without
+                    # lookback). Count consecutive over-threshold ticks; once
+                    # sustained, cancel the chunk so the open-loop runaway never
+                    # reaches the recorded dataset. The cancel fires on the NEXT
+                    # tick's `rrt.cancel_requested` branch (_cancel_rrt), and the
+                    # recorder drops the resulting short fragment.
+                    if self._rrt_abort_on_drift_rad > 0.0:
+                        if drift > self._rrt_abort_on_drift_rad:
+                            self._rrt_drift_streak += 1
+                        else:
+                            self._rrt_drift_streak = 0
+                        if (
+                            not rrt.cancel_requested
+                            and self._rrt_drift_streak >= self._rrt_abort_on_drift_ticks
+                        ):
+                            worst_j = int(np.abs(drift_vec).argmax())
+                            logger.warning(
+                                "RRT drift-abort: |actual-commanded|=%.3f rad for %d consecutive "
+                                "ticks (> %.2f) at step %d/%d (worst joint %d: actual=%.3f "
+                                "commanded=%.3f) — robot not tracking; cancelling chunk and "
+                                "DISCARDING the episode so no drift frames reach the dataset.",
+                                drift,
+                                self._rrt_drift_streak,
+                                self._rrt_abort_on_drift_rad,
+                                rrt.step,
+                                len(rrt.chunk),
+                                worst_j,
+                                float(actual[worst_j]),
+                                float(prev_wp[worst_j]),
+                            )
+                            # Dump the closest robot-vs-obstacle + robot-vs-robot
+                            # link pairs so you can see WHAT is physically
+                            # contacting the arm when drift piles up. When a
+                            # pair shows dist ≤ 0 (mesh penetration) AND is
+                            # SKIPPED in the planner's contract, the planner
+                            # accepts that config kinematically but PyBullet
+                            # generates contact force there → joint stall.
+                            # Pairs are labelled SKIPPED / not-skipped so it's
+                            # immediately obvious which side of the semantic
+                            # gap they sit on. See `_dump_drift_collision_diagnostic`.
+                            self._dump_drift_collision_diagnostic(actual)
+                            rrt.cancel_requested = True
+                            # Drop the ENTIRE in-progress RRT episode — not just
+                            # the post-abort frames, but the whole detection-delay
+                            # run that accumulated while drift was building. The
+                            # recorder consumes this at the top of its next step()
+                            # via _discard_episode(), which clears both its frame
+                            # buffer AND the dataset's in-memory episode buffer
+                            # (nothing is on disk until save_episode), so zero
+                            # drift frames are committed. No-op when not recording.
+                            ctx = getattr(self, "_teleop_context", None)
+                            if ctx is not None:
+                                ctx.discard_requested = True
+                            # Request a re-plan per `rrt_drift_trigger`. The
+                            # cancelled chunk reaches IDLE next tick; the
+                            # InterventionController then fires the trigger
+                            # through the SAME `_trigger_source` path the other
+                            # triggers use (reason="drift_stall"), so the
+                            # lookback choice stays consistent. "discard" leaves
+                            # this None → no re-plan, control returns to policy.
+                            self._rrt_drift_replan_no_lookback = {
+                                "lookback": False,
+                                "no_lookback": True,
+                            }.get(self._rrt_drift_trigger, None)
+                    # Always log step 1 (= landing), then every 10th, plus any
+                    # tick whose drift crosses 0.1 rad. Include the RAW actual +
+                    # commanded values for the worst joint so we can tell, by
+                    # comparing against the RECORDED observation.state / action
+                    # offline, which of two bugs is in play:
+                    #   * live `actual` RAMPS but recorded state STALLS ⇒ the
+                    #     wrapper sees a PHANTOM robot state (it's planning /
+                    #     drift-checking against a config the real robot isn't
+                    #     at). `_latest_actual_q` != recorded agent_pos.
+                    #   * live `commanded` (chunk) stays FLAT but recorded
+                    #     action RAMPS ⇒ the rel-action postprocessor is
+                    #     FABRICATING the ramp; chunk != recorded action.
+                    if rrt.step == 1 or rrt.step % 10 == 0 or drift > 0.1:
+                        worst_j = int(np.abs(drift_vec).argmax())
+                        logger.info(
+                            "RRT drift @ step %d/%d: |actual-commanded|=%.4f rad "
+                            "(worst joint %d: actual=%.4f commanded=%.4f Δ=%+.4f; max-so-far %.4f)",
+                            rrt.step,
+                            len(rrt.chunk),
+                            drift,
+                            worst_j,
+                            float(actual[worst_j]),
+                            float(prev_wp[worst_j]),
+                            float(drift_vec[worst_j]),
+                            self._rrt_drift_max,
+                        )
+                    # Full-vector dump at the landing tick and every 20 ticks so
+                    # the live `_latest_actual_q` and chunk trajectories can be
+                    # aligned against the recorded observation.state / action
+                    # frame-by-frame offline (the decisive (a)-vs-(b) check).
+                    if rrt.step == 1 or rrt.step % 20 == 0:
+                        logger.info(
+                            "RRT drift raw @ step %d/%d: actual=%s commanded(chunk[step-1])=%s",
+                            rrt.step,
+                            len(rrt.chunk),
+                            np.array2string(actual, precision=4, suppress_small=True),
+                            np.array2string(prev_wp, precision=4, suppress_small=True),
+                        )
                 wp = rrt.chunk[rrt.step][: self.num_dofs]
                 rrt.step += 1
                 gripper = float(self._desired_q[-1]) if self._desired_q is not None else 0.0
@@ -1433,6 +1727,125 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             self._desired_q = self.postprocessor(action).cpu().numpy().reshape(-1)
 
         return action
+
+    def _dump_drift_collision_diagnostic(self, actual_q: np.ndarray) -> None:
+        """Log the closest robot-vs-obstacle + robot-vs-self mesh distances
+        at the currently-stuck config, labelling each pair by its SKIP
+        status in the planner's contract. Called from the drift-abort
+        branch of `select_action` — helps identify pairs where the planner
+        accepts a config (skipped from its collision check) but PyBullet's
+        constraint solver still generates contact force, holding a joint
+        stuck.
+
+        Semantic gap this reveals:
+          * Planner says "no collision" for a SKIPPED pair regardless of
+            actual mesh overlap → RRT plans a chunk through that config
+          * PyBullet's solver enforces non-penetration on ALL meshes,
+            skipped or not → generates contact force → joint fails to
+            track the commanded ruckig path → drift accumulates → abort
+          * The diagnostic makes the offending pair visible so you can
+            move it from SELF_COLLISION_SKIP_PAIRS to
+            SELF_COLLISION_SKIP_PAIRS_EVAL_TERMINATE_EXTRA (planner
+            catches it, eval terminate still ignores it).
+
+        Best-effort: silently no-ops if any pybullet call fails; skips
+        pair enumeration if the planner state isn't available.
+        """
+        try:
+            # Snap the wrapper's pybullet client to the stuck config so
+            # getClosestPoints reflects the ACTUAL stuck geometry, not
+            # whatever was left from the last planner tick.
+            self._sync_joints(actual_q)
+
+            num_joints = p.getNumJoints(self._robot_id, physicsClientId=self._pb_client)
+
+            # Read the planner's skip contract so we can label pairs.
+            planner = getattr(self._rrt_source.state, "planner", None)
+            strict_self_skips: set[frozenset[int]] = set()
+            obstacle_skip_pairs: set[tuple[int, int]] = set()
+            if planner is not None:
+                # STRICT list (used by RRT + escape).
+                _s = planner._collision_kwargs.get("self_collision_skip_pairs") or []
+                strict_self_skips = {frozenset((int(a), int(b))) for a, b in _s}
+                obstacle_skip_pairs = set(getattr(planner, "_skip_pairs", set()))
+
+            def _link_name(link_i: int) -> str:
+                if link_i == -1:
+                    return "base(-1)"
+                info = p.getJointInfo(self._robot_id, link_i, physicsClientId=self._pb_client)
+                return f"{info[12].decode('utf-8')}({link_i})"
+
+            def _obs_name(oid: int) -> str:
+                # Wrapper doesn't hold names; the planner does when available.
+                if planner is not None:
+                    return f"{planner._obstacle_names.get(oid, str(oid))}(id={oid})"
+                return f"obstacle({oid})"
+
+            # Robot-vs-obstacle: enumerate every (link, obstacle) pair whose
+            # closest points are within 5 cm. Sorted most-penetrating first.
+            obs_hits: list[tuple[float, int, int, bool]] = []
+            for obs_id in getattr(self, "_obstacle_ids", []):
+                for link_i in range(-1, num_joints):
+                    pts = p.getClosestPoints(
+                        bodyA=self._robot_id,
+                        bodyB=obs_id,
+                        distance=0.05,
+                        linkIndexA=link_i,
+                        physicsClientId=self._pb_client,
+                    )
+                    for pt in pts:
+                        dist = float(pt[8])
+                        skipped = (link_i, obs_id) in obstacle_skip_pairs
+                        obs_hits.append((dist, link_i, obs_id, skipped))
+                        break  # closest point per (link, obstacle) pair
+            obs_hits.sort(key=lambda t: t[0])
+
+            # Robot self-collision: enumerate every non-adjacent link pair
+            # within 2 cm. Sorted most-penetrating first.
+            self_hits: list[tuple[float, int, int, str]] = []
+            for a in range(num_joints):
+                for b in range(a + 1, num_joints):
+                    # Cheap adjacency check: parent link relation.
+                    _pa = p.getJointInfo(self._robot_id, a, physicsClientId=self._pb_client)[16]
+                    _pb = p.getJointInfo(self._robot_id, b, physicsClientId=self._pb_client)[16]
+                    if _pa == b or _pb == a:
+                        continue
+                    pts = p.getClosestPoints(
+                        self._robot_id,
+                        self._robot_id,
+                        distance=0.02,
+                        linkIndexA=a,
+                        linkIndexB=b,
+                        physicsClientId=self._pb_client,
+                    )
+                    for pt in pts:
+                        dist = float(pt[8])
+                        if frozenset((a, b)) in strict_self_skips:
+                            status = "SKIPPED (strict)"
+                        else:
+                            status = "not-skipped"
+                        self_hits.append((dist, a, b, status))
+                        break
+            self_hits.sort(key=lambda t: t[0])
+
+            # Log — cap at top-6 per bucket to keep the log short.
+            lines = ["[drift-abort collision diagnostic]"]
+            lines.append(f"  Robot-vs-obstacle (top {min(6, len(obs_hits))} closest, ≤ 50 mm):")
+            for dist, link_i, obs_id, skipped in obs_hits[:6]:
+                tag = "SKIPPED" if skipped else "not-skipped"
+                lines.append(
+                    f"    {_link_name(link_i):<30} vs {_obs_name(obs_id):<28} "
+                    f"dist={dist * 1000:>+7.2f} mm  ({tag})"
+                )
+            lines.append(f"  Robot self-collision (top {min(6, len(self_hits))} closest, ≤ 20 mm):")
+            for dist, a, b, status in self_hits[:6]:
+                lines.append(
+                    f"    {_link_name(a):<30} vs {_link_name(b):<30} dist={dist * 1000:>+7.2f} mm  ({status})"
+                )
+            logger.warning("\n".join(lines))
+        except Exception as e:
+            # Diagnostic must not crash the eval — swallow anything unexpected.
+            logger.debug("drift-abort collision diagnostic failed: %s", e)
 
     def get_optim_params(self):
         return self.inner_policy.get_optim_params()

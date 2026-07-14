@@ -41,9 +41,12 @@ from __future__ import annotations
 import csv
 import logging
 import random
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import numpy as np
 
 from lerobot.configs.intervention import InterventionConfig
 from lerobot.policies.last_mile.detectors import EEDistanceProgressTracker
@@ -317,12 +320,38 @@ class InterventionController:
         # scenario reset; advance the scenario when this hits the configured
         # cap (otherwise unbounded since cycles_used only counts executed cycles).
         self.backoff_rounds: int = 0
+        # Stuck-detection state — used by the planner-side in_collision
+        # override at the top of tick() to gate retries on actually being
+        # stuck (not just close-to-obstacle). See InterventionConfig's
+        # `stuck_threshold_rad_per_tick` / `stuck_consecutive_ticks`.
+        # `_prev_actual_q` is the previous tick's wrapper._latest_actual_q
+        # (None on the first tick of a scenario); `_consecutive_stuck_ticks`
+        # counts ticks where |q_curr - q_prev| stayed below the threshold.
+        # Both reset on scenario reset.
+        self._prev_actual_q: np.ndarray | None = None
+        self._consecutive_stuck_ticks: int = 0
+        # Mode at the previous tick's stuck-eval — used to detect RRT
+        # mode transitions (IDLE→EXECUTING or EXECUTING→IDLE) so we can
+        # reset the stuck counter at each boundary. Policy-mode "stuck"
+        # (slow approach) shouldn't carry into RRT-mode (where the
+        # signal we want is "joint physically blocked despite being
+        # commanded to move fast"). Initialized to IDLE to match
+        # `prev_mode` at scenario start.
+        self._prev_stuck_eval_mode: RRTMode = RRTMode.IDLE
         # One-shot latch for mid-RRT collisions. While True, further
         # in_collision observations during the same EXECUTING chunk are
         # ignored (we already requested a retry; the new path needs a few
         # ticks to take effect). Cleared the moment in_collision flips
         # back to False.
         self._in_collision_during_rrt: bool = False
+        # Debug telemetry for the mid-RRT collision WARNING — populated at
+        # each IDLE→EXECUTING transition and read at the WARNING site to
+        # report how far the robot has moved since the chunk started + the
+        # recent Δq pattern. Helps distinguish "real wedge" from "ruckig
+        # ramp-up false positive" by exposing whether the robot is actually
+        # tracking the commanded waypoints.
+        self._chunk_start_actual_q: np.ndarray | None = None
+        self._recent_dq: deque[float] = deque(maxlen=10)
         self.last_status: str = "running"
         # Chronological list of trigger reasons for each intervention cycle
         # that fired this scenario. Same vocabulary as the "Triggering %s
@@ -355,7 +384,7 @@ class InterventionController:
         # within a scenario regardless of which phase is active.
         self.total_step_count: int = 0
 
-    def _trigger_source(self, reason: str | None = None) -> None:
+    def _trigger_source(self, reason: str | None = None, no_lookback_override: bool | None = None) -> None:
         """Trigger the active guidance source, dispatching no_lookback per
         the wrapper's collision-detection mode AND (for hybrid) the per-
         trigger reason.
@@ -367,13 +396,19 @@ class InterventionController:
                 reused so the retry uses the same dispatch policy as the
                 original trigger. Pass an explicit reason on the first
                 fire of every cycle to keep the mapping accurate.
+            no_lookback_override: when not None, force the lookback choice
+                instead of deriving it from the mode/reason. Used by the
+                drift-stall re-plan, whose lookback policy is set explicitly
+                by the `rrt_drift_trigger` config rather than the mode.
         """
         if reason is not None:
             self._last_trigger_reason = reason
         effective_reason = reason or self._last_trigger_reason
 
         use_no_lookback = False
-        if self._collision_detection_mode == "future_chunk":
+        if no_lookback_override is not None:
+            use_no_lookback = bool(no_lookback_override)
+        elif self._collision_detection_mode == "future_chunk":
             use_no_lookback = True
         elif self._collision_detection_mode == "hybrid":
             # Only collision-related triggers go no-lookback; stall /
@@ -388,7 +423,10 @@ class InterventionController:
         # segment so the recorded dataset doesn't contain velocity-from-
         # rest artifacts that mismatch the policy's observation history at
         # training time.
-        if effective_reason in {"time stall", "no_progress", "no_progress_ori"} and not use_no_lookback:
+        if (
+            effective_reason in {"time stall", "no_progress", "no_progress_ori", "drift_stall"}
+            and not use_no_lookback
+        ):
             from lerobot.policies.teleop_recording import TeleopRecordingContext
 
             n_obs_steps = int(getattr(self.wrapper.inner_policy.config, "n_obs_steps", 1))
@@ -425,6 +463,17 @@ class InterventionController:
             self._orientation_tracker.reset()
         self._missing_position_error_warned = False
         self._missing_orientation_error_warned = False
+        # Stuck-detection state: forget the prior scenario's last actual_q
+        # and zero the consecutive-stuck counter so the next scenario's
+        # first tick doesn't compute Δq against stale data.
+        self._prev_actual_q = None
+        self._consecutive_stuck_ticks = 0
+        self._prev_stuck_eval_mode = RRTMode.IDLE
+        # Debug-telemetry state for mid-RRT WARNING — clear chunk-start
+        # baseline and recent-Δq buffer so a new scenario doesn't blend
+        # the prior scenario's motion history.
+        self._chunk_start_actual_q = None
+        self._recent_dq.clear()
 
     def _check_no_progress(
         self,
@@ -538,6 +587,145 @@ class InterventionController:
         # whether or not this tick ends up doing real work.
         self.total_step_count += 1
 
+        # ── Drift-stall re-plan ───────────────────────────────────────────
+        # The SA wrapper's drift-abort cancelled a wedged chunk and (when
+        # `rrt_drift_trigger` is "lookback"/"no_lookback") requested a re-plan.
+        # The cancel completes one tick later, so by now the source is IDLE.
+        # Fire a fresh trigger through the SAME machinery the other triggers
+        # use — recorded as reason "drift_stall", with the lookback choice
+        # forced from the config. The episode was already discarded by the
+        # wrapper, so no drift frames reach the dataset either way.
+        _drift_no_lookback = getattr(self.wrapper, "_rrt_drift_replan_no_lookback", None)
+        if self.cfg.method == "rrt" and _drift_no_lookback is not None and mode == RRTMode.IDLE:
+            self.wrapper._rrt_drift_replan_no_lookback = None
+            self.target_rrt_steps = random.randint(self.cfg.rrt_steps_min, self.cfg.rrt_steps_max)
+            # Set pending so the "externally-triggered RRT" detector below
+            # doesn't ALSO book this cycle when the source leaves IDLE.
+            self.pending_rrt_trigger = True
+            self.plan_failures = 0
+            self.rrt_step_count = 0
+            self.policy_step_count = 0
+            self.trigger_reasons.append("drift_stall")
+            self.trigger_steps.append(self.total_step_count)
+            self.rrt_steps_executed.append(0)
+            self._source.state.target_steps = self.target_rrt_steps
+            logger.info(
+                "Triggering RRT (drift_stall re-plan) at scenario step %d (no_lookback=%s).",
+                self.total_step_count,
+                bool(_drift_no_lookback),
+            )
+            self._trigger_source(reason="drift_stall", no_lookback_override=bool(_drift_no_lookback))
+            return "continue"
+
+        # Override the env-provided `in_collision` with a planner-matched
+        # one when running RRT method. The env's `is_robot_in_collision`
+        # uses 0.0 clearance by default (only flags actual geometric
+        # penetration), which MISSES the "joint physically wedged against
+        # geometry but not penetrating" case. PyBullet's position
+        # controller can't move a joint past a contact even though the
+        # contact normal stops further motion at ~0 penetration — joint
+        # sits stuck, env reports `in_collision=False`, the mid-RRT retry
+        # check at the EXECUTING branch below never fires, RRT runs to
+        # plan-end while the robot can't track the commanded waypoint
+        # (manifests in recorded data as a state "stuck-then-snap"
+        # discontinuity flagged by detect_dataset_anomalies's TELEPORT
+        # class).
+        #
+        # The planner-side check uses the SAME clearances the RRT planner
+        # plans with (--policy.shared_autonomy_config.rrt_obstacle_clearance
+        # / .rrt_self_collision_clearance), so the controller's collision
+        # signal matches the planner's worldview: if the planner would
+        # refuse to route THROUGH this config, treat the robot being AT
+        # this config as retry-worthy.
+        #
+        # Gates:
+        #   - method == "rrt" only (oracle_goal source has no planner).
+        #   - wrapper._latest_actual_q must exist (refreshed every
+        #     wrapper.select_action; only None before the very first
+        #     observation arrives, which is also when no RRT can be
+        #     running, so the controller's in_collision logic is a no-op
+        #     anyway in that window).
+        # Replaces the env value entirely (not OR'd) per design — planner
+        # clearance is STRICTLY more conservative (>=) than env's 0.0
+        # default, so any env-positive case is also planner-positive.
+        if self.cfg.method == "rrt":
+            actual_q = getattr(self.wrapper, "_latest_actual_q", None)
+            if actual_q is not None:
+                # Reset stuck-tracking on RRT mode transitions. Policy-mode
+                # "stuck" (e.g., robot slow-approaching the goal at < 0.01
+                # rad/tick for many consecutive ticks) is a DIFFERENT signal
+                # from RRT-mode "stuck" (joint physically blocked despite
+                # being commanded to move fast). Without this reset, a long
+                # slow-policy-approach accumulates the counter past the
+                # threshold; the moment RRT starts a fresh cycle, the
+                # FIRST RRT tick inherits stuck=True even though RRT is
+                # ramping up from rest normally — every chunk-step-0
+                # planner-check then false-fires `obstacle_collision` and
+                # triggers an immediate retry. Reset on EITHER direction
+                # of mode transition: IDLE→non-IDLE (cycle starting) AND
+                # non-IDLE→IDLE (cycle ending) so neither phase contaminates
+                # the other's stuck signal.
+                _src_mode = self._source.state.mode
+                if _src_mode != self._prev_stuck_eval_mode:
+                    self._consecutive_stuck_ticks = 0
+                    self._prev_actual_q = None
+                    # Reset chunk-start baseline + recent-Δq buffer on EVERY
+                    # mode transition. We want the WARNING-site telemetry
+                    # to describe the CURRENT EXECUTING phase only — prior
+                    # chunks' motion history would be misleading. Re-captured
+                    # below when the new mode is EXECUTING.
+                    self._recent_dq.clear()
+                    if _src_mode == RRTMode.EXECUTING:
+                        self._chunk_start_actual_q = actual_q.copy()
+                    else:
+                        self._chunk_start_actual_q = None
+                self._prev_stuck_eval_mode = _src_mode
+                # Stuck-detection: track the consecutive-tick streak where
+                # the robot's joint-L2 |Δstate| stays below the threshold.
+                # Used below to GATE the planner-side in_collision override
+                # — a true wedge has both "in_collision" and "can't move",
+                # whereas a false-positive approach-near-obstacle has
+                # "in_collision" but the robot is tracking commanded motion
+                # normally.
+                if self._prev_actual_q is not None:
+                    dq = float(np.linalg.norm(actual_q - self._prev_actual_q))
+                    self._recent_dq.append(dq)
+                    if dq < self.cfg.stuck_threshold_rad_per_tick:
+                        self._consecutive_stuck_ticks += 1
+                    else:
+                        self._consecutive_stuck_ticks = 0
+                self._prev_actual_q = actual_q.copy()
+
+                planner_in_collision, planner_kind = self._source.is_in_collision_at(actual_q)
+                # Gate the override on stuck-detection. Without the gate,
+                # the controller's per-tick check fires on every config
+                # within the in-progress clearance — including legitimate
+                # approach configs where the goal IS within clearance of
+                # the target object. The gate requires the robot to ALSO
+                # be stuck (Δq < threshold for N consecutive ticks) before
+                # treating the proximity as a real wedge. `threshold == 0`
+                # disables the gate (legacy "fire on every proximity" mode).
+                stuck = (
+                    self.cfg.stuck_threshold_rad_per_tick > 0.0
+                    and self._consecutive_stuck_ticks >= self.cfg.stuck_consecutive_ticks
+                )
+                if self.cfg.stuck_threshold_rad_per_tick <= 0.0:
+                    # Gate disabled — preserve legacy behavior (fire on
+                    # every planner-positive tick).
+                    in_collision = planner_in_collision
+                    collision_kind = planner_kind
+                elif planner_in_collision and stuck:
+                    # WEDGE confirmed (proximity + can't move). Fire retry.
+                    in_collision = True
+                    collision_kind = planner_kind
+                else:
+                    # Either no proximity OR moving normally → not a wedge.
+                    # Suppress the trigger; the env's own in_collision
+                    # (penetration-only) is also gated off here since the
+                    # planner check is strictly more conservative.
+                    in_collision = False
+                    collision_kind = None
+
         # Detect externally-triggered RRT (e.g., the SA wrapper's future_chunk
         # predictive shield called ``rrt_source.trigger()`` directly inside
         # select_action). Without this branch, ``target_rrt_steps`` would
@@ -557,6 +745,21 @@ class InterventionController:
             self.plan_failures = 0
             self.rrt_step_count = 0
             self.policy_step_count = 0
+            # Reset the controller-cancel flag for this fresh cycle. Without
+            # this, a previous cycle's auto-cancel (which sets the flag in
+            # the EXECUTING branch below) can leak into THIS shield-triggered
+            # cycle: the flag normally resets at the mode-IDLE branch
+            # below, but a shield trigger fires INSIDE select_action() so
+            # the mode transitions IDLE → EXECUTING within a single
+            # controller.tick() — the IDLE branch never runs between the
+            # two cycles, the flag stays True, and the auto-cancel guard
+            # at the EXECUTING branch (`if not controller_initiated_cancel
+            # and rrt_step_count >= target_rrt_steps`) gates off, causing
+            # the new cycle to run to FULL chunk length instead of stopping
+            # at the sampled `target_rrt_steps`. Symptom: log says
+            # "executing N/M waypoints" but actual recording is M frames
+            # because the cap was silently disabled.
+            self.controller_initiated_cancel = False
             # Use a distinct trigger label so the per-scenario CSV makes
             # it easy to count shield-driven vs controller-driven cycles.
             self.trigger_reasons.append("future_chunk_coll")
@@ -597,17 +800,71 @@ class InterventionController:
         # Use a one-shot latch so we don't spam retries while the
         # collision persists across multiple ticks (the new path needs
         # a few ticks to actually move the robot out).
-        if mode == RRTMode.EXECUTING and in_collision:
+        #
+        # NOTE: this branch USED TO `return "continue"` early after
+        # firing the retry. That short-circuited the auto-cancel
+        # cap-check in the EXECUTING branch below — for a cycle that
+        # keeps the planner-check seeing in_collision=True every tick
+        # (e.g., final approach where the goal is intentionally within
+        # the planner's clearance of the target object), the cap NEVER
+        # fired and the cycle ran until env success / chunk exhaustion.
+        # Now we just fire the retry and FALL THROUGH so the EXECUTING
+        # branch below still increments rrt_step_count and honors the
+        # cap regardless of whether the per-tick collision-check is
+        # firing.
+        if mode == RRTMode.EXECUTING and in_collision:  # noqa: SIM102
             if not getattr(self, "_in_collision_during_rrt", False):
                 self._in_collision_during_rrt = True
+                # Debug telemetry: surface WHY the per-tick collision check
+                # fired so we can distinguish a real wedge from a ruckig
+                # ramp-up false positive without rerunning with verbose=True.
+                #   pair  — closest violating link pair + actual distance
+                #   stuck — consecutive-tick stuck counter state + recent Δq
+                #   move  — |actual_q - chunk_start_actual_q| (how far the
+                #           robot has actually moved since EXECUTING began;
+                #           tiny = still ramping up, large = real progress)
+                pair_info = self._source.describe_collision_at(actual_q)
+                if pair_info is not None:
+                    obs_pair = pair_info.get("closest_obstacle")
+                    self_pair = pair_info.get("closest_self")
+
+                    def _fmt_pair(d: dict | None) -> str:
+                        if d is None:
+                            return "n/a"
+                        flag = "VIOLATION" if d["in_violation"] else "ok"
+                        return (
+                            f"{d['link_a_name']} ⟷ {d['link_b_name']}: "
+                            f"dist={d['distance_m'] * 1000:.2f}mm, threshold={d['threshold_m'] * 1000:.2f}mm [{flag}]"
+                        )
+
+                    pair_str = f"obs={_fmt_pair(obs_pair)} | self={_fmt_pair(self_pair)}"
+                else:
+                    pair_str = "(planner uninitialized; describe returned None)"
+                recent_dq_str = (
+                    "[" + ", ".join(f"{x * 1000:.2f}" for x in list(self._recent_dq)[-5:]) + "] mrad/tick"
+                    if self._recent_dq
+                    else "(no Δq samples yet)"
+                )
+                if self._chunk_start_actual_q is not None:
+                    move_norm = float(np.linalg.norm(actual_q - self._chunk_start_actual_q))
+                    move_str = f"{move_norm * 1000:.1f}mrad joint-L2 since chunk start"
+                else:
+                    move_str = "(no chunk-start baseline)"
                 logger.warning(
-                    "Collision detected mid-RRT (scenario step %d, chunk step %d) — "
-                    "asking source to replan to a different IK branch",
+                    "Collision detected mid-RRT (scenario step %d, chunk step %d, planner_kind=%s) — "
+                    "asking source to replan to a different IK branch. "
+                    "[debug] %s | stuck_counter=%d/%d (last 5 |Δq|=%s) | %s",
                     self.total_step_count,
                     self.rrt_step_count,
+                    collision_kind or "unknown",
+                    pair_str,
+                    self._consecutive_stuck_ticks,
+                    self.cfg.stuck_consecutive_ticks,
+                    recent_dq_str,
+                    move_str,
                 )
                 self._source.request_retry_after_collision()
-            return "continue"
+            # Intentional fall-through to the EXECUTING branch below.
         # Collision cleared (either we're no longer EXECUTING or
         # in_collision flipped back to False) — reset the latch so a
         # future collision can trigger another retry.
@@ -877,9 +1134,21 @@ class InterventionContext:
     # Index of the scenario being processed by the current rollout() call.
     # Incremented by lerobot_eval.rollout() each invocation; pushed to
     # `TeleopRecordingContext.source_scenario_idx` so the recorded dataset
-    # tags each saved episode with the scenario it came from.
+    # tags each saved episode with the scenario it came from. This is a
+    # RUN-LOCAL rollout counter (0, 1, 2, ...), not the underlying eval
+    # benchmark index — see `benchmark_subset` for the mapping.
     scenario_idx: int = 0
     n_committed_episodes: int = 0
+    # The eval-benchmark subset the rollouts are drawing from, in the order
+    # scenarios are visited. Used to translate the rollout-local
+    # `scenario_idx` into the underlying benchmark episode index for the
+    # per-scenario CSV, so downstream tooling can correlate rows to
+    # scenarios without re-deriving the subset. When set, the CSV's
+    # `scenario_idx` column reports `subset[rollout_idx % len(subset)]`;
+    # when None (env doesn't expose a subset), the raw rollout counter is
+    # reported unchanged. Populated from `cfg.env.eval_benchmark_subset` at
+    # context construction in lerobot_eval.
+    benchmark_subset: list[int] | None = None
 
     # `method`: per-run constant ("rrt" / "oracle_goal"), recorded on every
     # row so when CSVs from different runs are concatenated (or when grepping
@@ -926,17 +1195,28 @@ class InterventionContext:
         self._csv_writer.writerow(self.CSV_COLUMNS)
         self._csv_file.flush()
 
+    def resolve_scenario_idx(self, rollout_idx: int) -> int:
+        """Translate a rollout-local counter to the underlying eval benchmark
+        index via `benchmark_subset`. Returns `rollout_idx` unchanged when
+        no subset is configured or when it's empty."""
+        subset = self.benchmark_subset
+        if not subset:
+            return int(rollout_idx)
+        return int(subset[int(rollout_idx) % len(subset)])
+
     def record_scenario_result(self, scenario_idx: int, success: bool) -> None:
         """Append a row to the CSV for the just-finished scenario.
 
         Reads controller state directly so callers don't have to remember
-        which fields belong on the row.
+        which fields belong on the row. The `scenario_idx` argument is the
+        rollout-local counter; the CSV records the resolved benchmark index
+        so downstream tooling can join against `eval_info.json`.
         """
         if self._csv_writer is None:
             raise RuntimeError("InterventionContext.record_scenario_result called before open_csv()")
         ctrl = self.controller
         row = (
-            scenario_idx,
+            self.resolve_scenario_idx(scenario_idx),
             int(bool(success)),
             ctrl.cycles_used,
             ctrl.last_status,

@@ -399,6 +399,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "no override (use the dataset's recorded value).",
     )
     p.add_argument(
+        "--print_top_pc1",
+        type=int,
+        default=0,
+        metavar="K",
+        help="After PCA projection, print the top-K scatter points by "
+        "ABSOLUTE PC1 value (most-extreme PC1) per source, with their "
+        "decoded (source, sub-dataset path, original episode_id, "
+        "chunk_idx_within_episode) breakdown. Use to identify which "
+        "specific episode produced an outlier point on the scatter — "
+        "e.g. the one intervention chunk that's dragging PC1 out to ±5. "
+        "0 = off. Prints to stdout, doesn't modify the PNG.",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Print resolved dataset paths + sidecar provenance, then exit.",
@@ -2837,7 +2850,9 @@ def _gather_sources(
             )
         raise ValueError(f"Unknown plot_mode {plot_mode!r}")
 
-    def sample_concat(p_or_paths: Path | list) -> tuple[np.ndarray, np.ndarray | None]:
+    def sample_concat(
+        p_or_paths: Path | list,
+    ) -> tuple[np.ndarray, np.ndarray | None, list[dict]]:
         """Wrapper around `sample()` that transparently concatenates the
         result over a list of paths. Used by --round=all where each "source"
         (intervention, blend at a given ratio) is the union of that
@@ -2852,22 +2867,33 @@ def _gather_sources(
         EPISODE level preserves the per-episode arrow rendering and the
         'episode in full' semantic — we just drop whole episodes randomly
         until the cap is honored.
+
+        Third return value is a per-sub-path offset table:
+            [{"path": Path, "offset": int, "n_episodes": int}, ...]
+        Used by `--print_top_pc1` to decode offsetted episode ids (the
+        re-namespacing applied at line `+ ep_offset`) back to (sub-path,
+        per-sub-path-original-ep-id). Singleton-path sources return a
+        single-entry table with offset 0.
         """
         if isinstance(p_or_paths, list):
             feats_parts = []
             eps_parts: list[np.ndarray] = []
+            offset_table: list[dict] = []
             ep_offset = 0
             any_eps_seen = False
             for sub in p_or_paths:
                 sub_feats, sub_eps = sample(sub)
                 feats_parts.append(sub_feats)
+                sub_n_eps = 0
                 if sub_eps is not None:
                     any_eps_seen = True
                     # Re-namespace episode ids across rounds so per-episode
                     # arrow rendering doesn't collide (round 1's ep 0 vs
                     # round 2's ep 0 are different recordings).
                     eps_parts.append(np.asarray(sub_eps, dtype=np.int64) + ep_offset)
-                    ep_offset += int(sub_eps.max() + 1) if len(sub_eps) else ep_offset
+                    sub_n_eps = int(sub_eps.max() + 1) if len(sub_eps) else 0
+                offset_table.append({"path": sub, "offset": ep_offset, "n_episodes": sub_n_eps})
+                ep_offset += sub_n_eps
             feats = np.concatenate(feats_parts, axis=0) if feats_parts else np.empty((0, 0))
             eps = np.concatenate(eps_parts, axis=0) if any_eps_seen and eps_parts else None
             # Post-concat per-source cap. Skip when the source has no
@@ -2893,8 +2919,10 @@ def _gather_sources(
                 keep_mask = np.isin(eps, np.fromiter(keep_set, dtype=np.int64))
                 feats = feats[keep_mask]
                 eps = eps[keep_mask]
-            return feats, eps
-        return sample(p_or_paths)
+            return feats, eps, offset_table
+        feats, eps = sample(p_or_paths)
+        n_eps = int(eps.max() + 1) if eps is not None and len(eps) else 0
+        return feats, eps, [{"path": p_or_paths, "offset": 0, "n_episodes": n_eps}]
 
     sources: list[dict] = []
 
@@ -2917,6 +2945,7 @@ def _gather_sources(
 
     # 1. Base — pastel blue, drawn underneath everything else.
     base_feats, base_eps = sample(resolved["base_path"])
+    _base_n_eps = int(base_eps.max() + 1) if base_eps is not None and len(base_eps) else 0
     sources.append(
         {
             "label": "base",
@@ -2928,6 +2957,7 @@ def _gather_sources(
             "filled": True,
             "features": base_feats,
             "episodes": base_eps,
+            "episode_offset_table": [{"path": resolved["base_path"], "offset": 0, "n_episodes": _base_n_eps}],
             "path": resolved["base_path"],  # for downstream video rendering
         }
     )
@@ -2940,7 +2970,7 @@ def _gather_sources(
         cmap = plt.get_cmap("rainbow")
         pcts = np.array([p for p, _ in blends], dtype=float) / 100.0
         for (pct, path), color_t in zip(blends, [cmap(p) for p in pcts], strict=True):
-            feats, eps = sample_concat(path)
+            feats, eps, offset_table = sample_concat(path)
             sources.append(
                 {
                     "label": f"b{pct:03d}",
@@ -2953,11 +2983,12 @@ def _gather_sources(
                     "features": feats,
                     "episodes": eps,
                     "path": path,  # Path or list[Path] (latter in --round=all mode)
+                    "episode_offset_table": offset_table,
                 }
             )
 
     # 3. Intervention — HOLLOW black ring (foreground reference).
-    iv_feats, iv_eps = sample_concat(resolved["intervention_path"])
+    iv_feats, iv_eps, iv_offset_table = sample_concat(resolved["intervention_path"])
     sources.append(
         {
             "label": "intervention",
@@ -2970,6 +3001,7 @@ def _gather_sources(
             "features": iv_feats,
             "episodes": iv_eps,
             "path": resolved["intervention_path"],
+            "episode_offset_table": iv_offset_table,
         }
     )
 
@@ -3011,6 +3043,7 @@ def plot_state_coverage_pca(
     pca_basis: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
     cluster_xlim: tuple[float, float] | None = None,
     cluster_ylim: tuple[float, float] | None = None,
+    print_top_pc1: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[float, float], tuple[float, float]]:
     """Concat all source features, fit a single 2D PCA, project each source,
     and scatter-plot. Each scatter source's per-episode time direction is
@@ -3050,6 +3083,111 @@ def plot_state_coverage_pca(
     else:
         mean, components, sv = numpy_pca_2d(all_feats)
         proj_2d = (all_feats - mean) @ components.T
+
+    # Optional diagnostic: print the top-K scatter points by |PC1| per source,
+    # with each row decoded back to its source dataset + original (per-sub-
+    # path) episode id + chunk index within that episode. Useful when one
+    # outlier point on the scatter is dominating PC1 and you need to find
+    # the actual episode it came from to inspect.
+    if print_top_pc1 and print_top_pc1 > 0:
+        print(
+            f"\n[print_top_pc1={print_top_pc1}] top-{print_top_pc1} most "
+            f"extreme |PC1| chunks per source ({space_label} space):"
+        )
+        row_offset = 0
+        for s in sources:
+            n_rows = int(s["features"].shape[0])
+            if n_rows == 0:
+                row_offset += n_rows
+                continue
+            src_proj = proj_2d[row_offset : row_offset + n_rows]
+            src_eps = s.get("episodes")
+            offset_table = s.get("episode_offset_table") or []
+            # Sort rows by descending |PC1|. argsort returns ascending, so flip.
+            order = np.argsort(-np.abs(src_proj[:, 0]))[:print_top_pc1]
+            print(f"\n  source={s['label']!r}  (n_rows={n_rows})")
+            # Pre-resolve each sub-path's DAgger round number via the
+            # canonical naming parser (avoid duplicating round-regex logic).
+            # `parse_dataset_short` returns None for `round` on base / non-
+            # DAgger datasets — display "?" for those rather than crashing
+            # decode.
+            for entry in offset_table:
+                parsed = parse_dataset_short(Path(entry["path"]).name)
+                entry["dagger_round"] = parsed.round
+            if len(offset_table) > 1:
+                # --round=all: show the per-sub-path offset table once so the
+                # user can independently decode any offsetted ep id printed
+                # below.
+                print(f"    offset table ({len(offset_table)} sub-datasets):")
+                for entry in offset_table:
+                    r = entry["dagger_round"]
+                    r_str = f"round={r}" if r is not None else "round=?"
+                    print(
+                        f"      {r_str:<10s}  offset={entry['offset']:<4d}  "
+                        f"n_eps={entry['n_episodes']:<3d}  "
+                        f"path={entry['path']}"
+                    )
+            # Build a per-source episode → (chunk_idx_within_episode) map so
+            # we can name "the Nth chunk of episode E". `episodes` is parallel
+            # to `features` (and `proj_2d` slice), so we count occurrences in
+            # order.
+            chunk_idx_within_ep: dict[int, int] = {}
+            chunk_idx_per_row: list[int] = []
+            if src_eps is not None:
+                for ep in src_eps.tolist():
+                    e = int(ep)
+                    chunk_idx_per_row.append(chunk_idx_within_ep.get(e, 0))
+                    chunk_idx_within_ep[e] = chunk_idx_within_ep.get(e, 0) + 1
+            for rank, idx in enumerate(order):
+                pc1 = float(src_proj[idx, 0])
+                pc2 = float(src_proj[idx, 1])
+                if src_eps is not None:
+                    offsetted_ep = int(src_eps[idx])
+                    chunk_idx = chunk_idx_per_row[idx]
+                    # Decode offsetted_ep → (sub_path, per-sub-path-ep_id).
+                    sub_path = None
+                    local_ep = offsetted_ep
+                    dagger_round: int | None = None
+                    for entry in offset_table:
+                        nxt = entry["offset"] + entry["n_episodes"]
+                        if entry["offset"] <= offsetted_ep < nxt:
+                            sub_path = entry["path"]
+                            local_ep = offsetted_ep - entry["offset"]
+                            dagger_round = entry.get("dagger_round")
+                            break
+                    round_str = (
+                        f"round={dagger_round}  "
+                        if dagger_round is not None
+                        else ("round=?  " if sub_path is not None else "")
+                    )
+                    sub_str = f"  local_ep={local_ep}  sub_path={sub_path}" if sub_path is not None else ""
+                    # Frame range within the local episode: chunk i spans
+                    # frames [start_frame, start_frame + chunk_len) where
+                    # start_frame = chunk_idx * chunk_len. Use chunk_len
+                    # when available (chunk mode); fall back to chunk_idx
+                    # only when chunk_len is None/0 (e.g. observation mode
+                    # where each point is a single frame).
+                    if chunk_len and chunk_len > 0:
+                        start_frame = chunk_idx * int(chunk_len)
+                        end_frame = start_frame + int(chunk_len)
+                        frame_str = f"start_frame={start_frame}  (frames [{start_frame}, {end_frame}))"
+                    else:
+                        frame_str = f"frame_idx={chunk_idx}"
+                    print(
+                        f"    #{rank + 1:<2d}  PC1={pc1:+.4f}  PC2={pc2:+.4f}  "
+                        f"{round_str}"
+                        f"offsetted_ep={offsetted_ep:<4d}  chunk_idx_in_ep={chunk_idx}  "
+                        f"{frame_str}"
+                        f"{sub_str}"
+                    )
+                else:
+                    print(
+                        f"    #{rank + 1:<2d}  PC1={pc1:+.4f}  PC2={pc2:+.4f}  "
+                        f"row_idx_within_source={int(idx):<4d}  "
+                        "(no episode metadata for this source — trajectory mode?)"
+                    )
+            row_offset += n_rows
+
     # Cluster-plot axis limits: derived from THIS plot's projection if not
     # supplied. Caller threads them into variants alongside `pca_basis` so
     # every cluster*of* file in the lineage uses identical axes.
@@ -3687,6 +3825,7 @@ def main(argv: list[str] | None = None) -> int:
             pca_basis=pca_basis,
             cluster_xlim=cluster_xlim,
             cluster_ylim=cluster_ylim,
+            print_top_pc1=args.print_top_pc1,
         )
         print(f"  wrote {out_p}")
         return result

@@ -91,8 +91,13 @@ class RRTGuidanceSource:
         num_ik_candidates: int = 16,
         obstacle_clearance: float | None = None,
         self_collision_clearance: float | None = None,
+        in_progress_obstacle_clearance: float | None = None,
+        in_progress_self_collision_clearance: float | None = None,
         self_collision_skip_pairs: list[list[int]] | None = None,
         diagnostic_log_pairs: str = "off",
+        ik_skip_gripper_obstacle_pairs: bool = False,
+        escape_clearance_factor: float = 1.5,
+        rewind_clearance_factor: float | None = None,
     ) -> None:
         self._wrapper = wrapper
         # Same dataclass that used to live on the wrapper as `_rrt`. The
@@ -171,6 +176,19 @@ class RRTGuidanceSource:
         self.self_collision_clearance = (
             float(self_collision_clearance) if self_collision_clearance is not None else None
         )
+        # In-progress clearances — used by `is_in_collision_at()` for the
+        # controller's per-tick check during RRT execution. Falls back to
+        # the planning clearances when None (legacy / unset behavior).
+        self.in_progress_obstacle_clearance = (
+            float(in_progress_obstacle_clearance)
+            if in_progress_obstacle_clearance is not None
+            else self.obstacle_clearance
+        )
+        self.in_progress_self_collision_clearance = (
+            float(in_progress_self_collision_clearance)
+            if in_progress_self_collision_clearance is not None
+            else self.self_collision_clearance
+        )
         # Normalized to list[tuple[int, int]] for the planner. None / empty
         # → no skips. Order within each pair doesn't matter; the planner
         # normalizes (a,b) and (b,a) to the same frozenset for lookup.
@@ -187,6 +205,20 @@ class RRTGuidanceSource:
                 f"diagnostic_log_pairs must be one of 'off'/'first'/'always', got {diagnostic_log_pairs!r}"
             )
         self.diagnostic_log_pairs = diagnostic_log_pairs
+        # Forwarded to the planner. When True, the IK candidate filter skips
+        # gripper-finger ⟷ obstacle pairs so grasp-goal IKs aren't rejected
+        # on the intentional finger-near-target proximity. See planner ctor.
+        self.ik_skip_gripper_obstacle_pairs = bool(ik_skip_gripper_obstacle_pairs)
+        # Escape-stop margins (multiplier on planner obstacle clearance).
+        # `escape_clearance_factor` is the contact-normal/lift escape's
+        # margin (1.5× default — see RRTToGoalPlanner ctor docstring for
+        # the ramp-up cascade rationale). `rewind_clearance_factor` is the
+        # policy-history rewind's margin; None = inherit
+        # escape_clearance_factor. Forwarded to the planner ctor.
+        self.escape_clearance_factor = float(escape_clearance_factor)
+        self.rewind_clearance_factor = (
+            float(rewind_clearance_factor) if rewind_clearance_factor is not None else None
+        )
         # Env handle for the pre-execution teleport. Set externally via the
         # wrapper's `set_env_for_teleport(env)`; None means teleport is a no-op.
         self._env_for_teleport: object | None = None
@@ -317,6 +349,24 @@ class RRTGuidanceSource:
             st.step = 0
             st.mode = GuidanceMode.PLANNING
             st.cancel_requested = False
+            # Force no_lookback for the retry. A retry happens MID-cycle,
+            # so there are 0 policy-driven frames between the original
+            # trigger and now — the lookback cap (`_frames_since_last_rrt_end`)
+            # would clamp the sampled lookback to 0 anyway. Without
+            # `no_lookback=True`, _do_plan still runs the lookback path:
+            # samples a value (logged as "Sampled lookback for this trigger:
+            # N"), caps it to 0 (logged as "Capping lookback N → 0"), then
+            # calls _teleport_env_to_q_start(current_state, 0) — a no-op
+            # teleport that fires the recorder's split flag and produces
+            # the misleading "double lookback" log trail.
+            # Setting no_lookback=True takes the no-lookback branch in
+            # _do_plan: q_start = current state, no lookback sampling/log/
+            # teleport, ruckig starts at recent joint velocity for
+            # continuity. The ESCAPE teleport (for q_start-in-collision)
+            # still fires independently in the no_lookback branch — so the
+            # wedge case where the new IK's start is in collision still
+            # gets handled (escape_end_q != None → teleport to escape).
+            st.no_lookback = True
         # blocking_plan or not — for collision retry we run synchronously
         # so the controller's next tick sees the new EXECUTING state.
         self._do_plan()
@@ -358,6 +408,12 @@ class RRTGuidanceSource:
             # but if it does, fall back to a hold to keep select_action's
             # contract (always returns an action).
             return GuidanceStepResult(action=wrapper.get_hold_action(ctx.inner_action))
+
+        # NOTE: RRT drift diagnostics live in the WRAPPER's playback loop
+        # (shared_autonomy_wrapper.select_action, the `wp = rrt.chunk[rrt.step]`
+        # branch), NOT here — the wrapper drives the RRT chunk directly and does
+        # not call this next_action() for the RRT source. Don't add per-tick
+        # logging here; it would be dead code.
 
         if st.cancel_requested:
             # Wrapper observes finished=True + cancel_requested and will
@@ -531,6 +587,67 @@ class RRTGuidanceSource:
 
     # ── Internal planning ───────────────────────────────────────────────── #
 
+    def is_in_collision_at(self, q: np.ndarray) -> tuple[bool, str | None]:
+        """Probe whether ``q`` is in collision under the IN-PROGRESS
+        clearances (`rrt_in_progress_obstacle_clearance` /
+        `rrt_in_progress_self_collision_clearance` from this source's
+        config) — distinct from the planning clearances used by the
+        BiRRT routing pass.
+
+        Why two clearance sets:
+          * Planning clearance (`obstacle_clearance` here, default 2 cm)
+            keeps NON-GOAL waypoints clear during routing. The goal pose
+            itself is exempt (approach/grasp tasks intentionally place
+            the EE within centimeters of the target object).
+          * In-progress clearance (default 1 cm obstacle, 2 mm self) sits
+            between the env's 0.0 penetration-only check (which misses
+            wedges) and the planner's 2 cm path clearance (which would
+            false-positive on legitimate goal-approach configs near the
+            target object). Catches wedges without flagging goal
+            approach.
+
+        Returns (False, None) gracefully when the planner hasn't been
+        initialized yet OR has no obstacles loaded (i.e., no RRT cycle has
+        run yet in this scenario — load_obstacles() populates the list).
+        The wedge case the controller cares about only manifests during /
+        between RRT cycles, by which point obstacles are guaranteed loaded
+        via the most recent _do_plan call. Self-collision is checked
+        regardless of obstacle-loading state.
+
+        Returns: (in_collision, kind) where kind is "obstacle" / "self" /
+        None matching `check_links_in_collision(return_kind=True)`.
+        """
+        planner = self.state.planner
+        if planner is None:
+            return False, None
+        result = planner.is_q_in_collision(
+            q,
+            return_kind=True,
+            obstacle_clearance=self.in_progress_obstacle_clearance,
+            self_collision_clearance=self.in_progress_self_collision_clearance,
+        )
+        # is_q_in_collision returns (bool, kind) when return_kind=True.
+        in_coll, kind = result  # type: ignore[misc]
+        return bool(in_coll), kind
+
+    def describe_collision_at(self, q: np.ndarray) -> dict | None:
+        """Debug probe: returns the closest violating pair at ``q``.
+
+        Wraps `RRTToGoalPlanner.describe_collision_at` with the same
+        in-progress clearances `is_in_collision_at` uses, so the result
+        reflects the SAME thresholds that caused the controller's check
+        to fire. Returns None when the planner is uninitialized or no
+        pair is below threshold.
+        """
+        planner = self.state.planner
+        if planner is None:
+            return None
+        return planner.describe_collision_at(
+            q,
+            obstacle_clearance=self.in_progress_obstacle_clearance,
+            self_collision_clearance=self.in_progress_self_collision_clearance,
+        )
+
     def _ensure_planner(self) -> RRTToGoalPlanner:
         """Lazy-init the planner (so the import / setup happens only when used)."""
         wrapper = self._wrapper
@@ -555,6 +672,9 @@ class RRTGuidanceSource:
                 self_collision_clearance=self.self_collision_clearance,
                 self_collision_skip_pairs=self.self_collision_skip_pairs,
                 diagnostic_log_pairs=self.diagnostic_log_pairs,
+                ik_skip_gripper_obstacle_pairs=self.ik_skip_gripper_obstacle_pairs,
+                escape_clearance_factor=self.escape_clearance_factor,
+                rewind_clearance_factor=self.rewind_clearance_factor,
             )
         return self.state.planner
 
@@ -711,6 +831,20 @@ class RRTGuidanceSource:
             # history hasn't accumulated enough samples; in that case we
             # silently fall back to v=0 (same as the lookback path).
             _ruckig_start_vel = recent_vel if no_lookback else None
+            # Refresh the planner's policy-history context so its
+            # highest-priority escape method (`_escape_via_policy_history_rewind`)
+            # can walk the wrapper's recent `_actual_q_history` deque and
+            # land on an in-distribution config instead of a synthetic
+            # contact-normal IK push. Capped at `_frames_since_last_rrt_end`
+            # so the rewind never lands in a prior RRT cycle's trajectory.
+            # When the cap is 0 (mid-RRT retry, back-to-back shield cycle,
+            # very start of scenario), the rewind method returns None and
+            # the chain falls through to the existing contact-normal /
+            # self-collision-gradient escapes — same behavior as before.
+            planner.set_policy_history_context(
+                history=getattr(wrapper, "_actual_q_history", None),
+                max_lookback=int(getattr(wrapper, "_frames_since_last_rrt_end", 0) or 0),
+            )
             chunk, escape_end_q = planner.plan(
                 q_start,
                 target_ee_pos,
@@ -763,6 +897,12 @@ class RRTGuidanceSource:
                     self._teleport_env_to_q_start(teleport_target, 0)
                 elif not no_lookback:
                     self._teleport_env_to_q_start(q_start_full, effective_lookback)
+            # NOTE: The recorder split-on-teleport signal is now set INSIDE
+            # `_teleport_env_to_q_start` (atomically with the actual env
+            # mutation) instead of at this caller's bookkeeping level. So
+            # adding a new code path that needs an env teleport doesn't
+            # require remembering to thread `teleport_fired` accounting
+            # through this block — every teleport sets the flag for free.
         except RRTPlanningError as e:
             logger.warning("RRT planning failed: %s", e)
             st.mode = GuidanceMode.IDLE
@@ -876,6 +1016,42 @@ class RRTGuidanceSource:
             )
             target.teleport_joint_state(splatsim_robot, q_start_full.tolist())  # type: ignore[attr-defined]
             logger.info("Teleport call returned.")
+            # ATOMIC with the actual env mutation: signal the recorder to
+            # start a fresh episode on the next real frame. Done HERE (not
+            # at the caller's `if teleport_fired` bookkeeping) so every
+            # current AND future code path that calls this helper gets the
+            # split signal for free — the previous design required each
+            # caller to remember to set `teleport_fired = True` and run a
+            # post-call accounting block, which is the kind of action-at-
+            # a-distance that quietly breaks when a new teleport callsite
+            # is added later. Co-locating the flag-set with the actual
+            # `target.teleport_joint_state(...)` call makes "env state
+            # mutated → recorder told to split" an atomic invariant.
+            ctx = getattr(wrapper, "_teleop_context", None)
+            if ctx is not None:
+                ctx.force_episode_split_next_real_frame = True
+            # Keep the wrapper's actual-pose caches consistent with reality the
+            # INSTANT we mutate the sim — don't wait for the next obs decode one
+            # tick later. The robot is now kinematically AT q_start_full with
+            # ~zero velocity. Any reader in the gap before that decode would
+            # otherwise see the stale PRE-teleport pose: a same-tick collision
+            # retry's q_start (= _latest_actual_q), the gripper readback, or
+            # recent_joint_velocity (also ruckig's start_vel for no-lookback
+            # plans). Mirror the episode split the recorder just received:
+            # reset the rolling history to a single fresh sample rather than
+            # appending, so recent-velocity reads ~0 (a teleported robot is at
+            # rest) instead of the bogus rewind-sized delta that appending onto
+            # the pre-teleport trajectory would inject into start_vel. The
+            # history refills from real obs decodes over the chunk's execution.
+            fresh = q_start_full.reshape(-1)[: wrapper.num_dofs + 1].copy()
+            wrapper._latest_actual_q = fresh
+            wrapper._actual_q_history.clear()
+            wrapper._actual_q_history.append(fresh)
+            # Arm the landing-error diagnostic: stash the arm-joint target we
+            # just teleported to (= the chunk's start). The wrapper measures
+            # how far the robot actually lands from it on the next real obs
+            # decode and logs the error — see _pending_teleport_landing.
+            wrapper._pending_teleport_landing = fresh[: wrapper.num_dofs].copy()
         except Exception:
             logger.exception(
                 "Teleport-to-q_start failed; continuing without rewind. "

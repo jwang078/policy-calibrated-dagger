@@ -110,12 +110,16 @@ class _MetaProxy:
     dict, not the inner sub-dataset's meta.
     """
 
-    def __init__(self, inner_meta, aggregated_stats: dict[str, dict[str, np.ndarray]]):
+    def __init__(self, inner_meta, aggregated_stats: dict[str, dict[str, np.ndarray]], multi_dataset=None):
         # Use object.__setattr__ to avoid triggering __setattr__ semantics
         # below if subclasses ever override it. Two underscores so attribute
         # lookup is unambiguous against any forwarded attr from inner_meta.
         object.__setattr__(self, "_inner", inner_meta)
         object.__setattr__(self, "_stats", aggregated_stats)
+        # The wrapped MultiLeRobotDataset, used to serve AGGREGATE counts
+        # (total_episodes / total_frames) instead of the base sub-dataset's.
+        # None for legacy callers → counts fall back to the inner (base) meta.
+        object.__setattr__(self, "_multi", multi_dataset)
 
     @property
     def stats(self) -> dict[str, dict[str, np.ndarray]]:
@@ -128,9 +132,35 @@ class _MetaProxy:
         # later reads see the new value.
         object.__setattr__(self, "_stats", new_stats)
 
+    @property
+    def total_episodes(self) -> int:
+        """Aggregate episode count across ALL sub-datasets, not just base.
+
+        Without this, `__getattr__` would forward to the base sub-dataset's
+        meta and report only base's episode count — a misleading number in
+        logs for a multi-source run. Falls back to the inner (base) meta when
+        no MultiLeRobotDataset was supplied. NOTE: only the COUNT is corrected;
+        `.episodes` (the per-episode metadata table) is still base's, since a
+        unified cross-source episode table isn't reconstructed here. Counts are
+        what training/logging read; the per-episode table isn't used in the
+        multi-dataset dataloader path.
+        """
+        if self._multi is not None:
+            return self._multi.num_episodes
+        return self._inner.total_episodes
+
+    @property
+    def total_frames(self) -> int:
+        """Aggregate frame count across ALL sub-datasets, not just base.
+        (See `total_episodes` for the count-vs-table caveat.)
+        """
+        if self._multi is not None:
+            return self._multi.num_frames
+        return self._inner.total_frames
+
     def __getattr__(self, name: str):
         # `__getattr__` only fires when normal lookup fails, so it won't
-        # shadow `_inner`, `_stats`, or `stats`.
+        # shadow `_inner`, `_stats`, `stats`, `_multi`, or the count properties.
         return getattr(self._inner, name)
 
 
@@ -361,6 +391,7 @@ class MultiSourceNormalizingDataset(Dataset):
             self._meta_proxy = _MetaProxy(
                 self.multi_dataset._datasets[0].meta,
                 self._exposed_stats,
+                multi_dataset=self.multi_dataset,
             )
         return self._meta_proxy
 

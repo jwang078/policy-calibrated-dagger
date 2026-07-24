@@ -113,6 +113,10 @@ class FilterCollisionsConfig:
     # the orchestrator's start_sim helper spawns this on an auxiliary port).
     env_task: str = "upright_small_engine_new"
     env_robot_name: str = "robot_iphone_w_engine_new"
+    # Arm DOF count (state/action dim = num_dofs + 1). Default 6 (UR5); the
+    # orchestrator passes --num_dofs from the env profile (planar -> 3) so the
+    # filtered dataset's schema matches the source's.
+    num_dofs: int = 6
     env_camera_names: list[str] = field(default_factory=lambda: ["base_rgb", "wrist_rgb"])
     env_image_resize_modes: list[str] = field(default_factory=lambda: ["letterbox", "stretch"])
     env_fps: int = 30
@@ -413,7 +417,7 @@ def _run(
             cfg.target_repo_id,
             fps=cfg.env_fps,
             image_keys=image_keys,
-            num_dofs=6,  # Same as augment_dataset_with_blending.py default.
+            num_dofs=cfg.num_dofs,
         )
 
     # ── Per-episode CSV writer ─────────────────────────────────────────────

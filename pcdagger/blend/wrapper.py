@@ -52,6 +52,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rrt_to_goal import RRTMode
 from lerobot.policies.teleop_recording import FrameSource
 from lerobot.processor import AbsoluteActionsProcessorStep, PolicyProcessorPipeline, to_relative_actions
+from lerobot.utils.constants import ACTION
 
 if TYPE_CHECKING:
     from lerobot.policies.teleop_recording import TeleopRecordingContext
@@ -128,8 +129,12 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
     config_class = PreTrainedConfig
     name = "shared_autonomy_wrapper"
 
-    # Arm joint limits (matches SplatSim PybulletRobotServerBase).
-    # Override in subclass or set on instance for different robots.
+    # Class-level default arm joint limits (matches SplatSim UR5's
+    # PybulletRobotServerBase). Used as a fallback when the loaded URDF
+    # doesn't publish limits. Instance-level `self.lower_limits` /
+    # `self.upper_limits` (populated in `_load_urdf`) override these per-
+    # robot from the URDF's own `getJointInfo` values, so no subclass edit
+    # is needed for new robots.
     lower_limits = [-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -np.pi]
     upper_limits = [np.pi, 0, np.pi, np.pi, np.pi, np.pi]
 
@@ -142,9 +147,9 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         forward_flow_ratio: float,
         show_slider: bool = True,
         start_paused: bool = False,
-        robot_name: str = "robot_iphone_w_engine_curtain",
+        robot_name: str | None = None,
         max_joint_delta: float = 0.016,
-        num_dofs: int = 6,
+        num_dofs: int | None = None,
         policy_guidance_representation: PolicyGuidanceRepresentation = PolicyGuidanceRepresentation.DELTA,
         blend_mode: BlendMode | str = BlendMode.EVERY_STEP,
         guidance_blend_strategy: GuidanceBlendStrategy | str = GuidanceBlendStrategy.DENOISE,
@@ -171,9 +176,17 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         rrt_ik_skip_gripper_obstacle_pairs: bool = False,
         rrt_escape_clearance_factor: float = 1.5,
         rrt_rewind_clearance_factor: float | None = None,
+        rrt_final_approach_dist: float = 0.0,
+        rrt_final_approach_vel_scale: float = 0.3,
+        rrt_final_approach_acc_scale: float = 0.25,
+        rrt_uniform_path_speed: bool = False,
         rrt_abort_on_drift_rad: float = 0.15,
         rrt_abort_on_drift_ticks: int = 8,
         rrt_drift_trigger: str = "lookback",
+        shield_check_every_n_ticks: int = 1,
+        debug_shield_force_trigger: bool = False,
+        debug_shield_trace_anchor: bool = False,
+        debug_rrt_drift_log: bool = False,
     ):
         # Bypass PreTrainedPolicy.__init__ — we proxy the inner policy's config
         nn.Module.__init__(self)
@@ -190,6 +203,12 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             else guidance_blend_strategy
         )
         self._desired_q: np.ndarray | None = None  # raw joint-space IK seed [num_dofs]
+        # Cached dummy-action template for `_lightweight_inner_call`'s
+        # skip-forward-pass branch. Lazily populated on first use so we
+        # only hit next(inner.parameters()) once (rather than every RRT
+        # tick during long executions). Shape = (1, num_dofs+1),
+        # dtype/device matches the inner policy's parameters.
+        self._inner_action_template: Tensor | None = None
         # Most recent ACTUAL joint state, unnormalized from the latest observation.
         # Used as q_start for RRT planning so the plan starts where the robot is,
         # not where it was commanded to be (which can diverge when the policy
@@ -269,7 +288,13 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # (lerobot-eval --intervention) via `self._oracle_goal_source.trigger()`.
         self._oracle_goal_source = OracleGoalGuidanceSource(self)
 
-        self.num_dofs = num_dofs
+        # ── DOF resolution (num_dofs = arm joints, excluding gripper) ──
+        # Priority: explicit > policy action_feature_names > action_dim - 1.
+        # Auto-detection lets the same wrapper support planar_3joint (3 DOF),
+        # UR5 small_engine (6 DOF), and future variants without per-robot
+        # class subclasses. See `_resolve_num_dofs` docstring.
+        resolved_num_dofs = self._resolve_num_dofs(num_dofs, inner_policy)
+        self.num_dofs = resolved_num_dofs
         self._max_joint_delta = max_joint_delta
         self._prev_dq: np.ndarray | None = None  # previous joint velocity (raw, [num_dofs])
         self.skip_collision: bool = False  # set True for visualization (dataset guidance is known-safe)
@@ -334,6 +359,10 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             ik_skip_gripper_obstacle_pairs=rrt_ik_skip_gripper_obstacle_pairs,
             escape_clearance_factor=rrt_escape_clearance_factor,
             rewind_clearance_factor=rrt_rewind_clearance_factor,
+            final_approach_dist=rrt_final_approach_dist,
+            final_approach_vel_scale=rrt_final_approach_vel_scale,
+            final_approach_acc_scale=rrt_final_approach_acc_scale,
+            uniform_path_speed=rrt_uniform_path_speed,
         )
 
         # NOTE on `ratio` scope: forward_flow_ratio is applied ONLY to the
@@ -348,17 +377,157 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         logger.info(
             f"SharedAutonomyPolicyWrapper: forward_flow_ratio={forward_flow_ratio} "
             f"(obs-teleop blending only — RRT chunks play verbatim), "
-            f"robot={robot_name}, "
+            f"robot={robot_name!r} ({'explicit' if robot_name else 'auto-detect from oracle'}), "
+            f"num_dofs={self.num_dofs}, "
             f"rrt_collision_detection={self._collision_detection_mode}"
         )
 
-        # Load pybullet DIRECT client for FK+IK (same pattern as KeyboardInterfaceAgent)
+        # Pybullet client is created up-front (needs a valid clientId for the
+        # RRT source's constructor + property shims). The URDF itself is
+        # loaded either now (explicit `robot_name`) or lazily on the first
+        # `select_action` receipt of `oracle_env_config["robot"]` (when the
+        # env is configured with `--env.include_oracle_info=true`). `_urdf_loaded`
+        # gates the lazy path.
+        self._pb_client = p.connect(p.GUI if show_slider else p.DIRECT)
+        self._show_slider = show_slider  # for the launch_ratio_slider guard below
+        self._robot_id: int | None = None
+        self._ee_link: int | None = None
+        self._num_pb_joints: int = 0
+        self._num_movable_joints: int = 0
+        self._loaded_robot_name: str | None = None
+        self._urdf_loaded: bool = False
+        self._obstacle_ids: list[int] = []
+        # DEBUG-ONLY: shield force-trigger + anchor trace. See docstrings on
+        # the corresponding SharedAutonomyConfig fields for semantics.
+        self._debug_shield_force_trigger: bool = bool(debug_shield_force_trigger)
+        self._debug_shield_trace_anchor: bool = bool(debug_shield_trace_anchor)
+        self._debug_rrt_drift_log: bool = bool(debug_rrt_drift_log)
+        # Shield rate-limiter: only run the expensive per-tick FK collision
+        # sweep every N ticks. Counter increments each tick the shield gate
+        # is otherwise open; check runs at counter % N == 0. Reset on
+        # scenario reset.
+        self._shield_check_every_n_ticks: int = max(1, int(shield_check_every_n_ticks))
+        self._shield_check_tick_counter: int = 0
+        # Shield-cooldown counter. Set to N by a failed shield trigger; ticks
+        # down to 0 while the shield is suppressed. Prevents per-tick "shield
+        # fires → RRT fails to plan (start in collision) → flush queue →
+        # diffusion re-predicts fresh chunk with new noise → different
+        # commanded position → visible shake" cascade. See select_action's
+        # shield block.
+        self._shield_cooldown_ticks: int = 0
+        # How many ticks to suppress the shield after a failed plan. Short
+        # enough (~0.5 s at 30 fps) that the arm gets fresh RRT attempts
+        # quickly when stuck in collision (sliding on an obstacle) — the
+        # planner has three escape methods and one of them may succeed on
+        # a subsequent tick as the policy nudges the arm slightly. Long
+        # enough that we don't spend ALL CPU on retrying escape chains
+        # (each attempt is ~50-200 ms of pybullet iters). Was previously
+        # 60 (2 s) which was too passive: episodes could burn hundreds of
+        # collision ticks between attempts.
+        self._SHIELD_COOLDOWN_ON_PLAN_FAIL: int = 15
+        # Per-scenario latch: once we've logged "shield can't fire because
+        # oracle has no task goal", stop firing the shield for the rest of
+        # this scenario so we don't spam the log or spin uselessly. Reset
+        # on new-oracle receipt (= new episode). See _shield_can_plan().
+        self._shield_disabled_no_goal: bool = False
+        # Identity of the oracle_env_config dict most recently applied.
+        # Used to detect new episodes (new oracle received) and reset the
+        # per-scenario shield-disabled latch.
+        self._last_applied_oracle_id: int | None = None
+        if robot_name is not None:
+            self._load_urdf(robot_name)
+            # Static-scene fallback (table + walls) is small_engine-specific
+            # geometry the pre-oracle-era wrapper always loaded. When the
+            # URDF is deferred to oracle we skip it — the oracle always
+            # publishes the correct obstacles and would tear these down
+            # immediately anyway, and they'd cause false collisions for
+            # arbitrary non-small_engine robots. Explicit robot_name path
+            # keeps the historical behavior for backwards compat.
+            self._load_static_obstacles()
+
+        if show_slider:
+            from lerobot.policies.shared_autonomy_gui import launch_ratio_slider
+
+            launch_ratio_slider(self)
+
+    @staticmethod
+    def _resolve_num_dofs(explicit: int | None, inner_policy: PreTrainedPolicy) -> int:
+        """Resolve arm-joint DOF count (excludes gripper).
+
+        Priority:
+          1. `explicit` — the value passed to __init__ / read from
+             SharedAutonomyConfig.num_dofs. Wins whenever non-None so users
+             can pin an unusual layout.
+          2. `inner_policy.config.action_feature_names` — the per-dim action
+             names published by the policy config (e.g. ["joint_1",
+             "joint_2", "joint_3", "gripper"]). We count non-gripper entries.
+             This is the cleanest signal because it names each action dim.
+          3. `action_dim - 1` — assumes exactly one gripper dim. Fallback
+             for policies that don't publish action_feature_names.
+        Raises when the policy provides no action shape at all (fatal —
+        the wrapper can't proceed without knowing DOF count).
+        """
+        if explicit is not None:
+            return int(explicit)
+        pol_cfg = inner_policy.config
+        names = getattr(pol_cfg, "action_feature_names", None)
+        if names:
+            n = sum(1 for name in names if "gripper" not in name.lower())
+            if n > 0:
+                logger.info(
+                    "SA wrapper: auto-detected num_dofs=%d from "
+                    "policy.action_feature_names=%s (excluded gripper dims).",
+                    n,
+                    names,
+                )
+                return n
+        action_feat = (pol_cfg.output_features or {}).get(ACTION)
+        if action_feat is not None and getattr(action_feat, "shape", None):
+            action_dim = int(action_feat.shape[0])
+            # Assume 1 gripper dim (matches every SplatSim robot to date).
+            n = max(action_dim - 1, 1)
+            logger.info(
+                "SA wrapper: auto-detected num_dofs=%d from action_dim=%d "
+                "(assumed 1 gripper dim; set --policy.shared_autonomy_config.num_dofs=N to override).",
+                n,
+                action_dim,
+            )
+            return n
+        raise ValueError(
+            "SA wrapper: could not resolve num_dofs — pass "
+            "--policy.shared_autonomy_config.num_dofs=N or ensure the "
+            "policy publishes output_features['action'].shape / "
+            "action_feature_names."
+        )
+
+    def _load_urdf(self, robot_name: str) -> None:
+        """Load the arm URDF into the wrapper's private pybullet client.
+        Idempotent-ish: safe to call once at __init__ (explicit robot_name)
+        or lazily on first oracle receipt. Populates:
+          * self._robot_id, self._ee_link, self._num_pb_joints
+          * self._num_movable_joints
+          * self.lower_limits / self.upper_limits — auto-derived from URDF's
+            getJointInfo when the URDF publishes limits; falls back to the
+            class-level defaults otherwise. Overwriting the class attrs on
+            self doesn't affect the class default (Python attribute lookup).
+        Called a second time (different robot_name) logs a warning and no-ops
+        — hot-reloading a different URDF into the same pybullet client is
+        risky (obstacle IDs, joint index assumptions, RRT source state);
+        the user should restart the wrapper if the robot changed mid-run.
+        """
+        if self._urdf_loaded:
+            if robot_name != self._loaded_robot_name:
+                logger.warning(
+                    "SA wrapper: URDF already loaded as %r; ignoring lazy-load "
+                    "request for %r (hot-reload not supported). Restart the "
+                    "wrapper if the robot really changed.",
+                    self._loaded_robot_name,
+                    robot_name,
+                )
+            return
         robot_config = SplatObjectConfig(name="robot", splat_name=robot_name)
         urdf_path = resolve_splatsim_path(robot_config.urdf_path)
         ee_link_name = robot_config.wrist_camera_link_name
-
-        self._pb_client = p.connect(p.GUI if show_slider else p.DIRECT)
-        # TODO(hardcoded): base_position from robot_iphone_w_engine_new config
         # Match SplatSim's load_urdf flags for articulated objects so the
         # planner's collision shapes are byte-identical to the simulator's:
         #   - URDF_USE_IMPLICIT_CYLINDER: use analytical cylinders for any
@@ -377,35 +546,92 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             | p.URDF_USE_SELF_COLLISION
             | p.URDF_USE_SELF_COLLISION_EXCLUDE_PARENT
         )
+        # Base position comes from the same SplatObjectConfig that SplatSim
+        # uses when it loads the robot on the sim side (see
+        # PybulletRobotServerBase._load_urdf → splatsim_obj.config.base_position).
+        # This MUST match the sim's value — otherwise the planner's private
+        # pybullet client places the arm at a different world position than
+        # the actual sim, so obstacles/goal-EE-poses (which are in world
+        # frame) map to different arm configs. Result: planner reports
+        # "collision-free" for a path the real robot crashes through (or
+        # vice versa), and the planner's start_config check falsely fails.
+        # Was previously hardcoded to [0, 0, -0.088] (small_engine's value);
+        # planar_3joint uses [0, 0, 0] → 88 mm vertical drift.
+        _base_pos = list(robot_config.base_position)
+        logger.info(
+            "SA wrapper: loading robot %r at base_position=%s (from SplatObjectConfig).",
+            robot_name,
+            _base_pos,
+        )
         self._robot_id = p.loadURDF(
             urdf_path,
             useFixedBase=True,
-            basePosition=[0, 0, -0.088],
+            basePosition=_base_pos,
             flags=urdf_flags,
             physicsClientId=self._pb_client,
         )
         self._ee_link = self._find_ee_link(ee_link_name)
         self._num_pb_joints = p.getNumJoints(self._robot_id, physicsClientId=self._pb_client)
+        self._num_movable_joints = sum(
+            1
+            for i in range(self._num_pb_joints)
+            if p.getJointInfo(self._robot_id, i, physicsClientId=self._pb_client)[2] != p.JOINT_FIXED
+        )
+        self._derive_joint_limits_from_urdf()
+        self._loaded_robot_name = robot_name
+        self._urdf_loaded = True
+        logger.info(
+            "SA wrapper: loaded URDF %r (path=%s, ee_link=%s, pb_joints=%d, movable=%d, num_dofs=%d).",
+            robot_name,
+            urdf_path,
+            ee_link_name,
+            self._num_pb_joints,
+            self._num_movable_joints,
+            self.num_dofs,
+        )
         # One-time AABB log per robot link at the rest pose. Matches the
         # diagnostic we use for obstacles in load_obstacles, so you can
         # eyeball that all gripper / arm links have non-degenerate
         # collision geometry after the URDF flag change.
         self._log_robot_link_aabbs()
 
-        # Count movable (non-fixed) joints for null-space IK arrays.
-        self._num_movable_joints = sum(
-            1
-            for i in range(self._num_pb_joints)
-            if p.getJointInfo(self._robot_id, i, physicsClientId=self._pb_client)[2] != p.JOINT_FIXED
-        )
-
-        self._obstacle_ids: list[int] = []
-        self._load_static_obstacles()
-
-        if show_slider:
-            from lerobot.policies.shared_autonomy_gui import launch_ratio_slider
-
-            launch_ratio_slider(self)
+    def _derive_joint_limits_from_urdf(self) -> None:
+        """Populate instance-level `lower_limits` / `upper_limits` from the
+        loaded URDF's per-joint info (fields [8]=lower, [9]=upper of
+        getJointInfo). Only the first `num_dofs` MOVABLE (non-fixed) joints
+        are consumed — matches _sync_joints' `1..1+num_dofs` convention.
+        If any joint reports lower >= upper (unlimited in URDF), we fall
+        back to the class-level default for the whole array — mixing per-
+        joint URDF limits with class defaults would produce a nonsense
+        combined range."""
+        if self._robot_id is None:
+            return
+        limits: list[tuple[float, float]] = []
+        movable_seen = 0
+        for i in range(self._num_pb_joints):
+            info = p.getJointInfo(self._robot_id, i, physicsClientId=self._pb_client)
+            if info[2] == p.JOINT_FIXED:
+                continue
+            if movable_seen >= self.num_dofs:
+                break
+            lo, hi = float(info[8]), float(info[9])
+            limits.append((lo, hi))
+            movable_seen += 1
+        if len(limits) == self.num_dofs and all(lo < hi for lo, hi in limits):
+            self.lower_limits = [lo for lo, _ in limits]
+            self.upper_limits = [hi for _, hi in limits]
+            logger.info(
+                "SA wrapper: derived joint limits from URDF: lower=%s, upper=%s",
+                self.lower_limits,
+                self.upper_limits,
+            )
+        else:
+            logger.info(
+                "SA wrapper: URDF joint limits missing/degenerate; keeping "
+                "class-level defaults (lower=%s, upper=%s).",
+                self.lower_limits,
+                self.upper_limits,
+            )
 
     # ---- pybullet FK + IK -------------------------------------------------- #
 
@@ -541,6 +767,22 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
     # the wrapper-level API before the source extraction (lerobot-eval --intervention,
     # last_mile/helpers.py, shared_autonomy_gui.py). New callers should prefer
     # `self._rrt_source.<...>` directly.
+
+    def _shield_can_plan(self) -> bool:
+        """Return True iff the RRT source has enough info to plan a recovery
+        trajectory right now. Used to gate the future-chunk shield so it
+        doesn't infinite-retrigger against a collision the planner can't
+        resolve. Currently checks for a task goal
+        (oracle_env_config.task.target_ee_pos/quat) — planar reacher envs
+        that don't publish a task goal will return False, letting the
+        wrapper log ONCE and disable the shield for the scenario. Extend
+        this check if future planner failure modes need gating too."""
+        from splatsim.utils.rrt_to_goal import extract_task_goal
+
+        oracle = self._rrt_source.state.oracle_env_config
+        if oracle is None:
+            return False
+        return extract_task_goal(oracle) is not None
 
     def _check_future_chunk_collision(self) -> tuple[bool, int | None, str | None, np.ndarray | None]:
         """Run the future-chunk predictive shield.
@@ -684,6 +926,46 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             skip_pairs=obstacle_skip_pairs,
             actual_gripper_q=actual_gripper_q,
         )
+        # DIAGNOSTIC (why-doesn't-shield-fire-earlier): for the NO-COLLISION
+        # case, probe chunk-step 0 (immediate command) and chunk-step -1
+        # (deepest lookahead the shield can see) for their closest-pair
+        # distance. Log ONLY when either is inside a 5 cm proximity window
+        # so we see the approach ramp up without spamming steady-state ticks.
+        # This reveals whether the policy's chunk projects into the obstacle
+        # BEFORE the shield's threshold hits (i.e., shield had a chance to
+        # fire but chose not to under the current threshold) vs. the chunk
+        # never reaches the obstacle geometrically until step 0 (i.e., the
+        # policy jumps commanded position across a chunk boundary, giving
+        # the shield no runway). Falls back silently when planner isn't
+        # ready (mirror-loaded, no obstacles) or describe returns None.
+        planner = self._rrt_source.state.planner
+        if not collides and planner is not None and chunk_dof.shape[0] > 0:
+            _steps_to_probe = [0]
+            if chunk_dof.shape[0] > 1:
+                _steps_to_probe.append(int(chunk_dof.shape[0]) - 1)
+            _probes: list[tuple[int, float, str, str]] = []
+            _min_dist = float("inf")
+            for _k in _steps_to_probe:
+                _base_q = q_current_dof + chunk_dof[_k] if action_format == "rel" else chunk_dof[_k]
+                if actual_gripper_q is not None:
+                    _probe_q = np.concatenate(
+                        [
+                            np.asarray(_base_q, dtype=np.float64),
+                            np.asarray([actual_gripper_q], dtype=np.float64),
+                        ]
+                    )
+                else:
+                    _probe_q = np.asarray(_base_q, dtype=np.float64)
+                _info = planner.describe_collision_at(
+                    _probe_q,
+                    obstacle_clearance=ob_clear,
+                    self_collision_clearance=self_clear,
+                )
+                if _info is not None:
+                    _d = float(_info.get("distance_m", float("inf")))
+                    _probes.append((_k, _d, _info.get("link_a_name", "?"), _info.get("link_b_name", "?")))
+                    if _d < _min_dist:
+                        _min_dist = _d
         # Re-derive the offending future joint config so the caller can
         # probe `planner.describe_collision_at(future_q)` to identify the
         # violating link pair. Mirrors the math `check_chunk_collision`
@@ -707,58 +989,98 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         The inner policy's action queue stores NORMALIZED actions of shape
         ``(n_steps, B=1, action_dim)``. We need them in RAW units (radians
         for joint dims) AND we need rel-format chunks to remain as rel
-        deltas (not as per-step "where to go from current state"), so we
-        bypass the AbsoluteActionsProcessorStep's add-last-state behavior
-        by temporarily zeroing its state during the postprocessor pass.
+        deltas (not as per-step "where to go from current state").
 
-        Returns ``(n_steps, action_dim)`` numpy array, or None if no
-        AbsoluteActionsProcessorStep was found in the pipeline (caller
-        should skip the shield in that case rather than guess at format).
+        Historical implementation temporarily zeroed the SHARED
+        ``rel_step._last_state`` (used by the outer postprocessor too) so
+        the AbsoluteActionsProcessorStep would add 0 during a normal
+        `self.postprocessor(chunk[k])` pass, then restored via try/finally.
+        That mutation, even bracketed, made the shared anchor the wrong
+        value for the duration of the shield loop — visible per-tick jitter
+        in the returned action when the outer postprocessor happened to
+        read the shared anchor at the wrong instant. Fixed here by running
+        only the pre-abs-step tail of the pipeline (unnormalize → device)
+        directly on each chunk step, then returning the rel-delta values
+        without ever touching `rel_step._last_state`.
+
+        Returns ``(n_steps, action_dim)`` numpy array, or None on failure
+        (caller should skip the shield rather than guess at format).
         """
-        # Find the AbsoluteActionsProcessorStep so we can snapshot + zero
-        # the relative_step._last_state.
-        abs_step = None
-        for _step in self.postprocessor.steps:
+        # Find the AbsoluteActionsProcessorStep so we can (a) confirm this
+        # is a rel-format pipeline (only then does zero-anchor apply) and
+        # (b) run every OTHER step in the pipeline manually — skipping the
+        # abs step to keep chunk values as pre-abs (rel-delta) numbers.
+        abs_step_idx = None
+        for idx, _step in enumerate(self.postprocessor.steps):
             if isinstance(_step, AbsoluteActionsProcessorStep):
-                abs_step = _step
+                abs_step_idx = idx
                 break
-        if abs_step is None or not abs_step.enabled or abs_step.relative_step is None:
-            # No add-state step → postprocessor output IS the denormalized
-            # action directly. Run it per-step and stack.
+        if abs_step_idx is None:
+            # No abs step in the pipeline → postprocessor output IS the
+            # denormalized abs-format action. Run the full pipeline per-step
+            # and stack. No shared-state mutation risk.
             out_rows: list[np.ndarray] = []
             for k in range(chunk.shape[0]):
-                # chunk[k] has shape (B=1, action_dim). The postprocessor
-                # expects a single tensor in that shape (it's how the
-                # wrapper already calls it via `self.postprocessor(inner_action)`).
                 row = self.postprocessor(chunk[k]).detach().cpu().numpy().reshape(-1)
                 out_rows.append(row)
             return np.stack(out_rows, axis=0) if out_rows else None
-
-        rel_step = abs_step.relative_step
-        saved_state = rel_step._last_state
-        try:
-            # Zero out the cached state so AbsoluteActionsProcessorStep
-            # adds 0 to every action, leaving the unnormalized rel-delta
-            # (or unnormalized abs target if the policy is abs-mode).
-            if saved_state is not None:
-                rel_step._last_state = torch.zeros_like(saved_state)
-            else:
-                # If no state has been cached yet, fall back to skipping
-                # the abs step entirely (chunk denormalization still works
-                # via the other steps in the pipeline).
-                abs_step.enabled = False
+        abs_step = cast(AbsoluteActionsProcessorStep, self.postprocessor.steps[abs_step_idx])
+        # DEBUG: snapshot the shared anchor before/after this call so we can
+        # spot mutations that leak past the intended scope (see
+        # `debug_shield_trace_anchor` docstring on SharedAutonomyConfig).
+        _trace_anchor = None
+        if self._debug_shield_trace_anchor and abs_step.relative_step is not None:
+            _pre = abs_step.relative_step._last_state
+            _trace_anchor = (
+                _pre.detach().clone() if _pre is not None else None,
+                id(_pre) if _pre is not None else None,
+            )
+        if not abs_step.enabled or abs_step.relative_step is None:
+            # Abs step present but disabled → same as no-abs-step case.
             out_rows = []
             for k in range(chunk.shape[0]):
                 row = self.postprocessor(chunk[k]).detach().cpu().numpy().reshape(-1)
                 out_rows.append(row)
             return np.stack(out_rows, axis=0) if out_rows else None
-        finally:
-            # Restore the original cached state (and the enabled flag if we
-            # touched it) so the next normal select_action call sees the
-            # right denormalization context.
-            rel_step._last_state = saved_state
-            if saved_state is None:
-                abs_step.enabled = True
+
+        # Rel-format pipeline: run every step EXCEPT the abs step on each
+        # chunk element. Bypass the pipeline's own __call__ (which wraps
+        # input in a transition + iterates all steps) by manually building
+        # the transition, running the non-abs steps in order, then
+        # unwrapping the action tensor.
+        from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+
+        out_rows = []
+        for k in range(chunk.shape[0]):
+            transition = policy_action_to_transition(chunk[k])
+            for idx, _step in enumerate(self.postprocessor.steps):
+                if idx == abs_step_idx:
+                    continue
+                transition = _step(transition)
+            action_t = transition_to_policy_action(transition)
+            out_rows.append(action_t.detach().cpu().numpy().reshape(-1))
+        result = np.stack(out_rows, axis=0) if out_rows else None
+        # DEBUG trace post-condition: the shared anchor MUST be byte-identical
+        # after this call (identity + value). Any drift means a downstream
+        # step secretly mutated `rel_step._last_state` and the outer decoder
+        # will now produce wrong absolute actions. Log LOUDLY when this fires.
+        if _trace_anchor is not None and abs_step.relative_step is not None:
+            _pre_val, _pre_id = _trace_anchor
+            _post = abs_step.relative_step._last_state
+            _post_id = id(_post) if _post is not None else None
+            _drift = None
+            if _pre_val is not None and _post is not None:
+                _drift = float((_post - _pre_val).abs().max().item())
+            if _pre_id != _post_id or (_drift is not None and _drift > 1e-9):
+                logger.error(
+                    "SA wrapper _denormalize_chunk_to_raw MUTATED shared anchor: "
+                    "id changed %s→%s, max-abs drift=%s. This corrupts the outer "
+                    "postprocessor decode and causes per-tick oscillation.",
+                    _pre_id,
+                    _post_id,
+                    f"{_drift:.6e}" if _drift is not None else "n/a",
+                )
+        return result
 
     @property
     def _rrt(self):
@@ -874,6 +1196,101 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         eval/recording path). See `RRTGuidanceSource.trigger` for details.
         """
         self._rrt_source.trigger()
+
+    def _maintain_inner_obs_history(self, batch: dict[str, Tensor]) -> None:
+        """Push the current batch into the inner policy's obs-history queue
+        WITHOUT running the (expensive) forward pass. No-op for policies that
+        don't maintain a `_queues[OBS_*]` deque (PI0 / PI0.5 read obs directly
+        from the batch on each predict_action_chunk call, so there's no history
+        to keep current).
+
+        Mirrors the pre-forward-pass portion of DiffusionPolicy.select_action:
+        image stacking + populate_queues. Skips the DDPM denoising loop. Used
+        by `_lightweight_inner_call` during RRT / oracle-goal execution so
+        the inner policy's obs history stays current — otherwise the fresh
+        chunk generated at RRT-end would fill its obs queue by copying the
+        FIRST obs it saw post-RRT, losing the recent history.
+        """
+        inner = self.inner_policy
+        queues = getattr(inner, "_queues", None)
+        if not isinstance(queues, dict):
+            return  # PI0 / PI0.5: no obs queue to update
+        _batch = batch
+        image_features = getattr(getattr(inner, "config", None), "image_features", None)
+        if image_features:
+            from lerobot.utils.constants import OBS_IMAGES
+
+            _batch = dict(batch)
+            _batch[OBS_IMAGES] = torch.stack([_batch[k] for k in image_features], dim=-4)
+        from lerobot.policies.utils import populate_queues
+
+        populate_queues(queues, _batch)
+
+    def _lightweight_inner_call(self, batch: dict[str, Tensor]) -> Tensor:
+        """Fast substitute for `inner_policy.select_action(batch)` used during
+        RRT / oracle-goal EXECUTING mode, when the inner action would be
+        DISCARDED (intervention branch overrides it).
+
+        Two cases:
+          * Inner has a cached chunk (queue non-empty) → delegate to the full
+            select_action: it's cheap (populate_queues + popleft, no forward
+            pass) AND we get a real action tensor for downstream dtype/device
+            references. Same cost as before this optimization.
+          * Inner's chunk is empty → the full select_action would trigger a
+            full DDPM denoise / Pi0 flow-matching forward pass here (~100-500 ms
+            depending on model + device). We SKIP that. Manually push obs into
+            the inner's history queue so the eventual fresh chunk (generated
+            at intervention-end when the wrapper's `_flush_inner_action_queue`
+            fires) has an up-to-date history to condition on. Return a
+            zero-filled dummy tensor with the correct dtype / device / shape
+            for downstream `inner_action.dtype / .device / .shape[0]` uses
+            (get_hold_action, _normalize_policy_guidance_action's device
+            match, oracle/obs_teleop next_action ctx fields).
+
+        Net effect: RRT execution never triggers an inner forward pass. For
+        n_action_steps=32 and a 100-tick RRT, saves ~3 forward passes = a few
+        hundred ms of GPU time. For n_action_steps=1 it's dramatic.
+        """
+        inner = self.inner_policy
+        # Diffusion caches in inner._queues[ACTION]; PI0 / PI0.5 caches in
+        # inner._action_queue. Either non-empty ⇒ next select_action call
+        # will just pop, not run the model — cheap to run normally.
+        diffusion_cached = False
+        _q = getattr(inner, "_queues", None)
+        if isinstance(_q, dict):
+            from lerobot.utils.constants import ACTION as _A
+
+            _dq = _q.get(_A)
+            diffusion_cached = _dq is not None and len(_dq) > 0
+        _pi_q = getattr(inner, "_action_queue", None)
+        pi_cached = _pi_q is not None and len(_pi_q) > 0
+
+        if diffusion_cached or pi_cached:
+            _act = inner.select_action(batch)
+            # Defensive: some policy adapters (Peft-wrapped, custom) can
+            # under-specify the select_action contract and return None on the
+            # non-forward-pass path. Downstream code (RRT playback, hold-action
+            # emission) needs a real Tensor for dtype/device — fall through to
+            # the manual dummy path when the delegated call disappoints us.
+            if _act is not None:
+                return _act
+
+        # Fresh forward pass would fire (or the delegate returned None) — skip it.
+        self._maintain_inner_obs_history(batch)
+        # Cache dtype/device so long RRT executions don't hit
+        # next(inner.parameters()) every tick. Also guarantees a stable
+        # (dtype, device) for the dummy tensor even if inner_policy briefly
+        # loses its parameter iter (mid-move to a new device, etc.).
+        template = self._inner_action_template
+        if template is None:
+            _param = next(inner.parameters(), None)
+            _dtype = _param.dtype if _param is not None else torch.float32
+            _device = _param.device if _param is not None else torch.device("cpu")
+            # Full action dim = arm DOFs + gripper — matches what the model
+            # would have returned.
+            template = torch.zeros((1, self.num_dofs + 1), dtype=_dtype, device=_device)
+            self._inner_action_template = template
+        return template.clone()
 
     def _flush_inner_action_queue(self) -> None:
         """Drop the inner policy's cached actions without resetting its obs queue.
@@ -1208,6 +1625,8 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self._frames_since_last_rrt_end = 0
         self._prev_rrt_mode = RRTMode.IDLE
         self._prev_dq = None
+        self._shield_cooldown_ticks = 0
+        self._shield_check_tick_counter = 0
         # Clear RRT chunk state on episode boundary; keep the planner instance
         # so its obstacle cache survives if the env config hash matches next episode.
         self._rrt_source.reset()
@@ -1270,8 +1689,43 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # down the wrapper's hardcoded fallback obstacles on first oracle load.
         oracle_cfg = batch.pop("oracle_env_config", None)
         if oracle_cfg is not None:
+            # Reset per-scenario shield-disabled latch on new oracle receipt.
+            # SplatSimEnv rebuilds oracle_env_config on env.reset(), so a
+            # different dict identity here == new scenario. Clear the latch
+            # so the shield can re-evaluate goal availability against the
+            # new task (target may now be published for the new episode).
+            if id(oracle_cfg) != self._last_applied_oracle_id:
+                self._shield_disabled_no_goal = False
+                self._last_applied_oracle_id = id(oracle_cfg)
+            # Lazy URDF load: when the SA config didn't pin robot_name, use
+            # the splat_name published by the sim on first oracle receipt.
+            # Guarded on _urdf_loaded so a subsequent oracle receipt is a
+            # no-op (URDFs don't hot-reload safely).
+            if not self._urdf_loaded:
+                robot_info = oracle_cfg.get("robot") or {}
+                splat_name = robot_info.get("splat_name")
+                if splat_name:
+                    self._load_urdf(splat_name)
+                else:
+                    raise RuntimeError(
+                        "SA wrapper: robot_name was not set in "
+                        "SharedAutonomyConfig AND oracle_env_config did not "
+                        "include robot.splat_name. Set "
+                        "--policy.shared_autonomy_config.robot_name=<name> "
+                        "explicitly, or ensure the sim publishes robot info."
+                    )
             self._rrt_source.update_oracle_config(oracle_cfg)
             self._oracle_goal_source.update_oracle_config(oracle_cfg)
+        elif not self._urdf_loaded:
+            # No oracle AND no explicit robot_name → we can't proceed. Fail
+            # fast on this first tick rather than crash later in _sync_joints.
+            raise RuntimeError(
+                "SA wrapper: URDF not loaded (robot_name not set in "
+                "SharedAutonomyConfig) and no oracle_env_config on first "
+                "select_action. Either set "
+                "--policy.shared_autonomy_config.robot_name=<name> or "
+                "enable --env.include_oracle_info=true."
+            )
 
         # The obs-driven source pops OBS_GUIDANCE_CHUNK from the batch and computes
         # has_guidance for this tick. Done BEFORE inner_policy.select_action so the
@@ -1325,9 +1779,54 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             self._flush_inner_action_queue()
             self._obs_teleop_source.cancel()
 
-        # Always call inner_policy.select_action to keep obs queues updated (e.g. diffusion
-        # maintains n_obs_steps history in _queues). Discard output when guidance overrides.
-        inner_action = self.inner_policy.select_action(batch)
+        # Inner policy call — full or lightweight depending on whether an
+        # intervention (RRT / oracle-goal) is currently EXECUTING.
+        #
+        # Full select_action: pushes obs into `_queues[OBS_*]`, if the ACTION
+        # queue is empty runs a full forward pass (DDPM denoising for
+        # diffusion; flow-matching solve for Pi0/0.5) — the expensive part.
+        #
+        # During intervention EXECUTING: the wrapper's downstream branches
+        # (RRT playback ~2080, oracle-goal playback ~2100) DISCARD the inner
+        # action and emit an intervention waypoint instead. Running the full
+        # forward pass just to throw the result away is pure waste. The
+        # `_lightweight_inner_call` helper (a) pops cached actions cheaply
+        # when the queue is non-empty, or (b) pushes obs into the history
+        # queue and returns a dummy tensor (correct dtype/device/shape) when
+        # the queue would otherwise trigger a fresh forward pass.
+        #
+        # `_flush_inner_action_queue` fires on intervention-end (see
+        # `_cancel_intervention`, `_finish_rrt`) so the next tick's full
+        # select_action call generates a fresh chunk against an up-to-date
+        # (RRT-tracked) obs history, without needing to remember to bootstrap
+        # anything.
+        #
+        # PLANNING mode: we still call full select_action because the blocking
+        # plan is likely to just run once per intervention cycle, and any obs
+        # decode / normalization state the inner might have side-effected
+        # on the pre-plan tick should stay valid. Cheap in practice —
+        # PLANNING lasts one tick before flipping to EXECUTING.
+        _intervention_executing = self._rrt.mode == RRTMode.EXECUTING or self._oracle_goal_source.is_active()
+        if _intervention_executing:
+            inner_action = self._lightweight_inner_call(batch)
+        else:
+            inner_action = self.inner_policy.select_action(batch)
+        # Belt-and-suspenders: downstream branches (RRT playback, oracle-goal
+        # playback, get_hold_action) index `inner_action.dtype/.device/.shape[0]`
+        # unconditionally. Any code path that ever produces None here would
+        # take down the whole select_action call (has happened when a policy
+        # adapter under-specifies its select_action contract). Fall back to
+        # the cached dummy template — same shape/dtype/device as the model's
+        # real output, safe for every downstream consumer.
+        if inner_action is None:
+            template = self._inner_action_template
+            if template is None:
+                _param = next(self.inner_policy.parameters(), None)
+                _dtype = _param.dtype if _param is not None else torch.float32
+                _device = _param.device if _param is not None else torch.device("cpu")
+                template = torch.zeros((1, self.num_dofs + 1), dtype=_dtype, device=_device)
+                self._inner_action_template = template
+            inner_action = template.clone()
 
         # Sync _desired_q from the ACTUAL observed joint state (not the cumulative
         # commanded value). The wrapper's pybullet client uses resetJointState
@@ -1371,15 +1870,33 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
 
         if actual_q_t is not None:
             actual_q = actual_q_t[0].detach().cpu().numpy().astype(np.float64)
-            # observation.state is [num_dofs joints + gripper] = num_dofs+1 entries.
-            self._desired_q = actual_q.reshape(-1)[: self.num_dofs + 1]
+            # observation.state is normally [num_dofs joints + gripper] =
+            # num_dofs+1 entries. But when --exclude_gripper_from_state is
+            # set at the preprocessor, obs.state is arm-only (num_dofs
+            # entries). We MUST still keep `_desired_q` and `_latest_actual_q`
+            # sized to num_dofs+1 — the RRT-playback branch (~line 2082)
+            # reads gripper via `_desired_q[-1]`, and a short array would
+            # make `[-1]` return the last ARM joint (e.g. joint_3 ≈ -1.35 rad)
+            # as the gripper command. The env's Robotiq interprets that as
+            # a close-fingers command mid-RRT → collision → physics kick →
+            # spurious episode split. Pad the missing gripper slot with
+            # 0.0 (open pose). The wrapper doesn't observe or plan gripper
+            # motion in the exclude-gripper mode, so "always open" is the
+            # correct constant assumption (matches the parallel fix in
+            # is_q_in_collision).
+            _flat = actual_q.reshape(-1)
+            if _flat.size < self.num_dofs + 1:
+                _pad = np.zeros(self.num_dofs + 1, dtype=np.float64)
+                _pad[: _flat.size] = _flat[: self.num_dofs]
+                _flat = _pad  # gripper slot stays 0.0 (open)
+            self._desired_q = _flat[: self.num_dofs + 1].copy()
             # Preserve a copy of the actual observation for RRT's q_start —
             # _desired_q gets overwritten with the commanded action at the end
             # of select_action, so by the time the planner thread reads it the
             # value reflects "where we want the robot to go next", not "where
             # the robot is right now". When commanded ≠ actual (collision,
             # mid-chunk replay, etc.) the latter is what RRT needs.
-            self._latest_actual_q = actual_q.reshape(-1)[: self.num_dofs + 1].copy()
+            self._latest_actual_q = _flat[: self.num_dofs + 1].copy()
             # Also push into the rolling history so RRT can pull q_start from
             # N steps ago (pre-jump pose), not just the current actual_q.
             self._actual_q_history.append(self._latest_actual_q.copy())
@@ -1454,10 +1971,63 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # preempt the policy and trigger RRT from the CURRENT continuous-
         # motion state (no_lookback=True). The recorded intervention episode
         # therefore starts velocity-continuous, in-distribution.
-        if self._collision_detection_mode in ("future_chunk", "hybrid") and self._rrt.mode == RRTMode.IDLE:
+        # Decrement the post-fail cooldown by one every tick. Skips shield
+        # evaluation while >0. Reset by a successful plan (below) or by
+        # episode reset.
+        if self._shield_cooldown_ticks > 0:
+            self._shield_cooldown_ticks -= 1
+        # Rate-limiter: only run the shield's FK sweep every N ticks. Bumps
+        # ONLY when the outer gate would otherwise have run the check, so
+        # cooldown skips + mode-EXECUTING skips don't consume rate-limit
+        # budget and delay the next real check post-cooldown.
+        _shield_gate_open = (
+            self._collision_detection_mode in ("future_chunk", "hybrid")
+            and self._rrt.mode == RRTMode.IDLE
+            and not self._shield_disabled_no_goal
+            and self._shield_cooldown_ticks == 0
+        )
+        _rate_limit_hit = False
+        if _shield_gate_open:
+            _rate_limit_hit = self._shield_check_tick_counter % self._shield_check_every_n_ticks != 0
+            self._shield_check_tick_counter += 1
+        if _shield_gate_open and not _rate_limit_hit:
             shield_collides, shield_step, shield_kind, shield_offending_q = (
                 self._check_future_chunk_collision()
             )
+            # DEBUG: force a synthetic "collision" so the full trigger path
+            # runs every tick regardless of the real FK check. Reproduces
+            # heavy-shield-firing pathologies (queue thrashing, shared-
+            # anchor mutation) even in scenarios with no real collisions.
+            if self._debug_shield_force_trigger and not shield_collides:
+                shield_collides = True
+                shield_kind = "debug_forced"
+                shield_step = 0
+            # NOTE: the "current-config already in collision → skip shield"
+            # gate that used to live here has been removed. The planner has
+            # three escape methods (policy-history rewind, contact-normal,
+            # self-collision gradient), and any one of them can succeed
+            # even when the current config is in collision. Skipping the
+            # trigger meant the arm could get stuck sliding against an
+            # obstacle for many ticks without ever attempting an escape.
+            # Now: shield still fires, RRT attempts all escape methods, and
+            # only when planning FAILS does the post-trigger cooldown gate
+            # engage (see below) to avoid per-tick escape-chain thrashing.
+            if shield_collides and not self._shield_can_plan():
+                # RRT can't recover without a task goal — firing the shield
+                # would infinite-loop (trigger → source aborts with "no
+                # goal" → shield sees same predicted collision → repeat).
+                # Log ONCE per scenario and latch off; oracle change on
+                # next episode re-enables via _last_applied_oracle_id.
+                logger.warning(
+                    "Future-chunk shield detected predicted %s collision at step %d "
+                    "but oracle_env_config publishes no task.target_ee_pos — "
+                    "RRT has nothing to plan toward. Disabling shield for this "
+                    "scenario to prevent infinite retriggering.",
+                    shield_kind or "unknown",
+                    shield_step if shield_step is not None else -1,
+                )
+                self._shield_disabled_no_goal = True
+                shield_collides = False  # skip the trigger block below
             if shield_collides:
                 # Debug telemetry: surface which link pair tripped the shield
                 # so we can tell whether grasp-finger ⟷ target-object proximity
@@ -1488,13 +2058,41 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                     shield_step if shield_step is not None else -1,
                     pair_str,
                 )
-                # Flush the colliding chunk so it doesn't drain in parallel
-                # with the RRT chunk execution about to start.
-                self._flush_inner_action_queue()
                 # Synchronous (blocking) RRT trigger from current state.
                 # In future_chunk mode the source's _do_plan reads
                 # q_start = wrapper._latest_actual_q and skips teleport.
+                # NOTE: We flush the inner-policy chunk queue ONLY if the
+                # plan actually succeeded (RRT is now EXECUTING). If the
+                # plan failed (start in collision, escape failed, no goal,
+                # etc.), RRT stays IDLE and flushing would just force the
+                # diffusion policy to re-predict a fresh chunk with new
+                # noise NEXT tick — producing per-tick action jitter (the
+                # exact "robot shakes every frame" pathology). The current
+                # chunk was FK-predicted to collide, but a re-predicted
+                # chunk with different noise is no more likely to be safe
+                # AND the resulting per-tick noise-driven commanded jumps
+                # tend to push the robot further into collision, causing
+                # amplitude-growing shakes. Better to let the current
+                # chunk keep executing (it's about to collide but the env
+                # will handle that via terminate_on_collision) than to
+                # noise-thrash the arm every tick indefinitely.
                 self._rrt_source.trigger(no_lookback=True)
+                if self._rrt.mode == RRTMode.EXECUTING:
+                    # Plan succeeded — safe to flush; the RRT chunk about
+                    # to play out supersedes anything left in the inner
+                    # queue.
+                    self._flush_inner_action_queue()
+                    self._shield_cooldown_ticks = 0
+                else:
+                    # Plan failed — suppress the shield for the next N ticks
+                    # so we don't retrigger every frame against the same
+                    # unresolvable collision. Inner policy keeps driving.
+                    self._shield_cooldown_ticks = self._SHIELD_COOLDOWN_ON_PLAN_FAIL
+                    logger.info(
+                        "Future-chunk shield: RRT plan failed; suppressing shield "
+                        "for %d ticks to avoid per-frame queue thrash.",
+                        self._SHIELD_COOLDOWN_ON_PLAN_FAIL,
+                    )
                 # Refresh local view so the EXECUTING branch picks up.
 
         # Capture q_prev BEFORE any action computation so velocity limiting sees the true
@@ -1612,44 +2210,38 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                                 "lookback": False,
                                 "no_lookback": True,
                             }.get(self._rrt_drift_trigger, None)
-                    # Always log step 1 (= landing), then every 10th, plus any
-                    # tick whose drift crosses 0.1 rad. Include the RAW actual +
-                    # commanded values for the worst joint so we can tell, by
-                    # comparing against the RECORDED observation.state / action
-                    # offline, which of two bugs is in play:
-                    #   * live `actual` RAMPS but recorded state STALLS ⇒ the
-                    #     wrapper sees a PHANTOM robot state (it's planning /
-                    #     drift-checking against a config the real robot isn't
-                    #     at). `_latest_actual_q` != recorded agent_pos.
-                    #   * live `commanded` (chunk) stays FLAT but recorded
-                    #     action RAMPS ⇒ the rel-action postprocessor is
-                    #     FABRICATING the ramp; chunk != recorded action.
-                    if rrt.step == 1 or rrt.step % 10 == 0 or drift > 0.1:
-                        worst_j = int(np.abs(drift_vec).argmax())
-                        logger.info(
-                            "RRT drift @ step %d/%d: |actual-commanded|=%.4f rad "
-                            "(worst joint %d: actual=%.4f commanded=%.4f Δ=%+.4f; max-so-far %.4f)",
-                            rrt.step,
-                            len(rrt.chunk),
-                            drift,
-                            worst_j,
-                            float(actual[worst_j]),
-                            float(prev_wp[worst_j]),
-                            float(drift_vec[worst_j]),
-                            self._rrt_drift_max,
-                        )
-                    # Full-vector dump at the landing tick and every 20 ticks so
-                    # the live `_latest_actual_q` and chunk trajectories can be
-                    # aligned against the recorded observation.state / action
-                    # frame-by-frame offline (the decisive (a)-vs-(b) check).
-                    if rrt.step == 1 or rrt.step % 20 == 0:
-                        logger.info(
-                            "RRT drift raw @ step %d/%d: actual=%s commanded(chunk[step-1])=%s",
-                            rrt.step,
-                            len(rrt.chunk),
-                            np.array2string(actual, precision=4, suppress_small=True),
-                            np.array2string(prev_wp, precision=4, suppress_small=True),
-                        )
+                    # Gated by debug_rrt_drift_log — off by default because these
+                    # fire every 10th RRT-chunk tick and drown the rest of the
+                    # log. Enable when debugging phantom-state / rel-action-
+                    # postprocessor drift bugs. Includes both a per-joint worst
+                    # summary and a full-vector dump so the live
+                    # `_latest_actual_q` and chunk trajectories can be aligned
+                    # against the RECORDED observation.state / action frame-by-
+                    # frame offline (distinguishes (a) phantom actual, from
+                    # (b) fabricated commanded rel-action ramp).
+                    if self._debug_rrt_drift_log:
+                        if rrt.step == 1 or rrt.step % 10 == 0 or drift > 0.1:
+                            worst_j = int(np.abs(drift_vec).argmax())
+                            logger.info(
+                                "RRT drift @ step %d/%d: |actual-commanded|=%.4f rad "
+                                "(worst joint %d: actual=%.4f commanded=%.4f Δ=%+.4f; max-so-far %.4f)",
+                                rrt.step,
+                                len(rrt.chunk),
+                                drift,
+                                worst_j,
+                                float(actual[worst_j]),
+                                float(prev_wp[worst_j]),
+                                float(drift_vec[worst_j]),
+                                self._rrt_drift_max,
+                            )
+                        if rrt.step == 1 or rrt.step % 20 == 0:
+                            logger.info(
+                                "RRT drift raw @ step %d/%d: actual=%s commanded(chunk[step-1])=%s",
+                                rrt.step,
+                                len(rrt.chunk),
+                                np.array2string(actual, precision=4, suppress_small=True),
+                                np.array2string(prev_wp, precision=4, suppress_small=True),
+                            )
                 wp = rrt.chunk[rrt.step][: self.num_dofs]
                 rrt.step += 1
                 gripper = float(self._desired_q[-1]) if self._desired_q is not None else 0.0
@@ -1725,6 +2317,86 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             self._desired_q = self._last_raw_action.reshape(-1).copy()
         else:
             self._desired_q = self.postprocessor(action).cpu().numpy().reshape(-1)
+
+        # DEBUG: gated by debug_shield_trace_anchor. Logs the wrapper's exit
+        # source (inner/guidance/rrt/oracle) and the commanded absolute joint
+        # target this tick — same value the outer postprocessor + env will
+        # see. Comparing consecutive ticks makes per-tick jitter obvious.
+        #
+        # ALSO logs at chunk-boundary ticks the raw rel-action delta the inner
+        # policy predicted AND the anchor the postprocessor added, so we can
+        # separate "policy predicted a big rel_0 (undertrained)" from
+        # "anchor drifted from actual current state (wrapper/preproc bug)".
+        # For a well-trained rel-action policy, rel_0 should be ~0 rad (the
+        # first waypoint of a fresh chunk is "stay where you are"); anchor
+        # should equal the just-observed actual joint state. Any drift
+        # between anchor and latest_actual_q on a chunk-boundary tick is
+        # the smoking gun for an anchor bug.
+        if self._debug_shield_trace_anchor:
+            _source = "inner"
+            if self._rrt.mode == RRTMode.EXECUTING:
+                _source = "rrt"
+            elif self._oracle_goal_source.is_active():
+                _source = "oracle_goal"
+            # Chunk-boundary diagnostics: fires ONLY when the inner policy's
+            # action queue was empty on entry (i.e., it re-predicted a fresh
+            # chunk this tick). Detected by peeking the queue AFTER select
+            # (has n_action_steps - 1 entries if a fresh chunk was just
+            # generated + one popped; if the queue had entries before, it'd
+            # be one fewer now — heuristic based on chunk-size threshold).
+            try:
+                _pending = self.inner_policy.get_pending_action_chunk()
+                _q_len = 0 if _pending is None else int(_pending.shape[0])
+                _ncfg = getattr(self.inner_policy.config, "n_action_steps", None)
+                _chunk_boundary = (
+                    _ncfg is not None and _q_len >= _ncfg - 1  # fresh chunk minus the 1 popped this tick
+                )
+            except Exception:
+                _chunk_boundary = False
+            if _chunk_boundary and self._latest_actual_q is not None:
+                # Fetch anchor from the (shared) rel_step and denormalize the
+                # inner_action so we can compare in raw radians.
+                _anchor_raw = None
+                _rel0_raw = None
+                for _step in self.postprocessor.steps:
+                    if isinstance(_step, AbsoluteActionsProcessorStep):
+                        _rs = _step.relative_step
+                        if _rs is not None and _rs._last_state is not None:
+                            _a = _rs._last_state
+                            if _a.ndim == 3:
+                                _a = _a[..., -1, :]
+                            _anchor_raw = _a.detach().cpu().numpy().reshape(-1)
+                        break
+                # Denormalize inner_action to get raw rel_0 (bypass abs step).
+                try:
+                    _raw = self._denormalize_chunk_to_raw(inner_action.unsqueeze(0))
+                    if _raw is not None:
+                        _rel0_raw = _raw[0]
+                except Exception:  # nosec B110 - debug logging path; missing denormalized value is optional
+                    pass
+                _actual = self._latest_actual_q.reshape(-1)[: self.num_dofs]
+                _drift = None
+                if _anchor_raw is not None:
+                    _drift = _anchor_raw[: self.num_dofs] - _actual
+                logger.info(
+                    "SA-CHUNK-BOUNDARY anchor=[%s] actual=[%s] anchor-actual=[%s] rel_0_raw=[%s]",
+                    " ".join(
+                        f"{x:+.4f}" for x in (_anchor_raw[: self.num_dofs] if _anchor_raw is not None else [])
+                    ),
+                    " ".join(f"{x:+.4f}" for x in _actual),
+                    " ".join(f"{x:+.4f}" for x in _drift) if _drift is not None else "n/a",
+                    " ".join(
+                        f"{x:+.4f}" for x in (_rel0_raw[: self.num_dofs] if _rel0_raw is not None else [])
+                    ),
+                )
+            elif self._obs_teleop_source.is_active():
+                _source = "obs_teleop"
+            _dq = self._desired_q.reshape(-1)[: self.num_dofs]
+            logger.info(
+                "SA-tick src=%s q_cmd=[%s]",
+                _source,
+                " ".join(f"{x:+.4f}" for x in _dq),
+            )
 
         return action
 

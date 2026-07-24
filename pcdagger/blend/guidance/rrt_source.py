@@ -98,6 +98,10 @@ class RRTGuidanceSource:
         ik_skip_gripper_obstacle_pairs: bool = False,
         escape_clearance_factor: float = 1.5,
         rewind_clearance_factor: float | None = None,
+        final_approach_dist: float = 0.0,
+        final_approach_vel_scale: float = 0.3,
+        final_approach_acc_scale: float = 0.25,
+        uniform_path_speed: bool = False,
     ) -> None:
         self._wrapper = wrapper
         # Same dataclass that used to live on the wrapper as `_rrt`. The
@@ -219,6 +223,16 @@ class RRTGuidanceSource:
         self.rewind_clearance_factor = (
             float(rewind_clearance_factor) if rewind_clearance_factor is not None else None
         )
+        # Final-approach taper (ruckig): brake to a stop `final_approach_dist`
+        # rad before the goal, then creep at the scaled limits so the tracked
+        # robot doesn't overshoot the final waypoint. Mirrors SplatSim
+        # traj-gen's TrajectoryGenModeConfig.final_approach_* so intervention
+        # chunks and demos end with the same approach behavior. Forwarded to
+        # the planner ctor; 0.0 = off.
+        self.final_approach_dist = float(final_approach_dist)
+        self.final_approach_vel_scale = float(final_approach_vel_scale)
+        self.final_approach_acc_scale = float(final_approach_acc_scale)
+        self.uniform_path_speed = bool(uniform_path_speed)
         # Env handle for the pre-execution teleport. Set externally via the
         # wrapper's `set_env_for_teleport(env)`; None means teleport is a no-op.
         self._env_for_teleport: object | None = None
@@ -675,6 +689,10 @@ class RRTGuidanceSource:
                 ik_skip_gripper_obstacle_pairs=self.ik_skip_gripper_obstacle_pairs,
                 escape_clearance_factor=self.escape_clearance_factor,
                 rewind_clearance_factor=self.rewind_clearance_factor,
+                final_approach_dist=self.final_approach_dist,
+                final_approach_vel_scale=self.final_approach_vel_scale,
+                final_approach_acc_scale=self.final_approach_acc_scale,
+                uniform_path_speed=self.uniform_path_speed,
             )
         return self.state.planner
 
@@ -845,6 +863,23 @@ class RRTGuidanceSource:
                 history=getattr(wrapper, "_actual_q_history", None),
                 max_lookback=int(getattr(wrapper, "_frames_since_last_rrt_end", 0) or 0),
             )
+            # Pass the env's ACTUAL gripper config so every planner-side
+            # collision check evaluates against the real finger geometry
+            # (typically closing around an object mid-grasp), not the URDF's
+            # wide-open default that `set_robot_joint_positions` forces every
+            # time the planner sets the robot to a new pose. Without this,
+            # escape's rewind check (which snaps the actual gripper from
+            # q_full[num_dofs]) disagrees with BiRRT / ruckig checks (which
+            # see wide-open fingers) — the exact mismatch that cascades to
+            # 5-retry backoff on grasp tasks. None when the wrapper's obs.state
+            # excludes the gripper dim (`exclude_gripper_from_state=True` or
+            # q_start_full is arm-only): planner then leaves the gripper
+            # untouched (legacy behavior).
+            _actual_gripper_q: float | None
+            if q_start_full.size > wrapper.num_dofs:
+                _actual_gripper_q = float(q_start_full[wrapper.num_dofs])
+            else:
+                _actual_gripper_q = None
             chunk, escape_end_q = planner.plan(
                 q_start,
                 target_ee_pos,
@@ -853,6 +888,7 @@ class RRTGuidanceSource:
                 recent_joint_velocity=recent_vel,
                 exclude_q_goals=list(self.state.excluded_q_goals),
                 ruckig_start_vel=_ruckig_start_vel,
+                actual_gripper_q=_actual_gripper_q,
             )
             # Capture the chosen IK goal so request_retry_after_collision()
             # can add it to the excluded list on retry. Set on planner state

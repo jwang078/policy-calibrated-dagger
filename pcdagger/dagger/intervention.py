@@ -702,13 +702,23 @@ class InterventionController:
                 # within the in-progress clearance — including legitimate
                 # approach configs where the goal IS within clearance of
                 # the target object. The gate requires the robot to ALSO
-                # be stuck (Δq < threshold for N consecutive ticks) before
+                # be stuck (Δq < threshold for N of last N*2 ticks) before
                 # treating the proximity as a real wedge. `threshold == 0`
                 # disables the gate (legacy "fire on every proximity" mode).
-                stuck = (
-                    self.cfg.stuck_threshold_rad_per_tick > 0.0
-                    and self._consecutive_stuck_ticks >= self.cfg.stuck_consecutive_ticks
-                )
+                #
+                # Uses a "K of last 2K ticks" window (not "K consecutive")
+                # because the position controller's residual motion when
+                # the arm is sliding against an obstacle often bounces
+                # ACROSS the threshold (Δq ~ 0.005-0.015 rad while the
+                # threshold is 0.01), which would reset the consecutive
+                # counter every few ticks and never converge. The window
+                # test tolerates a couple of above-threshold outliers per
+                # cycle while still requiring the arm to be mostly-stuck.
+                _need = int(self.cfg.stuck_consecutive_ticks)
+                _window_len = max(_need * 2, _need + 1)
+                _recent = list(self._recent_dq)[-_window_len:]
+                _stuck_in_window = sum(1 for _d in _recent if _d < self.cfg.stuck_threshold_rad_per_tick)
+                stuck = self.cfg.stuck_threshold_rad_per_tick > 0.0 and _stuck_in_window >= _need
                 if self.cfg.stuck_threshold_rad_per_tick <= 0.0:
                     # Gate disabled — preserve legacy behavior (fire on
                     # every planner-positive tick).
@@ -1032,17 +1042,23 @@ class InterventionController:
         )
 
         # Triggers, all gated on mode == IDLE:
-        #   * stall: policy_step_count >= threshold (lifts backoff cooldown)
-        #   * collision: policy hit an obstacle (suppressed during cooldown)
-        #   * no-progress (position): EE position not improving (suppressed
-        #     during cooldown)
-        #   * no-progress (orientation): EE orientation not improving (also
-        #     suppressed during cooldown)
-        # Trigger fires whichever first. Backoff cooldown gives the policy
-        # the full window after a planning backoff so we don't burst-retrigger
-        # the moment it's handed back control.
+        #   * stall: policy_step_count >= threshold (lifts backoff cooldown).
+        #     Gated on policy_steps_before_rrt / policy_steps_between_rrt.
+        #   * collision: policy hit an obstacle. NOT gated on
+        #     `policy_steps_before_rrt` NOR on `in_backoff_cooldown` — an
+        #     arm actively wedged against geometry needs help immediately,
+        #     regardless of whether earlier plans failed OR whether we're
+        #     still in the "let policy try first" warmup window. The
+        #     controller's `stuck`-gate on the planner-side in_collision
+        #     override (`_consecutive_stuck_ticks >= stuck_consecutive_ticks`
+        #     AND `planner_in_collision`) already prevents false positives
+        #     from legitimate approach-near-obstacle configs.
+        #   * no-progress: EE progress trackers (position + orientation).
+        #     Suppressed during backoff cooldown (drift-based signals are
+        #     ambiguous mid-recovery; wait for the stall gate to lift
+        #     cooldown before re-arming them).
         should_trigger_stall = self.policy_step_count >= self.next_policy_threshold
-        should_trigger_collision = in_collision and not self.in_backoff_cooldown
+        should_trigger_collision = in_collision
         if should_trigger_stall:
             self.in_backoff_cooldown = False
         if (

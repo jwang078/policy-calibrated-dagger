@@ -272,41 +272,24 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LEROBOT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=lib_dagger_lineage.sh
+source "$SCRIPT_DIR/lib_dagger_lineage.sh"
 
-# Normalize path: accept absolute, relative-to-cwd, or basename-only.
-TRAIN_DIR="${TRAIN_DIR%/}"
-if [[ ! "$TRAIN_DIR" =~ ^/ ]]; then
-    if [[ -d "$TRAIN_DIR" ]]; then
-        TRAIN_DIR="$(cd "$TRAIN_DIR" && pwd)"
-    elif [[ -d "$LEROBOT_ROOT/outputs/training/$TRAIN_DIR" ]]; then
-        TRAIN_DIR="$LEROBOT_ROOT/outputs/training/$TRAIN_DIR"
-    elif [[ -d "$LEROBOT_ROOT/$TRAIN_DIR" ]]; then
-        TRAIN_DIR="$LEROBOT_ROOT/$TRAIN_DIR"
-    else
-        # Path doesn't exist on disk. That's legal in --delete_episodes mode,
-        # where the target round's training dir may not have been created yet
-        # (intervention recorded, training not started). Make it absolute so
-        # dirname/basename are stable: a bare basename resolves under
-        # outputs/training, an `outputs/...`-style relative path under the repo.
-        if [[ "$TRAIN_DIR" == */* ]]; then
-            TRAIN_DIR="$LEROBOT_ROOT/$TRAIN_DIR"
-        else
-            TRAIN_DIR="$LEROBOT_ROOT/outputs/training/$TRAIN_DIR"
-        fi
-    fi
-fi
-if [[ ! -d "$TRAIN_DIR" ]]; then
-    if [[ -n "$DELETE_EPISODES" ]]; then
-        # --delete_episodes operates on the round's intervention dataset, which
-        # exists independently of (and before) the round's training dir. Allow
-        # a not-yet-trained round here; the dataset resolution below falls back
-        # to an earlier round's sidecar when this round's is absent.
+# Normalize path: accept absolute, relative-to-cwd, "outputs/training/<basename>"
+# relative to the repo, or a bare basename (looked up under outputs/training/).
+# In --delete_episodes mode the target round's training dir may not exist yet
+# (intervention recorded, training not started) — DGR_ALLOW_MISSING makes the
+# helper return a plausibly-absolute path anyway so dirname/basename below
+# stay stable.
+if [[ -n "$DELETE_EPISODES" ]]; then
+    TRAIN_DIR="$(DGR_ALLOW_MISSING=true dgr_normalize_train_dir "$TRAIN_DIR")" || exit 1
+    if [[ ! -d "$TRAIN_DIR" ]]; then
         echo "[cleanup] note: training dir does not exist yet (round not trained):"
         echo "  $TRAIN_DIR"
         echo "[cleanup] --delete_episodes continues against the round's intervention dataset."
-    else
-        echo "ERROR: training dir not found: $TRAIN_DIR" >&2; exit 1
     fi
+else
+    TRAIN_DIR="$(dgr_normalize_train_dir "$TRAIN_DIR")" || exit 1
 fi
 
 # Prompt the user (once, up-front) whether to preserve round 1's intervention

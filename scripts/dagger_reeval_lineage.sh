@@ -27,17 +27,35 @@
 #
 # Usage:
 #   bash my_scripts/dagger_reeval_lineage.sh \
-#       --filter d5jvm_g0_03dag \
+#       [<training_dir_path> ...] \
+#       [--filter d5jvm_g0_03dag] \
 #       --episode_length=800 \
 #       [--n_episodes=5] [--seed=0] \
 #       [--env_external_port=6001] [--headless] [--no_manage_splatsim] \
 #       [--model=diffusion] \
 #       [--dry-run] [--force_rerun]
 #
+# You must specify AT LEAST ONE of --filter / a positional training-dir path.
+# Positional paths and --filter substrings compose (OR semantics).
+#
+# Positional paths (same UX as dagger_cleanup_lineage.sh):
+#   * A base-policy dir (no `_dag<N>` in the basename) —
+#     e.g. `outputs/training/diffusion_planar_3joint_delta_base`. All
+#     downstream DAgger lineages that finetuned from this base
+#     (`<basename>_<tag>_(ft_)?dag<N>` on disk) are re-evaluated.
+#   * A DAgger round dir — e.g. `outputs/training/diffusion_..._d100_ft_dag2`.
+#     The exact lineage (all its rounds) is re-evaluated; the round number
+#     in the path is IGNORED (use --rounds to scope to specific rounds).
+#   * Paths can be absolute, relative to cwd, or a bare basename (looked
+#     up under outputs/training/).
+#   * The model prefix ("diffusion"/"pi05"/"act") is inferred from the
+#     basename and restricts the model scan to just those prefixes.
+#
 # Options:
 #   --filter SUBSTR [SUBSTR ...]  Restrict to lineages whose name contains ANY
 #                                 of the given substrings (OR semantics —
-#                                 matches dagger_progress.sh). Required.
+#                                 matches dagger_progress.sh). Required unless
+#                                 at least one positional path is provided.
 #   --exclude_filter SUBSTR [...] Additive negative filter on lineage names.
 #                                 A lineage matching ANY entry here is dropped
 #                                 even if it matched --filter. Compose to
@@ -129,8 +147,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib_lerobot_eval.sh"
 # shellcheck source=lib_splatsim_manage.sh
 source "$SCRIPT_DIR/lib_splatsim_manage.sh"
+# shellcheck source=lib_dagger_lineage.sh
+source "$SCRIPT_DIR/lib_dagger_lineage.sh"
 
 # Defaults
+# Positional training-dir paths → converted into exact-lineage matchers
+# (round dirs) or lineage-name-prefix matchers (base-policy dirs) by
+# resolve_positional_paths() below. Compose with --filter (OR semantics).
+POS_PATHS=()
+POS_EXACT_LINEAGES=()     # entries "<model>:<lineage_key>" — exact match
+POS_LINEAGE_PREFIXES=()   # entries "<model>:<lineage_key>" — lineage.startswith("<lineage_key>_")
+POS_MODELS=()             # union of model prefixes derived from POS_PATHS
 FILTERS=()
 # --exclude_filter SUBSTR ... — additive negative filter on lineage names.
 # A lineage matching ANY of these is dropped even if it matched --filter.
@@ -259,17 +286,46 @@ while (( i < ${#args[@]} )); do
             sed -n '1,/^set -euo pipefail/p' "$0" | grep '^#' | sed 's/^# \?//'
             exit 0
             ;;
-        *) echo "Unknown argument: $arg" >&2; exit 1 ;;
+        --*) echo "Unknown argument: $arg" >&2; exit 1 ;;
+        *)  POS_PATHS+=( "$arg" ) ;;
     esac
     i=$((i + 1))
+done
+
+# Keep dagger_naming.py in sync with our known prefixes.
+export DGR_KNOWN_MODEL_PREFIXES="${KNOWN_MODEL_PREFIXES[*]}"
+
+# Resolve positional paths into exact-lineage / lineage-prefix matchers.
+# Each path is normalized then passed to dgr_lineage_from_train_dir; the
+# resulting (model, kind, lineage_key) tuple populates POS_EXACT_LINEAGES
+# (round dirs) or POS_LINEAGE_PREFIXES (base-policy dirs). We also collect
+# the union of model prefixes so downstream we only scan the relevant ones.
+for _pos_path in "${POS_PATHS[@]}"; do
+    _pos_resolved="$(dgr_normalize_train_dir "$_pos_path" "$TRAINING_ROOT")" || exit 1
+    _pos_meta="$(dgr_lineage_from_train_dir "$_pos_resolved")" || exit 1
+    _pos_model="$(printf '%s\n' "$_pos_meta" | sed -n 1p)"
+    _pos_kind="$(printf  '%s\n' "$_pos_meta" | sed -n 2p)"
+    _pos_key="$(printf   '%s\n' "$_pos_meta" | sed -n 3p)"
+    case "$_pos_kind" in
+        round) POS_EXACT_LINEAGES+=( "${_pos_model}:${_pos_key}" ) ;;
+        base)  POS_LINEAGE_PREFIXES+=( "${_pos_model}:${_pos_key}" ) ;;
+        *) echo "ERROR: dgr_lineage_from_train_dir returned unknown kind '$_pos_kind' for $_pos_resolved" >&2; exit 1 ;;
+    esac
+    # Track the model prefix (deduped).
+    _pos_seen=false
+    for _m in "${POS_MODELS[@]}"; do
+        [[ "$_m" == "$_pos_model" ]] && _pos_seen=true && break
+    done
+    [[ "$_pos_seen" == false ]] && POS_MODELS+=( "$_pos_model" )
 done
 
 if [[ -z "$EPISODE_LENGTH" ]]; then
     echo "ERROR: --episode_length=N is required (the whole point of this script)" >&2
     exit 1
 fi
-if (( ${#FILTERS[@]} == 0 )); then
-    echo "ERROR: --filter SUBSTR is required (otherwise this would re-eval every lineage on disk)" >&2
+if (( ${#FILTERS[@]} == 0 && ${#POS_PATHS[@]} == 0 )); then
+    echo "ERROR: at least one of --filter SUBSTR or a positional <training_dir_path> is required" >&2
+    echo "  (otherwise this would re-eval every lineage on disk)." >&2
     exit 1
 fi
 if [[ "$SKIP_NC" == true && "$NC_ONLY" == true ]]; then
@@ -293,8 +349,13 @@ case "$TERMINATE_ON_COLLISION" in
 esac
 
 # Build the model-prefix scan list.
+#   --model always wins (explicit CLI override).
+#   Otherwise, positional paths narrow the scan to the models they name.
+#   Otherwise, scan all known prefixes.
 if [[ -n "$MODEL_PREFIX" ]]; then
     MODEL_PREFIXES=( "$MODEL_PREFIX" )
+elif (( ${#POS_MODELS[@]} > 0 )); then
+    MODEL_PREFIXES=( "${POS_MODELS[@]}" )
 else
     MODEL_PREFIXES=( "${KNOWN_MODEL_PREFIXES[@]}" )
 fi
@@ -307,9 +368,20 @@ fi
 
 echo "════════════════════════════════════════════════════════════════"
 if [[ "$N_EPISODES_OVERRIDDEN" == "true" ]]; then
-    echo "DAgger re-eval: filter='${FILTERS[*]}'  episode_length=$EPISODE_LENGTH  n_episodes=$N_EPISODES (CLI override)  seed=$SEED"
+    echo "DAgger re-eval: episode_length=$EPISODE_LENGTH  n_episodes=$N_EPISODES (CLI override)  seed=$SEED"
 else
-    echo "DAgger re-eval: filter='${FILTERS[*]}'  episode_length=$EPISODE_LENGTH  n_episodes=auto (per-round from sidecar; fallback=$N_EPISODES_FALLBACK)  seed=$SEED"
+    echo "DAgger re-eval: episode_length=$EPISODE_LENGTH  n_episodes=auto (per-round from sidecar; fallback=$N_EPISODES_FALLBACK)  seed=$SEED"
+fi
+if (( ${#FILTERS[@]} > 0 )); then
+    echo "  --filter (lineage substring, OR): '${FILTERS[*]}'"
+fi
+if (( ${#POS_EXACT_LINEAGES[@]} > 0 )); then
+    echo "  positional (exact-lineage match):"
+    for _e in "${POS_EXACT_LINEAGES[@]}"; do echo "    • $_e"; done
+fi
+if (( ${#POS_LINEAGE_PREFIXES[@]} > 0 )); then
+    echo "  positional (base-policy — enumerate downstream lineages):"
+    for _e in "${POS_LINEAGE_PREFIXES[@]}"; do echo "    • $_e"; done
 fi
 if (( ${#EXCLUDE_FILTERS[@]} > 0 )); then
     echo "  exclude_filter (lineages dropped if any match): '${EXCLUDE_FILTERS[*]}'"
@@ -354,6 +426,37 @@ _base_lineage_dir() {
     [[ -d "$base_dir" ]] && echo "$base_dir" || echo ""
 }
 
+# ── _positional_base_dir_for_lineage: when the user passed a positional
+# base-policy path (kind="base" → recorded in POS_LINEAGE_PREFIXES), use
+# THAT path as the dag0 for every downstream lineage that matched it —
+# regardless of what `_base_lineage_dir` can find via its naming search.
+# This is the whole point of the "pass a base-policy path" UX: eval the
+# base itself alongside its descendants. Without this, non-basewrist bases
+# (e.g. `..._delta_state`) silently drop dag0 because `_base_lineage_dir`
+# only fallback-resolves `_basewrist_`-suffixed naming.
+# Args: $1 = model prefix ("diffusion"/"pi05"/"act"), $2 = lineage key.
+# Echoes the absolute path to `$TRAINING_ROOT/${prefix}_${key}` if any
+# POS_LINEAGE_PREFIXES entry matches (model + prefix relation) and the dir
+# exists on disk; empty otherwise.
+_positional_base_dir_for_lineage() {
+    local prefix="$1" lineage="$2"
+    local entry m_want pref_want candidate
+    for entry in "${POS_LINEAGE_PREFIXES[@]}"; do
+        m_want="${entry%%:*}"
+        pref_want="${entry#*:}"
+        [[ "$m_want" == "$prefix" ]] || continue
+        if [[ "$lineage" == "${pref_want}_"* || "$lineage" == "$pref_want" ]]; then
+            candidate="$TRAINING_ROOT/${prefix}_${pref_want}"
+            if [[ -d "$candidate" ]]; then
+                echo "$candidate"
+                return 0
+            fi
+        fi
+    done
+    echo ""
+    return 0
+}
+
 # ── _round_dir_matches_filters: should this round dir be processed?
 # Args: $1 = round basename like `ft_dag2` / `dag5_s` / `ft_dag3_nc` /
 # `dag0` (synthetic round-0 from the base lineage dir).
@@ -386,14 +489,36 @@ _round_dir_matches_filters() {
     return 0
 }
 
-# ── lineage_filter_matches: does this lineage name pass the --filter /
-# --exclude_filter combo? Substring-based (positive list ANY-match, then
-# negative list ANY-match drops).
+# ── _lineage_filter_matches <model> <lineage>: does this (model, lineage)
+# pair pass the --filter / --exclude_filter / positional-path combo?
+#   * --exclude_filter: substring ANY-match on lineage → DROP (takes
+#     precedence over everything).
+#   * Positional exact matches (POS_EXACT_LINEAGES entries "<model>:<key>"):
+#     accept when both fields match exactly.
+#   * Positional lineage-prefix matches (POS_LINEAGE_PREFIXES entries
+#     "<model>:<key>"): accept when model matches AND the lineage starts
+#     with "<key>_" — i.e. the downstream lineage is a tagged variant of
+#     the base policy at "<key>".
+#   * --filter: substring ANY-match on lineage → ACCEPT.
+# Returns 0 on accept, 1 on reject.
 _lineage_filter_matches() {
-    local lineage="$1"
-    # Negative list takes precedence.
+    local model="$1" lineage="$2"
     for ef in "${EXCLUDE_FILTERS[@]}"; do
         [[ "$lineage" == *"$ef"* ]] && return 1
+    done
+    for entry in "${POS_EXACT_LINEAGES[@]}"; do
+        local m_want="${entry%%:*}" l_want="${entry#*:}"
+        [[ "$m_want" == "$model" && "$l_want" == "$lineage" ]] && return 0
+    done
+    for entry in "${POS_LINEAGE_PREFIXES[@]}"; do
+        local m_want="${entry%%:*}" pref_want="${entry#*:}"
+        if [[ "$m_want" == "$model" ]]; then
+            [[ "$lineage" == "${pref_want}_"* ]] && return 0
+            # Allow exact match against the base too (an untagged lineage
+            # whose name IS the base-policy basename — rare but legal when
+            # run_tag is empty).
+            [[ "$lineage" == "$pref_want" ]] && return 0
+        fi
     done
     for f in "${FILTERS[@]}"; do
         [[ "$lineage" == *"$f"* ]] && return 0
@@ -631,7 +756,7 @@ for prefix in "${MODEL_PREFIXES[@]}"; do
     )
     for _ps_lineage in "${_ps_lineages[@]}"; do
         [[ -n "$_ps_lineage" ]] || continue
-        _lineage_filter_matches "$_ps_lineage" || continue
+        _lineage_filter_matches "$prefix" "$_ps_lineage" || continue
         mapfile -t _ps_round_dirs < <(
             { ls -d "$TRAINING_ROOT/${prefix}_${_ps_lineage}_dag"[0-9]*    2>/dev/null || true
               ls -d "$TRAINING_ROOT/${prefix}_${_ps_lineage}_ft_dag"[0-9]* 2>/dev/null || true
@@ -641,7 +766,12 @@ for prefix in "${MODEL_PREFIXES[@]}"; do
         # can scope to it via --rounds=0. dagger_progress.sh treats this dir
         # the same way (its "dag0" row), so the chart and the reeval set
         # agree on which checkpoints exist.
-        _ps_base_dir=$(_base_lineage_dir "$prefix" "$_ps_lineage")
+        # Precedence: a matching positional base-policy path wins over the
+        # naming-search fallback (the whole point of the positional-base UX
+        # is "eval THIS base + its descendants", so it must always be the
+        # dag0 when the user asked for it).
+        _ps_base_dir=$(_positional_base_dir_for_lineage "$prefix" "$_ps_lineage")
+        [[ -z "$_ps_base_dir" ]] && _ps_base_dir=$(_base_lineage_dir "$prefix" "$_ps_lineage")
         if [[ -n "$_ps_base_dir" ]]; then
             _ps_round_dirs=( "$_ps_base_dir" "${_ps_round_dirs[@]}" )
         fi
@@ -724,7 +854,7 @@ for prefix in "${MODEL_PREFIXES[@]}"; do
     )
     for lineage in "${lineages[@]}"; do
         [[ -n "$lineage" ]] || continue
-        _lineage_filter_matches "$lineage" || continue
+        _lineage_filter_matches "$prefix" "$lineage" || continue
         echo "── lineage: ${prefix}_${lineage}"
         n_lineages_evaluated=$((n_lineages_evaluated + 1))
 
@@ -739,7 +869,10 @@ for prefix in "${MODEL_PREFIXES[@]}"; do
         )
         # Prepend the base-policy dir as synthetic dag0 — same logic as the
         # pre-scan, kept in lockstep so the planned and actual work agree.
-        base_lineage_dir=$(_base_lineage_dir "$prefix" "$lineage")
+        # Positional-base-path wins over the naming-search fallback (see
+        # _positional_base_dir_for_lineage's docstring).
+        base_lineage_dir=$(_positional_base_dir_for_lineage "$prefix" "$lineage")
+        [[ -z "$base_lineage_dir" ]] && base_lineage_dir=$(_base_lineage_dir "$prefix" "$lineage")
         if [[ -n "$base_lineage_dir" ]]; then
             round_dirs=( "$base_lineage_dir" "${round_dirs[@]}" )
         fi
@@ -993,7 +1126,13 @@ PYEOF
 done
 
 if (( n_lineages_evaluated == 0 )); then
-    echo "No lineages matched filter='${FILTERS[*]}'. Nothing to do."
+    if (( ${#FILTERS[@]} > 0 && ${#POS_PATHS[@]} > 0 )); then
+        echo "No lineages matched --filter='${FILTERS[*]}' or positional paths (${POS_PATHS[*]}). Nothing to do."
+    elif (( ${#POS_PATHS[@]} > 0 )); then
+        echo "No lineages matched positional paths: ${POS_PATHS[*]}. Nothing to do."
+    else
+        echo "No lineages matched --filter='${FILTERS[*]}'. Nothing to do."
+    fi
     exit 0
 fi
 
@@ -1035,4 +1174,11 @@ if (( ${#SKIPPED_RUNS[@]} > 0 )); then
     echo
 fi
 
-echo "Run \`bash my_scripts/dagger_progress.sh --filter ${FILTERS[*]}\` — the chart prefers reeval results by default; rows sourced from a reeval are tagged with \`*<reeval_tag>\` in the eval_step column. Pass --no_prefer_reeval to force the legacy wandb-log scrape."
+# Suggest a follow-up dagger_progress.sh invocation using whichever filter
+# the user gave us — positional paths get echoed back verbatim (progress
+# also accepts them), --filter substrings pass through as-is.
+if (( ${#FILTERS[@]} > 0 )); then
+    echo "Run \`bash my_scripts/dagger_progress.sh --filter ${FILTERS[*]}\` — the chart prefers reeval results by default; rows sourced from a reeval are tagged with \`*<reeval_tag>\` in the eval_step column. Pass --no_prefer_reeval to force the legacy wandb-log scrape."
+else
+    echo "Chart these results with dagger_progress.sh (it prefers reeval results by default). Rows sourced from a reeval are tagged with \`*<reeval_tag>\` in the eval_step column; pass --no_prefer_reeval to force the legacy wandb-log scrape."
+fi

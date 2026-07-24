@@ -98,10 +98,17 @@ resolve_config() {
     fi
     if [[ -d "$input" ]]; then
         local candidate
+        # Order matters: lerobot-train derives checkpoint_path / pretrained_path
+        # from the config file's LOCATION, so we must resolve to the config that
+        # sits inside the checkpoint tree. The experiment root also holds a
+        # train_config.json (pre-training snapshot written by lerobot_train.py
+        # at run start) — it is NOT resumable (no model.safetensors next to it),
+        # so it's the LAST fallback, only hit when the input dir has no
+        # checkpoint-shaped layout.
         for candidate in \
-            "$input/train_config.json" \
+            "$input/checkpoints/last/pretrained_model/train_config.json" \
             "$input/pretrained_model/train_config.json" \
-            "$input/checkpoints/last/pretrained_model/train_config.json"
+            "$input/train_config.json"
         do
             if [[ -f "$candidate" ]]; then
                 echo "$candidate"
@@ -190,6 +197,14 @@ DRY_RUN=false
 # lerobot-train flag without this script having to enumerate them. Bare
 # positional args or unknown --flag (without =) still error so typos are caught.
 EXTRA_LEROBOT_TRAIN_ARGS=()
+# --exclude_gripper_from_state: mirror of train_sweep.sh's flag. Resolved
+# below (after we've inspected the checkpoint's train_config.json to know
+# env.num_dofs / env.state_dim) into a concrete
+# --observation_dim_slice='{"observation.state": [0,...,STATE_DIM-1] minus [NUM_DOFS]}'
+# forwarded to lerobot-train. Applied whether or not the checkpoint's
+# saved pipeline already carries a SelectObservationDimsProcessorStep
+# (factory's post-hoc block inserts/replaces uniformly).
+EXCLUDE_GRIPPER_FROM_STATE=false
 
 for arg in "$@"; do
     case "$arg" in
@@ -210,10 +225,39 @@ for arg in "$@"; do
         --job_name=*)               JOB_NAME="${arg#*=}" ;;
         --batch_size=*)             BATCH_SIZE="${arg#*=}" ;;
         --dry-run)                  DRY_RUN=true ;;
+        --exclude_gripper_from_state)         EXCLUDE_GRIPPER_FROM_STATE=true ;;
+        --exclude_gripper_from_state=*)       EXCLUDE_GRIPPER_FROM_STATE="${arg#*=}" ;;
         --*=*)                      EXTRA_LEROBOT_TRAIN_ARGS+=( "$arg" ) ;;
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
+
+# Resolve --exclude_gripper_from_state → --observation_dim_slice=... by
+# reading env.num_dofs + env.state_dim from the checkpoint's train_config
+# (so we know where the gripper sits in observation.state and how wide the
+# state vector is). Applied uniformly regardless of whether the resumed
+# checkpoint already trained with the flag — factory.py's post-hoc block
+# in make_pre_post_processors handles the insert/replace.
+case "$EXCLUDE_GRIPPER_FROM_STATE" in
+    true|false) ;;
+    *) echo "ERROR: --exclude_gripper_from_state must be true or false (got '$EXCLUDE_GRIPPER_FROM_STATE')." >&2; exit 1 ;;
+esac
+if [[ "$EXCLUDE_GRIPPER_FROM_STATE" == "true" ]]; then
+    _slice_json="$(python3 -c "
+import json, sys
+c = json.load(open('$CONFIG_PATH'))
+env = c.get('env') or {}
+num_dofs = env.get('num_dofs')
+state_dim = env.get('state_dim')
+if num_dofs is None or state_dim is None:
+    sys.exit(f'ERROR: env.num_dofs / env.state_dim missing from {sys.argv[0]}\\'s train_config; cannot resolve slice.')
+if state_dim <= num_dofs:
+    sys.exit(f'ERROR: --exclude_gripper_from_state=true requires state_dim ({state_dim}) > num_dofs ({num_dofs}); no gripper dim to drop.')
+keep = [i for i in range(state_dim) if i != num_dofs]
+print(json.dumps({'observation.state': keep}))
+")" || { echo "$_slice_json" >&2; exit 1; }
+    EXTRA_LEROBOT_TRAIN_ARGS+=( --observation_dim_slice="$_slice_json" )
+fi
 
 # Auto-follow: when --steps is set but --scheduler_decay_steps isn't, match it.
 # Reason: training schedule (cosine decay etc.) is parameterized by
@@ -292,7 +336,9 @@ except Exception:
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 CMD_ARGS=( lerobot-train --resume=true --config_path="$CONFIG_PATH" )
 [[ -n "$STEPS" ]]                  && CMD_ARGS+=( --steps="$STEPS" )
-[[ -n "$EVAL_FREQ" ]]              && CMD_ARGS+=( --eval_freq="$EVAL_FREQ" )
+# Upstream renamed --eval_freq → --env_eval_freq (env-eval cadence) and added
+# a separate --eval_steps for dataset-eval. We only care about env-eval.
+[[ -n "$EVAL_FREQ" ]]              && CMD_ARGS+=( --env_eval_freq="$EVAL_FREQ" )
 [[ -n "$SAVE_FREQ" ]]              && CMD_ARGS+=( --save_freq="$SAVE_FREQ" )
 if [[ -n "$SCHEDULER_DECAY_STEPS" ]]; then
     if [[ "$POLICY_SUPPORTS_DECAY_STEPS" == "true" ]]; then

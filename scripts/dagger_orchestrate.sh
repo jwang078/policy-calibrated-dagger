@@ -50,6 +50,19 @@ set -euo pipefail
 #   --initial_policy_path=PATH    Skip round-0 base training; use this checkpoint
 #                                 as the round-1 input policy.
 #   (unset)                       Run train_sweep.sh on the base dataset first.
+#   --retrain_round0              Force round-0 base training to run even when a
+#                                 usable checkpoint already exists (at
+#                                 --initial_policy_path or the derived base
+#                                 training dir). The existing training dir is
+#                                 rm -rf'd first (printed-only under --dry-run),
+#                                 then the standard train_sweep.sh round-0
+#                                 command runs fresh. Pair with --dry-run to
+#                                 just SEE the round-0 training command without
+#                                 deleting anything. Requires starting at round
+#                                 1 step 1; rejected in rerun-blends mode
+#                                 (reruns never own round 0). One-shot: drop the
+#                                 flag on subsequent resumes or the base is
+#                                 wiped and retrained again every invocation.
 #
 # Shared external SplatSim:
 #   --env_external_port=N         (default 6001)
@@ -571,6 +584,11 @@ FINETUNE_EXTRA_ARGS=""
 # startup (see mode-purity validation below).
 USE_WEIGHTED_SAMPLING=false
 DAGGER_DATA_FRACTION="0.3"
+# --exclude_gripper_from_state: forwarded verbatim to every downstream
+# training + intervention invocation. See train_sweep.sh's flag docstring
+# for the rationale (dropping the constant-0 gripper dim from
+# observation.state to avoid MIN_MAX-normalization NaN + wasted input slot).
+EXCLUDE_GRIPPER_FROM_STATE=false
 # --norm_mode controls how MultiSourceNormalizingDataset exposes stats to the
 # policy in weighted-sampling mode. See
 # src/lerobot/datasets/multi_source_normalizing_dataset.py docstring + the
@@ -633,6 +651,15 @@ START_ROUND=""    # empty → auto-detect
 # datasets + trained policies. Validated post-NUM_ROUNDS-derivation below.
 FROM_ROUND=""
 FORCE_RESTART=false
+# --retrain_round0: force the round-0 base training to run from scratch even
+# when a usable checkpoint already exists (either at --initial_policy_path or
+# at the derived BASE_TRAINING_DIR). The existing training dir is rm -rf'd
+# (echo-only under --dry-run) and the standard train_sweep.sh round-0 command
+# is issued fresh — train_sweep.sh never resumes (lerobot-train refuses a
+# pre-existing output dir), so removal is the only way to retrain in place.
+# Also the easiest way to RECOVER the round-0 training command: pass
+# --retrain_round0 --dry-run and read the printed train_sweep.sh invocation.
+RETRAIN_ROUND0=false
 # --resume: auto-confirm the resume prompt (default Y). Useful for batch /
 # sweep invocations that shouldn't block on stdin. When prior work is fully
 # complete (nothing to resume from), the orchestrator exits 0 instead of
@@ -711,6 +738,17 @@ MANAGE_SPLATSIM=true
 # is still injected — it controls a wrapper-side surface, not the sim.
 # Default false → byte-identical to today's interactive behavior.
 HEADLESS=false
+# Sync-physics-to-client: forward `--sync_physics_to_client` to
+# launch_nodes.py so the sim only steps physics in response to a client
+# command. Eliminates "sim races ahead while the policy is thinking"
+# jumps that appear as frame-forward glitches in recorded videos when
+# using slow policies (diffusion U-Net inference at chunk boundaries).
+# Default ON — the intervention-recording use case ALWAYS wants sim time
+# gated on client commands so recorded episodes don't contain artifacts
+# from wallclock-driven physics that raced ahead during inference.
+# Opt out with --no_sync_physics_to_client if you need the legacy async
+# behavior (e.g. reproducing an old dataset exactly).
+SYNC_PHYSICS=true
 SPLATSIM_ROOT="$HOME/code/SplatSim"
 SPLATSIM_ROBOT="sim_ur_pybullet_small_engine_new_interactive"
 # Empty by default — the sim launch script (`launch_nodes.py`) will fall
@@ -720,6 +758,18 @@ SPLATSIM_ROBOT="sim_ur_pybullet_small_engine_new_interactive"
 # hardcoded literal from this script keeps SplatSim as the single source
 # of truth for the env's canonical splat/URDF identifier.
 SPLATSIM_ROBOT_NAME=""
+# ── Env profile ──────────────────────────────────────────────────────────────
+# `--env_profile=NAME` sources my_scripts/env_profiles/NAME.sh, setting every
+# env-specific value (ENV_TASK, ROBOT_VARIANT/ROBOT_NAME, NUM_DOFS, CAMERAS,
+# EVAL_BENCHMARK_REPO_ID) in ONE place so swapping environments is a single flag,
+# forwarded verbatim through dagger_orchestrate_sweep.sh. The SAME profile is
+# passed to train_sweep.sh so training + eval + server-launch all agree.
+# Precedence: these built-in defaults < profile < explicit CLI flags. No
+# profile → the UR5 defaults below reproduce the historical hardcoded behavior.
+PROFILE_NAME=""
+ENV_TASK="upright_small_engine_new"   # lerobot --env.task + splatsim register_env key
+NUM_DOFS=6                             # arm joints; state/action dim = NUM_DOFS + 1 (gripper)
+CAMERAS="basewrist"                    # camera set; also the training-dir `_<cameras>` name suffix
 DRY_RUN=false
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -822,6 +872,31 @@ INTERVENTION_SUBSET_JSON=""
 # Capture original argv before parsing so the dagger config sidecar can log
 # the exact invocation that produced each per-round training dir.
 ORIG_ARGV=( "$@" )
+
+# Pre-scan for --env_profile so it sets env-specific defaults BEFORE the main
+# arg loop, which explicit flags then override (defaults < profile < flags).
+for arg in "$@"; do
+    case "$arg" in
+        --env_profile=*) PROFILE_NAME="${arg#*=}" ;;
+    esac
+done
+if [[ -n "$PROFILE_NAME" ]]; then
+    _PROFILE_FILE="$SCRIPT_DIR/env_profiles/${PROFILE_NAME}.sh"
+    if [[ ! -f "$_PROFILE_FILE" ]]; then
+        echo "ERROR: --env_profile='$PROFILE_NAME' not found: $_PROFILE_FILE" >&2
+        echo "Available profiles:" >&2
+        ls "$SCRIPT_DIR/env_profiles" 2>/dev/null | sed 's/\.sh$//;s/^/  /' >&2
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    source "$_PROFILE_FILE"
+    # Map the profile's env-neutral names onto this orchestrator's var names.
+    # (ENV_TASK / NUM_DOFS / CAMERAS / EVAL_BENCHMARK_REPO_ID share names.)
+    [[ -n "${ROBOT_VARIANT:-}" ]] && SPLATSIM_ROBOT="$ROBOT_VARIANT"
+    [[ -n "${ROBOT_NAME:-}" ]]    && SPLATSIM_ROBOT_NAME="$ROBOT_NAME"
+    echo "[dagger] Loaded env profile '$PROFILE_NAME' (task=$ENV_TASK, num_dofs=$NUM_DOFS, cameras=$CAMERAS, robot=$SPLATSIM_ROBOT)."
+fi
+
 for arg in "$@"; do
     case "$arg" in
         --base_short=*)               BASE_SHORT="${arg#*=}" ;;
@@ -831,7 +906,15 @@ for arg in "$@"; do
         --run_tag=*)                  RUN_TAG="${arg#*=}" ;;
         --dag_short_override=*)       DAG_SHORT_OVERRIDE="${arg#*=}" ;;
         --num_rounds=*)               NUM_ROUNDS="${arg#*=}" ;;
+        # Feature-selection overrides (win over the env profile). --cameras picks
+        # the IMAGE inputs (state=none | base | wrist | basewrist);
+        # --include_env_state_obs picks whether the policy consumes the ORACLE
+        # object-coord input (its WIDTH is a dataset property set by the profile).
+        # Combine them for vision-only / oracle-only / vision+oracle.
+        --cameras=*)                  CAMERAS="${arg#*=}" ;;
+        --include_env_state_obs=*)    INCLUDE_ENV_STATE_OBS="${arg#*=}" ;;
         --initial_policy_path=*)      INITIAL_POLICY_PATH="${arg#*=}" ;;
+        --retrain_round0)             RETRAIN_ROUND0=true ;;
         --env_external_port=*)        ENV_EXTERNAL_PORT="${arg#*=}" ;;
         --env_external_host=*)        ENV_EXTERNAL_HOST="${arg#*=}" ;;
         --intermediate_mode=*)        INTERMEDIATE_MODE="${arg#*=}" ;;
@@ -856,6 +939,8 @@ for arg in "$@"; do
         --finetune_extra_args=*)             FINETUNE_EXTRA_ARGS="${arg#*=}" ;;
         --use_weighted_sampling)             USE_WEIGHTED_SAMPLING=true ;;
         --dagger_data_fraction=*)            DAGGER_DATA_FRACTION="${arg#*=}" ;;
+        --exclude_gripper_from_state)        EXCLUDE_GRIPPER_FROM_STATE=true ;;
+        --exclude_gripper_from_state=*)      EXCLUDE_GRIPPER_FROM_STATE="${arg#*=}" ;;
         --norm_mode=*)                       NORM_MODE="${arg#*=}" ;;
         --dagger_skip_succeeded_in_prev_eval=*) DAGGER_SKIP_SUCCEEDED_IN_PREV_EVAL="${arg#*=}" ;;
         --rerun_blends_from=*)               RERUN_BLENDS_FROM="${arg#*=}" ;;
@@ -885,13 +970,89 @@ for arg in "$@"; do
         --manage_splatsim)            MANAGE_SPLATSIM=true ;;
         --no_manage_splatsim)         MANAGE_SPLATSIM=false ;;
         --headless)                   HEADLESS=true ;;
+        --sync_physics_to_client)     SYNC_PHYSICS=true ;;
+        --no_sync_physics_to_client)  SYNC_PHYSICS=false ;;
         --splatsim_root=*)            SPLATSIM_ROOT="${arg#*=}" ;;
         --splatsim_robot=*)           SPLATSIM_ROBOT="${arg#*=}" ;;
         --splatsim_robot_name=*)      SPLATSIM_ROBOT_NAME="${arg#*=}" ;;
+        --env_profile=*)              ;;  # consumed in the pre-scan above; no-op here
         --dry-run)                    DRY_RUN=true ;;
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
+
+# --retrain_round0 is a source-lineage operation: rerun lineages never train
+# round 0 (they branch off the SOURCE's policies), so honoring it here would
+# at best be a no-op and at worst rm -rf a base dir the source depends on.
+if [[ "$RETRAIN_ROUND0" == true && -n "$RERUN_BLENDS_FROM" ]]; then
+    echo "ERROR: --retrain_round0 is incompatible with --rerun_blends_from (rerun lineages never train round 0)." >&2
+    echo "  Retrain the base in the SOURCE lineage instead: either invoke dagger_orchestrate.sh" >&2
+    echo "  directly with the source's --run_tag + --retrain_round0, or pass --retrain_round0" >&2
+    echo "  to dagger_orchestrate_sweep.sh alongside --auto_create_source (the sweep forwards" >&2
+    echo "  it only to the source-create step)." >&2
+    exit 1
+fi
+
+# ACTION dim = joints + 1 gripper (always); STATE dim defaults to the same
+# (proprioception: joints + gripper). Oracle-info profiles instead expose object
+# coords via a SEPARATE observation.environment_state feature of width
+# ENV_STATE_DIM. All forwarded to lerobot eval as
+# --env.{num_dofs,state_dim,action_dim,env_state_dim}.
+ACTION_DIM=$((NUM_DOFS + 1))
+STATE_DIM="${STATE_DIM:-$ACTION_DIM}"
+ENV_STATE_DIM="${ENV_STATE_DIM:-0}"
+# Whether the policy CONSUMES the oracle env_state (its width is the profile's
+# ENV_STATE_DIM). Default: on for state-only, off otherwise. User override:
+# --include_env_state_obs=true|false. Mirrors train_sweep.sh so the round-0 name
+# check + intervention env agree with what train_sweep will build.
+if [ -z "${INCLUDE_ENV_STATE_OBS:-}" ]; then
+    if [ "$CAMERAS" = "state" ]; then INCLUDE_ENV_STATE_OBS=true; else INCLUDE_ENV_STATE_OBS=false; fi
+fi
+case "$INCLUDE_ENV_STATE_OBS" in
+    true|false) ;;
+    *) echo "ERROR: --include_env_state_obs must be true or false (got '$INCLUDE_ENV_STATE_OBS')." >&2; exit 1 ;;
+esac
+if [ "$INCLUDE_ENV_STATE_OBS" = "true" ]; then EFF_ENV_STATE_DIM="$ENV_STATE_DIM"; else EFF_ENV_STATE_DIM=0; fi
+
+# --exclude_gripper_from_state validation + reusable pass-through arrays.
+# When true, every downstream training/eval invocation gets the flag (or the
+# equivalent --observation_dim_slice=... for direct lerobot-eval calls).
+# Kept as arrays so the "off" case is a clean no-op empty expansion —
+# `"${EXCLUDE_GRIPPER_TRAIN_ARG[@]}"` disappears when the array is empty.
+case "$EXCLUDE_GRIPPER_FROM_STATE" in
+    true|false) ;;
+    *) echo "ERROR: --exclude_gripper_from_state must be true or false (got '$EXCLUDE_GRIPPER_FROM_STATE')." >&2; exit 1 ;;
+esac
+EXCLUDE_GRIPPER_TRAIN_ARG=()   # for train_sweep.sh / resume_training.sh (accept the flag)
+EXCLUDE_GRIPPER_EVAL_ARG=()    # for lerobot-eval (accepts the resolved slice JSON)
+if [[ "$EXCLUDE_GRIPPER_FROM_STATE" == "true" ]]; then
+    if (( STATE_DIM <= NUM_DOFS )); then
+        echo "ERROR: --exclude_gripper_from_state=true requires STATE_DIM (=$STATE_DIM) > NUM_DOFS (=$NUM_DOFS)," >&2
+        echo "       i.e. observation.state must actually contain a gripper dim to drop." >&2
+        exit 1
+    fi
+    EXCLUDE_GRIPPER_TRAIN_ARG=( --exclude_gripper_from_state=true )
+    # Build the slice JSON once for lerobot-eval: keep every index except
+    # NUM_DOFS (gripper slot). Same convention as train_sweep.sh + the
+    # resume_training.sh checkpoint-derived resolver.
+    _obs_slice_indices="$(python3 -c "
+import json, sys
+n, s = int(sys.argv[1]), int(sys.argv[2])
+print(json.dumps({'observation.state': [i for i in range(s) if i != n]}))
+" "$NUM_DOFS" "$STATE_DIM")"
+    EXCLUDE_GRIPPER_EVAL_ARG=( --observation_dim_slice="$_obs_slice_indices" )
+fi
+
+# Naming tag mirrored from train_sweep.sh via the shared dagger_naming.py
+# helper — one source of truth for (cameras, include_env_state, exclude_gripper)
+# → tag mapping. Both scripts calling the same function guarantees the
+# round-0 base-name check below can't drift from what train_sweep will produce.
+_INCLUDE_ENV_STATE_BOOL=false
+[ "${EFF_ENV_STATE_DIM}" -gt 0 ] && _INCLUDE_ENV_STATE_BOOL=true
+CAMERA_NAME_TAG="$(python3 "$SCRIPT_DIR/dagger_naming.py" camera_name_tag \
+    --cameras="$CAMERAS" \
+    --include_env_state="$_INCLUDE_ENV_STATE_BOOL" \
+    --exclude_gripper="$EXCLUDE_GRIPPER_FROM_STATE")"
 
 if [[ -z "$BASE_SHORT" ]]; then
     echo "ERROR: --base_short is required" >&2; exit 1
@@ -1482,10 +1643,55 @@ if [[ -n "$INITIAL_POLICY_PATH" ]]; then
     _stripped="${_stripped%/pretrained_model}"
     _stripped="${_stripped%/checkpoints/*}"
     BASE_POLICY_STEM="$(basename "$_stripped")"
+
+    # Pre-flight camera-tag consistency check: the base policy's on-disk
+    # basename ends in the camera_name_tag it was TRAINED with (state /
+    # stateng / baseos / etc.). If the user enables --exclude_gripper_from_state
+    # on top of a base whose tag lacks `ng` (or vice-versa), the round-1
+    # intervention step feeds sliced obs into a policy that expects full obs
+    # → SHAPE MISMATCH → crash. Fail loudly at startup with a helpful hint.
+    # Only checks BASE policy dirs (basename doesn't end in `_dag<N>`); passing
+    # a DAgger round dir as initial_policy_path is a legit-but-unusual flow
+    # where we can't cleanly extract a camera tag from the trailing lineage
+    # tokens, so we skip the check and trust the user.
+    if [[ ! "$BASE_POLICY_STEM" =~ _dag[0-9]+ ]]; then
+        _actual_camera_tag="${BASE_POLICY_STEM##*_}"
+        # `parse_camera_name_tag` errors (non-zero exit) on non-camera-tag
+        # trailing tokens — treat as "not a base policy dir, skip".
+        _actual_parsed="$(python3 "$SCRIPT_DIR/dagger_naming.py" parse_camera_name_tag "$_actual_camera_tag" 2>/dev/null || echo "")"
+        if [[ -n "$_actual_parsed" ]]; then
+            _actual_excl_grip="$(printf '%s' "$_actual_parsed" | python3 -c "import json,sys; print('true' if json.load(sys.stdin)['exclude_gripper'] else 'false')")"
+            if [[ "$_actual_excl_grip" != "$EXCLUDE_GRIPPER_FROM_STATE" ]]; then
+                echo "ERROR: --exclude_gripper_from_state=$EXCLUDE_GRIPPER_FROM_STATE but --initial_policy_path's basename says otherwise:" >&2
+                echo "         path: $INITIAL_POLICY_PATH" >&2
+                echo "     basename: $BASE_POLICY_STEM" >&2
+                echo "  camera tag: $_actual_camera_tag  (parsed: exclude_gripper=$_actual_excl_grip)" >&2
+                echo "" >&2
+                echo "  The base policy's model architecture was fixed at training time by the tag." >&2
+                echo "  Feeding sliced obs into a full-obs base (or vice-versa) crashes on shape mismatch." >&2
+                echo "  Fix by one of:" >&2
+                if [[ "$EXCLUDE_GRIPPER_FROM_STATE" == "true" ]]; then
+                    # Suggest the expected tag by re-deriving it.
+                    _INCLUDE_ENV_STATE_BOOL=false
+                    [ "${EFF_ENV_STATE_DIM}" -gt 0 ] && _INCLUDE_ENV_STATE_BOOL=true
+                    _expected_tag="$(python3 "$SCRIPT_DIR/dagger_naming.py" camera_name_tag \
+                        --cameras="$CAMERAS" --include_env_state="$_INCLUDE_ENV_STATE_BOOL" --exclude_gripper=true)"
+                    _base_root="${BASE_POLICY_STEM%_*}"
+                    echo "    * point --initial_policy_path at a base whose basename ends in \`_${_expected_tag}\`" >&2
+                    echo "      (e.g. \`${_base_root}_${_expected_tag}\`), OR" >&2
+                    echo "    * omit --initial_policy_path so round-0 trains a fresh sliced base." >&2
+                else
+                    echo "    * drop --exclude_gripper_from_state to keep the base's full-obs contract, OR" >&2
+                    echo "    * omit --initial_policy_path so round-0 trains a fresh sliced base." >&2
+                fi
+                exit 1
+            fi
+        fi
+    fi
 else
     # No initial policy: round 0 will train from scratch using train_sweep.sh,
     # which produces this name pattern. Round 1+ dag dirs hang off of it.
-    BASE_POLICY_STEM="${TRAIN_OUTPUT_MODEL_PREFIX}_${BASE_SHORT}_${TRAIN_OUTPUT_ACTION_TAG}_basewrist"
+    BASE_POLICY_STEM="${TRAIN_OUTPUT_MODEL_PREFIX}_${BASE_SHORT}_${TRAIN_OUTPUT_ACTION_TAG}_${CAMERA_NAME_TAG}"
 fi
 
 # Helper: combine BASE_POLICY_STEM + METHOD_TAG with a given (run_tag,
@@ -2099,9 +2305,16 @@ resolve_latest_checkpoint() {
     fi
     # 3. directly-nested pretrained_model
     candidate="$exp_dir/pretrained_model"
-    [[ -d "$candidate" && -f "$candidate/train_config.json" ]] && { echo "$candidate"; return 0; }
-    # 4. the exp_dir itself
-    [[ -d "$exp_dir" && -f "$exp_dir/train_config.json" ]] && { echo "$exp_dir"; return 0; }
+    [[ -d "$candidate" && -f "$candidate/train_config.json" && -f "$candidate/config.json" ]] \
+        && { echo "$candidate"; return 0; }
+    # 4. the exp_dir itself (flat "Hub-download" layout)
+    # `config.json` is the policy descriptor written by save_pretrained;
+    # requiring it here means a crashed training dir that saved only the
+    # pre-training `train_config.json` snapshot won't be misdiagnosed as a
+    # complete checkpoint — same reasoning as the tightened check in
+    # BASE_TRAINING_DIR resolution above.
+    [[ -d "$exp_dir" && -f "$exp_dir/train_config.json" && -f "$exp_dir/config.json" ]] \
+        && { echo "$exp_dir"; return 0; }
     echo "ERROR: cannot resolve a checkpoint dir from '$exp_dir'" >&2
     return 1
 }
@@ -2253,6 +2466,9 @@ start_sim() {
     # visualizer window, ~50% less GPU memory, faster startup. Mirrors what
     # start_filter_sim() does unconditionally for the collision-filter sim.
     [[ "$HEADLESS" == true ]] && launch_cmd+=( --headless )
+    # --sync_physics_to_client: sim only steps physics when the client
+    # sends a command. Prevents "sim races ahead during inference" jumps.
+    [[ "$SYNC_PHYSICS" == true ]] && launch_cmd+=( --sync_physics_to_client )
     echo "Starting SplatSim:"
     echo "  cwd:     $SPLATSIM_ROOT"
     echo "  cmd:     ${launch_cmd[*]}"
@@ -3255,6 +3471,12 @@ elif [[ "$ALL_ROUNDS_DONE" == true ]] && { ! do_final_scratch || [[ "$FINAL_SCRA
         MSG="all $NUM_ROUNDS dag rounds complete (no final-scratch requested with --final_mode=$FINAL_MODE)"
     fi
     echo "Pipeline detected: $MSG."
+    if [[ "$RETRAIN_ROUND0" == true ]]; then
+        echo "WARNING: --retrain_round0 ignored — the lineage is already fully complete, so the" >&2
+        echo "  orchestrator exits before round 0. Retraining the base under a complete lineage" >&2
+        echo "  would invalidate every downstream round anyway; use --force_restart to rebuild" >&2
+        echo "  the whole lineage, or delete the base training dir manually first." >&2
+    fi
     if [[ "$DRY_RUN" == true ]]; then
         echo "[DRY-RUN] Would exit without running anything."
         exit 0
@@ -3493,6 +3715,50 @@ print_gpu_state() {
     fi
 }
 
+# Guard: --initial_policy_path must match the output basename train_sweep.sh
+# derives from the other flags, otherwise round-0 training would write to a
+# DIFFERENT dir than the one the orchestrator keeps looking for. Used by both
+# the "path doesn't exist yet → train there" branch and --retrain_round0.
+assert_round0_dir_matches_derived_name() {
+    local _expected_basename="${TRAIN_OUTPUT_MODEL_PREFIX}_${BASE_SHORT}_${TRAIN_OUTPUT_ACTION_TAG}_${CAMERA_NAME_TAG}"
+    local _actual_basename
+    _actual_basename="$(basename "${1%/}")"
+    [[ "$_actual_basename" == "$_expected_basename" ]] && return 0
+    echo "ERROR: --initial_policy_path doesn't match the round-0 output name that" >&2
+    echo "  train_sweep.sh would produce from your other flags." >&2
+    echo "" >&2
+    echo "  --initial_policy_path basename : $_actual_basename" >&2
+    echo "  train_sweep.sh would write to  : $_expected_basename" >&2
+    echo "                                   (= <model_prefix>_<base_short>_<action_tag>_<cameras>)" >&2
+    echo "" >&2
+    echo "  Derived from:" >&2
+    echo "    --model=$MODEL             → model_prefix=$TRAIN_OUTPUT_MODEL_PREFIX" >&2
+    echo "    --base_short=$BASE_SHORT" >&2
+    echo "    --action_format=$ACTION_FORMAT → action_tag=$TRAIN_OUTPUT_ACTION_TAG" >&2
+    echo "    cameras=$CAMERAS (from --env_profile=$PROFILE_NAME / --cameras)" >&2
+    if [[ -z "$PROFILE_NAME" && "$CAMERAS" == "basewrist" ]]; then
+        echo "    ⚠ CAMERAS is the default 'basewrist' and no --env_profile is set." >&2
+        echo "      If you meant an oracle/state run, pass --env_profile=... as a" >&2
+        echo "      TOP-LEVEL flag (NOT inside --finetune_extra_args)." >&2
+    fi
+    echo "" >&2
+    echo "  Fix — either:" >&2
+    echo "    (a) point --initial_policy_path at the derived name:" >&2
+    echo "        --initial_policy_path=outputs/training/$_expected_basename" >&2
+    echo "    (b) or set --env_profile / --cameras / --base_short / --model /" >&2
+    echo "        --action_format so the derived name matches your existing path." >&2
+    exit 1
+}
+
+# --retrain_round0 only makes sense when the run actually enters round 0
+# (EFFECTIVE_START_ROUND == 1). Warn loudly instead of silently ignoring.
+if [[ "$RETRAIN_ROUND0" == true ]] && (( EFFECTIVE_START_ROUND > 1 )); then
+    echo "WARNING: --retrain_round0 ignored — resume detection starts at round $EFFECTIVE_START_ROUND," >&2
+    echo "  so the round-0 block is never entered. Retraining the base under an in-progress" >&2
+    echo "  lineage would invalidate the rounds already trained on top of it; use" >&2
+    echo "  --force_restart to rebuild the lineage from scratch if that's the intent." >&2
+fi
+
 # ── Round 0: train base if needed; always resolve CURRENT_POLICY for round 1 ──
 # Split into two responsibilities:
 #   (a) resolve CURRENT_POLICY for round 1's input (always needed when round 1
@@ -3502,7 +3768,14 @@ print_gpu_state() {
 #       from step 1 fresh AND no prior base training exists AND no
 #       --initial_policy_path was given).
 if (( EFFECTIVE_START_ROUND == 1 )); then
-    BASE_TRAINING_DIR="$LEROBOT_ROOT/outputs/training/${TRAIN_OUTPUT_MODEL_PREFIX}_${BASE_SHORT}_${TRAIN_OUTPUT_ACTION_TAG}_basewrist"
+    # Use CAMERA_NAME_TAG (matches train_sweep.sh's suffix rules — includes
+    # `os`/`ng` when env_state / gripper-exclusion apply) instead of raw
+    # CAMERAS. Otherwise the `training_exists` fallback would match the
+    # WRONG base — e.g. this sweep with --exclude_gripper_from_state expects
+    # `_stateng` but bare CAMERAS is `_state`, silently picking up a
+    # pre-existing full-obs base whose input dim doesn't match this sweep's
+    # sliced [3]-dim policy → shape mismatch at eval time.
+    BASE_TRAINING_DIR="$LEROBOT_ROOT/outputs/training/${TRAIN_OUTPUT_MODEL_PREFIX}_${BASE_SHORT}_${TRAIN_OUTPUT_ACTION_TAG}_${CAMERA_NAME_TAG}"
 
     # CURRENT_POLICY unset = "no valid base checkpoint yet — need to train".
     # We set it in the INITIAL_POLICY_PATH sub-branches below when the path
@@ -3518,7 +3791,17 @@ if (( EFFECTIVE_START_ROUND == 1 )); then
             CURRENT_POLICY="$INITIAL_POLICY_PATH/checkpoints/last/pretrained_model"
         elif [[ -d "$INITIAL_POLICY_PATH/pretrained_model" ]]; then
             CURRENT_POLICY="$INITIAL_POLICY_PATH/pretrained_model"
-        elif [[ -d "$INITIAL_POLICY_PATH" && -f "$INITIAL_POLICY_PATH/train_config.json" ]]; then
+        elif [[ -d "$INITIAL_POLICY_PATH" \
+                && -f "$INITIAL_POLICY_PATH/train_config.json" \
+                && -f "$INITIAL_POLICY_PATH/config.json" ]]; then
+            # Flat "Hub-download" layout: pretrained artifacts sit next to
+            # train_config.json in the dir root. `config.json` is the policy
+            # descriptor (written by save_pretrained); requiring it excludes
+            # crashed-training dirs that saved only train_config.json (the
+            # pre-training snapshot) but no actual checkpoint — otherwise
+            # lerobot-eval would load the dir and immediately fail with
+            # "config.json not found" (which happened before this check
+            # was tightened).
             CURRENT_POLICY="$INITIAL_POLICY_PATH"
         elif [[ -d "$INITIAL_POLICY_PATH" ]]; then
             # Path exists but its layout isn't one of the recognized
@@ -3532,52 +3815,60 @@ if (( EFFECTIVE_START_ROUND == 1 )); then
             # omitted, but with the user's chosen output dir instead of the
             # auto-derived one).
             #
-            # SAFETY CHECK: train_sweep.sh always writes to
-            #   outputs/training/<model_prefix>_<dataset_short>_<delta|abs>_basewrist
-            # (basewrist because the diffusion/pi05/act dispatch is hardcoded
-            # to the basewrist camera setup in train_sweep.sh:_run_all_jobs,
-            # which forces --policy.input_features to include BOTH
-            # observation.images.base_rgb and observation.images.wrist_rgb —
-            # so `_basewrist` in the derived name always faithfully reflects
-            # the model's actual input modality set). If the user's
-            # --initial_policy_path basename doesn't match that derived
-            # basename, train_sweep will write to the derived path and the
-            # orchestrator will keep looking for `INITIAL_POLICY_PATH` after
-            # training — infinite mismatch. Fail loudly up front with a
-            # concrete correction the user can paste.
-            _expected_basename="${TRAIN_OUTPUT_MODEL_PREFIX}_${BASE_SHORT}_${TRAIN_OUTPUT_ACTION_TAG}_basewrist"
-            _actual_basename="$(basename "$INITIAL_POLICY_PATH")"
-            if [[ "$_actual_basename" != "$_expected_basename" ]]; then
-                echo "ERROR: --initial_policy_path doesn't match the round-0 output name that" >&2
-                echo "  train_sweep.sh would produce from your other flags." >&2
-                echo "" >&2
-                echo "  --initial_policy_path basename : $_actual_basename" >&2
-                echo "  train_sweep.sh would write to  : $_expected_basename" >&2
-                echo "                                   (= <model_prefix>_<base_short>_<action_tag>_basewrist)" >&2
-                echo "" >&2
-                echo "  Derived from:" >&2
-                echo "    --model=$MODEL             → model_prefix=$TRAIN_OUTPUT_MODEL_PREFIX" >&2
-                echo "    --base_short=$BASE_SHORT" >&2
-                echo "    --action_format=$ACTION_FORMAT → action_tag=$TRAIN_OUTPUT_ACTION_TAG" >&2
-                echo "    (basewrist = hardcoded camera dispatch in train_sweep.sh — locks" >&2
-                echo "     policy.input_features to base_rgb + wrist_rgb + observation.state)" >&2
-                echo "" >&2
-                echo "  Fix — either:" >&2
-                echo "    (a) point --initial_policy_path at the derived name:" >&2
-                echo "        --initial_policy_path=outputs/training/$_expected_basename" >&2
-                echo "    (b) or adjust --base_short/--model/--action_format so the derived" >&2
-                echo "        name matches your existing path." >&2
-                exit 1
-            fi
+            # SAFETY CHECK: train_sweep.sh writes to
+            #   outputs/training/<model_prefix>_<dataset_short>_<delta|abs>_<cameras>
+            # where <cameras> is the camera-set suffix (basewrist / base / wrist /
+            # state) — driven by the env profile (--env_profile) or an explicit
+            # --cameras, held here in $CAMERAS. If the user's --initial_policy_path
+            # basename doesn't match that derived basename, train_sweep would write
+            # to the derived path and the orchestrator would keep looking for
+            # INITIAL_POLICY_PATH after training — infinite mismatch. Fail loudly
+            # up front with a concrete correction the user can paste.
+            #
+            # NOTE: if this shows an unexpected suffix (e.g. _basewrist when you
+            # meant _state), CAMERAS didn't get set — usually because
+            # --env_profile was passed inside --finetune_extra_args instead of as
+            # a TOP-LEVEL flag, so the profile pre-scan never ran.
+            assert_round0_dir_matches_derived_name "$INITIAL_POLICY_PATH"
             echo "Round 0: --initial_policy_path='$INITIAL_POLICY_PATH' does not exist on disk yet."
             echo "  → basename matches the train_sweep.sh derived name; will train base policy here."
             BASE_TRAINING_DIR="$INITIAL_POLICY_PATH"
         fi
     fi
 
+    # --retrain_round0: discard any checkpoint resolved above and force the
+    # train_sweep.sh branch below to run fresh. train_sweep.sh never resumes
+    # (lerobot-train refuses a pre-existing output dir), so the existing dir
+    # is removed first — via run_or_echo, so --dry-run only PRINTS the rm and
+    # the training command (useful to recover the round-0 command without
+    # touching disk).
+    if [[ "$RETRAIN_ROUND0" == true ]]; then
+        if (( EFFECTIVE_START_STEP != 1 )); then
+            echo "ERROR: --retrain_round0 requires starting at round 1, step 1, but resume" >&2
+            echo "  detection says step $EFFECTIVE_START_STEP — round 1 already has artifacts built on the" >&2
+            echo "  current base. Retraining the base now would silently invalidate them." >&2
+            echo "  Use --force_restart to rebuild the lineage, or clean round 1 first." >&2
+            exit 1
+        fi
+        if [[ -n "$INITIAL_POLICY_PATH" && -d "$INITIAL_POLICY_PATH" ]]; then
+            # Retrain happens AT the user's path — but only if it's where
+            # train_sweep.sh will actually write, else we'd delete one dir
+            # and train into another.
+            assert_round0_dir_matches_derived_name "$INITIAL_POLICY_PATH"
+            BASE_TRAINING_DIR="${INITIAL_POLICY_PATH%/}"
+        fi
+        CURRENT_POLICY=""
+        if [[ -d "$BASE_TRAINING_DIR" ]]; then
+            echo "Round 0: --retrain_round0 — removing existing base training dir before retraining:"
+            run_or_echo rm -rf "$BASE_TRAINING_DIR"
+        else
+            echo "Round 0: --retrain_round0 set; no existing base training dir at $BASE_TRAINING_DIR (nothing to remove)."
+        fi
+    fi
+
     if [[ -n "$CURRENT_POLICY" ]]; then
         echo "Round 0: skipped (using --initial_policy_path=$CURRENT_POLICY)."
-    elif training_exists "$BASE_TRAINING_DIR"; then
+    elif [[ "$RETRAIN_ROUND0" != true ]] && training_exists "$BASE_TRAINING_DIR"; then
         CURRENT_POLICY="$(resolve_latest_checkpoint "$BASE_TRAINING_DIR")"
         echo "Round 0: skipped (found existing base training at $BASE_TRAINING_DIR)."
         # Write a round-0 sidecar so this base is discoverable as
@@ -3589,6 +3880,44 @@ if (( EFFECTIVE_START_ROUND == 1 )); then
         # is what matters for reproducibility).
         write_dagger_config_sidecar 0 "$BASE_TRAINING_DIR/dagger/config.json" "$BASE_TRAINING_DIR"
     elif (( EFFECTIVE_START_STEP == 1 )); then
+        # Fail loud when BASE_TRAINING_DIR exists on disk but training_exists
+        # returned False (usually: checkpoint step < train_config.json's
+        # `steps` — an interrupted / partially-completed base). Restarting
+        # fresh from this branch is guaranteed to fail at train_sweep.sh's
+        # overwrite guard (lerobot-train refuses a pre-existing --output_dir),
+        # so we'd waste the user's setup and print a confusing FileExistsError.
+        # Give them the two real options up front instead.
+        if [[ -d "$BASE_TRAINING_DIR" ]]; then
+            _existing_last="$BASE_TRAINING_DIR/checkpoints/last/pretrained_model"
+            _cfg_target=""
+            _cfg_actual=""
+            if [[ -f "$_existing_last/train_config.json" ]]; then
+                _cfg_target="$(python3 -c "import json,sys; print(int(json.load(open(sys.argv[1])).get('steps', 0)))" "$_existing_last/train_config.json" 2>/dev/null || echo "")"
+            fi
+            if [[ -L "$BASE_TRAINING_DIR/checkpoints/last" ]]; then
+                _cfg_actual="$(readlink -f "$BASE_TRAINING_DIR/checkpoints/last" 2>/dev/null | xargs -r basename)"
+            fi
+            echo "ERROR: --initial_policy_path was not given AND no complete base training exists at:" >&2
+            echo "  $BASE_TRAINING_DIR" >&2
+            echo "  A directory IS on disk there, but training_exists() rejected it. Common cause:" >&2
+            echo "  the checkpoint's step count is below train_config.json's target 'steps' (i.e." >&2
+            echo "  training was cut off before finishing)." >&2
+            if [[ -n "$_cfg_target$_cfg_actual" ]]; then
+                echo "    target steps (train_config.json): ${_cfg_target:-<unreadable>}" >&2
+                echo "    actual  steps (checkpoints/last): ${_cfg_actual:-<unreadable>}" >&2
+            fi
+            echo "  Restarting Round 0 from scratch would fail at lerobot-train's overwrite guard." >&2
+            echo "" >&2
+            echo "  Pick ONE of:" >&2
+            echo "    (a) Use the existing partial checkpoint AS THE BASE (accept its current step count):" >&2
+            echo "        --initial_policy_path=$BASE_TRAINING_DIR" >&2
+            echo "    (b) Resume base training to the configured target first, then rerun this sweep:" >&2
+            echo "        bash my_scripts/resume_training.sh $BASE_TRAINING_DIR/checkpoints/last/pretrained_model \\" >&2
+            echo "            --steps=${_cfg_target:-<target-steps>}" >&2
+            echo "    (c) Nuke and retrain from zero:" >&2
+            echo "        rm -rf $BASE_TRAINING_DIR   # then rerun the sweep" >&2
+            exit 1
+        fi
         # Starting fresh and no prior base — train it now. The orchestrator
         # has not started its managed sim yet (start_sim happens inside the
         # per-round loop), so in managed mode we omit --env_external_port and
@@ -3638,12 +3967,15 @@ if (( EFFECTIVE_START_ROUND == 1 )); then
         run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
             --dataset_repo="$BASE_REPO" \
             --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
-            --cameras=basewrist \
+            --cameras="$CAMERAS" \
+            --include_env_state_obs="$INCLUDE_ENV_STATE_OBS" \
+            ${PROFILE_NAME:+--env_profile="$PROFILE_NAME"} \
             "${ROUND0_EVAL_ARGS[@]}" \
             "${ROUND0_EXTRA_ARGS[@]}" \
             "${ROUND0_ABS_ACTION_ARG[@]}" \
             "${TRAIN_EXT_PORT_SWEEP[@]}" \
             "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
+            "${EXCLUDE_GRIPPER_TRAIN_ARG[@]}" \
             "${OFFLINE_POLICY_ARG[@]}"
         if [[ "$DRY_RUN" != true ]]; then
             CURRENT_POLICY="$(resolve_latest_checkpoint "$BASE_TRAINING_DIR")"
@@ -3961,6 +4293,36 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
         if [[ -n "$RRT_SELF_COLLISION_SKIP_PAIRS" ]]; then
             RRT_CLEARANCE_ARGS+=( "--policy.shared_autonomy_config.rrt_self_collision_skip_pairs=$RRT_SELF_COLLISION_SKIP_PAIRS" )
         fi
+        # Auto-pick --env.image_resize_modes from $MODEL. The EnvConfig
+        # default is [letterbox] (good for pretrained VLAs), but diffusion
+        # policies want [stretch] — nothing else in the pipeline auto-picks
+        # based on policy type, so a --model=diff run silently uses
+        # letterbox and every downstream teleop_recording call expects the
+        # letterbox-suffixed image keys. User's own --env.image_resize_modes
+        # in $INTERVENTION_EXTRA_ARGS WINS: skip the auto-emit when they've
+        # already set one (grep test) AND — as belt+suspenders — emit
+        # BEFORE $INTERVENTION_EXTRA_ARGS so draccus's last-flag-wins rule
+        # would still let their override through even if the grep missed.
+        AUTO_RESIZE_MODE_ARG=()
+        if ! grep -q -- '--env.image_resize_modes' <<< "$INTERVENTION_EXTRA_ARGS"; then
+            case "$MODEL" in
+                diff)  AUTO_RESIZE_MODE_ARG=( "--env.image_resize_modes=[stretch]" ) ;;
+                pi)    AUTO_RESIZE_MODE_ARG=( "--env.image_resize_modes=[letterbox]" ) ;;
+                # act / anything else: leave the EnvConfig default alone.
+            esac
+        fi
+        # Auto-set --env.camera_names=[] when this is a state-only run.
+        # --cameras=state means the policy consumes only observation.state
+        # (+ environment_state), no image features. The sim server is
+        # launched without any explicit camera args and typically doesn't
+        # publish wrist_rgb / base_rgb; leaving env.camera_names at its
+        # default ['base_rgb', 'wrist_rgb'] makes teleop_recording expect
+        # image keys the sim never sends → RuntimeError at frame-build.
+        # Same user-priority rule as image_resize_modes.
+        AUTO_CAMERAS_ARG=()
+        if [ "$CAMERAS" = "state" ] && ! grep -q -- '--env.camera_names' <<< "$INTERVENTION_EXTRA_ARGS"; then
+            AUTO_CAMERAS_ARG=( "--env.camera_names=[]" )
+        fi
         # Persist the lerobot-eval output (the lerobot PROCESS — distinct from
         # the sim subprocess's splatsim_<ts>.log) to a per-recording file right
         # next to it, so the SA-wrapper / RRT drift + teleport-landing
@@ -3982,7 +4344,11 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             --policy.path="$CURRENT_POLICY" \
             --policy.shared_autonomy_config.enabled=true \
             --env.type=splatsim \
-            --env.task=upright_small_engine_new \
+            --env.task="$ENV_TASK" \
+            --env.num_dofs="$NUM_DOFS" \
+            --env.state_dim="$STATE_DIM" \
+            --env.action_dim="$ACTION_DIM" \
+            --env.env_state_dim="$EFF_ENV_STATE_DIM" \
             --env.fps=30 \
             --env.external_port="$ENV_EXTERNAL_PORT" \
             --env.external_host="$ENV_EXTERNAL_HOST" \
@@ -4001,6 +4367,9 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             "${OFFLINE_DATASET_ARG[@]}" \
             "${HEADLESS_EVAL_ARG[@]}" \
             "${RRT_CLEARANCE_ARGS[@]}" \
+            "${EXCLUDE_GRIPPER_EVAL_ARG[@]}" \
+            "${AUTO_RESIZE_MODE_ARG[@]}" \
+            "${AUTO_CAMERAS_ARG[@]}" \
             $INTERVENTION_EXTRA_ARGS 2>&1 | tee "$EVAL_LOG"
 
         # Stats on the intervention dataset (relative-action sidecar).
@@ -4064,7 +4433,8 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
                     --episode_index="all" \
                     --env_external_port="$ENV_EXTERNAL_PORT" \
                     --env_external_host="$ENV_EXTERNAL_HOST" \
-                    --env_task="upright_small_engine_new" \
+                    --env_task="$ENV_TASK" \
+                    --num_dofs="$NUM_DOFS" \
                     --eval_benchmark_repo_id="$EVAL_BENCHMARK_REPO_ID" \
                     --blend_strategy="denoise" \
                     --guidance_repr="absolute_pos" \
@@ -4107,8 +4477,9 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
                     run_or_echo python "$SCRIPT_DIR/filter_blend_collisions.py" \
                         --source_repo_id="$BLEND_REPO" \
                         --target_repo_id="$NOCOLL_REPO" \
-                        --env_task="upright_small_engine_new" \
+                        --env_task="$ENV_TASK" \
                         --env_robot_name="$SPLATSIM_ROBOT_NAME" \
+                        --num_dofs="$NUM_DOFS" \
                         --env_external_port="$FILTER_COLLISION_ENV_PORT_RESOLVED" \
                         --env_external_host="$ENV_EXTERNAL_HOST" \
                         --env_eval_benchmark_repo_id="$EVAL_BENCHMARK_REPO_ID" \
@@ -4361,12 +4732,15 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
                 --dataset_repo="$MERGED_REPO" \
                 --run_name="$SCRATCH_RUN_NAME" \
                 --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
-                --cameras=basewrist \
+                --cameras="$CAMERAS" \
+                --include_env_state_obs="$INCLUDE_ENV_STATE_OBS" \
+                ${PROFILE_NAME:+--env_profile="$PROFILE_NAME"} \
                 --eval_benchmark_repo_id="$EVAL_BENCHMARK_REPO_ID" \
                 "${_PER_ROUND_SCRATCH_EXTRA_ARGS[@]}" \
                 "${ABS_ACTION_ARG[@]}" \
                 "${TRAIN_EXT_PORT_SWEEP[@]}" \
                 "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
+                "${EXCLUDE_GRIPPER_TRAIN_ARG[@]}" \
                 "${OFFLINE_POLICY_ARG[@]}"
         else
             # Finetune mode. Two important details:
@@ -4697,6 +5071,10 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                     --dataset.stats_paths="$DAG_CFG_WEIGHTED_STATS_PATHS_JSON"
                     --dataset.norm_mode="$NORM_MODE"
                     --dataset.stats_path=
+                    # Explicit opt-in to the fork-only WeightedRandomSampler
+                    # path — upstream users setting sample_weights alone
+                    # would otherwise get upstream's EpisodeAwareSampler.
+                    --dataset.use_weighted_sampling=true
                 )
                 echo "Weighted sampling: ${#W_REPO_IDS[@]} sub-datasets (1 base + $_n_dag DAgger); cap=${DAGGER_DATA_FRACTION} (per-frame proportional below cap; see [weighted-weights] diagnostic above); weights=${W_WEIGHTS[*]}; norm_mode=$NORM_MODE"
             elif [[ "$ACTION_FORMAT" == "rel" ]]; then
@@ -4789,6 +5167,7 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                 "${FT_SCHEDULER_NAME_ARG[@]}" \
                 "${FT_EVAL_BENCHMARK_ARG[@]}" \
                 "${HEADLESS_TRAIN_ARGS[@]}" \
+                "${EXCLUDE_GRIPPER_TRAIN_ARG[@]}" \
                 "${OFFLINE_POLICY_ARG[@]}" \
                 $FINETUNE_EXTRA_ARGS \
                 --eval.n_episodes="$EVAL_N_EPISODES"
@@ -4862,6 +5241,7 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                     --dataset.stats_paths="$NC_STATS_PATHS_JSON" \
                     --dataset.norm_mode="$NORM_MODE" \
                     --dataset.stats_path= \
+                    --dataset.use_weighted_sampling=true \
                     --policy.repo_id="$NOCOLL_RUN_NAME" \
                     --output_dir="$NOCOLL_TRAIN_OUTPUT_DIR" \
                     --job_name="$NOCOLL_RUN_NAME" \
@@ -4874,6 +5254,7 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                     "${FT_SCHEDULER_NAME_ARG[@]}" \
                     "${FT_EVAL_BENCHMARK_ARG[@]}" \
                     "${HEADLESS_TRAIN_ARGS[@]}" \
+                    "${EXCLUDE_GRIPPER_TRAIN_ARG[@]}" \
                     "${OFFLINE_POLICY_ARG[@]}" \
                     $FINETUNE_EXTRA_ARGS \
                     --eval.n_episodes="$EVAL_N_EPISODES"
@@ -5099,10 +5480,13 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
             run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
                 --run_name="$FINAL_SCRATCH_RUN_NAME" \
                 --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
-                --cameras=basewrist \
+                --cameras="$CAMERAS" \
+                --include_env_state_obs="$INCLUDE_ENV_STATE_OBS" \
+                ${PROFILE_NAME:+--env_profile="$PROFILE_NAME"} \
                 "${ABS_ACTION_ARG[@]}" \
                 "${TRAIN_EXT_PORT_SWEEP[@]}" \
                 "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
+                "${EXCLUDE_GRIPPER_TRAIN_ARG[@]}" \
                 "${OFFLINE_POLICY_ARG[@]}" \
                 "${MULTI_DATASET_ARGS[@]}" \
                 "${FS_EVAL_ARGS[@]}"
@@ -5111,10 +5495,13 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
                 --dataset_repo="$LAST_MERGED_REPO" \
                 --run_name="$FINAL_SCRATCH_RUN_NAME" \
                 --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
-                --cameras=basewrist \
+                --cameras="$CAMERAS" \
+                --include_env_state_obs="$INCLUDE_ENV_STATE_OBS" \
+                ${PROFILE_NAME:+--env_profile="$PROFILE_NAME"} \
                 "${ABS_ACTION_ARG[@]}" \
                 "${TRAIN_EXT_PORT_SWEEP[@]}" \
                 "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
+                "${EXCLUDE_GRIPPER_TRAIN_ARG[@]}" \
                 "${OFFLINE_POLICY_ARG[@]}" \
                 "${FS_EVAL_ARGS[@]}"
         fi

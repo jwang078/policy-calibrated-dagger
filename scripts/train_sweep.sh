@@ -26,19 +26,28 @@ set -euo pipefail
 #                           is used, and which chunk size the relative-action
 #                           stats sidecar is keyed off (pi05/pi0 → 50, diffusion
 #                           → 8, act → none — uses absolute actions).
-#   --cameras=NAME          Which camera set to train against:
-#                           "basewrist" (default) | "base" | "wrist".
-#                           basewrist → policy.input_features includes BOTH
-#                             observation.images.base_rgb AND
-#                             observation.images.wrist_rgb + observation.state.
-#                           base / wrist → only that camera + observation.state.
-#                           Also appears as the `_<cameras>` suffix on the
-#                           auto-derived run_name (training-dir basename), so
-#                           swapping this changes the output path. Downstream
-#                           callers that construct expected names (e.g.
-#                           dagger_orchestrate.sh's round-0 safety check) must
-#                           either mirror the default or thread this value
-#                           through.
+#   --cameras=NAME          Which IMAGE inputs to train against:
+#                           "basewrist" (default) | "base" | "wrist" | "state".
+#                           basewrist → both base_rgb + wrist_rgb; base / wrist →
+#                             that one camera; state → NO image (oracle/state-only).
+#                           observation.state (joints+gripper) is ALWAYS included.
+#                           Appears as the `_<cameras>` suffix on the auto-derived
+#                           run_name (with "os" appended when env_state is also
+#                           consumed, e.g. _baseos), so swapping it changes the
+#                           output path. Downstream callers that construct expected
+#                           names (dagger_orchestrate.sh's round-0 check) mirror
+#                           this derivation.
+#   --include_env_state_obs=BOOL
+#                           Whether the policy consumes the ORACLE input
+#                           observation.environment_state (object coords). Its
+#                           WIDTH is a dataset property from the env profile
+#                           (ENV_STATE_DIM); this only toggles consumption.
+#                           Default: true for --cameras=state (needs it), else
+#                           false. Combine with --cameras for the feature modes:
+#                             oracle-only   = --cameras=state
+#                             vision-only   = --cameras=base
+#                             vision+oracle = --cameras=base --include_env_state_obs=true
+#                           One dual-purpose dataset serves all of them.
 #   --env_external_port=N   Connect lerobot-train's inline eval to an external
 #                           SplatSim ZMQ server at this port (e.g. 6001) instead
 #                           of spawning a new one. Required when training has to
@@ -54,6 +63,17 @@ set -euo pipefail
 #       --ratios="0.2 0.4 0.6 0.8 1.0"
 
 # ── USER CONFIG (defaults) ────────────────────────────────────────────────────
+# Env profile: `--env_profile=NAME` sources my_scripts/env_profiles/NAME.sh,
+# which sets the env-specific values below (ENV_TASK, ROBOT_NAME, NUM_DOFS,
+# CAMERAS, DATASET_REPO, EVAL_BENCHMARK_REPO_ID) in ONE place so swapping
+# environments (small_engine <-> planar <-> ...) is a single flag. Precedence:
+# these built-in defaults < profile < explicit CLI flags. No profile → these
+# UR5 defaults reproduce the historical hardcoded behavior.
+PROFILE_NAME=""
+# Env-specific (overridable via profile or explicit flags):
+ENV_TASK="upright_small_engine_new"   # lerobot --env.task + splatsim register_env key
+ROBOT_NAME=""                          # "" = lerobot SplatsimEnv default; profile sets for non-UR5 arms
+NUM_DOFS=6                             # arm joints; state/action dim = NUM_DOFS + 1 (gripper)
 DATASET_REPO="JennyWWW/splatsim_approach_lever_11_50failsrrtpi05"
 USE_RELATIVE_ACTIONS=true
 RATIO_SWEEP=false
@@ -136,11 +156,43 @@ EVAL_BENCHMARK_REPO_ID=""
 # final-scratch training so the user defines eval knobs ONCE at the sweep
 # level, not once per training path).
 EXTRA_ARGS_STR=""
+# --exclude_gripper_from_state: drop the gripper dim (last dim of
+# observation.state) from what the policy consumes. The dataset still
+# records the full [NUM_DOFS + 1] state — only the runtime policy input
+# view is sliced. Backed by TrainPipelineConfig.observation_dim_slice
+# (see src/lerobot/configs/train.py). Reason: constant/unused dims have
+# min == max in dataset stats, poisoning MIN_MAX normalization AND
+# wasting an input slot; e.g. the always-0 gripper in the planar env.
+# Only active when observation.state actually contains a trailing gripper
+# dim (STATE_DIM > NUM_DOFS_ARM).
+EXCLUDE_GRIPPER_FROM_STATE=false
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Pre-scan for --env_profile BEFORE the main arg loop so the profile can set
+# env-specific defaults that explicit CLI flags (parsed below) then override.
+# Precedence: built-in defaults (above) < profile < explicit flags.
+for arg in "$@"; do
+    case "$arg" in
+        --env_profile=*) PROFILE_NAME="${arg#*=}" ;;
+    esac
+done
+if [[ -n "$PROFILE_NAME" ]]; then
+    _PROFILE_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env_profiles/${PROFILE_NAME}.sh"
+    if [[ ! -f "$_PROFILE_FILE" ]]; then
+        echo "ERROR: --env_profile='$PROFILE_NAME' not found: $_PROFILE_FILE" >&2
+        echo "Available profiles:" >&2
+        ls "$(dirname "$_PROFILE_FILE")" 2>/dev/null | sed 's/\.sh$//;s/^/  /' >&2
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    source "$_PROFILE_FILE"
+    echo "Loaded env profile '$PROFILE_NAME' (task=$ENV_TASK, num_dofs=$NUM_DOFS, cameras=$CAMERAS)."
+fi
 
 for arg in "$@"; do
     case "$arg" in
         --dry-run)              DRY_RUN=true ;;
+        --env_profile=*)        ;;  # consumed in the pre-scan above; no-op here
         --ratio_sweep)          RATIO_SWEEP=true ;;
         --no_relative)          USE_RELATIVE_ACTIONS=false ;;
         --headless)             HEADLESS=true ;;
@@ -150,12 +202,15 @@ for arg in "$@"; do
         --policy.push_to_hub=*) POLICY_PUSH_TO_HUB="${arg#*=}" ;;
         --run_name=*)           RUN_NAME_OVERRIDE="${arg#*=}" ;;
         --model=*)              MODEL="${arg#*=}" ;;
-        --cameras=*)            CAMERAS="${arg#*=}" ;;
+        --cameras=*)                CAMERAS="${arg#*=}" ;;
+        --include_env_state_obs=*)  INCLUDE_ENV_STATE_OBS="${arg#*=}" ;;
         --eval_n_episodes=*)    EVAL_N_EPISODES="${arg#*=}" ;;
         --eval_benchmark_subset=*) EVAL_BENCHMARK_SUBSET="${arg#*=}" ;;
         --eval_benchmark_repo_id=*) EVAL_BENCHMARK_REPO_ID="${arg#*=}" ;;
         --eval_benchmark=*)         EVAL_BENCHMARK_REPO_ID="${arg#*=}" ;;  # short alias
         --extra_args=*)             EXTRA_ARGS_STR="${arg#*=}" ;;
+        --exclude_gripper_from_state)         EXCLUDE_GRIPPER_FROM_STATE=true ;;
+        --exclude_gripper_from_state=*)       EXCLUDE_GRIPPER_FROM_STATE="${arg#*=}" ;;
         --multi_dataset_repo_ids=*)      MULTI_DATASET_REPO_IDS="${arg#*=}" ;;
         --multi_dataset_sample_weights=*) MULTI_DATASET_SAMPLE_WEIGHTS="${arg#*=}" ;;
         --multi_dataset_stats_paths=*)   MULTI_DATASET_STATS_PATHS="${arg#*=}" ;;
@@ -164,14 +219,102 @@ for arg in "$@"; do
     esac
 done
 
+# ACTION dim = arm joints + 1 gripper (always). STATE dim defaults to the same,
+# but an oracle-info profile overrides STATE_DIM (state = joints+gripper + object
+# coords, wider than the action). Both flow to --policy.input_features (state
+# shape) + --env.{state,action}_dim so env/policy/dataset agree on widths.
+ACTION_DIM=$((NUM_DOFS + 1))
+STATE_DIM="${STATE_DIM:-$ACTION_DIM}"
+# Oracle env_state (observation.environment_state, FeatureType.ENV): privileged
+# world state (object coords). The WIDTH is a fixed property of the dataset/env —
+# the env profile provides it via ENV_STATE_DIM (2 planar-reach, 6 planar-2obst,
+# 15 small-engine, …) — NOT something the user sets per run. The user only toggles
+# whether the POLICY consumes it, via --include_env_state_obs=true|false.
+ENV_STATE_DIM="${ENV_STATE_DIM:-0}"
+# Default: consume env_state for a state-only run (no image → it needs it),
+# otherwise off (pure vision). Profile or --include_env_state_obs overrides.
+if [ -z "${INCLUDE_ENV_STATE_OBS:-}" ]; then
+    if [ "$CAMERAS" = "state" ]; then INCLUDE_ENV_STATE_OBS=true; else INCLUDE_ENV_STATE_OBS=false; fi
+fi
+case "$INCLUDE_ENV_STATE_OBS" in
+    true|false) ;;
+    *) echo "ERROR: --include_env_state_obs must be true or false (got '$INCLUDE_ENV_STATE_OBS')." >&2; exit 1 ;;
+esac
+if [ "$INCLUDE_ENV_STATE_OBS" = "true" ] && [ "${ENV_STATE_DIM}" -le 0 ]; then
+    echo "ERROR: --include_env_state_obs=true but the env profile records no oracle" >&2
+    echo "       env_state (ENV_STATE_DIM=0). Use a profile whose dataset stores object" >&2
+    echo "       coords, or set --include_env_state_obs=false." >&2
+    exit 1
+fi
+# EFFECTIVE width fed to the policy/env: the recorded width when consumed, else 0.
+if [ "$INCLUDE_ENV_STATE_OBS" = "true" ]; then EFF_ENV_STATE_DIM="$ENV_STATE_DIM"; else EFF_ENV_STATE_DIM=0; fi
+
+# --exclude_gripper_from_state validation + derivation. When true, drop the
+# gripper dim from observation.state as the policy input (dataset unchanged).
+# The gripper joint always sits at index NUM_DOFS in observation.state (arm
+# joints occupy [0..NUM_DOFS-1]; gripper at NUM_DOFS; any oracle coords a
+# legacy profile pushed into observation.state at NUM_DOFS+1..STATE_DIM-1).
+# So we build a "keep all indices except NUM_DOFS" list and reduce the
+# declared state shape by 1.
+case "$EXCLUDE_GRIPPER_FROM_STATE" in
+    true|false) ;;
+    *) echo "ERROR: --exclude_gripper_from_state must be true or false (got '$EXCLUDE_GRIPPER_FROM_STATE')." >&2; exit 1 ;;
+esac
+OBSERVATION_DIM_SLICE_JSON=""
+EFF_POLICY_STATE_DIM="$STATE_DIM"
+if [ "$EXCLUDE_GRIPPER_FROM_STATE" = "true" ]; then
+    if [ "$STATE_DIM" -le "$NUM_DOFS" ]; then
+        echo "ERROR: --exclude_gripper_from_state=true requires STATE_DIM (=$STATE_DIM) > NUM_DOFS (=$NUM_DOFS)," >&2
+        echo "       i.e. observation.state must actually contain a gripper dim to drop." >&2
+        exit 1
+    fi
+    # Emit [0,1,...,NUM_DOFS-1, NUM_DOFS+1, ..., STATE_DIM-1] — every index
+    # except NUM_DOFS (the gripper joint slot).
+    _keep_indices=""
+    _first=1
+    for _i in $(seq 0 $((STATE_DIM - 1))); do
+        [ "$_i" = "$NUM_DOFS" ] && continue
+        if [ "$_first" = "1" ]; then _keep_indices="$_i"; _first=0
+        else _keep_indices="$_keep_indices,$_i"; fi
+    done
+    OBSERVATION_DIM_SLICE_JSON="{\"observation.state\": [${_keep_indices}]}"
+    EFF_POLICY_STATE_DIM=$((STATE_DIM - 1))
+fi
+
+# Reusable --policy.input_features fragment: the proprioceptive state, plus the
+# environment_state input when consumed. The diffusion policy requires an image OR
+# environment_state, so a state-only run must consume it (guarded below).
+# NOTE: use EFF_POLICY_STATE_DIM (not STATE_DIM) so the declared shape matches
+# what the slice step will actually emit — matches TrainPipelineConfig.validate()'s
+# post-slice shrink so we don't fight it via `last-wins` draccus semantics.
+STATE_FEATURE_JSON="\"observation.state\": {\"type\": \"STATE\", \"shape\": [${EFF_POLICY_STATE_DIM}]}"
+if [ "${EFF_ENV_STATE_DIM}" -gt 0 ]; then
+    STATE_FEATURE_JSON="${STATE_FEATURE_JSON}, \"observation.environment_state\": {\"type\": \"ENV\", \"shape\": [${EFF_ENV_STATE_DIM}]}"
+fi
+
+# Naming tag = the `_<cameras>` run_name suffix. Delegated to dagger_naming.py
+# (see camera_name_tag()) so this string is derived in ONE place and the
+# orchestrator's pre-flight consistency check (parse_camera_name_tag) always
+# agrees with what train_sweep.sh actually emits. The rules encoded there:
+#   * base tag       = cameras verbatim (state / base / wrist / basewrist).
+#   * +os suffix     iff cameras != "state" AND env_state is consumed.
+#   * +ng suffix     iff --exclude_gripper_from_state was set.
+_TRAIN_SWEEP_SH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_INCLUDE_ENV_STATE_BOOL=false
+[ "${EFF_ENV_STATE_DIM}" -gt 0 ] && _INCLUDE_ENV_STATE_BOOL=true
+CAMERA_NAME_TAG="$(python3 "$_TRAIN_SWEEP_SH_DIR/dagger_naming.py" camera_name_tag \
+    --cameras="$CAMERAS" \
+    --include_env_state="$_INCLUDE_ENV_STATE_BOOL" \
+    --exclude_gripper="$EXCLUDE_GRIPPER_FROM_STATE")"
+
 # --cameras validation. Only three variants are wired through
 # `set_camera_args`; a bad value would silently produce an empty
 # CAMERA_ARGS and lerobot-train would then complain about missing input
 # features far downstream. Fail loudly here.
 case "$CAMERAS" in
-    basewrist|base|wrist) ;;
+    basewrist|base|wrist|state) ;;
     *)
-        echo "ERROR: --cameras='$CAMERAS' is not valid. Expected one of: basewrist, base, wrist." >&2
+        echo "ERROR: --cameras='$CAMERAS' is not valid. Expected one of: basewrist, base, wrist, state." >&2
         exit 1
         ;;
 esac
@@ -359,14 +502,25 @@ SHARED_ARGS=(
     --wandb.enable=true
     --policy.device=cuda
     --env.type=splatsim
-    --env.task=upright_small_engine_new
+    --env.task="$ENV_TASK"
     --env.fps=30
+    # Arm-size passthrough so the eval env, policy, and dataset agree on vector
+    # widths (planar arm != UR5). Derived from NUM_DOFS via the env profile.
+    --env.num_dofs="$NUM_DOFS"
+    --env.state_dim="$STATE_DIM"
+    --env.action_dim="$ACTION_DIM"
+    --env.env_state_dim="$EFF_ENV_STATE_DIM"
     --env.eval_benchmark_repo_id="$_EVAL_BENCHMARK_REPO_ID_ARG"
     --eval.n_episodes="$_EVAL_N_EPISODES_ARG"
     --eval.batch_size=1
     --eval.use_async_envs=false
     --dataset.image_transforms.enable=true
 )
+# Only pass --env.robot_name when the profile set it (empty = lerobot
+# SplatsimEnv's own default, preserving historical UR5 behavior).
+if [[ -n "${ROBOT_NAME:-}" ]]; then
+    SHARED_ARGS+=( --env.robot_name="$ROBOT_NAME" )
+fi
 # Conditional: eval_benchmark_subset is only meaningful when the caller
 # passes it. Adding an empty string would confuse draccus, so keep it out
 # of SHARED_ARGS when unset.
@@ -403,7 +557,7 @@ DIFFUSION_ARGS=(
     --policy.type=diffusion
     --steps=75000
     --batch_size=32
-    --eval_freq=25000
+    --env_eval_freq=25000
     --save_freq=25000
     --policy.vision_backbone=resnet18
     --policy.pretrained_backbone_weights=null
@@ -420,8 +574,8 @@ PI05_ARGS=(
     --steps=6000
     # --steps=3000
     --batch_size=16
-    --eval_freq=2000
-    # --eval_freq=1000
+    --env_eval_freq=2000
+    # --env_eval_freq=1000
     --save_freq=2000
     # --save_freq=1000
     --policy.scheduler_decay_steps=6000
@@ -444,7 +598,7 @@ ACT_ARGS=(
     --policy.type=act
     --steps=50000
     --batch_size=8
-    --eval_freq=10000
+    --env_eval_freq=10000
     --save_freq=10000
     --policy.vision_backbone=resnet18
     --policy.chunk_size=50
@@ -471,7 +625,7 @@ set_camera_args() {
             CAMERA_ARGS=(
                 "--env.camera_names=[\"base_rgb\", \"wrist_rgb\"]"
                 "--env.image_resize_modes=[\"${resize_mode}\"]"
-                "--policy.input_features={\"observation.images.base_rgb\": {\"type\": \"VISUAL\", \"shape\": [3, 224, 224]}, \"observation.images.wrist_rgb\": {\"type\": \"VISUAL\", \"shape\": [3, 224, 224]}, \"observation.state\": {\"type\": \"STATE\", \"shape\": [7]}}"
+                "--policy.input_features={\"observation.images.base_rgb\": {\"type\": \"VISUAL\", \"shape\": [3, 224, 224]}, \"observation.images.wrist_rgb\": {\"type\": \"VISUAL\", \"shape\": [3, 224, 224]}, ${STATE_FEATURE_JSON}}"
                 "--rename_map={\"observation.images.base_rgb_${resize_mode}\": \"observation.images.base_rgb\", \"observation.images.wrist_rgb_${resize_mode}\": \"observation.images.wrist_rgb\"}"
             )
             ;;
@@ -479,7 +633,7 @@ set_camera_args() {
             CAMERA_ARGS=(
                 "--env.camera_names=[\"base_rgb\"]"
                 "--env.image_resize_modes=[\"${resize_mode}\"]"
-                "--policy.input_features={\"observation.images.base_rgb\": {\"type\": \"VISUAL\", \"shape\": [3, 224, 224]}, \"observation.state\": {\"type\": \"STATE\", \"shape\": [7]}}"
+                "--policy.input_features={\"observation.images.base_rgb\": {\"type\": \"VISUAL\", \"shape\": [3, 224, 224]}, ${STATE_FEATURE_JSON}}"
                 "--rename_map={\"observation.images.base_rgb_${resize_mode}\": \"observation.images.base_rgb\"}"
             )
             ;;
@@ -487,8 +641,28 @@ set_camera_args() {
             CAMERA_ARGS=(
                 "--env.camera_names=[\"wrist_rgb\"]"
                 "--env.image_resize_modes=[\"${resize_mode}\"]"
-                "--policy.input_features={\"observation.images.wrist_rgb\": {\"type\": \"VISUAL\", \"shape\": [3, 224, 224]}, \"observation.state\": {\"type\": \"STATE\", \"shape\": [7]}}"
+                "--policy.input_features={\"observation.images.wrist_rgb\": {\"type\": \"VISUAL\", \"shape\": [3, 224, 224]}, ${STATE_FEATURE_JSON}}"
                 "--rename_map={\"observation.images.wrist_rgb_${resize_mode}\": \"observation.images.wrist_rgb\"}"
+            )
+            ;;
+        state)
+            # State-only (no image): observation.state (proprioception) PLUS a
+            # separate observation.environment_state (object coords) — both come
+            # from ${STATE_FEATURE_JSON}. No camera_names / rename_map. For the
+            # planar oracle env (--env_profile=planar_oracle*). The diffusion
+            # policy requires an image OR environment_state, so env_state MUST be
+            # consumed here — i.e. --include_env_state_obs=true (the default for
+            # --cameras=state) and a profile that records it (ENV_STATE_DIM > 0).
+            if [ "${EFF_ENV_STATE_DIM}" -le 0 ]; then
+                echo "ERROR: --cameras=state has no image, so it needs" >&2
+                echo "       observation.environment_state — but env_state isn't being consumed." >&2
+                echo "       Use --include_env_state_obs=true with an oracle-recording profile" >&2
+                echo "       (ENV_STATE_DIM > 0), or add images via --cameras=base/wrist/basewrist." >&2
+                exit 1
+            fi
+            CAMERA_ARGS=(
+                "--env.camera_names=[]"
+                "--policy.input_features={${STATE_FEATURE_JSON}}"
             )
             ;;
     esac
@@ -514,7 +688,7 @@ run_job() {
     if [[ -n "${RUN_NAME_OVERRIDE:-}" ]]; then
         run_name="$RUN_NAME_OVERRIDE"
     else
-        run_name="${policy_prefix}_${DATASET_SHORT}_${action_suffix}_${camera_suffix}"
+        run_name="${policy_prefix}_${DATASET_SHORT}_${action_suffix}_${CAMERA_NAME_TAG}"
     fi
 
     set_camera_args "$resize_mode" "$camera_suffix"
@@ -535,6 +709,7 @@ run_job() {
             --dataset.stats_paths="$MULTI_DATASET_STATS_PATHS"
             --dataset.norm_mode="$MULTI_DATASET_NORM_MODE"
             --dataset.stats_path=
+            --dataset.use_weighted_sampling=true
             --output_dir="./outputs/training/${run_name}"
             --job_name="${run_name}"
             --policy.repo_id="${run_name}"
@@ -573,6 +748,14 @@ run_job() {
                 full_cmd+=(--dataset.stats_path="${STATS_DIR}/stats_rel${chunk_size}.json")
             fi
         fi
+    fi
+
+    # --exclude_gripper_from_state → --observation_dim_slice=... on the
+    # lerobot-train side. Emitted BEFORE per-job extra_args and
+    # EXTRA_ARGS_STR so those can still override (draccus last-wins).
+    # Empty when the flag is off — no-op passthrough.
+    if [[ -n "$OBSERVATION_DIM_SLICE_JSON" ]]; then
+        full_cmd+=(--observation_dim_slice="$OBSERVATION_DIM_SLICE_JSON")
     fi
 
     # Append per-job extra args last so they override any earlier defaults (e.g. batch_size)
@@ -643,6 +826,11 @@ DIFFUSION_BASE_EXTRA=()
 DIFFUSION_WRIST_ENV=""
 DIFFUSION_WRIST_EXTRA=()
 
+# state-only (oracle) — no image; the resnet backbone still loads but sees no
+# image features, so this is cheap. Bigger batch is fine (tiny per-sample cost).
+DIFFUSION_STATE_ENV=""
+DIFFUSION_STATE_EXTRA=()
+
 # pi05 basewrist: needs extra VRAM setting + smaller batch size
 PI05_BASEWRIST_ENV="PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 PI05_BASEWRIST_EXTRA=(--batch_size=8)
@@ -653,6 +841,9 @@ PI05_BASE_EXTRA=(--batch_size=8)
 PI05_WRIST_ENV=""
 PI05_WRIST_EXTRA=(--batch_size=8)
 
+PI05_STATE_ENV=""
+PI05_STATE_EXTRA=(--batch_size=8)
+
 ACT_BASEWRIST_ENV=""
 ACT_BASEWRIST_EXTRA=()
 
@@ -661,6 +852,9 @@ ACT_BASE_EXTRA=()
 
 ACT_WRIST_ENV=""
 ACT_WRIST_EXTRA=()
+
+ACT_STATE_ENV=""
+ACT_STATE_EXTRA=()
 
 # ── Run jobs ──────────────────────────────────────────────────
 

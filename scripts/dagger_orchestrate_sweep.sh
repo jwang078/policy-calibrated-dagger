@@ -73,6 +73,16 @@
 #                                 → same as above (collision auto-resolved)
 #                             --run_tag=my_v2 --rerun_blends_from=30ep
 #                                 → explicit; no auto-suffix
+#   --retrain_round0        (requires --auto_create_source) Forwarded to the
+#                           source-create orchestrator call ONLY: forces the
+#                           round-0 base training to run from scratch even if
+#                           its checkpoint already exists on disk (the old
+#                           training dir is rm -rf'd first; with --dry-run the
+#                           rm and the train_sweep.sh command are only
+#                           printed — handy for recovering the exact round-0
+#                           training command). Never forwarded to the
+#                           per-iteration rerun invocations. One-shot flag:
+#                           drop it after the base is rebuilt.
 #   --auto_rerun_tag_suffix=NAME
 #                           Suffix used by the auto-disambiguation above.
 #                           Default "_rr". Has no effect when --run_tag is
@@ -116,6 +126,13 @@ SWEEP_COMBINATIONS_OF=""
 CONTINUE_ON_ERROR=false
 AUTO_CREATE_SOURCE=false
 AUTO_RERUN_TAG_SUFFIX="_rr"   # appended to source's run_tag when sweep tag is missing or collides
+# --retrain_round0: forwarded ONLY to the --auto_create_source orchestrator
+# call (round 0 lives in the source lineage; rerun iterations never train it
+# and the orchestrator rejects the flag in rerun mode). Kept out of
+# ORCHESTRATOR_ARGS so per-iteration invocations don't each wipe + retrain
+# the shared base. One-shot: drop it once the base is rebuilt, or every sweep
+# invocation retrains round 0 again.
+RETRAIN_ROUND0=false
 # When --interleave_rounds is set, the sweep does ROUND-FIRST iteration
 # instead of ITERATION-FIRST: for r in 1..NUM_ROUNDS, for each iteration,
 # call dagger_orchestrate.sh with --num_rounds=$r. Combined with the
@@ -146,6 +163,7 @@ for arg in "$@"; do
         --sweep_combinations_of=*)   SWEEP_COMBINATIONS_OF="${arg#*=}" ;;
         --continue_on_error)         CONTINUE_ON_ERROR=true ;;
         --auto_create_source)        AUTO_CREATE_SOURCE=true ;;
+        --retrain_round0)            RETRAIN_ROUND0=true ;;
         --auto_rerun_tag_suffix=*)   AUTO_RERUN_TAG_SUFFIX="${arg#*=}" ;;
         --interleave_rounds)         INTERLEAVE_ROUNDS=true ;;
         --blends=*)
@@ -173,6 +191,16 @@ if [[ -n "$COMBINATION_POOL" || -n "$SWEEP_COMBINATIONS_OF" ]]; then
         echo "  Pick one mode per invocation." >&2
         exit 1
     fi
+fi
+
+# --retrain_round0 only reaches the orchestrator through the source-create
+# preamble; without --auto_create_source the sweep would silently drop it.
+if [[ "$RETRAIN_ROUND0" == "true" && "$AUTO_CREATE_SOURCE" != "true" ]]; then
+    echo "ERROR: --retrain_round0 requires --auto_create_source (round 0 is trained by the" >&2
+    echo "  source-create step; per-iteration rerun invocations never train round 0)." >&2
+    echo "  To retrain the base without a sweep, invoke dagger_orchestrate.sh directly with" >&2
+    echo "  the source's --run_tag + --retrain_round0." >&2
+    exit 1
 fi
 
 if [[ -z "$SWEEP_BLENDS" && -z "$COMBINATION_POOL" ]]; then
@@ -682,6 +710,7 @@ if [[ "$AUTO_CREATE_SOURCE" == "true" ]]; then
         esac
     done
     CREATE_ARGS+=( "--run_tag=$SOURCE_RUN_TAG" --resume )
+    [[ "$RETRAIN_ROUND0" == "true" ]] && CREATE_ARGS+=( --retrain_round0 )
 
     echo
     echo "════════════════════════════════════════════════════════════════════════════════"

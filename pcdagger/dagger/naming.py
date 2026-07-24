@@ -168,6 +168,89 @@ def format_blends_tag(blends: list[float]) -> str:
     return "b" + "_".join(parts)
 
 
+_VALID_CAMERAS = ("basewrist", "base", "wrist", "state")
+
+
+def camera_name_tag(cameras: str, include_env_state: bool, exclude_gripper: bool) -> str:
+    """Combine feature-source flags → the `_<tag>` suffix that goes into every
+    training-dir basename (train_sweep.sh sets this as `CAMERA_NAME_TAG`).
+
+    Rules (must match train_sweep.sh's inline derivation exactly, since the
+    orchestrator's base-policy name check compares against the training dir
+    that train_sweep.sh will produce):
+      * base tag       = cameras verbatim (one of `basewrist`/`base`/`wrist`/`state`).
+      * `+os` suffix   iff cameras != "state" AND env_state is consumed.
+                       `state` implies oracle already, so no `os` there —
+                       preserves existing `_state` naming.
+      * `+ng` suffix   iff --exclude_gripper_from_state was set. Applied AFTER
+                       `os` so an image+oracle+no-gripper run is `baseosng`,
+                       a state-only+no-gripper run is `stateng`.
+
+    Args:
+        cameras: raw --cameras value.
+        include_env_state: EFF_ENV_STATE_DIM > 0 (i.e. the policy consumes
+            observation.environment_state).
+        exclude_gripper: --exclude_gripper_from_state boolean.
+
+    Returns:
+        The tag string (never empty for valid inputs).
+
+    Raises:
+        ValueError: if `cameras` is not one of the recognized values.
+    """
+    if cameras not in _VALID_CAMERAS:
+        raise ValueError(f"cameras={cameras!r} not in {_VALID_CAMERAS}")
+    tag = cameras
+    if cameras != "state" and include_env_state:
+        tag = f"{tag}os"
+    if exclude_gripper:
+        tag = f"{tag}ng"
+    return tag
+
+
+def parse_camera_name_tag(tag: str) -> dict:
+    """Inverse of camera_name_tag(): parse a `_<tag>` suffix back into its
+    (cameras, include_env_state, exclude_gripper) components.
+
+    Peels the optional trailing tokens in reverse-emit order:
+      * `ng` at the end → exclude_gripper=True.
+      * `os` at the end (of what's left) → include_env_state=True. Only legal
+        when the remaining root is NOT `state` (per camera_name_tag's rules);
+        a `stateos` prefix would be a naming violation.
+      * whatever remains must be one of _VALID_CAMERAS.
+
+    Returns a dict {"cameras", "include_env_state", "exclude_gripper"}.
+    Raises ValueError on any malformed input so callers can fail loudly
+    (used in the orchestrator's pre-flight base-path consistency check).
+    """
+    original = tag
+    exclude_gripper = False
+    if tag.endswith("ng"):
+        tag = tag[:-2]
+        exclude_gripper = True
+    include_env_state = False
+    if tag.endswith("os"):
+        tag = tag[:-2]
+        include_env_state = True
+    if tag not in _VALID_CAMERAS:
+        raise ValueError(
+            f"unrecognized camera_name_tag {original!r}: peeled to root "
+            f"{tag!r} which is not one of {_VALID_CAMERAS}"
+        )
+    # `state` implies oracle, so `stateos` should never appear (camera_name_tag
+    # explicitly suppresses `os` for state runs). Catch it as a naming violation.
+    if tag == "state" and include_env_state:
+        raise ValueError(
+            f"malformed camera_name_tag {original!r}: `state` implies oracle "
+            "already and never gets an `os` suffix (see camera_name_tag())"
+        )
+    return {
+        "cameras": tag,
+        "include_env_state": include_env_state,
+        "exclude_gripper": exclude_gripper,
+    }
+
+
 def derive_base_dataset_short(
     stem: str, run_tag: str, model_tag: str, method_tag: str, blends_tag: str
 ) -> str:
@@ -645,6 +728,21 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--model", required=True)
     sp.add_argument("dir_name", help="training dir basename (no path components)")
 
+    # Camera-tag helpers -------------------------------------------------------
+    sp = sub.add_parser(
+        "camera_name_tag",
+        help="cameras + env-state + gripper flags → the `_<tag>` suffix on training-dir basenames",
+    )
+    sp.add_argument("--cameras", required=True)
+    sp.add_argument("--include_env_state", required=True, choices=["true", "false"])
+    sp.add_argument("--exclude_gripper", required=True, choices=["true", "false"])
+
+    sp = sub.add_parser(
+        "parse_camera_name_tag",
+        help="`_<tag>` suffix → JSON {cameras, include_env_state, exclude_gripper}",
+    )
+    sp.add_argument("tag", help="camera tag with no leading underscore (e.g. `stateng`, `baseos`)")
+
     return p
 
 
@@ -697,6 +795,16 @@ def _cli_main(argv: list[str]) -> int:
         result = lineage_of(args.dir_name, args.model)
         # Bash convention: empty stdout = "no match". Caller checks `[[ -n "$out" ]]`.
         print(result if result is not None else "")
+    elif cmd == "camera_name_tag":
+        print(
+            camera_name_tag(
+                cameras=args.cameras,
+                include_env_state=(args.include_env_state == "true"),
+                exclude_gripper=(args.exclude_gripper == "true"),
+            )
+        )
+    elif cmd == "parse_camera_name_tag":
+        print(json.dumps(parse_camera_name_tag(args.tag)))
     else:
         print(f"unknown subcommand: {cmd}", file=sys.stderr)
         return 2

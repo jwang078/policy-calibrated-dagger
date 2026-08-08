@@ -166,7 +166,7 @@ class ScenarioResult:
     plan_failures: int
     method: str = ""
     # Comma-separated chronological list of trigger reasons for each cycle
-    # that fired this scenario. Possible values: "time stall",
+    # that fired this scenario. Possible values: "time stall", "joint_stall",
     # "self_collision", "obstacle_collision", "no_progress",
     # "no_progress_ori". The legacy "in_collision" label is still emitted
     # as a fallback when the env doesn't surface a collision-kind signal
@@ -330,6 +330,13 @@ class InterventionController:
         # Both reset on scenario reset.
         self._prev_actual_q: np.ndarray | None = None
         self._consecutive_stuck_ticks: int = 0
+        # Joint-stall trigger state. Separate from _consecutive_stuck_ticks
+        # so the trigger's threshold can differ from the wedge gate's, AND
+        # so this counter can be scoped to POLICY mode only (RRT-mode stall
+        # is Ruckig deceleration, not a real stall). Reset on scenario
+        # start AND on any RRT cycle (below), so the count reflects the
+        # CURRENT policy phase's motion only.
+        self._joint_stall_policy_ticks: int = 0
         # Mode at the previous tick's stuck-eval — used to detect RRT
         # mode transitions (IDLE→EXECUTING or EXECUTING→IDLE) so we can
         # reset the stuck counter at each boundary. Policy-mode "stuck"
@@ -355,7 +362,7 @@ class InterventionController:
         self.last_status: str = "running"
         # Chronological list of trigger reasons for each intervention cycle
         # that fired this scenario. Same vocabulary as the "Triggering %s
-        # (%s)..." log line: "time stall", "self_collision",
+        # (%s)..." log line: "time stall", "joint_stall", "self_collision",
         # "obstacle_collision", "no_progress", "no_progress_ori". Legacy
         # "in_collision" is still emitted as a fallback when the env
         # doesn't surface a collision-kind signal. Reset on scenario reset;
@@ -391,7 +398,8 @@ class InterventionController:
 
         Args:
             reason: the trigger reason being fired (e.g., "in_collision",
-                "time stall", "no_progress", "self_collision"). Optional —
+                "time stall", "joint_stall", "no_progress", "self_collision").
+                Optional —
                 when omitted (retry path), the last recorded reason is
                 reused so the retry uses the same dispatch policy as the
                 original trigger. Pass an explicit reason on the first
@@ -414,6 +422,18 @@ class InterventionController:
             # Only collision-related triggers go no-lookback; stall /
             # no-progress triggers still rewind.
             use_no_lookback = effective_reason in self._collision_trigger_reasons
+        # Scheduled cadence triggers ("time stall" = the step budget elapsed,
+        # robot in healthy motion) may opt into no-lookback so the recorded
+        # correction starts velocity-continuous instead of rewind+cold-start.
+        # Applies on top of any detection mode; genuine stalls (joint_stall /
+        # no_progress*) are unaffected. See
+        # InterventionConfig.scheduled_trigger_no_lookback.
+        if (
+            not use_no_lookback
+            and effective_reason == "time stall"
+            and bool(getattr(self.cfg, "scheduled_trigger_no_lookback", False))
+        ):
+            use_no_lookback = True
 
         # Rest-start triggers ("time stall", "no_progress", "no_progress_ori")
         # will start RRT from a stopped (or near-stopped) state: the robot
@@ -424,7 +444,7 @@ class InterventionController:
         # rest artifacts that mismatch the policy's observation history at
         # training time.
         if (
-            effective_reason in {"time stall", "no_progress", "no_progress_ori", "drift_stall"}
+            effective_reason in {"time stall", "no_progress", "no_progress_ori", "drift_stall", "joint_stall"}
             and not use_no_lookback
         ):
             from lerobot.policies.teleop_recording import TeleopRecordingContext
@@ -468,6 +488,7 @@ class InterventionController:
         # first tick doesn't compute Δq against stale data.
         self._prev_actual_q = None
         self._consecutive_stuck_ticks = 0
+        self._joint_stall_policy_ticks = 0
         self._prev_stuck_eval_mode = RRTMode.IDLE
         # Debug-telemetry state for mid-RRT WARNING — clear chunk-start
         # baseline and recent-Δq buffer so a new scenario doesn't blend
@@ -675,6 +696,11 @@ class InterventionController:
                     # chunks' motion history would be misleading. Re-captured
                     # below when the new mode is EXECUTING.
                     self._recent_dq.clear()
+                    # Joint-stall trigger is POLICY-mode-scoped: reset on
+                    # every mode transition so RRT cycles never contribute
+                    # to a stall count that then fires the moment policy
+                    # resumes (Ruckig deceleration would inflate it).
+                    self._joint_stall_policy_ticks = 0
                     if _src_mode == RRTMode.EXECUTING:
                         self._chunk_start_actual_q = actual_q.copy()
                     else:
@@ -694,6 +720,16 @@ class InterventionController:
                         self._consecutive_stuck_ticks += 1
                     else:
                         self._consecutive_stuck_ticks = 0
+                    # Joint-stall streak — same signal (per-tick joint-L2 Δ)
+                    # but its OWN threshold + POLICY-mode gate. Only meaningful
+                    # when a policy is actively producing commands; during RRT
+                    # execution the counter stays at 0 (reset on mode transition
+                    # above; not incremented here since _src_mode != IDLE).
+                    if _src_mode == RRTMode.IDLE and self.cfg.joint_stall_window_steps > 0:
+                        if dq < self.cfg.joint_stall_threshold_rad:
+                            self._joint_stall_policy_ticks += 1
+                        else:
+                            self._joint_stall_policy_ticks = 0
                 self._prev_actual_q = actual_q.copy()
 
                 planner_in_collision, planner_kind = self._source.is_in_collision_at(actual_q)
@@ -822,6 +858,42 @@ class InterventionController:
         # branch below still increments rrt_step_count and honors the
         # cap regardless of whether the per-tick collision-check is
         # firing.
+        # Per-driver clearance override (`future_chunk.rrt_obstacle_clearance`
+        # / `future_chunk.rrt_self_collision_clearance`): while an RRT chunk
+        # is executing, the env's near-miss `in_collision` flag uses the env's
+        # clearance (~ the planner's 0.02 m ROUTING margin) — stricter than
+        # makes sense mid-RRT, where planned paths deliberately squeeze near
+        # obstacles and killing the chunk at 16-18 mm causes replan churn.
+        # When set, re-verify the flag at the looser mid-RRT clearances and
+        # ignore it unless actually violated. Policy-driving strictness
+        # (`future_chunk.obstacle_clearance`, the wrapper shield) is
+        # unaffected. None (default) = trust the env flag as-is (legacy).
+        if mode == RRTMode.EXECUTING and in_collision:
+            _fc = getattr(self.wrapper, "_future_chunk_config", None)
+            _rrt_ob = getattr(_fc, "rrt_obstacle_clearance", None)
+            _rrt_self = getattr(_fc, "rrt_self_collision_clearance", None)
+            if _rrt_ob is not None or _rrt_self is not None:
+                _pi = self._source.describe_collision_at(actual_q)
+                if _pi is not None:
+
+                    def _violates(pair: dict | None, clearance: float | None) -> bool:
+                        if pair is None:
+                            return False
+                        if clearance is None:
+                            # No override for this kind — fall back to the
+                            # describe-reported violation (≈ env behavior).
+                            return bool(pair["in_violation"])
+                        return float(pair["distance_m"]) < float(clearance)
+
+                    _ob_pair = _pi.get("closest_obstacle")
+                    _self_pair = _pi.get("closest_self")
+                    if not (_violates(_ob_pair, _rrt_ob) or _violates(_self_pair, _rrt_self)):
+                        # Silently below the mid-RRT thresholds — the env flag
+                        # was only the cheap broad-phase gate for the precise
+                        # query above; not an event worth narrating. The real
+                        # trigger (below) logs when it actually fires.
+                        in_collision = False
+
         if mode == RRTMode.EXECUTING and in_collision:  # noqa: SIM102
             if not getattr(self, "_in_collision_during_rrt", False):
                 self._in_collision_during_rrt = True
@@ -914,16 +986,48 @@ class InterventionController:
             return "continue"
 
         if self.unexpected_natural_finish:
-            # Env did not report success this step → goal-vs-success mismatch.
-            logger.warning(
-                "Natural %s finish did not produce env success. Possible "
-                "mismatch between intervention goal pose and env success condition; "
-                "marking scenario and advancing.",
+            # Clear the flag regardless of which branch we take below — otherwise
+            # a subsequent tick would re-enter this block on the same finish.
+            self.unexpected_natural_finish = False
+            # Env did not report success this step. Historically this hard-advanced
+            # the scenario immediately (assumption: config-level "RRT goal ≠ env
+            # success predicate" mismatch, unrecoverable). But it also fires on
+            # recoverable near-misses — teleport landing drift (see wrapper's
+            # "RRT teleport landing error" log line — routinely 0.1–0.3 rad even
+            # when the plan itself is fine), ruckig smoothing rounding at the
+            # chunk endpoint, and the joint-vs-EE tolerance gap where a small
+            # joint-space offset accumulates into a sub-mm EE offset that just
+            # exceeds `pos_tolerance_m`. When that happens with cycles_used=1
+            # and `max_cycles_per_scenario=5`, we were silently throwing away 4
+            # more cycles of DAgger opportunity per affected scenario.
+            #
+            # Match the controller-cancel branch's semantics instead: cycles_used
+            # was already incremented in the wait-one-tick block above; if we're
+            # under the cap, let the policy resume driving from the RRT-finish
+            # pose. The policy can often bridge the last small gap; if it can't,
+            # the normal triggers (time stall / future-chunk shield / collision)
+            # will fire another RRT cycle. Only advance with
+            # `rrt_finished_no_success` once the cap is truly hit.
+            if self.cycles_used >= self.cfg.max_cycles_per_scenario:
+                logger.warning(
+                    "Natural %s finish did not produce env success and "
+                    "cycles_used=%d/%d — advancing with rrt_finished_no_success.",
+                    self.cfg.method.upper(),
+                    self.cycles_used,
+                    self.cfg.max_cycles_per_scenario,
+                )
+                self.last_status = "rrt_finished_no_success"
+                self._finalize_active_rrt_steps()
+                return "advance"
+            logger.info(
+                "Natural %s finish did not produce env success; letting policy "
+                "resume from the RRT-finish pose (cycles used %d/%d, will retry "
+                "on next trigger if policy can't close the gap).",
                 self.cfg.method.upper(),
+                self.cycles_used,
+                self.cfg.max_cycles_per_scenario,
             )
-            self.last_status = "rrt_finished_no_success"
-            self._finalize_active_rrt_steps()
-            return "advance"
+            return "continue"
 
         # Plan failure detection — RRT-only. We use a "pending trigger" flag set
         # the moment we call source.trigger(); if the next observation of IDLE
@@ -1059,6 +1163,17 @@ class InterventionController:
         #     cooldown before re-arming them).
         should_trigger_stall = self.policy_step_count >= self.next_policy_threshold
         should_trigger_collision = in_collision
+        # Joint-stall trigger: robot's joint config hasn't moved for N
+        # consecutive POLICY ticks (per-tick |Δq| < joint_stall_threshold_rad).
+        # Purely kinematic — no EE / goal reference — so it correctly fires
+        # even when the policy legitimately needs to move AWAY from the goal
+        # to find a path around an obstacle. Counter is maintained + reset
+        # in the tick-loop's stuck-detection block above. Disabled when
+        # joint_stall_window_steps == 0 (default).
+        should_trigger_joint_stall = (
+            self.cfg.joint_stall_window_steps > 0
+            and self._joint_stall_policy_ticks >= self.cfg.joint_stall_window_steps
+        )
         if should_trigger_stall:
             self.in_backoff_cooldown = False
         if (
@@ -1066,6 +1181,7 @@ class InterventionController:
             or should_trigger_collision
             or should_trigger_no_progress_pos
             or should_trigger_no_progress_ori
+            or should_trigger_joint_stall
         ):
             self.target_rrt_steps = random.randint(self.cfg.rrt_steps_min, self.cfg.rrt_steps_max)
             if should_trigger_collision:
@@ -1086,6 +1202,12 @@ class InterventionController:
                 reason = "no_progress"
             elif should_trigger_no_progress_ori:
                 reason = "no_progress_ori"
+            elif should_trigger_joint_stall:
+                # Prefer this over "time stall" — the joint-stall signal
+                # tells you the policy is actively producing zero-motion
+                # commands, whereas "time stall" only tells you the
+                # policy_steps_before_rrt / _between_rrt cadence elapsed.
+                reason = "joint_stall"
             else:
                 reason = "time stall"
             self.trigger_reasons.append(reason)

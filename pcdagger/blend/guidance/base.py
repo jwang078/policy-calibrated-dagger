@@ -2,13 +2,17 @@
 
 The SA wrapper hosts a list of pluggable `GuidanceSource` implementations. Each
 source describes WHERE its guidance comes from (RRT plan, observation key,
-oracle interpolation). The wrapper decides HOW to integrate the source's chunk
-with the inner policy via the source's declared `integration_mode`:
+oracle interpolation) and declares an `integration_mode`:
 
   * VERBATIM — the source's chunk is the action; inner policy ignored.
-  * BLENDED  — the source's chunk is fed through the wrapper's shared blend
-               math (DENOISE / LINEAR_INTERPOLATION) against the inner
-               policy's predicted chunk at the wrapper's `forward_flow_ratio`.
+               (RRT and OracleGoal chunks always play this way; the wrapper's
+               RRT playback branch drives RRT chunks inline.)
+  * BLENDED  — the source blends its guidance against the inner policy's
+               predicted chunk at the wrapper's `forward_flow_ratio` via
+               DENOISE or INTERPOLATE. The blend math lives in
+               ObservationTeleopGuidanceSource (`_build_and_emit_blended`),
+               which computes its own integration_mode from the ratio
+               (0.0 = VERBATIM teleop, otherwise BLENDED).
 
 Method-triggered sources (RRT, OracleGoal) expose `trigger()` / `cancel()`.
 Observation-driven sources (ObservationTeleop) auto-activate via `update()`
@@ -92,8 +96,6 @@ class GuidanceStepResult:
 
     action: Tensor  # normalized action to return from select_action
     raw7: np.ndarray | None = None  # raw [num_dofs+gripper] for _desired_q update
-    advance_step: bool = True
-    finished: bool = False  # chunk exhausted; triggers wrapper's _finish_source
     flush_inner_queue_after: bool = False
     frame_source: object | None = None  # FrameSource enum value; None = wrapper picks default
 
@@ -123,7 +125,8 @@ class GuidanceSource(Protocol):
         """True iff this source wants to produce the next action.
 
         Method-triggered: `state.mode in (PLANNING, EXECUTING)`.
-        Observation-driven: `has_guidance or draining_prior_chunk`.
+        Observation-driven: always True at ratio==0 (pure-teleop mode);
+        otherwise `has_guidance or draining_prior_chunk`.
         """
         ...
 

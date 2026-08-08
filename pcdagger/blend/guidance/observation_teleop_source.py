@@ -5,9 +5,11 @@ every tick. When the chunk is non-NaN this source becomes active and produces
 the next action by either:
 
   * VERBATIM (`forward_flow_ratio == 0.0`): pure FK+IK teleop or hold action.
-  * BLENDED (`0 < forward_flow_ratio < 1`): mix the guidance into the inner
-    policy's predicted chunk via DENOISE or LINEAR_INTERPOLATION; subsequent
-    ticks drain the cached `_guided_chunk` until exhausted.
+  * BLENDED (`0 < forward_flow_ratio <= 1`): mix the guidance into the inner
+    policy's predicted chunk via DENOISE or INTERPOLATE (ratio=1.0 is a valid
+    policy-dominated blend — "blend100"). ONCE_PER_CHUNK drains the cached
+    `_guided_chunk` between rebuilds; EVERY_STEP re-blends every tick (see
+    `_build_and_emit_blended` for the per-strategy cursor/anchor rules).
 
 This is fundamentally different in lifecycle from method-triggered sources
 (RRT, OracleGoal): it auto-activates from observation content rather than
@@ -20,6 +22,9 @@ Source-owned state migrated out of the wrapper:
   * `_last_decoded_guidance_chunk` — diagnostic decode of the most recent
     guidance chunk back to raw joints
   * `has_guidance` — set by `update()` per tick
+  * `_anchor_chunk_orig` — the stored pure-policy anchor chunk (source-native,
+    never lived on the wrapper): INTERPOLATE's mixing base and the guidance-
+    fill base for both strategies
 
 Stays on the wrapper (used by multiple sources): `_normalize_policy_guidance_action`,
 `get_hold_action`, `get_full_teleop_action`, `_project_delta_for_collision`,
@@ -60,8 +65,9 @@ class ObservationTeleopGuidanceSource:
     Lifecycle:
       * `update(ctx)` is called every tick. It pops `OBS_GUIDANCE_CHUNK` from
         the batch, sets `has_guidance` for the tick, and caches the raw chunk.
-      * `is_active()` returns True iff there's active guidance OR the source
-        is still draining a previously-built blended chunk.
+      * `is_active()` returns True at ratio==0 ALWAYS (pure-teleop mode emits
+        either a teleop or a hold action); at ratio>0, iff there's active
+        guidance OR the source is still draining a previously-built chunk.
       * `next_action(ctx)` produces the action via either pure-teleop or
         blend-and-drain logic.
       * `cancel()` / `reset()` clear the cached blended chunk.
@@ -83,6 +89,9 @@ class ObservationTeleopGuidanceSource:
         self._last_decoded_guidance_chunk: np.ndarray | None = None
         # Per-tick state set by update().
         self._guidance_chunk_raw: Tensor | None = None
+        # Pure policy chunk from the last fresh build — INTERPOLATE's mixing
+        # base (see the collapse note at the build site).
+        self._anchor_chunk_orig: Tensor | None = None
         self.has_guidance: bool = False
 
     # ── Protocol API ───────────────────────────────────────────────────── #
@@ -132,12 +141,14 @@ class ObservationTeleopGuidanceSource:
     def cancel(self) -> None:
         """Clear the cached blended chunk and reset cursors."""
         self._guided_chunk = None
+        self._anchor_chunk_orig = None
         self._chunk_step = 99_999_999_999  # forces chunk_exhausted on next call
         self._had_guidance_last_step = False
 
     def reset(self) -> None:
         """Episode-boundary reset."""
         self._guided_chunk = None
+        self._anchor_chunk_orig = None
         self._chunk_step = 0  # fresh-episode value (different from cancel's "force-exhausted")
         self._had_guidance_last_step = False
         self._last_decoded_guidance_chunk = None
@@ -194,6 +205,11 @@ class ObservationTeleopGuidanceSource:
             and not chunk_exhausted
             and (not self.has_guidance or wrapper.blend_mode == BlendMode.ONCE_PER_CHUNK)
         ):
+            # Guidance ghost: during drain the guidance target for this tick
+            # is the decoded chunk entry at the emit cursor.
+            if self._wrapper.show_guidance_ghost and self._last_decoded_guidance_chunk is not None:
+                _idx = min(self._chunk_step, self._last_decoded_guidance_chunk.shape[1] - 1)
+                self._wrapper.update_guidance_ghost(self._last_decoded_guidance_chunk[0, _idx])
             action = self._guided_chunk[:, self._chunk_step, :]
             self._chunk_step += 1
             # Tag as POLICY — the blend path's frames are not committed by the recorder
@@ -208,11 +224,33 @@ class ObservationTeleopGuidanceSource:
     # ── Helpers ────────────────────────────────────────────────────────── #
 
     def _chunk_exhausted(self) -> bool:
-        return self._guided_chunk is None or self._chunk_step >= self._wrapper.config.n_action_steps
+        if self._guided_chunk is None:
+            return True
+        # Bound by BOTH the configured executed-prefix length AND the actual
+        # chunk length. They coincide for diffusion (predict_action_chunk
+        # returns exactly n_action_steps actions), but the cursor must never
+        # index past the real tensor for policies (or config overrides) where
+        # the produced chunk is shorter than config.n_action_steps.
+        limit = min(int(self._wrapper.config.n_action_steps), int(self._guided_chunk.shape[1]))
+        return self._chunk_step >= limit
 
     def _build_and_emit_blended(self, ctx: GuidanceCallCtx, base_noise: Tensor | None) -> GuidanceStepResult:
-        """The blend-construct path: build / refresh `_guided_chunk`, emit step 0."""
+        """Build / refresh `_guided_chunk` and emit the entry at the cursor.
+
+        SHARED-PATH CONTRACT — INTERPOLATE is the glass-box debug proxy for
+        DENOISE. Both strategies run the IDENTICAL pipeline: cursor rule,
+        anchor-chunk generation cadence (one pure-policy model call per
+        chunk), rel-anchor refresh cadence, guidance encoding + fill,
+        decoded-guidance diagnostic, ghost updates, x_tsw construction (and
+        therefore rng-stream consumption), emission indexing. They differ at
+        exactly ONE branch: how `blended` is produced from the shared inputs
+        (linear mix vs. model denoise). Changing anything outside that branch
+        changes BOTH strategies — that is the point: whatever interpolate
+        validates about indexing/anchoring/inputs is guaranteed to hold for
+        the black-box denoise path too.
+        """
         from lerobot.policies.shared_autonomy_wrapper import (
+            BlendMode,
             FrameSource,
             GuidanceBlendStrategy,
             PolicyGuidanceRepresentation,
@@ -221,33 +259,65 @@ class ObservationTeleopGuidanceSource:
         wrapper = self._wrapper
         guidance_chunk_raw = self._guidance_chunk_raw
         ratio = wrapper.forward_flow_ratio
+        strategy = wrapper.guidance_blend_strategy
+
+        # ── Time-anchoring predicate: the ONE fork that cadence hangs off ──
+        # DENOISE + EVERY_STEP re-generates the emitted chunk each call via
+        # predict_action_chunk conditioned on the live obs queue → the
+        # emitted chunk is re-anchored to "now" every tick (index 0 = the
+        # action for NOW, rel deltas relative to the CURRENT state). Every
+        # other combination emits from the chunk built at t0 (index k means
+        # "t0 + k", deltas relative to state_t0). This difference is FORCED,
+        # not stylistic: INTERPOLATE's policy content comes from one model
+        # call per chunk (now-anchoring it would cost a call per tick), while
+        # DENOISE's per-tick call is inherent and its output cannot be made
+        # t0-anchored. Two cadences follow from the predicate — both
+        # directions of getting either wrong produced observed bugs:
+        #   * cursor: pinned to 0 when now-anchored (else: future-action
+        #     sawtooth — "shakes at goal/obstacle"); advancing when
+        #     t0-anchored (else: the t0 action re-emitted forever).
+        #   * rel-anchor refresh: per tick when now-anchored; only at fresh
+        #     builds when t0-anchored (else: decode adds state_now to
+        #     t0-anchored deltas — an r-scaled extrapolation that pushed
+        #     ratio 0.9 outside the [policy, guidance] envelope).
+        emits_now_anchored = (
+            wrapper.blend_mode == BlendMode.EVERY_STEP and strategy == GuidanceBlendStrategy.DENOISE
+        )
+        if emits_now_anchored:
+            self._chunk_step = 0
         chunk_exhausted = self._chunk_exhausted()
+        if emits_now_anchored or chunk_exhausted or self._guided_chunk is None:
+            wrapper.refresh_relative_anchor()
+
+        # ── Anchor chunk: ONE pure-policy model call per chunk (shared) ────
+        # Stored as `_anchor_chunk_orig` and used as the policy component /
+        # guidance-fill base for BOTH strategies. Never replaced by the
+        # previous BLENDED chunk: mixing against one's own output is a
+        # geometric recursion whose fixed point is guidance — every ratio < 1
+        # collapsed onto the guidance trajectory before this was pinned.
+        # (predict_action_chunk reads the live obs queues — inner
+        # select_action already ran this tick.)
+        if chunk_exhausted or self._guided_chunk is None or self._anchor_chunk_orig is None:
+            noise_kwargs = {"noise": base_noise} if base_noise is not None else {}
+            self._anchor_chunk_orig = wrapper.inner_policy.predict_action_chunk(ctx.batch, **noise_kwargs)
+            self._chunk_step = 0
+        base_chunk = self._anchor_chunk_orig
 
         # max_action_dim: PI0.5 pads actions to this size; diffusion uses raw action_dim.
         max_action_dim = getattr(wrapper.config, "max_action_dim", None)
         batch_size = (
             guidance_chunk_raw.shape[0] if guidance_chunk_raw is not None else ctx.inner_action.shape[0]
         )
+        device = base_chunk.device
+        anchor_len = base_chunk.shape[1]
+        action_dim = base_chunk.shape[2]
 
-        # Determine anchor chunk for IK:
-        # - If chunk exhausted or no buffer yet: get a fresh policy chunk via predict_action_chunk.
-        #   inner_policy.select_action was already called above (obs queues updated for diffusion),
-        #   so predict_action_chunk reads from up-to-date obs queues.
-        # - Otherwise: reuse _guided_chunk so guidance accumulates on top of itself.
-        if chunk_exhausted or self._guided_chunk is None:
-            noise_kwargs = {"noise": base_noise} if base_noise is not None else {}
-            anchor_chunk = wrapper.inner_policy.predict_action_chunk(ctx.batch, **noise_kwargs)
-            self._chunk_step = 0
-        else:
-            anchor_chunk = self._guided_chunk
-
-        device = anchor_chunk.device
-        anchor_len = anchor_chunk.shape[1]
-        action_dim = anchor_chunk.shape[2]
-
-        # Build the normalized guidance chunk to use as noise anchor.
-        # Clone anchor and zero-pad to max_action_dim if needed (required by PI0.5).
-        guidance_chunk = anchor_chunk.clone()
+        # ── Guidance encode + fill (shared) ────────────────────────────────
+        # Clone the pure-policy base and overwrite [cursor:] with the demo's
+        # normalized guidance. For a now-anchored emit the cursor is 0, so
+        # guidance covers the whole chunk; for t0-anchored emits, entries
+        # below the cursor were already emitted and are never read again.
+        guidance_chunk = base_chunk.clone()
         if max_action_dim is not None and action_dim < max_action_dim:
             pad = torch.zeros(
                 batch_size,
@@ -270,54 +340,61 @@ class ObservationTeleopGuidanceSource:
             and guidance_chunk_raw is not None
         ):
             self._fill_chunk_delta(
-                guidance_chunk, guidance_chunk_raw, anchor_chunk, anchor_len, action_dim, batch_size, device
+                guidance_chunk, guidance_chunk_raw, base_chunk, anchor_len, action_dim, batch_size, device
             )
         else:
             raise NotImplementedError(
                 f"Unsupported policy_guidance_representation: {wrapper.policy_guidance_representation}"
             )
 
-        # Diagnostic: decode the constructed guidance_chunk back to raw joints
-        # so callers can compare what is being fed into the blend against the
-        # demo trajectory.
+        # ── Diagnostics (shared): decoded guidance + ghosts ────────────────
         decoded_steps = [
             wrapper.postprocessor(guidance_chunk[:, t_abs, :action_dim]) for t_abs in range(anchor_len)
         ]
         self._last_decoded_guidance_chunk = torch.stack(decoded_steps, dim=1).detach().cpu().numpy()
+        if wrapper.show_guidance_ghost:
+            _g_idx = min(self._chunk_step, self._last_decoded_guidance_chunk.shape[1] - 1)
+            wrapper.update_guidance_ghost(self._last_decoded_guidance_chunk[0, _g_idx])
 
-        # Build the guidance noise regardless of blend strategy to consume the rng seed.
-        # It's ok to do this duplicate work for INTERPOLATE because that's a debug mode.
+        # ── x_tsw (shared): built for BOTH strategies ──────────────────────
+        # INTERPOLATE never consumes x_tsw, but building it keeps the rng
+        # stream consumption IDENTICAL across strategies — a seeded
+        # interpolate run stays noise-aligned with its denoise counterpart,
+        # which is what makes like-for-like A/B debugging valid.
         x_tsw = self._build_guidance_noise_from_chunk(guidance_chunk, ratio, base_noise=base_noise)
 
-        if wrapper.guidance_blend_strategy == GuidanceBlendStrategy.INTERPOLATE:
-            # Simple linear interpolation in clean action space — no denoising.
-            blended = anchor_chunk.clone()
+        # ── n_anchor_steps slice (shared computation) ──────────────────────
+        anchor_slice: Tensor | None = None
+        if wrapper.n_anchor_steps > 0:
+            n_a = min(wrapper.n_anchor_steps, anchor_len - self._chunk_step)
+            anchor_slice = guidance_chunk[:, self._chunk_step : self._chunk_step + n_a, :action_dim]
+
+        # ── THE strategy branch — the only place the two paths differ ──────
+        if strategy == GuidanceBlendStrategy.INTERPOLATE:
+            # Glass-box stand-in for the denoiser: exact constant-ratio mix
+            # of the SAME two inputs the denoiser sees (pure-policy base,
+            # guidance fill).
+            blended = base_chunk.clone()
             g = guidance_chunk[:, :, :action_dim]
-            blended[:, :, :action_dim] = ratio * anchor_chunk + (1.0 - ratio) * g
-            # Snap first n_anchor_steps to guidance exactly (mirrors DENOISE inpainting).
-            if wrapper.n_anchor_steps > 0:
-                n_a = min(wrapper.n_anchor_steps, anchor_len - self._chunk_step)
-                blended[:, self._chunk_step : self._chunk_step + n_a, :action_dim] = guidance_chunk[
-                    :, self._chunk_step : self._chunk_step + n_a, :action_dim
-                ]
-            self._guided_chunk = blended
-        elif wrapper.guidance_blend_strategy == GuidanceBlendStrategy.DENOISE:
+            blended[:, :, :action_dim] = ratio * base_chunk[:, :, :action_dim] + (1.0 - ratio) * g
+            if anchor_slice is not None:
+                # Post-hoc snap = the non-iterative analogue of DENOISE's
+                # in-loop inpainting (no sampler exists to re-anchor inside).
+                blended[:, self._chunk_step : self._chunk_step + anchor_slice.shape[1], :action_dim] = (
+                    anchor_slice
+                )
+        elif strategy == GuidanceBlendStrategy.DENOISE:
             denoise_kwargs: dict = {"noise": x_tsw, "sa_noise_ratio": ratio}
-            if wrapper.n_anchor_steps > 0:
-                # Pass first n_anchor_steps of normalized guidance as anchor_action.
-                # The denoising loop will re-anchor these positions at every step,
-                # so the final chunk exactly matches guidance at steps 0..n_a-1
-                # while letting the model generate a coherent continuation.
-                n_a = min(wrapper.n_anchor_steps, anchor_len - self._chunk_step)
-                denoise_kwargs["anchor_action"] = guidance_chunk[
-                    :, self._chunk_step : self._chunk_step + n_a, :action_dim
-                ]
+            if anchor_slice is not None:
+                # In-loop inpainting: the sampler re-anchors these positions
+                # at EVERY denoising step so neighbouring steps stay coherent
+                # — cannot be replicated by post-assignment, hence the only
+                # mechanism difference beyond the mix itself.
+                denoise_kwargs["anchor_action"] = anchor_slice
             blended = wrapper.inner_policy.predict_action_chunk(ctx.batch, **denoise_kwargs)
-            self._guided_chunk = blended
         else:
-            raise NotImplementedError(
-                f"Unsupported guidance_blend_strategy: {wrapper.guidance_blend_strategy}"
-            )
+            raise NotImplementedError(f"Unsupported guidance_blend_strategy: {strategy}")
+        self._guided_chunk = blended
 
         action = self._guided_chunk[:, self._chunk_step, :]
         self._chunk_step += 1

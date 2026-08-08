@@ -17,12 +17,27 @@
 """
 Policy wrapper for shared autonomy that works transparently with lerobot_eval.py.
 
-Extracts policy_guidance_chunk (a 7-d delta vector [dx,dy,dz,droll,dpitch,dyaw,gripper])
-from the observation dict, then applies FK→IK guidance to the full predicted action chunk
-and re-runs partial diffusion/flow-matching denoising with the guided chunk as the noise
-anchor. This means guidance is applied coherently across the entire action window.
+Hosts three pluggable guidance sources, dispatched per tick in priority order
+(see `select_action`):
 
-Works with any noise/flow-based policy (PI0.5, Diffusion) without modifying lerobot_eval.py.
+1. **RRT** (`RRTGuidanceSource`): method-triggered planner recovery. Plans to
+   the oracle task goal and plays the chunk back VERBATIM (forward_flow_ratio
+   does not apply). Includes the future-chunk predictive shield in
+   `rrt_collision_detection={future_chunk,hybrid}` modes.
+2. **Oracle-goal** (`OracleGoalGuidanceSource`): method-triggered joint-space
+   interpolation toward `q_goal_bias`, also played verbatim.
+3. **Obs-teleop** (`ObservationTeleopGuidanceSource`): observation-driven.
+   Consumes `observation.policy_guidance_chunk` — either a 7-d EE delta
+   (`PolicyGuidanceRepresentation.DELTA`, FK→IK applied) or raw absolute
+   joint targets (`ABSOLUTE_POS`) — and either passes it through (ratio=0
+   pure teleop) or blends it with the inner policy per
+   `GuidanceBlendStrategy` (partial-denoise or linear interpolate) at
+   `forward_flow_ratio`.
+
+When no source is active, the inner policy's action is returned unchanged.
+Works with noise/flow-based policies (Diffusion, PI0/PI0.5) without modifying
+lerobot_eval.py; relative-action policies are handled via the shared
+`RelativeActionsProcessorStep` anchor (see `refresh_relative_anchor`).
 """
 
 from __future__ import annotations
@@ -80,12 +95,20 @@ class BlendMode(Enum):
     """How often guidance blending is applied within an action chunk.
 
     EVERY_STEP:     (default) Re-blend every select_action call that has guidance.
-                    Each call runs a full denoising pass with fresh random noise.
-                    Allows continuous steering but sacrifices temporal coherence.
+                    What "re-blend" costs depends on the strategy:
+                    * DENOISE — a full denoising pass per call, conditioned on the
+                      live obs queue (fresh torch.randn unless the caller pins
+                      `base_noise`), so the policy component re-grounds every tick.
+                    * INTERPOLATE — only the guidance term and the linear mix are
+                      recomputed per call; the pure-policy anchor chunk is still
+                      generated ONCE per chunk (no extra model calls), so the
+                      policy component re-grounds only at chunk boundaries.
+                    Allows continuous steering; temporal coherence depends on the
+                    strategy and on whether `base_noise` is pinned.
     ONCE_PER_CHUNK: Blend only when a new anchor chunk is generated (chunk exhausted
                     or first guidance call). Subsequent calls with guidance drain the
                     blended chunk without re-blending. Produces temporally coherent
-                    action chunks from a single denoising pass.
+                    action chunks from a single blend.
     """
 
     EVERY_STEP = "every_step"
@@ -95,13 +118,17 @@ class BlendMode(Enum):
 class GuidanceBlendStrategy(Enum):
     """How the guidance chunk is blended with the policy output.
 
-    DENOISE:     (default) Build partially-noised guidance, then run the model's
-                 denoising from t=ratio down to t=0. The model's visual conditioning
-                 can override guidance if it has a strong prior.
-    INTERPOLATE: Simple linear interpolation in clean action space:
-                 blended = ratio * policy_output + (1-ratio) * guidance.
-                 No denoising involved. Guarantees the guidance has proportional
-                 influence, but the result is not "on-manifold".
+    DENOISE:     (default) Build partially-noised guidance (x_tsw), then run the
+                 model's denoising from t≈ratio·T down to 0. The model's
+                 conditioning can override guidance if it has a strong prior.
+    INTERPOLATE: Glass-box debug stand-in for DENOISE. Linear interpolation in
+                 clean (normalized) action space against the STORED pure-policy
+                 anchor chunk: blended = ratio * anchor_chunk + (1-ratio) * guidance
+                 (constant-ratio — never mixed against its own previous output,
+                 which would geometrically collapse onto guidance). No denoising.
+                 Guarantees proportional guidance influence, but the result is
+                 not "on-manifold". Implemented in ObservationTeleopGuidanceSource;
+                 both strategies share one code path up to the final blend.
     """
 
     DENOISE = "denoise"
@@ -109,34 +136,46 @@ class GuidanceBlendStrategy(Enum):
 
 
 class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
-    """Wraps a policy to blend human EE-delta guidance with diffusion/flow policy output.
-
-    The keyboard agent sends a 7-d delta [dx,dy,dz,droll,dpitch,dyaw,gripper] as
-    observation.policy_guidance_chunk (or all-NaN when no key is held).
+    """Wraps a policy to blend external guidance with diffusion/flow policy output.
 
     At each select_action() call this wrapper:
-    1. Always calls inner_policy.select_action(batch) to keep obs queues updated (needed
-       for policies like diffusion that maintain n_obs_steps history).
-    2. When guidance is active: applies FK→IK delta to all remaining steps in the current
-       chunk, re-runs partial denoising (noise scheduling) with the guided chunk as anchor,
-       and returns the next action from the blended chunk buffer.
-    3. The blended chunk buffer (_guided_chunk) is refreshed every guidance step with the
-       latest delta, and drains step-by-step between refreshes.
-    4. On transition out of guidance: drains the remaining buffer before handing back to
-       the inner policy.
+    1. Lets the obs-teleop source pop `observation.policy_guidance_chunk` from
+       the batch (so the inner policy never sees it) and compute has_guidance.
+    2. Calls the inner policy — full select_action normally (keeps obs queues
+       current for n_obs_steps policies like diffusion), or the lightweight
+       no-forward-pass variant while an intervention is EXECUTING (its output
+       would be discarded anyway; see `_lightweight_inner_call`).
+    3. Decodes the ACTUAL joint state from obs (staleness-gated by the env's
+       `state_version` mutation clock), refreshes `_desired_q` /
+       `_latest_actual_q` / the lookback history, and syncs the private
+       pybullet client.
+    4. Runs the future-chunk predictive shield when configured (FK-checks the
+       inner policy's cached chunk; triggers RRT with no_lookback on predicted
+       collision).
+    5. Dispatches to the highest-priority active source: RRT playback (verbatim,
+       cancelled by incoming user guidance) → oracle-goal playback (verbatim)
+       → obs-teleop (pure teleop at ratio=0, or DENOISE/INTERPOLATE blending
+       at 0<ratio≤1) → otherwise the inner policy's own action.
+    6. Updates `_desired_q` from the emitted action and tags the recording
+       context (frame_source / has_guidance) for the teleop recorder.
+
+    The blended-chunk buffer, emit cursor, and blend math are OWNED by
+    `ObservationTeleopGuidanceSource` (property shims `_guided_chunk` /
+    `_chunk_step` / … exist for back-compat); RRT state is owned by
+    `RRTGuidanceSource` (back-compat via the `_rrt` property view).
     """
 
     config_class = PreTrainedConfig
     name = "shared_autonomy_wrapper"
 
-    # Class-level default arm joint limits (matches SplatSim UR5's
-    # PybulletRobotServerBase). Used as a fallback when the loaded URDF
-    # doesn't publish limits. Instance-level `self.lower_limits` /
-    # `self.upper_limits` (populated in `_load_urdf`) override these per-
-    # robot from the URDF's own `getJointInfo` values, so no subclass edit
-    # is needed for new robots.
-    lower_limits = [-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -np.pi]
-    upper_limits = [np.pi, 0, np.pi, np.pi, np.pi, np.pi]
+    # Arm joint limits. The ROBOT'S URDF is the single source of truth:
+    # `_derive_joint_limits_from_urdf` (called from `_load_urdf`) populates
+    # `self.lower_limits` / `self.upper_limits` from the URDF's per-joint
+    # `getJointInfo` limits. A neutral ±π × num_dofs placeholder is set at
+    # ctor time (before the URDF loads) and kept — with a warning — only if
+    # the URDF's limits are missing/degenerate; fix the URDF in that case
+    # rather than hardcoding limits here or in a robot config (a second copy
+    # would drift from the URDF the sim itself loads).
 
     def __init__(
         self,
@@ -146,9 +185,9 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         inverse_preprocessor: PolicyProcessorPipeline,
         forward_flow_ratio: float,
         show_slider: bool = True,
+        pybullet_gui: bool = False,
         start_paused: bool = False,
         robot_name: str | None = None,
-        max_joint_delta: float = 0.016,
         num_dofs: int | None = None,
         policy_guidance_representation: PolicyGuidanceRepresentation = PolicyGuidanceRepresentation.DELTA,
         blend_mode: BlendMode | str = BlendMode.EVERY_STEP,
@@ -180,6 +219,16 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         rrt_final_approach_vel_scale: float = 0.3,
         rrt_final_approach_acc_scale: float = 0.25,
         rrt_uniform_path_speed: bool = False,
+        # CHOMP-lite trajopt smoothing (soft collision + smoothness) on the
+        # RRT path before ruckig. See SharedAutonomyConfig.rrt_trajopt_* and
+        # trajopt_smooth_path in SplatSim for cost formulation. 0 = disabled;
+        # default 15 matches SharedAutonomyConfig / TrajectoryGenModeConfig.
+        rrt_trajopt_passes: int = 15,
+        rrt_trajopt_lr: float = 0.02,
+        rrt_trajopt_smoothness_weight: float = 1.0,
+        rrt_trajopt_collision_weight: float = 5.0,
+        rrt_trajopt_collision_threshold: float = 0.10,
+        rrt_trajopt_fd_step: float = 0.01,
         rrt_abort_on_drift_rad: float = 0.15,
         rrt_abort_on_drift_ticks: int = 8,
         rrt_drift_trigger: str = "lookback",
@@ -221,7 +270,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # is triggered, q_start is taken from the oldest entry — that's the pose
         # the robot was at BEFORE the policy's current (presumably bad) action
         # chunk started commanding the robot toward a collision. Combined with
-        # _maybe_teleport_to_q_start below, this makes the recorded RRT segment
+        # the RRT source's _teleport_env_to_q_start, this makes the recorded RRT segment
         # begin at a clean pre-jump pose with no sim catch-up frames.
         # `_actual_q_history` is wrapper-owned (written every step from obs decode,
         # read by the RRT source via the wrapper back-ref to derive q_start).
@@ -257,6 +306,11 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # open-loop chunk runs away from the real robot (the divergence we're
         # chasing). None = no teleport pending a landing check.
         self._pending_teleport_landing: np.ndarray | None = None
+        # Env-mutation clock value returned by the most recent teleport RPC
+        # (None when the server predates state_version stamping). Compared
+        # against the observation's own stamp at decode time to detect a
+        # pre-teleport (stale) snapshot — see the gate in select_action.
+        self._pending_teleport_version: int | None = None
         # Frames-since-last-RRT-cycle-end counter. Used to cap the RRT
         # source's lookback so it never rewinds into a prior RRT cycle's
         # trajectory (which would teleport the env's robot to a config the
@@ -295,8 +349,13 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # class subclasses. See `_resolve_num_dofs` docstring.
         resolved_num_dofs = self._resolve_num_dofs(num_dofs, inner_policy)
         self.num_dofs = resolved_num_dofs
-        self._max_joint_delta = max_joint_delta
-        self._prev_dq: np.ndarray | None = None  # previous joint velocity (raw, [num_dofs])
+        # Neutral length-correct placeholder until the URDF publishes real
+        # limits (see the class-level comment). The historical class-level
+        # UR5 arrays were 6-element regardless of num_dofs — on a non-6-DOF
+        # robot with a limit-less URDF they would have produced wrong-length
+        # null-space arrays in _compute_next_joints.
+        self.lower_limits: list[float] = [-np.pi] * resolved_num_dofs
+        self.upper_limits: list[float] = [np.pi] * resolved_num_dofs
         self.skip_collision: bool = False  # set True for visualization (dataset guidance is known-safe)
         self.policy_guidance_representation = policy_guidance_representation
         self.n_anchor_steps = n_anchor_steps
@@ -363,6 +422,12 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             final_approach_vel_scale=rrt_final_approach_vel_scale,
             final_approach_acc_scale=rrt_final_approach_acc_scale,
             uniform_path_speed=rrt_uniform_path_speed,
+            trajopt_passes=rrt_trajopt_passes,
+            trajopt_lr=rrt_trajopt_lr,
+            trajopt_smoothness_weight=rrt_trajopt_smoothness_weight,
+            trajopt_collision_weight=rrt_trajopt_collision_weight,
+            trajopt_collision_threshold=rrt_trajopt_collision_threshold,
+            trajopt_fd_step=rrt_trajopt_fd_step,
         )
 
         # NOTE on `ratio` scope: forward_flow_ratio is applied ONLY to the
@@ -388,9 +453,14 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # `select_action` receipt of `oracle_env_config["robot"]` (when the
         # env is configured with `--env.include_oracle_info=true`). `_urdf_loaded`
         # gates the lazy path.
-        self._pb_client = p.connect(p.GUI if show_slider else p.DIRECT)
+        self._pb_client = p.connect(p.GUI if (show_slider or pybullet_gui) else p.DIRECT)
         self._show_slider = show_slider  # for the launch_ratio_slider guard below
         self._robot_id: int | None = None
+        # Guidance-ghost visualization (opt-in via `show_guidance_ghost`,
+        # set by callers like augment_dataset_with_blending). Lazy-created
+        # in the wrapper's OWN pybullet client (the --keep_sa_gui window).
+        self.show_guidance_ghost: bool = False
+        self._ghost_ids: dict[str, int] = {}
         self._ee_link: int | None = None
         self._num_pb_joints: int = 0
         self._num_movable_joints: int = 0
@@ -415,16 +485,14 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # commanded position → visible shake" cascade. See select_action's
         # shield block.
         self._shield_cooldown_ticks: int = 0
-        # How many ticks to suppress the shield after a failed plan. Short
-        # enough (~0.5 s at 30 fps) that the arm gets fresh RRT attempts
-        # quickly when stuck in collision (sliding on an obstacle) — the
-        # planner has three escape methods and one of them may succeed on
-        # a subsequent tick as the policy nudges the arm slightly. Long
-        # enough that we don't spend ALL CPU on retrying escape chains
-        # (each attempt is ~50-200 ms of pybullet iters). Was previously
-        # 60 (2 s) which was too passive: episodes could burn hundreds of
-        # collision ticks between attempts.
-        self._SHIELD_COOLDOWN_ON_PLAN_FAIL: int = 15
+        # How many ticks to suppress the shield after a failed plan. The
+        # default (15 ≈ 0.5 s at 30 fps) balances fresh RRT attempts while
+        # stuck in collision against burning every tick on ~50-200 ms
+        # escape-chain retries. Tunable via
+        # `future_chunk.plan_fail_cooldown_ticks` (0 = no cooldown).
+        self._SHIELD_COOLDOWN_ON_PLAN_FAIL: int = max(
+            0, int(getattr(self._future_chunk_config, "plan_fail_cooldown_ticks", 15))
+        )
         # Per-scenario latch: once we've logged "shield can't fire because
         # oracle has no task goal", stop firing the shield for the rest of
         # this scenario so we don't spam the log or spin uselessly. Reset
@@ -434,7 +502,12 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # Used to detect new episodes (new oracle received) and reset the
         # per-scenario shield-disabled latch.
         self._last_applied_oracle_id: int | None = None
-        if robot_name is not None:
+        # Truthiness, not `is not None`: callers that plumb a CLI string
+        # (e.g. augment_dataset_with_blending's --env_robot_name=) pass ''
+        # for "unset", which must defer URDF loading to the oracle exactly
+        # like None does — _load_urdf('') would resolve a SplatObjectConfig
+        # with urdf_path=None and crash.
+        if robot_name:
             self._load_urdf(robot_name)
             # Static-scene fallback (table + walls) is small_engine-specific
             # geometry the pre-oracle-era wrapper always loaded. When the
@@ -570,6 +643,11 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             flags=urdf_flags,
             physicsClientId=self._pb_client,
         )
+        # Stashed for the optional guidance-ghost visualization (a second,
+        # collision-disabled translucent copy of the robot showing where the
+        # guidance wants the robot THIS tick). See update_guidance_ghost.
+        self._ghost_urdf_path = urdf_path
+        self._ghost_base_pos = list(_base_pos)
         self._ee_link = self._find_ee_link(ee_link_name)
         self._num_pb_joints = p.getNumJoints(self._robot_id, physicsClientId=self._pb_client)
         self._num_movable_joints = sum(
@@ -577,8 +655,8 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             for i in range(self._num_pb_joints)
             if p.getJointInfo(self._robot_id, i, physicsClientId=self._pb_client)[2] != p.JOINT_FIXED
         )
-        self._derive_joint_limits_from_urdf()
         self._loaded_robot_name = robot_name
+        self._derive_joint_limits_from_urdf()
         self._urdf_loaded = True
         logger.info(
             "SA wrapper: loaded URDF %r (path=%s, ee_link=%s, pb_joints=%d, movable=%d, num_dofs=%d).",
@@ -596,14 +674,14 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self._log_robot_link_aabbs()
 
     def _derive_joint_limits_from_urdf(self) -> None:
-        """Populate instance-level `lower_limits` / `upper_limits` from the
-        loaded URDF's per-joint info (fields [8]=lower, [9]=upper of
-        getJointInfo). Only the first `num_dofs` MOVABLE (non-fixed) joints
-        are consumed — matches _sync_joints' `1..1+num_dofs` convention.
-        If any joint reports lower >= upper (unlimited in URDF), we fall
-        back to the class-level default for the whole array — mixing per-
-        joint URDF limits with class defaults would produce a nonsense
-        combined range."""
+        """Populate `lower_limits` / `upper_limits` from the loaded URDF's
+        per-joint info (fields [8]=lower, [9]=upper of getJointInfo). Only
+        the first `num_dofs` MOVABLE (non-fixed) joints are consumed —
+        matches _sync_joints' `1..1+num_dofs` convention. If any joint
+        reports lower >= upper (unlimited in URDF), the ctor's neutral
+        ±π × num_dofs placeholder is kept for the whole array (mixing
+        per-joint URDF limits with placeholders would produce a nonsense
+        combined range) and a warning names the URDF as the fix site."""
         if self._robot_id is None:
             return
         limits: list[tuple[float, float]] = []
@@ -626,9 +704,13 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 self.upper_limits,
             )
         else:
-            logger.info(
-                "SA wrapper: URDF joint limits missing/degenerate; keeping "
-                "class-level defaults (lower=%s, upper=%s).",
+            logger.warning(
+                "SA wrapper: URDF %r publishes missing/degenerate joint limits; "
+                "keeping the neutral ±π placeholder (lower=%s, upper=%s). IK "
+                "null-space will be unconstrained — add <limit lower= upper=> "
+                "to the URDF's joints to fix (the URDF is the single source "
+                "of truth for limits; do not hardcode them in configs).",
+                self._loaded_robot_name or "?",
                 self.lower_limits,
                 self.upper_limits,
             )
@@ -722,9 +804,6 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             physicsClientId=self._pb_client,
         )
         q_ik = np.array(joint_poses[: self.num_dofs])
-        # if np.max(np.abs(q_ik - q)) > 0.15:
-        #     return q  # reject singularity / far branch
-        # delta_q = np.clip(q_ik - q, -self._max_joint_delta, self._max_joint_delta)
         delta_q = q_ik - q
         return q + delta_q
 
@@ -792,10 +871,12 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         FK-checks the cumulative future joint trajectory against the
         wrapper's pybullet client (which holds the same obstacles RRT uses).
 
-        Returns ``(any_collides, first_step_idx, kind)`` mirroring
-        ``rrt_to_goal.check_chunk_collision``. When ``any_collides`` is
-        True, the caller should preempt the policy and trigger RRT from
-        the current state (no rewind / no teleport).
+        Returns ``(any_collides, first_step_idx, kind, offending_q)`` — the
+        first three mirror ``rrt_to_goal.check_chunk_collision``; ``offending_q``
+        is the predicted future joint config (arm + snapped gripper) at the
+        offending step, for `describe_collision_at` probing, or None. When
+        ``any_collides`` is True, the caller should preempt the policy and
+        trigger RRT from the current state (no rewind / no teleport).
 
         Pre-conditions: ``_latest_actual_q`` has been refreshed THIS tick
         AND the pybullet client has been synced via ``_sync_joints``.
@@ -844,7 +925,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # different absolute position from where the robot will actually go.
         # The relative_action_processor only refreshes its ``_last_state``
         # when the policy's chunk queue is empty (i.e., on chunk regen);
-        # during the 8 ticks the chunk plays out, ``_last_state`` stays
+        # for the n_action_steps ticks the chunk plays out, ``_last_state`` stays
         # FIXED at the chunk-gen-time obs state. So inference does
         # ``action[k] = chunk[k] + _last_state_chunk_gen`` for all k,
         # NOT ``chunk[k] + obs_state_at_tick_k``.
@@ -926,46 +1007,6 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             skip_pairs=obstacle_skip_pairs,
             actual_gripper_q=actual_gripper_q,
         )
-        # DIAGNOSTIC (why-doesn't-shield-fire-earlier): for the NO-COLLISION
-        # case, probe chunk-step 0 (immediate command) and chunk-step -1
-        # (deepest lookahead the shield can see) for their closest-pair
-        # distance. Log ONLY when either is inside a 5 cm proximity window
-        # so we see the approach ramp up without spamming steady-state ticks.
-        # This reveals whether the policy's chunk projects into the obstacle
-        # BEFORE the shield's threshold hits (i.e., shield had a chance to
-        # fire but chose not to under the current threshold) vs. the chunk
-        # never reaches the obstacle geometrically until step 0 (i.e., the
-        # policy jumps commanded position across a chunk boundary, giving
-        # the shield no runway). Falls back silently when planner isn't
-        # ready (mirror-loaded, no obstacles) or describe returns None.
-        planner = self._rrt_source.state.planner
-        if not collides and planner is not None and chunk_dof.shape[0] > 0:
-            _steps_to_probe = [0]
-            if chunk_dof.shape[0] > 1:
-                _steps_to_probe.append(int(chunk_dof.shape[0]) - 1)
-            _probes: list[tuple[int, float, str, str]] = []
-            _min_dist = float("inf")
-            for _k in _steps_to_probe:
-                _base_q = q_current_dof + chunk_dof[_k] if action_format == "rel" else chunk_dof[_k]
-                if actual_gripper_q is not None:
-                    _probe_q = np.concatenate(
-                        [
-                            np.asarray(_base_q, dtype=np.float64),
-                            np.asarray([actual_gripper_q], dtype=np.float64),
-                        ]
-                    )
-                else:
-                    _probe_q = np.asarray(_base_q, dtype=np.float64)
-                _info = planner.describe_collision_at(
-                    _probe_q,
-                    obstacle_clearance=ob_clear,
-                    self_collision_clearance=self_clear,
-                )
-                if _info is not None:
-                    _d = float(_info.get("distance_m", float("inf")))
-                    _probes.append((_k, _d, _info.get("link_a_name", "?"), _info.get("link_b_name", "?")))
-                    if _d < _min_dist:
-                        _min_dist = _d
         # Re-derive the offending future joint config so the caller can
         # probe `planner.describe_collision_at(future_q)` to identify the
         # violating link pair. Mirrors the math `check_chunk_collision`
@@ -1429,62 +1470,98 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
 
         return q_projected
 
-    # ---- motion limits ----------------------------------------------------- #
-
-    def _apply_velocity_limit(
-        self, q_proposed: np.ndarray, q_prev: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Uniform velocity scaling: if any joint exceeds v_max, scale the whole delta vector
-        down proportionally. This preserves the EE direction (unlike per-joint clipping).
-
-        Only applied to the joint dims (first num_dofs); gripper passes through unchanged.
-
-        Returns (q_actual, dq_actual) where dq_actual should be stored as _prev_dq for the
-        next step (needed if you later add acceleration/jerk limits — see below).
-        """
-        n = self.num_dofs
-        v_max = self._max_joint_delta  # 0.5 / self._fps  # max position delta per step (rad)
-
-        dq = q_proposed[:n] - q_prev[:n]
-        v_mag = np.max(np.abs(dq))
-        if v_mag > v_max:
-            dq = dq * (v_max / v_mag)  # scale whole vector, not per-joint clip
-
-        # Use q_proposed as base so gripper (and any extra dims) are always present,
-        # regardless of whether q_prev was set with or without gripper.
-        q_actual = q_proposed.copy()
-        q_actual[:n] = q_prev[:n] + dq
-
-        # To also add acceleration and jerk limits, track dq_prev and ddq_prev across steps
-        # and apply constraints in reverse order (jerk → accel → vel) before the vel limit:
-        #
-        # a_max = 1.0 / self._fps
-        # j_max = 10.0 / self._fps
-        #
-        # d2q = dq - dq_prev                      # proposed acceleration
-        # d3q = d2q - ddq_prev                    # proposed jerk
-        #
-        # # 1) Jerk limit: scale jerk vector uniformly
-        # j_mag = np.max(np.abs(d3q))
-        # if j_mag > j_max:
-        #     d3q = d3q * (j_max / j_mag)
-        # d2q = ddq_prev + d3q                    # accel after jerk constraint
-        #
-        # # 2) Acceleration limit: scale (jerk-constrained) accel vector uniformly
-        # a_mag = np.max(np.abs(d2q))
-        # if a_mag > a_max:
-        #     d2q = d2q * (a_max / a_mag)
-        # dq = dq_prev + d2q                      # velocity after accel constraint
-        #
-        # # 3) Velocity limit (same as above, applied to the now-cascaded dq)
-        #
-        # Also update _prev_ddq = dq_actual - dq_prev alongside _prev_dq each step.
-
-        # The gripper passed through
-
-        return q_actual, dq
-
     # ---- policy helpers ---------------------------------------------------- #
+
+    _GHOST_COLORS = {
+        # name → (rgba, description)
+        "guidance": ([0.1, 0.9, 0.2, 0.35], "GREEN = guidance target (where the demo wants the robot NOW)"),
+        "action": (
+            [0.15, 0.45, 1.0, 0.40],
+            "BLUE = executed action target (rel action decoded on the current anchor)",
+        ),
+    }
+
+    def _update_ghost(self, name: str, q_raw) -> None:
+        """Snap the named translucent ghost robot to joint config ``q_raw``.
+
+        Ghosts render in the wrapper's OWN pybullet window (pybullet_gui /
+        show_slider). Each ghost is a collision-disabled copy of the robot
+        URDF (setCollisionFilterGroupMask(0,0) on every link — the wrapper's
+        client doubles as the RRT/shield collision world, and the ghost is
+        never in the planner's obstacle list, so clearance queries can't see
+        it). Lazy-created on first update; any failure disables ghosts
+        rather than taking down the rollout.
+        """
+        if not self.show_guidance_ghost or self._robot_id is None:
+            return
+        try:
+            gid = self._ghost_ids.get(name)
+            if gid is None:
+                _conn = p.getConnectionInfo(self._pb_client)
+                if _conn.get("connectionMethod") != p.GUI:
+                    logger.warning(
+                        "Ghost visualization requested but the SA wrapper's pybullet client "
+                        "is HEADLESS (DIRECT) — ghosts would exist with no window to see "
+                        "them in. Enable the wrapper GUI (pybullet_gui=true in the shared "
+                        "autonomy config; augment_dataset_with_blending does this "
+                        "automatically when --show_guidance_ghost=true). Disabling ghosts."
+                    )
+                    self.show_guidance_ghost = False
+                    return
+                rgba, desc = self._GHOST_COLORS[name]
+                gid = p.loadURDF(
+                    self._ghost_urdf_path,
+                    useFixedBase=True,
+                    basePosition=self._ghost_base_pos,
+                    physicsClientId=self._pb_client,
+                )
+                n = p.getNumJoints(gid, physicsClientId=self._pb_client)
+                for link in range(-1, n):
+                    p.setCollisionFilterGroupMask(gid, link, 0, 0, physicsClientId=self._pb_client)
+                    p.changeVisualShape(gid, link, rgbaColor=rgba, physicsClientId=self._pb_client)
+                self._ghost_ids[name] = gid
+                logger.info("Ghost enabled (body id %d): %s", gid, desc)
+            q = np.asarray(q_raw, dtype=np.float64).reshape(-1)
+            for j in range(min(self.num_dofs, q.size)):
+                p.resetJointState(gid, 1 + j, float(q[j]), physicsClientId=self._pb_client)
+        except Exception:
+            logger.exception("ghost update %r failed; disabling ghosts.", name)
+            self.show_guidance_ghost = False
+
+    def update_guidance_ghost(self, q_raw) -> None:
+        """GREEN ghost: the guidance (demo) target for the current tick."""
+        self._update_ghost("guidance", q_raw)
+
+    def update_action_ghost(self, q_raw) -> None:
+        """BLUE ghost: the absolute target the wrapper is COMMANDING this tick
+        (the relative action decoded on top of the current anchor state).
+        Divergence between blue and the actual robot = tracking error (PD lag,
+        contact); divergence between blue and green = how far the blend's
+        output strays from the guidance."""
+        self._update_ghost("action", q_raw)
+
+    def refresh_relative_anchor(self) -> bool:
+        """Sync the rel-action decode anchor (`_last_state`) to the newest observed state.
+
+        Called by the obs-teleop source per its time-anchoring rule: every
+        tick for DENOISE + EVERY_STEP (the chunk is regenerated now-anchored
+        each call), otherwise only at fresh chunk builds (t0-anchored chunks
+        must keep the t0 anchor — refreshing per tick wrongly decodes them as an
+        r-scaled extrapolation). Without the per-tick refresh, now-anchored
+        chunks get decoded against an anchor up to n_action_steps-1 ticks
+        stale, displacing every executed target backwards by the robot's
+        motion since the last natural refresh — the "policy shakes backwards
+        at high blend ratios" bug. No-op (returns False) for abs-action
+        policies. See RelativeActionsProcessorStep.refresh_anchor for the
+        full mechanics.
+        """
+        for _step in self.postprocessor.steps:
+            if isinstance(_step, AbsoluteActionsProcessorStep):
+                abs_step = cast(AbsoluteActionsProcessorStep, _step)
+                if abs_step.enabled and abs_step.relative_step is not None:
+                    return bool(abs_step.relative_step.refresh_anchor())
+                break
+        return False
 
     def _normalize_policy_guidance_action(self, policy_guidance_action: Tensor) -> Tensor:
         """Normalize raw policy guidance action to policy's internal space.
@@ -1525,7 +1602,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
 
     def _build_guidance_noise_from_chunk(
         self, guidance_chunk: Tensor, ratio: float, base_noise: Tensor | None = None
-    ) -> tuple[Tensor, float] | None:
+    ) -> Tensor:
         """Build partially-noised guidance using the correct noise schedule.
 
         For diffusion (DDPM/DDIM):
@@ -1537,10 +1614,14 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             x_tsw = ratio * noise + (1 - ratio) * guidance
             Denoising then starts from t=ratio instead of t=1.0.
 
-        ratio=0 → pure human (no denoising), ratio=1 → pure policy (handled before this call).
+        ratio=0 never reaches this function (pure teleop is handled by the
+        obs-teleop source's ratio==0 branch). ratio=1 DOES reach it: t_sw lands
+        on the last timestep, so x_tsw is (almost) pure noise → a full-length
+        denoise ≈ the pure policy sample ("blend100" / pure-policy mode).
 
-        Returns (x_tsw, ratio) to pass as (noise=x_tsw, sa_noise_ratio=ratio) kwargs,
-        or None if the inner policy doesn't expose the needed interface.
+        Returns x_tsw, to pass as (noise=x_tsw, sa_noise_ratio=ratio) kwargs to
+        predict_action_chunk. Raises NotImplementedError when the inner policy
+        exposes neither a diffusion noise_scheduler nor flow-matching config.
         """
         device = guidance_chunk.device
         batch_size = guidance_chunk.shape[0]
@@ -1621,10 +1702,11 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self._obs_teleop_source.reset()
         self._desired_q = None
         self._latest_actual_q = None
+        self._pending_teleport_landing = None
+        self._pending_teleport_version = None
         self._actual_q_history.clear()
         self._frames_since_last_rrt_end = 0
         self._prev_rrt_mode = RRTMode.IDLE
-        self._prev_dq = None
         self._shield_cooldown_ticks = 0
         self._shield_check_tick_counter = 0
         # Clear RRT chunk state on episode boundary; keep the planner instance
@@ -1653,7 +1735,6 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         Pure teleop mode: apply FK+IK from _desired_q (not obs, to avoid lag).
 
         delta: [batch_size, 7] tensor [dx,dy,dz,droll,dpitch,dyaw,gripper]
-        inner_action: fallback action from inner policy (for dtype/device)
 
         Returns normalized action tensor.
         """
@@ -1787,7 +1868,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # diffusion; flow-matching solve for Pi0/0.5) — the expensive part.
         #
         # During intervention EXECUTING: the wrapper's downstream branches
-        # (RRT playback ~2080, oracle-goal playback ~2100) DISCARD the inner
+        # (the RRT / oracle-goal playback blocks below) DISCARD the inner
         # action and emit an intervention waypoint instead. Running the full
         # forward pass just to throw the result away is pure waste. The
         # `_lightweight_inner_call` helper (a) pops cached actions cheaply
@@ -1868,13 +1949,47 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         except Exception:
             actual_q_t = None
 
+        # Staleness gate on the env-mutation clock. A teleport that fired
+        # OUTSIDE select_action (the InterventionController's mid-RRT
+        # collision retry runs after env.step returned this tick's obs)
+        # mutates the sim AFTER the observation in hand was captured — the
+        # snapshot is one mutation stale. The server stamps every obs with
+        # its state_version and the teleport RPC returned the post-teleport
+        # version, so the comparison is exact and independent of control-loop
+        # ordering. On a stale obs: skip the state-cache update (the teleport
+        # already primed _latest_actual_q/_actual_q_history with the ACTUAL
+        # current pose) and keep the landing check armed for the next,
+        # post-teleport observation — previously this decode clobbered the
+        # caches with the pre-teleport pose and logged a bogus landing error
+        # equal to the escape-jump size (~0.2 rad observed).
+        _obs_ver = batch.get("state_version")
+        try:
+            _obs_ver = int(_obs_ver) if _obs_ver is not None else None
+        except (TypeError, ValueError):
+            _obs_ver = None
+        if (
+            actual_q_t is not None
+            and _obs_ver is not None
+            and self._pending_teleport_version is not None
+            and _obs_ver < self._pending_teleport_version
+        ):
+            logger.info(
+                "Obs decode: state_version=%d predates the last teleport (version %d) — "
+                "pre-teleport snapshot (controller-driven teleport landed after this obs "
+                "was captured). Skipping state-cache update; landing check deferred to "
+                "the next observation.",
+                _obs_ver,
+                self._pending_teleport_version,
+            )
+            actual_q_t = None  # treat as no-decode: caches keep the teleport-fresh pose
+
         if actual_q_t is not None:
             actual_q = actual_q_t[0].detach().cpu().numpy().astype(np.float64)
             # observation.state is normally [num_dofs joints + gripper] =
             # num_dofs+1 entries. But when --exclude_gripper_from_state is
             # set at the preprocessor, obs.state is arm-only (num_dofs
             # entries). We MUST still keep `_desired_q` and `_latest_actual_q`
-            # sized to num_dofs+1 — the RRT-playback branch (~line 2082)
+            # sized to num_dofs+1 — the RRT-playback branch below
             # reads gripper via `_desired_q[-1]`, and a short array would
             # make `[-1]` return the last ARM joint (e.g. joint_3 ≈ -1.35 rad)
             # as the gripper command. The env's Robotiq interprets that as
@@ -1919,6 +2034,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                     land_err,
                 )
                 self._pending_teleport_landing = None
+                self._pending_teleport_version = None
             # Track post-intervention idle frames. Bumped on every policy-
             # driven tick (RRT IDLE), zeroed the moment RRT leaves IDLE for
             # a new cycle. rrt_source._do_plan() caps its lookback sample
@@ -2088,17 +2204,14 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                     # so we don't retrigger every frame against the same
                     # unresolvable collision. Inner policy keeps driving.
                     self._shield_cooldown_ticks = self._SHIELD_COOLDOWN_ON_PLAN_FAIL
-                    logger.info(
+                    # debug level — routine backoff bookkeeping, not an event;
+                    # the plan failure itself already logged its own warning.
+                    logger.debug(
                         "Future-chunk shield: RRT plan failed; suppressing shield "
                         "for %d ticks to avoid per-frame queue thrash.",
                         self._SHIELD_COOLDOWN_ON_PLAN_FAIL,
                     )
                 # Refresh local view so the EXECUTING branch picks up.
-
-        # Capture q_prev BEFORE any action computation so velocity limiting sees the true
-        # previous position. get_full_teleop_action pre-updates _desired_q internally,
-        # so reading it afterward would give dq=0 (a no-op).
-        # q_prev_for_vel_limit = self._desired_q.reshape(-1).copy() if self._desired_q is not None else None
 
         # --- RRT-to-Goal mode: highest priority among non-paused branches. ---
         # Cancellation: user takes over (has_guidance) or explicit cancel button.
@@ -2114,7 +2227,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 return self.get_hold_action(inner_action)
             elif rrt.step >= len(rrt.chunk):
                 # print('finish rrt: chunk exhausted (step %d >= chunk length %d)' % (rrt.step, len(rrt.chunk)))
-                # Goal reached: restore prior ratio, auto-pause for the next step.
+                # Goal reached: cancel + clean caches, auto-pause for the next step.
                 self._log_rrt_drift_summary("completed")
                 self._finish_rrt()
                 action = self.get_hold_action(inner_action)
@@ -2246,10 +2359,12 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 rrt.step += 1
                 gripper = float(self._desired_q[-1]) if self._desired_q is not None else 0.0
                 raw7 = np.concatenate([wp, [gripper]]).astype(np.float64)
-                self._last_raw_action = raw7  # picked up by the post-block _desired_q update
+                self._last_raw_action = raw7
                 raw_t = torch.tensor(raw7, dtype=inner_action.dtype, device=inner_action.device).unsqueeze(0)
                 action = self._normalize_policy_guidance_action(raw_t)
-                # _desired_q is updated in the post-block via _last_raw_action.
+                # This branch returns before the shared post-block, so update
+                # _desired_q directly (raw float64 waypoint — no normalize→
+                # denormalize round-trip loss).
                 self._desired_q = raw7.copy()
                 return action
 
@@ -2338,6 +2453,8 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 _source = "rrt"
             elif self._oracle_goal_source.is_active():
                 _source = "oracle_goal"
+            elif self._obs_teleop_source.is_active():
+                _source = "obs_teleop"
             # Chunk-boundary diagnostics: fires ONLY when the inner policy's
             # action queue was empty on entry (i.e., it re-predicted a fresh
             # chunk this tick). Detected by peeking the queue AFTER select
@@ -2389,8 +2506,6 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                         f"{x:+.4f}" for x in (_rel0_raw[: self.num_dofs] if _rel0_raw is not None else [])
                     ),
                 )
-            elif self._obs_teleop_source.is_active():
-                _source = "obs_teleop"
             _dq = self._desired_q.reshape(-1)[: self.num_dofs]
             logger.info(
                 "SA-tick src=%s q_cmd=[%s]",

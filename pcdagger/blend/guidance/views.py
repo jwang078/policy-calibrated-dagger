@@ -1,12 +1,15 @@
 """Back-compat proxy views for the SA wrapper's old `_rrt` attribute.
 
-Several external callers (`InterventionController` in
-`lerobot.scripts.intervention_controller`, `shared_autonomy_gui.py`,
-`last_mile/helpers.py`) directly access `wrapper._rrt.mode`, write
+External callers used to directly access `wrapper._rrt.mode`, write
 `wrapper._rrt.target_steps`, etc. After the guidance-source refactor, that
 state lives inside `RRTGuidanceSource.state` (an `RRTRuntimeState` dataclass
 instance). The wrapper exposes `_rrt` as a property returning an
 `_RRTBackCompatView` so external reads/writes still hit the right place.
+Today `shared_autonomy_gui.py` still reads `wrapper._rrt.mode` through the
+view; `InterventionController` (`lerobot.scripts.intervention_controller`)
+has migrated to `wrapper._rrt_source` + `.state` directly, and
+`last_mile/helpers.py` only touches the wrapper's `auto_pause_on_rrt_finish`
+property — but the view remains the supported back-compat surface.
 
 This is a one-class file because the abstraction boundary is single-purpose.
 Other future sources may grow their own views; for now only RRT needs one
@@ -26,8 +29,8 @@ class _RRTBackCompatView:
 
     Reads and writes go to the underlying `RRTGuidanceSource.state`
     (which is an `RRTRuntimeState` instance — same dataclass that used
-    to live directly on the wrapper). Also proxies `.planner` and
-    `.oracle_env_config` which were previously dataclass fields.
+    to live directly on the wrapper). `.planner` and `.oracle_env_config`
+    are plain fields on that dataclass, forwarded like everything else.
 
     Implemented via __getattr__/__setattr__ rather than @property
     forwarding so we don't have to enumerate every field on the state

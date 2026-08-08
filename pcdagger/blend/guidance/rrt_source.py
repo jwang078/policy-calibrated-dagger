@@ -8,7 +8,7 @@ plumbing, and the obstacle adoption that used to happen in
 
 Wrapper-owned state (pybullet client, robot id, joint indices, num_dofs,
 fps, joint limits, `_desired_q`, `_actual_q_history`, `_latest_actual_q`,
-`_obstacle_ids`, `forward_flow_ratio`) is accessed via the back-reference
+`_obstacle_ids`) is accessed via the back-reference
 `self._wrapper`. This is a small encapsulation breach in exchange for not
 having to refactor the wrapper's per-step state plumbing — the source needs
 read access to a lot of wrapper-managed state to compute q_start, plan, and
@@ -72,10 +72,14 @@ class RRTGuidanceSource:
         # Collision-detection mode (see SharedAutonomyConfig docstring).
         # "pre_jump_lookback" → use the rewind/teleport flow, sample lookback
         # from [steps_min, steps_max].
-        # "future_chunk" → no rewind. Trigger callers pass no_lookback=True
+        # "future_chunk" → no rewind ever. Trigger callers pass no_lookback=True
         # to trigger(); _do_plan() reads q_start = wrapper._latest_actual_q.
+        # "hybrid" → shield + collision triggers use no_lookback; stall /
+        # no-progress triggers still rewind (per-trigger dispatch lives in
+        # InterventionController._trigger_source).
         collision_detection: str = "pre_jump_lookback",
-        # Tunables for pre_jump_lookback mode. Ignored when
+        # Tunables for the rewind flow (pre_jump_lookback + hybrid's
+        # stall/no-progress triggers). Ignored when
         # collision_detection == "future_chunk".
         pre_jump_lookback_steps_min: int = 5,
         pre_jump_lookback_steps_max: int | None = None,
@@ -102,6 +106,16 @@ class RRTGuidanceSource:
         final_approach_vel_scale: float = 0.3,
         final_approach_acc_scale: float = 0.25,
         uniform_path_speed: bool = False,
+        # CHOMP-lite trajopt smoothing pass. See SharedAutonomyConfig for
+        # semantics; forwarded to RRTToGoalPlanner in _ensure_planner.
+        # Default 15 matches SharedAutonomyConfig / the planner ctor
+        # (SplatSim's TrajectoryGenModeConfig uses 30).
+        trajopt_passes: int = 15,
+        trajopt_lr: float = 0.02,
+        trajopt_smoothness_weight: float = 1.0,
+        trajopt_collision_weight: float = 5.0,
+        trajopt_collision_threshold: float = 0.10,
+        trajopt_fd_step: float = 0.01,
     ) -> None:
         self._wrapper = wrapper
         # Same dataclass that used to live on the wrapper as `_rrt`. The
@@ -113,8 +127,9 @@ class RRTGuidanceSource:
                 f"'future_chunk', or 'hybrid', got {collision_detection!r}"
             )
         self.collision_detection = collision_detection
-        # Lookback tunables — only consulted in pre_jump_lookback mode.
-        # In future_chunk mode these are stored but unused (the no-lookback
+        # Lookback tunables — consulted in pre_jump_lookback and hybrid
+        # modes (hybrid's stall/no-progress triggers still rewind). In
+        # future_chunk mode these are stored but unused (the no-lookback
         # path bypasses them).
         self.pre_jump_lookback_steps_min = int(pre_jump_lookback_steps_min)
         # Optional upper bound for per-trigger random lookback sampling. When
@@ -233,6 +248,12 @@ class RRTGuidanceSource:
         self.final_approach_vel_scale = float(final_approach_vel_scale)
         self.final_approach_acc_scale = float(final_approach_acc_scale)
         self.uniform_path_speed = bool(uniform_path_speed)
+        self.trajopt_passes = int(trajopt_passes)
+        self.trajopt_lr = float(trajopt_lr)
+        self.trajopt_smoothness_weight = float(trajopt_smoothness_weight)
+        self.trajopt_collision_weight = float(trajopt_collision_weight)
+        self.trajopt_collision_threshold = float(trajopt_collision_threshold)
+        self.trajopt_fd_step = float(trajopt_fd_step)
         # Env handle for the pre-execution teleport. Set externally via the
         # wrapper's `set_env_for_teleport(env)`; None means teleport is a no-op.
         self._env_for_teleport: object | None = None
@@ -240,11 +261,6 @@ class RRTGuidanceSource:
         # hardcoded fallback obstacles (loaded in __init__ for no-oracle envs)
         # exactly once, when the first real oracle config arrives.
         self._oracle_replaced_static_obstacles = False
-        # Cached full-DOF q_start (joints + gripper) from the most recent
-        # plan(). Used by request_retry_after_collision() to teleport back
-        # to the SAME start the original plan used, rather than the current
-        # mid-execution pose where the collision happened.
-        self._last_q_start_full: np.ndarray | None = None
 
     # ── Public lifecycle API ────────────────────────────────────────────── #
 
@@ -282,8 +298,11 @@ class RRTGuidanceSource:
                 and teleport entirely — q_start = wrapper._latest_actual_q
                 (the robot's current config) and ruckig's start_vel matches
                 the robot's recent joint velocity. Used by the wrapper's
-                future-chunk predictive shield (and by the controller when
-                operating in `collision_detection="future_chunk"` mode).
+                future-chunk predictive shield (future_chunk + hybrid
+                modes), and by the controller: for every trigger in
+                `collision_detection="future_chunk"` mode, and for
+                collision-related triggers in "hybrid" (per-trigger
+                dispatch in `InterventionController._trigger_source`).
                 When False (default), the historical lookback flow runs.
         """
         del ctx  # RRT doesn't need ctx — it reads from the wrapper back-ref
@@ -324,8 +343,9 @@ class RRTGuidanceSource:
           3. Call `_do_plan` synchronously. This re-runs the IK solver,
              filters out excluded goals, runs RRT against remaining
              candidates, and re-applies ruckig — same code path as the
-             original trigger. Teleport-to-q_start fires again with the
-             SAME pre-trigger pose (cached in `_last_q_start_full`).
+             original trigger, but with `no_lookback=True` forced (see
+             below): the retry plans from the CURRENT joint state and no
+             teleport-to-q_start fires (the escape teleport still can).
           4. On success → EXECUTING with the new chunk.
              On failure (all IKs exhausted or all RRT attempts failed) →
              planner raises, _do_plan catches and goes IDLE; the
@@ -394,18 +414,23 @@ class RRTGuidanceSource:
         this then handles wrapper-side cleanup.
         """
         st = self.state
-        st.chunk = None
-        st.step = 0
-        st.mode = GuidanceMode.IDLE
-        st.cancel_requested = False
-        # Clear the controller's advertised cancel hint so a later trigger
-        # without one doesn't print a stale "X/Y" in the executing log.
-        st.target_steps = None
+        with st.lock:
+            st.chunk = None
+            st.step = 0
+            st.mode = GuidanceMode.IDLE
+            st.cancel_requested = False
+            # Clear the controller's advertised cancel hint so a later trigger
+            # without one doesn't print a stale "X/Y" in the executing log.
+            st.target_steps = None
 
     def next_action(self, ctx: GuidanceCallCtx) -> GuidanceStepResult:
         """Pop the next waypoint and return it as a normalized action.
 
-        Only called when `is_active()` is True. Handles three sub-cases:
+        NOTE: currently unreferenced — the wrapper's select_action drives
+        the RRT chunk inline (its own playback branch) rather than calling
+        this; see the drift-diagnostics NOTE below. Kept as the
+        GuidanceSource-shaped equivalent. If wired up, it would only be
+        called when `is_active()` is True. Handles three sub-cases:
           1. cancel requested (or obs guidance arrived) → tell the wrapper
              to cancel and return a hold action.
           2. chunk exhausted → tell the wrapper to finish (auto-pause + cancel).
@@ -430,13 +455,12 @@ class RRTGuidanceSource:
         # logging here; it would be dead code.
 
         if st.cancel_requested:
-            # Wrapper observes finished=True + cancel_requested and will
-            # take the "cancel + hold" path. Source clears its own state
-            # via cancel().
+            # Source clears its own state via cancel(); flush_inner_queue_after
+            # tells the (hypothetical) caller to drop the inner policy's stale
+            # chunk — mirrors what the wrapper's inline RRT cancel path does.
             self.cancel()
             return GuidanceStepResult(
                 action=wrapper.get_hold_action(ctx.inner_action),
-                finished=True,
                 flush_inner_queue_after=True,
             )
 
@@ -444,11 +468,10 @@ class RRTGuidanceSource:
             # Goal reached: source clears its own state; wrapper handles
             # auto-pause via the `auto_pause_on_finish` consult.
             self.cancel()
-            assert wrapper._desired_q is not None  # seeded above
+            assert wrapper._desired_q is not None  # seeded by the wrapper's obs decode each tick
             wrapper._last_raw_action = wrapper._desired_q.reshape(-1).copy()
             return GuidanceStepResult(
                 action=wrapper.get_hold_action(ctx.inner_action),
-                finished=True,
                 flush_inner_queue_after=True,
             )
 
@@ -469,11 +492,12 @@ class RRTGuidanceSource:
     def reset(self) -> None:
         """Episode-boundary reset (called from wrapper.reset())."""
         st = self.state
-        st.chunk = None
-        st.step = 0
-        st.mode = GuidanceMode.IDLE
-        st.cancel_requested = False
-        st.target_steps = None
+        with st.lock:
+            st.chunk = None
+            st.step = 0
+            st.mode = GuidanceMode.IDLE
+            st.cancel_requested = False
+            st.target_steps = None
 
     def update_oracle_config(self, cfg: dict) -> None:
         """Cache the oracle env config and (re)load obstacles when its hash changes.
@@ -693,6 +717,12 @@ class RRTGuidanceSource:
                 final_approach_vel_scale=self.final_approach_vel_scale,
                 final_approach_acc_scale=self.final_approach_acc_scale,
                 uniform_path_speed=self.uniform_path_speed,
+                trajopt_passes=self.trajopt_passes,
+                trajopt_lr=self.trajopt_lr,
+                trajopt_smoothness_weight=self.trajopt_smoothness_weight,
+                trajopt_collision_weight=self.trajopt_collision_weight,
+                trajopt_collision_threshold=self.trajopt_collision_threshold,
+                trajopt_fd_step=self.trajopt_fd_step,
             )
         return self.state.planner
 
@@ -700,7 +730,7 @@ class RRTGuidanceSource:
         """Worker entry: plan a trajectory, then transition to EXECUTING.
 
         Same logic as the wrapper's old `_do_rrt_plan` but reads q_start
-        sources, _desired_q, and forward_flow_ratio off `self._wrapper`.
+        sources and _desired_q off `self._wrapper`.
         """
         st = self.state
         wrapper = self._wrapper
@@ -728,8 +758,8 @@ class RRTGuidanceSource:
             planner = self._ensure_planner()
             planner.load_obstacles(st.oracle_env_config)
             # Prefer a pre-jump pose from the rolling history of actual joint
-            # observations. The OLDEST entry in the buffer is approximately
-            # `pre_jump_lookback_steps_min` steps before the trigger — usually
+            # observations. The entry `effective_lookback` steps back (fixed
+            # at steps_min, or sampled from [steps_min, steps_max]) is usually
             # before the policy started commanding the bad chunk that led to
             # collision. Planning from this pose (rather than the current
             # post-collision actual_q) produces a clean trajectory, and the
@@ -742,10 +772,9 @@ class RRTGuidanceSource:
             # trigger() onto st before _do_plan started). Lookback path
             # rewinds + teleports; no-lookback path plans from current q.
             no_lookback = bool(st.no_lookback)
-            # Consume the flag so a subsequent retry inside the same cycle
-            # (request_retry_after_collision → _do_plan directly) doesn't
-            # carry over a stale True. Retries always use the same
-            # _last_q_start_full anyway via the teleport callsite below.
+            # Consume the flag so a subsequent trigger doesn't carry over a
+            # stale True. (Retries via request_retry_after_collision re-set
+            # it to True themselves before calling _do_plan directly.)
             st.no_lookback = False
             if no_lookback:
                 # Predictive-shield / future_chunk path: no rewind, no
@@ -835,11 +864,12 @@ class RRTGuidanceSource:
 
             # Compute the robot's recent joint velocity from the trailing
             # samples in `_actual_q_history`. Mean per-step delta over the
-            # last few samples (matches the planner's leading-edge window
-            # default). Used only by PathSelectionStrategy.JOINT_VELOCITY_MATCH;
-            # other strategies ignore it. Pass `None` if the history is too
-            # short to derive a velocity — the planner will raise if the
-            # strategy needs it.
+            # last few samples (comparable to the planner's leading-edge
+            # window). Consumed by PathSelectionStrategy.JOINT_VELOCITY_MATCH
+            # (other strategies ignore it) AND, in no-lookback mode, as the
+            # basis for ruckig's start_vel below. Pass `None` if the history
+            # is too short to derive a velocity — the planner will raise if
+            # the strategy needs it.
             recent_vel = self._compute_recent_joint_velocity(wrapper)
 
             # In no-lookback mode we want ruckig to begin at the robot's
@@ -848,7 +878,19 @@ class RRTGuidanceSource:
             # motion the robot is in. recent_vel may be None when the
             # history hasn't accumulated enough samples; in that case we
             # silently fall back to v=0 (same as the lookback path).
-            _ruckig_start_vel = recent_vel if no_lookback else None
+            #
+            # UNITS: recent_vel is rad per CONTROL TICK (per-step delta; the
+            # JOINT_VELOCITY_MATCH scorer consumes it in those units,
+            # direction-only). Ruckig's current_velocity is rad/SECOND (same
+            # units as max_velocity) — scale by fps or the handoff velocity
+            # arrives 1/fps (~30x) too small and every "velocity-continuous"
+            # intervention still cold-starts from rest (observed in
+            # planar_3_d100_05dag recordings, 2026-07-29).
+            _ruckig_start_vel = (
+                recent_vel * float(getattr(wrapper, "_fps", 30) or 30)
+                if (no_lookback and recent_vel is not None)
+                else None
+            )
             # Refresh the planner's policy-history context so its
             # highest-priority escape method (`_escape_via_policy_history_rewind`)
             # can walk the wrapper's recent `_actual_q_history` deque and
@@ -895,10 +937,6 @@ class RRTGuidanceSource:
             # right before its return; copy out so source state is independent.
             if planner._last_chosen_q_goal is not None:
                 self.state.chosen_q_goal = planner._last_chosen_q_goal.copy()
-            # Remember q_start_full for any retry — the retry must teleport
-            # back to the same start (the policy's pre-trigger pose, NOT the
-            # current pose mid-execution).
-            self._last_q_start_full = q_start_full.copy()
             # Sim-only env teleport before chunk execution. Three cases:
             #
             #   (a) Escape happened (escape_end_q is not None): teleport
@@ -964,9 +1002,9 @@ class RRTGuidanceSource:
             target = st.target_steps
             exec_str = f"{target}/{n_total}" if target is not None and target < n_total else f"{n_total}"
             # NOTE: do NOT include `forward_flow_ratio` in this log — RRT
-            # chunks play VERBATIM (see shared_autonomy_wrapper.select_action
-            # line ~1105: `wp = rrt.chunk[rrt.step][: self.num_dofs]` with
-            # no ratio math). Including the wrapper's `forward_flow_ratio`
+            # chunks play VERBATIM (see shared_autonomy_wrapper.select_action's
+            # RRT playback branch: `wp = rrt.chunk[rrt.step][: self.num_dofs]`
+            # with no ratio math). Including the wrapper's `forward_flow_ratio`
             # here was previously misleading users into thinking RRT
             # recordings were being blended at that ratio when in fact
             # the ratio only governs obs-teleop blending (a different
@@ -980,23 +1018,30 @@ class RRTGuidanceSource:
         """Derive recent joint velocity from the wrapper's `_actual_q_history`.
 
         The history is a deque of recent actual_q observations sized to
-        `pre_jump_lookback_steps_min + 1` entries (or `_max + 1` when the
-        random-sampling mode is configured). We compute the mean per-step
-        joint delta over the trailing samples — matches the planner's
-        leading-edge averaging window so the two velocities are directly
-        comparable.
+        `max(steps_min, steps_max) + 1` entries in pre_jump_lookback /
+        hybrid modes, or a small fixed size in future_chunk mode (just
+        enough for this velocity estimate). We compute the mean per-step
+        joint delta over the trailing samples — a short window comparable
+        to the planner's leading-edge averaging window.
 
         Returns None when the history is too short to derive a velocity
-        (need at least 2 entries). The planner only consumes this value
-        when `PathSelectionStrategy.JOINT_VELOCITY_MATCH` is active.
+        (need at least 2 entries). The planner consumes this value when
+        `PathSelectionStrategy.JOINT_VELOCITY_MATCH` is active; _do_plan
+        also derives ruckig's start_vel from it for no-lookback plans.
         """
         history = wrapper._actual_q_history
         if len(history) < 2:
             return None
         # `history[0]` is the OLDEST entry; the last few are most recent.
-        # Convert to a stacked array for easy diff.
-        as_array = np.asarray(list(history), dtype=np.float64)  # [N, num_dofs+gripper]
-        # Mean per-step delta across the (N-1) consecutive pairs.
+        # Use only the TRAILING samples (leading-edge window of 4 deltas):
+        # in hybrid mode the deque is sized for the rewind depth
+        # (pre_jump_lookback_steps_max + 1, e.g. 101 entries), and averaging
+        # the whole deque produced a multi-second stale velocity — diluted
+        # magnitude, washed-out direction — instead of the robot's current
+        # motion. That defeated the velocity-continuous handoff this value
+        # exists for (docstring always promised trailing samples).
+        as_array = np.asarray(list(history)[-5:], dtype=np.float64)  # [<=5, num_dofs+gripper]
+        # Mean per-step delta across the consecutive pairs.
         deltas = np.diff(as_array, axis=0)
         avg_delta = deltas.mean(axis=0)
         return avg_delta[: wrapper.num_dofs]
@@ -1050,8 +1095,18 @@ class RRTGuidanceSource:
                 np.array2string(q_start_full[: wrapper.num_dofs], precision=3),
                 type(target).__name__,
             )
-            target.teleport_joint_state(splatsim_robot, q_start_full.tolist())  # type: ignore[attr-defined]
+            _teleport_ret = target.teleport_joint_state(splatsim_robot, q_start_full.tolist())  # type: ignore[attr-defined]
             logger.info("Teleport call returned.")
+            # Post-teleport env-mutation-clock version (int) when the server
+            # stamps observations; None on older servers / real-robot stubs.
+            # The wrapper compares it against each obs's own stamp to detect
+            # a pre-teleport snapshot (controller-driven teleports land after
+            # the current obs was captured) — see select_action's staleness
+            # gate. Falls back gracefully: version None disables the gate.
+            try:
+                wrapper._pending_teleport_version = int(_teleport_ret) if _teleport_ret is not None else None
+            except (TypeError, ValueError):
+                wrapper._pending_teleport_version = None
             # ATOMIC with the actual env mutation: signal the recorder to
             # start a fresh episode on the next real frame. Done HERE (not
             # at the caller's `if teleport_fired` bookkeeping) so every

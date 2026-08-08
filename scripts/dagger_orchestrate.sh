@@ -2272,6 +2272,38 @@ validate_repo_name() {
 # auto-pairs rerun lineages with their source for the overlay comparison plots.
 # Called once at the top of each round; re-writes idempotently on resume so the
 # latest invocation's values win.
+# ── staged config sidecar (from-scratch trainings) ─────────────────────────
+# A from-scratch round cannot get its sidecar written into <train_dir>/dagger/
+# up front: train_sweep.sh runs lerobot-train WITHOUT --resume, and
+# TrainPipelineConfig.__post_init__ raises FileExistsError on ANY pre-existing
+# output_dir (it tests `output_dir.is_dir()`), so pre-creating dagger/ would
+# kill the run before it starts. That is why the in-tree sidecar is written
+# only AFTER training returns — and why a crashed run used to leave no record
+# of the invocation at all.
+#
+# Stage it outside the training tree instead. The staged copy is written BEFORE
+# training and survives a crash, so you can always recover which invocation
+# produced a run. On success the post-training write promotes the real sidecar
+# into the training dir and the staged copy is removed.
+staged_dagger_config_path() {
+    echo "$LEROBOT_ROOT/outputs/dagger/pending/$(basename "$1").json"
+}
+
+stage_dagger_config_sidecar() {
+    local round_n="$1" train_dir="$2"
+    local staged; staged="$(staged_dagger_config_path "$train_dir")"
+    write_dagger_config_sidecar "$round_n" "$staged" "$train_dir"
+    [[ "$DRY_RUN" == true ]] || echo "  dagger config staged (survives a crash): $staged"
+}
+
+promote_staged_dagger_config() {
+    local train_dir="$1"
+    [[ "$DRY_RUN" == true ]] && return 0
+    local staged; staged="$(staged_dagger_config_path "$train_dir")"
+    [[ -f "$train_dir/dagger/config.json" && -f "$staged" ]] && rm -f "$staged"
+    return 0
+}
+
 write_dagger_config_sidecar() {
     local round_n="$1"
     local out_path="$2"
@@ -4569,6 +4601,7 @@ if (( EFFECTIVE_START_ROUND == 1 )); then
         if [[ -n "$ROUND0_EXTRA_ARGS_EFF" ]]; then
             ROUND0_EXTRA_ARGS=( --extra_args="$ROUND0_EXTRA_ARGS_EFF" )
         fi
+        stage_dagger_config_sidecar 0 "$BASE_TRAINING_DIR"
         run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
             --dataset_repo="$BASE_REPO" \
             --model="$TRAIN_OUTPUT_MODEL_PREFIX" \
@@ -4594,6 +4627,7 @@ if (( EFFECTIVE_START_ROUND == 1 )); then
         # so dagger_plot.py can pair this base with its downstream
         # _ft_dag<N> rounds instead of falling back to a synthetic anchor.
         write_dagger_config_sidecar 0 "$BASE_TRAINING_DIR/dagger/config.json" "$BASE_TRAINING_DIR"
+        promote_staged_dagger_config "$BASE_TRAINING_DIR"
     else
         # Resuming mid-round-1 with no initial_policy_path AND no base training
         # dir. We have no way to source a round-1 input policy. Abort.
@@ -6171,6 +6205,7 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
         if [[ -n "$ROUND0_EXTRA_ARGS_EFF" ]]; then
             FS_EVAL_ARGS+=( --extra_args="$ROUND0_EXTRA_ARGS_EFF" )
         fi
+        stage_dagger_config_sidecar "$NUM_ROUNDS" "$FINAL_SCRATCH_DIR"
         if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
             # --dataset_repo intentionally OMITTED — train_sweep.sh defaults
             # it to the long-since-unused placeholder when multi-dataset args
@@ -6215,6 +6250,7 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
         # invokes lerobot-train without --resume, which errors on any
         # pre-existing output dir; pre-mkdir would induce the failure.
         write_dagger_config_sidecar "$NUM_ROUNDS" "$FINAL_SCRATCH_DIR/dagger/config.json" "$FINAL_SCRATCH_DIR"
+        promote_staged_dagger_config "$FINAL_SCRATCH_DIR"
 
         if [[ "$DRY_RUN" == true ]]; then
             FINAL_POLICY_PATH="$FINAL_SCRATCH_DIR/checkpoints/last/pretrained_model"

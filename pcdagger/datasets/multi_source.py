@@ -197,6 +197,7 @@ class MultiSourceNormalizingDataset(Dataset):
         features: dict | None = None,  # back-compat; unused
         norm_map: dict | None = None,  # back-compat; unused
         norm_mode: str = "aggregated",
+        allow_key_mismatch: bool = False,
     ):
         super().__init__()
         del features, norm_map  # accepted for signature compat; not used here
@@ -232,7 +233,24 @@ class MultiSourceNormalizingDataset(Dataset):
         per_source_stats_raw: list[dict[str, dict[str, list]]] = []
         for path in stats_paths:
             per_source_stats_raw.append(self._load_stats_json(Path(path)))
-        self._validate_consistency(per_source_stats_raw, multi_dataset.repo_ids, stats_paths)
+        self._validate_consistency(
+            per_source_stats_raw,
+            multi_dataset.repo_ids,
+            stats_paths,
+            allow_key_mismatch=allow_key_mismatch,
+        )
+
+        # In allow_key_mismatch mode the validator only WARNED about differing
+        # feature keys; the aggregation code below KeyErrors if we still pass
+        # asymmetric dicts. Filter each source down to the shared intersection
+        # so aggregate_stats() sees a uniform schema.
+        if allow_key_mismatch:
+            feature_intersection = set(per_source_stats_raw[0])
+            for s in per_source_stats_raw[1:]:
+                feature_intersection &= set(s)
+            per_source_stats_raw = [
+                {k: v for k, v in s.items() if k in feature_intersection} for s in per_source_stats_raw
+            ]
 
         per_source_stats = [_to_numpy_stats(s) for s in per_source_stats_raw]
         # Aggregate. `aggregate_stats` from `compute_stats.py` does the
@@ -288,6 +306,7 @@ class MultiSourceNormalizingDataset(Dataset):
         per_source_stats: list[dict[str, dict[str, list]]],
         repo_ids: list[str],
         stats_paths: list[str],
+        allow_key_mismatch: bool = False,
     ) -> None:
         """Reject inconsistent sidecars before they cause an opaque aggregate failure.
 
@@ -296,12 +315,17 @@ class MultiSourceNormalizingDataset(Dataset):
 
           1. Every source must define the SAME set of feature keys. Aggregation
              over a key present in only some sources would silently downweight
-             the missing sources' contribution.
+             the missing sources' contribution. When `allow_key_mismatch=True`,
+             this check is DOWNGRADED to a warning that lists the intersection
+             (which the caller then reduces the raw dicts to before
+             aggregation) and the dropped keys per source.
           2. For each feature, every source must have the SAME set of stat
              keys (mean/std/count/min/max plus any quantiles). If one source
              has only mean/std and another has only min/max, aggregation
              becomes ambiguous and the downstream policy normalizer would
-             pick the wrong stats for its norm_map mode.
+             pick the wrong stats for its norm_map mode. Not relaxed by
+             `allow_key_mismatch` — a genuine per-stat-key mismatch on a
+             feature that IS in the intersection would still corrupt aggregation.
           3. The required basics (mean, std, count, min, max) must be present
              on every (source, feature) pair. `aggregate_feature_stats` uses
              these unconditionally; missing them gives a confusing KeyError
@@ -311,26 +335,63 @@ class MultiSourceNormalizingDataset(Dataset):
             raise ValueError("MultiSourceNormalizingDataset: no stats sidecars provided.")
 
         # Check 1: feature-key parity across sources.
+        # In allow_key_mismatch mode, downgrade the parity requirement to
+        # "intersection is non-empty" (empty intersection means every source
+        # would end up with zero features to normalize — still an error).
+        # Effective feature set (for check 2/3) is the intersection so we
+        # don't emit false-positive "stat keys disagree" for a feature only
+        # some sources define.
         ref_features = set(per_source_stats[0])
+        effective_features = set(ref_features)
         for i in range(1, len(per_source_stats)):
             cur_features = set(per_source_stats[i])
             if cur_features != ref_features:
                 missing_from_cur = ref_features - cur_features
                 extra_in_cur = cur_features - ref_features
-                raise ValueError(
-                    f"Multi-source stats sidecars have inconsistent feature keys.\n"
-                    f"  source[0] ({repo_ids[0]}) @ {stats_paths[0]}\n"
-                    f"    has features: {sorted(ref_features)}\n"
-                    f"  source[{i}] ({repo_ids[i]}) @ {stats_paths[i]}\n"
-                    f"    has features: {sorted(cur_features)}\n"
-                    f"  Missing in source[{i}]: {sorted(missing_from_cur)}\n"
-                    f"  Extra in source[{i}]:   {sorted(extra_in_cur)}\n"
-                    f"  All sub-datasets must contribute stats for the SAME feature set."
+                if not allow_key_mismatch:
+                    raise ValueError(
+                        f"Multi-source stats sidecars have inconsistent feature keys.\n"
+                        f"  source[0] ({repo_ids[0]}) @ {stats_paths[0]}\n"
+                        f"    has features: {sorted(ref_features)}\n"
+                        f"  source[{i}] ({repo_ids[i]}) @ {stats_paths[i]}\n"
+                        f"    has features: {sorted(cur_features)}\n"
+                        f"  Missing in source[{i}]: {sorted(missing_from_cur)}\n"
+                        f"  Extra in source[{i}]:   {sorted(extra_in_cur)}\n"
+                        f"  All sub-datasets must contribute stats for the SAME feature set.\n"
+                        f"  Set --dataset.multi_source_feature_intersection=true to use "
+                        f"the shared intersection instead (drops any feature not in ALL sources)."
+                    )
+                logger.warning(
+                    "Multi-source stats sidecars have inconsistent feature keys "
+                    "(allow_key_mismatch=True → using intersection).\n"
+                    "  source[0] (%s): %s\n"
+                    "  source[%d] (%s): %s\n"
+                    "  Missing in source[%d]: %s\n"
+                    "  Extra in source[%d]:   %s",
+                    repo_ids[0],
+                    sorted(ref_features),
+                    i,
+                    repo_ids[i],
+                    sorted(cur_features),
+                    i,
+                    sorted(missing_from_cur),
+                    i,
+                    sorted(extra_in_cur),
                 )
+                effective_features &= cur_features
+
+        if allow_key_mismatch and not effective_features:
+            raise ValueError(
+                "Multi-source stats sidecars have EMPTY feature intersection even with "
+                "allow_key_mismatch=True — no feature is defined in every source, so "
+                "there's nothing to normalize. Check that at least one common feature "
+                "(e.g. observation.state, action) exists across all sub-datasets."
+            )
 
         # Check 2 + 3: per-feature, every source has the SAME set of stat
-        # keys, AND that set includes the required basics.
-        for feature_key in sorted(ref_features):
+        # keys, AND that set includes the required basics. Restrict to the
+        # effective feature set so a partially-shared key doesn't false-alarm.
+        for feature_key in sorted(effective_features):
             ref_stat_keys = set(per_source_stats[0][feature_key])
             missing_basics = _REQUIRED_BASIC_STAT_KEYS - ref_stat_keys
             if missing_basics:

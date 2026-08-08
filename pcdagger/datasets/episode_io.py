@@ -90,3 +90,17 @@ def load_task_description(dataset_dir: Path) -> dict[int, str]:
         if desc:
             result[idx] = str(desc)
     return result
+
+
+def load_episodes_meta(dataset_dir: Path) -> pd.DataFrame:
+    """Read a dataset's ``meta/episodes`` parquets (per-episode metadata rows,
+    e.g. ``source_scenario_idx`` written by intervention recording).
+
+    ``dataset_dir`` may be the dataset root or its ``data`` subdir — both are
+    probed. Returns an empty frame when the meta dir doesn't exist.
+    """
+    for root in (dataset_dir, dataset_dir.parent):
+        ep_files = sorted((root / "meta" / "episodes").rglob("*.parquet"))
+        if ep_files:
+            return pd.concat([pd.read_parquet(f) for f in ep_files], ignore_index=True)
+    return pd.DataFrame()

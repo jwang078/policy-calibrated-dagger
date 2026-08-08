@@ -47,6 +47,7 @@ fields recording the filtering outcome (`pre_filter_n_frames`,
 
 import csv
 import faulthandler
+import json
 import logging
 import sys
 import time
@@ -85,6 +86,7 @@ from lerobot.envs.factory import make_env, make_env_config  # noqa: E402
 from lerobot.utils.constants import DEFAULT_FEATURES  # noqa: E402
 from lerobot.utils.import_utils import register_third_party_plugins  # noqa: E402
 from lerobot.utils.lerobot_dataset_utils import resolve_dataset_dir  # noqa: E402
+from lerobot.utils.sim_seeding import set_env_benchmark_indices  # noqa: E402
 from lerobot.utils.utils import init_logging  # noqa: E402
 
 # DEFAULT_FEATURES (timestamp, frame_index, episode_index, index, task_index)
@@ -194,11 +196,24 @@ def _episode_length(parquet_files: list[Path], episode_idx: int) -> int:
 def _find_first_collision_frame(
     vec_env,
     actions: np.ndarray,
-    source_scenario_idx: int,
+    playlist_pos: int | None = None,
 ) -> int | None:
-    """Reset env to `source_scenario_idx`, then step through `actions` until
-    either the trajectory ends (return None) or `info["in_collision"]` is true
-    for the first time (return that frame index).
+    """Reset env (advances the sim's pre-installed playlist by one slot),
+    then step through `actions` until either the trajectory ends (return None)
+    or `info["in_collision"]` is true for the first time (return that frame
+    index).
+
+    Scenario selection is DRIVEN BY THE PLAYLIST installed once in `_run`
+    before the outer loop — NOT by any per-reset scenario arg. The old code
+    passed `seed=[source_scenario_idx]` on the assumption that SplatSim's
+    EVAL_BENCHMARK mode maps seed→scenario, but it doesn't (see
+    `_handle_reset` in sim_robot_pybullet_base.py — seed is only randomness,
+    scenario is picked from an internal counter). Each `_run` iteration
+    consumes exactly one playlist slot, so the source-episode order in
+    `available_eps` must match the playlist installed in `_run`.
+    `playlist_pos` pins the reset to that exact slot via
+    `benchmark_start_index` so the replay stays correct even if the server's
+    counter drifted (e.g. a GUI interaction between resets).
 
     Termination handling: SplatSim envs default to ``terminate_on_success=True``,
     so a blend episode that succeeded mid-rollout will trigger ``terminated``
@@ -209,8 +224,8 @@ def _find_first_collision_frame(
     original episode is done from the env's point of view, anything past it
     is replay noise.
     """
-    # env.reset(seed=[N]) → splatsim server loads scenario N's objects + robot.
-    vec_env.reset(seed=[int(source_scenario_idx)])
+    reset_options = None if playlist_pos is None else {"benchmark_start_index": int(playlist_pos)}
+    vec_env.reset(options=reset_options)
     for t in range(len(actions)):
         # vec_env is a Gymnasium vector env wrapping a single sub-env, so
         # the action tensor needs a leading batch axis. info is also batched.
@@ -346,6 +361,7 @@ def _run(
 ) -> list[FilterEpisodeResult]:
     """Top-level: build env once, iterate episodes, stream survivors to target."""
     from splatsim.utils.lerobot_utils import (
+        build_lerobot_features,
         create_lerobot_dataset,
         finalize_lerobot_dataset,
         load_lerobot_dataset,
@@ -377,8 +393,78 @@ def _run(
             "in its episodes metadata. The filter needs this to load the right "
             "scenario per episode. Was the source produced by augment_dataset_with_blending.py?"
         )
+    # NOTE: this MUST preserve source order (filter iterates in source-episode
+    # order below). Do NOT dedup — the sim's EVAL_BENCHMARK playlist installed
+    # below expects one entry per episode we're going to iterate, with
+    # duplicates for scenarios that appear in multiple source episodes.
     available_eps = sorted(int(e) for e in source_episodes_meta["episode_index"].unique())
     logger.info("Source has %d episode(s) to filter.", len(available_eps))
+
+    # ── Read authoritative feature shapes + image keys from source info.json ──
+    # Same defense as augment_dataset_with_blending.py: SplatSimEnv's
+    # state_dim / action_dim / env_state_dim + env_camera_names /
+    # env_image_resize_modes default to UR5 assumptions (state=(7,),
+    # action=(7,), env_state_dim=0, base_rgb+wrist_rgb, letterbox+stretch).
+    # For a planar arm those defaults disagree with what the sim server
+    # publishes, and gymnasium's SyncVectorEnv pre-allocates its `out`
+    # buffer at the config's declared shapes; the first `reset()` then
+    # trips "ValueError: Output array is the wrong shape" at np.stack.
+    # Source dataset's meta/info.json is authoritative (it was written by
+    # the sim server when the source was originally recorded), so pull
+    # dims + image key naming directly from it. See the corresponding fix
+    # chain in augment_dataset_with_blending.py for the full pattern.
+    _source_info_path = source_root_dir / "meta" / "info.json"
+    with open(_source_info_path) as _f:
+        _source_info = json.load(_f)
+    _source_feats = _source_info.get("features", {})
+    _state_shape = _source_feats.get("observation.state", {}).get("shape", [7])
+    _action_shape = _source_feats.get("action", {}).get("shape", [7])
+    _env_state_shape = _source_feats.get("observation.environment_state", {}).get("shape", [0])
+    source_state_dim = int(_state_shape[0]) if _state_shape else 7
+    source_action_dim = int(_action_shape[0]) if _action_shape else 7
+    source_env_state_dim = int(_env_state_shape[0]) if _env_state_shape else 0
+    _KNOWN_RESIZE_MODES = ("letterbox", "stretch")
+    _src_img_keys = sorted(k for k in _source_feats if k.startswith("observation.images."))
+    _cams_seen: list[str] = []
+    _modes_seen: list[str] = []
+    for _k in _src_img_keys:
+        _stem = _k[len("observation.images.") :]
+        _mode = next((m for m in _KNOWN_RESIZE_MODES if _stem.endswith("_" + m)), None)
+        if _mode is None:
+            _cam = _stem
+        else:
+            _cam = _stem[: -len("_" + _mode)]
+            if _mode not in _modes_seen:
+                _modes_seen.append(_mode)
+        if _cam not in _cams_seen:
+            _cams_seen.append(_cam)
+    source_camera_names = _cams_seen
+    source_image_resize_modes = _modes_seen if _modes_seen else ["letterbox"]
+    logger.info(
+        "Source dataset feature shapes: state_dim=%d, action_dim=%d, env_state_dim=%d",
+        source_state_dim,
+        source_action_dim,
+        source_env_state_dim,
+    )
+    logger.info(
+        "Source dataset image keys: cameras=%s, resize_modes=%s",
+        source_camera_names,
+        source_image_resize_modes,
+    )
+    if list(cfg.env_camera_names) != source_camera_names:
+        logger.info(
+            "Overriding env_camera_names %s → %s (from source dataset)",
+            list(cfg.env_camera_names),
+            source_camera_names,
+        )
+        cfg.env_camera_names = source_camera_names
+    if list(cfg.env_image_resize_modes) != source_image_resize_modes:
+        logger.info(
+            "Overriding env_image_resize_modes %s → %s (from source dataset)",
+            list(cfg.env_image_resize_modes),
+            source_image_resize_modes,
+        )
+        cfg.env_image_resize_modes = source_image_resize_modes
 
     # ── Connect to externally-launched headless splatsim via ZMQ ───────────
     logger.info(
@@ -399,16 +485,81 @@ def _run(
         eval_benchmark_repo_id=cfg.env_eval_benchmark_repo_id,
         eval_benchmark_subset=None,
         include_oracle_info=False,
+        num_dofs=cfg.num_dofs,
+        state_dim=source_state_dim,
+        action_dim=source_action_dim,
+        env_state_dim=source_env_state_dim,
     )
     env_dict = make_env(env_cfg_obj, n_envs=1, use_async_envs=False)
     vec_env = env_dict["splatsim"][0]
 
+    # ── Install the per-episode scenario playlist ──────────────────────────
+    # Filter iterates source episodes in `available_eps` order below and
+    # calls `vec_env.reset()` once per episode; the sim's EVAL_BENCHMARK
+    # counter walks this playlist in sync so each reset lands on the
+    # ORIGINAL scenario that source episode was blended in. Same reasoning
+    # as augment_dataset_with_blending.py — SplatSim's `_handle_reset`
+    # ignores `seed` for scenario selection, so pinning per-reset via
+    # `vec_env.reset(seed=[N])` (the old code on line 213) does nothing;
+    # scenarios were being picked round-robin by the sim's internal counter
+    # regardless. Skips 0-frame episodes so the playlist stays aligned
+    # with the actual iteration order below.
+    def _resolve_scen(ep: int) -> int:
+        row = source_episodes_meta.loc[source_episodes_meta["episode_index"] == ep].iloc[0]
+        return int(row["source_scenario_idx"])
+
+    _valid_eps: list[int] = []
+    _playlist: list[int] = []
+    for _ep in available_eps:
+        if _episode_length(parquet_files, _ep) <= 0:
+            logger.warning("Source episode %d has 0 frames; skipping (excluded from playlist too)", _ep)
+            continue
+        _valid_eps.append(_ep)
+        _playlist.append(_resolve_scen(_ep))
+    logger.info(
+        "Installing sim EVAL_BENCHMARK playlist: %d entries. First 20: %s",
+        len(_playlist),
+        _playlist[:20],
+    )
+    set_env_benchmark_indices(vec_env, _playlist)
+
     # ── Build target dataset (matches source schema) ──────────────────────
     image_keys = [f"{cam}_{mode}" for cam in cfg.env_camera_names for mode in cfg.env_image_resize_modes]
+    # Derive the target schema from the SOURCE blend dataset's dims so the
+    # `_nocoll` sibling carries every feature through — including
+    # observation.environment_state when the blend has it. `_row_to_frame`
+    # copies exactly the target's declared features from each source row.
+    expected_features = build_lerobot_features(
+        image_keys,
+        cfg.num_dofs,
+        state_dim=source_state_dim,
+        env_state_dim=source_env_state_dim,
+    )
     existing = load_lerobot_dataset(cfg.target_repo_id)
     if existing is not None:
+        _existing_feats = existing.meta.features
+        _mismatches = []
+        for _key, _spec in expected_features.items():
+            if _key not in _existing_feats:
+                _mismatches.append(f"missing feature '{_key}' (expected shape {tuple(_spec['shape'])})")
+            elif tuple(_existing_feats[_key]["shape"]) != tuple(_spec["shape"]):
+                _mismatches.append(
+                    f"feature '{_key}' has shape {tuple(_existing_feats[_key]['shape'])}, "
+                    f"expected {tuple(_spec['shape'])}"
+                )
+        if _mismatches:
+            raise RuntimeError(
+                f"Target dataset {cfg.target_repo_id} already exists on disk but its schema "
+                f"does not match the source blend dataset {cfg.source_repo_id} "
+                f"(state_dim={source_state_dim}, env_state_dim={source_env_state_dim}):\n  - "
+                + "\n  - ".join(_mismatches)
+                + f"\nIt is stale. Refusing to append. Delete it and re-run:\n"
+                f"  rm -rf {existing.root}"
+            )
         logger.warning(
-            "Target dataset %s already exists locally — appending. Delete the directory for a fresh dataset.",
+            "Target dataset %s already exists locally — resuming into it (schema verified "
+            "compatible). Episodes whose source_episode_idx provenance is already present "
+            "will be SKIPPED (idempotent resume). Delete the directory for a fresh dataset.",
             cfg.target_repo_id,
         )
         target_ds = existing
@@ -418,6 +569,28 @@ def _run(
             fps=cfg.env_fps,
             image_keys=image_keys,
             num_dofs=cfg.num_dofs,
+            state_dim=source_state_dim,
+            env_state_dim=source_env_state_dim,
+        )
+
+    # Idempotent-resume skip set: source_episode_idx values already committed
+    # to the target. One blend episode per intervention source ep per ratio
+    # dataset (post blend-side idempotency fix), so this key is unique here.
+    # DROPPED episodes never reach the target and get re-checked on resume —
+    # same verdict, minor recompute, no duplication. Prevents the 3x-append
+    # duplication observed in r_dag1_blend*_nocoll (2026-07-31).
+    _done_srcs: set[int] = set()
+    for _f in sorted((Path(target_ds.root) / "meta" / "episodes").glob("chunk-*/*.parquet")):
+        try:
+            _df = pd.read_parquet(_f)
+        except Exception:
+            continue
+        if "source_episode_idx" in _df.columns:
+            _done_srcs.update(int(v) for v in _df["source_episode_idx"] if pd.notna(v))
+    if _done_srcs:
+        logger.info(
+            "[resume] target already contains %d filtered episode(s); their sources will be skipped.",
+            len(_done_srcs),
         )
 
     # ── Per-episode CSV writer ─────────────────────────────────────────────
@@ -447,12 +620,12 @@ def _run(
     target_ep_idx = int(target_ds.meta.total_episodes)
 
     try:
-        for source_ep in tqdm(available_eps, desc="filter episodes", leave=True):
+        # Iterate the SAME ordered list used to build the playlist above so
+        # each reset() consumes the correct playlist slot. Skipped 0-length
+        # episodes were already excluded upstream.
+        for playlist_pos, source_ep in enumerate(tqdm(_valid_eps, desc="filter episodes", leave=True)):
             t0 = time.time()
             ep_length = _episode_length(parquet_files, source_ep)
-            if ep_length <= 0:
-                logger.warning("Source episode %d has 0 frames; skipping.", source_ep)
-                continue
 
             # Pull per-episode metadata fields we want to preserve / use.
             ep_meta_row = source_episodes_meta.loc[source_episodes_meta["episode_index"] == source_ep].iloc[0]
@@ -469,6 +642,14 @@ def _run(
                 else int(source_ep)
             )
 
+            if source_episode_idx_meta in _done_srcs:
+                logger.info(
+                    "[resume] episode %d (source_episode_idx=%d) already in target — skipping.",
+                    source_ep,
+                    source_episode_idx_meta,
+                )
+                continue
+
             # Load full episode frames (we need them BOTH for the action stream
             # to replay AND for the per-frame data to copy to the target).
             frames_df = load_episode_frames(source_data_dir, source_ep, frame_index=0, n_frames=ep_length)
@@ -477,7 +658,7 @@ def _run(
             )
 
             # Replay through env, find first collision.
-            first_collision = _find_first_collision_frame(vec_env, actions, source_scenario_idx)
+            first_collision = _find_first_collision_frame(vec_env, actions, playlist_pos=playlist_pos)
             trimmed_to, kept, drop_reason = decide_trim(
                 ep_length, first_collision, cfg.pre_collision_margin, cfg.min_episode_length
             )

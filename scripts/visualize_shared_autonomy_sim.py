@@ -14,7 +14,7 @@ crash). Launch the simulator once:
         python scripts/launch_nodes.py \\
             --robot sim_ur_pybullet_small_engine_new_interactive \\
             --robot_port 6001 \\
-            --robot_name robot_iphone_w_engine_new \\
+            --robot_name robot_iphone_w_engine_curtain \\
             --eval_benchmark_repo_id <benchmark_dataset_repo_id>
 
 Then point this script at it:
@@ -24,7 +24,7 @@ Then point this script at it:
         --dataset_repo_id JennyWWW/splatsim_approach_lever_7_lowres_5path_10fails \\
         --episode_index 305 \\
         --forward_flow_ratios 0.0 0.05 0.2 0.4 0.8 1.0 \\
-        --blend_strategy denoise --guidance_repr delta --drain_chunk \\
+        --blend_strategy denoise --guidance_repr delta --blend_interval_frac \\
         --env_task upright_small_engine_new \\
         --env_external_port 6001
 
@@ -33,7 +33,7 @@ For example:
 cd ~/code/SplatSim && python scripts/launch_nodes.py \
     --robot sim_ur_pybullet_small_engine_new_interactive \
     --robot_port 6001 \
-    --robot_name robot_iphone_w_engine_new \
+    --robot_name robot_iphone_w_engine_curtain \
     --eval_benchmark_repo_id JennyWWW/eval_splatsim_approach_lever_benchmark_1000
 
 # 2. Run visualize (in another terminal)
@@ -42,13 +42,37 @@ python my_scripts/visualize_shared_autonomy_sim.py \
     --dataset_repo_id JennyWWW/splatsim_approach_lever_7_lowres_5path_10fails \
     --episode_index 305 \
     --forward_flow_ratios 0.0 0.05 0.2 0.4 0.8 1.0 \
-    --blend_strategy denoise --guidance_repr delta --drain_chunk \
+    --blend_strategy denoise --guidance_repr delta --blend_interval_frac \
     --env_task upright_small_engine_new --env_external_port 6001
 
-The ``--episode_index`` selects which benchmark scenario to load on the server via
-``vec_env.reset(seed=[episode_index])``. ``--frame_index`` is used only to slice the
-guidance (demo) actions from the dataset; the robot always starts from the episode's
-initial pose as seeded by the server.
+The benchmark scenario is resolved from the episode's ``source_scenario_idx``
+metadata when present (intervention datasets — same resolution the blend script
+uses), falling back to ``episode_index``, and pinned on every per-ratio reset via
+``vec_env.reset(options={"benchmark_start_index": ...})`` so all ratios roll out in
+the SAME scenario (a bare seeded reset would let the server's EVAL_BENCHMARK
+counter advance one scenario per reset).
+``--frame_index`` slices the guidance (demo) actions from the dataset AND teleports
+the robot to the demo's pose at that frame after the scenario reset (SplatSim
+servers support the teleport over ZMQ; other servers fall back to the
+episode-initial pose).
+
+**Sweep-parity debugging** — to reproduce what ``dagger_orchestrate_sweep.sh``'s
+blend step (``augment_dataset_with_blending.py``) actually runs, point at the
+ROUND'S INTERVENTION DATASET and mirror its blend flags (defaults here already
+match on start frame / rollout length / guidance construction):
+
+    python my_scripts/visualize_shared_autonomy_sim.py \\
+        --policy_path <the round's branching policy>/pretrained_model \\
+        --dataset_repo_id JennyWWW/<intervention_dataset> \\
+        --episode_index 0 \\
+        --forward_flow_ratios 0.0 0.7 1.0 \\
+        --blend_strategy denoise --guidance_repr absolute_pos \\
+        --fixed_base_noise=false --clip_sample=false --progress_guidance=true \\
+        --env_external_port 6005 --no_show
+
+(``--fixed_base_noise=true``, the default, instead pins one noise draw shared
+across ratios/ticks for cross-ratio comparability — cleaner plots, but NOT what
+the sweep executes unless it passes ``--fixed_base_noise=true`` too.)
 
 Imports plotting / IO helpers from the sibling parquet script
 (``visualize_shared_autonomy.py``) and batch-building helpers from
@@ -101,6 +125,7 @@ from lib_dataset_episode_io import (  # type: ignore[import-not-found]  # noqa: 
     find_parquet_files,
     get_available_episodes,
     load_episode_frames,
+    load_episodes_meta,
     load_task_description,
 )
 from lib_ee_kinematics import (  # type: ignore[import-not-found]  # noqa: E402
@@ -113,19 +138,94 @@ from lib_sa_plotting import (  # type: ignore[import-not-found]  # noqa: E402
     plot_joint_angles,
 )
 from lib_sa_policy_loading import (  # type: ignore[import-not-found]  # noqa: E402
+    apply_clip_sample_override,
     load_wrapped_policy,
+)
+from lib_sa_rollout import (  # type: ignore[import-not-found]  # noqa: E402,F401
+    # THE shared rollout core — the sweep's blend script executes the same
+    # code. _build_sim_batch/_run_filler_phase/progress_guidance_index are
+    # re-exported here for back-compat importers.
+    _apply_rename_map,
+    _build_sim_batch,
+    _run_filler_phase,
+    progress_guidance_index,
+    run_blended_rollout,
+    warn_if_sim_physics_unsynced,
 )
 
 from lerobot.envs import close_envs  # noqa: E402
 from lerobot.envs.factory import make_env, make_env_config, make_env_pre_post_processors  # noqa: E402
-from lerobot.envs.utils import preprocess_observation  # noqa: E402
 from lerobot.policies.shared_autonomy_wrapper import (  # noqa: E402
     BlendMode,
     GuidanceBlendStrategy,
     PolicyGuidanceRepresentation,
 )
 from lerobot.utils.lerobot_dataset_utils import make_default_rename_map, resolve_dataset_dir  # noqa: E402
-from lerobot.utils.sim_seeding import seed_splatsim_env_to_state  # noqa: E402
+
+# ── sim-server launch hint ────────────────────────────────────────────────────
+
+# launch_nodes.py --robot variant per env task. Mirrors the ENV_TASK →
+# ROBOT_VARIANT pairs in my_scripts/env_profiles/*.sh (keep in sync).
+_TASK_TO_ROBOT_VARIANT = {
+    "planar_3joint": "sim_pybullet_planar_interactive",
+    "planar_3joint_oracle": "sim_pybullet_planar_oracle_interactive",
+    "planar_3joint_oracle_simple": "sim_pybullet_planar_oracle_simple_interactive",
+    "upright_small_engine_new": "sim_ur_pybullet_small_engine_new_interactive",
+}
+
+# Splat names that are stale on disk but still recorded in old checkpoints'
+# train_configs. The sim must NOT be launched with these (e.g. the
+# robot_iphone_w_engine_new splat now renders a murky, mistracked wrist view);
+# the env side remaps them to the current splat, so the printed launch hint
+# and the env construction both use a working scene. Policy-side robot_name is
+# left as recorded. Pass --env_robot_name explicitly to bypass the remap.
+_STALE_ENV_ROBOT_NAMES = {
+    "robot_iphone_w_engine_new": "robot_iphone_w_engine_curtain",
+}
+
+
+def format_sim_launch_command(
+    *,
+    env_task: str,
+    robot_name: str | None,
+    port: int,
+    eval_benchmark_repo_id: str | None,
+) -> str:
+    """The launch_nodes.py invocation that starts the splatsim server this
+    script expects to find on ``port`` (matching env task / robot / benchmark)."""
+    variant = _TASK_TO_ROBOT_VARIANT.get(env_task, f"<launch_nodes.py robot variant for task '{env_task}'>")
+    lines = [
+        "cd ~/code/SplatSim && python -u scripts/launch_nodes.py \\",
+        f"    --robot {variant} \\",
+        f"    --robot_port {port} \\",
+    ]
+    if robot_name:
+        lines.append(f"    --robot_name {robot_name} \\")
+    if eval_benchmark_repo_id:
+        lines.append(f"    --eval_benchmark_repo_id {eval_benchmark_repo_id} \\")
+    # --sync_physics_to_client: physics steps only on client commands, so the
+    # sim never races ahead in wallclock time while the policy is thinking.
+    # Without it, slow policies produce jumpy rollouts that misrepresent them.
+    lines.append("    --headless --control_gui --sync_physics_to_client")
+    return "\n".join(lines)
+
+
+def check_sim_server_reachable(host: str, port: int, launch_hint: str) -> None:
+    """Fail fast if nothing is listening on host:port. A ZMQ REQ socket never
+    errors on a dead endpoint — the first reset request just queues forever,
+    so without this check a missing server looks like a silent freeze."""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            pass
+    except OSError:
+        raise SystemExit(
+            f"\nNo splatsim server listening on {host}:{port} — the ZMQ client "
+            f"would hang silently. Launch the sim in another terminal, then "
+            f"re-run this script:\n\n{launch_hint}\n"
+        )
+
 
 # ── env construction ──────────────────────────────────────────────────────────
 
@@ -142,6 +242,10 @@ def build_splatsim_env(
     external_host: str = "127.0.0.1",
     eval_benchmark_repo_id: str | None = None,
     eval_benchmark_subset: list[int] | None = None,
+    num_dofs: int | None = None,
+    state_dim: int | None = None,
+    action_dim: int | None = None,
+    env_state_dim: int | None = None,
     policy_cfg: Any,
 ):
     """Build a splatsim vec env (n_envs=1) plus the env-specific pre/post processors.
@@ -150,8 +254,25 @@ def build_splatsim_env(
     server via ZMQ; ``eval_benchmark_repo_id`` and ``eval_benchmark_subset`` are
     configured on the server side and are ignored here.
 
+    ``num_dofs`` / ``state_dim`` / ``action_dim`` / ``env_state_dim`` must match
+    what the sim server actually publishes — the SplatsimEnv defaults are
+    UR5-shaped (6/7/7/0), and gymnasium's SyncVectorEnv pre-allocates its obs
+    buffer from the declared observation_space, so a mismatched server (e.g.
+    planar arm: 3/4/4/8) fails at the first reset with "Output array is the
+    wrong shape". ``None`` keeps the config default.
+
     Returns (vec_env, env_cfg, env_preprocessor, env_postprocessor).
     """
+    dim_overrides = {
+        k: v
+        for k, v in {
+            "num_dofs": num_dofs,
+            "state_dim": state_dim,
+            "action_dim": action_dim,
+            "env_state_dim": env_state_dim,
+        }.items()
+        if v is not None
+    }
     env_cfg = make_env_config(
         "splatsim",
         task=task,
@@ -164,104 +285,12 @@ def build_splatsim_env(
         external_host=external_host,
         eval_benchmark_repo_id=eval_benchmark_repo_id,
         eval_benchmark_subset=eval_benchmark_subset,
+        **dim_overrides,
     )
     env_dict = make_env(env_cfg, n_envs=1, use_async_envs=False)
     vec_env = env_dict["splatsim"][0]
     env_pre, env_post = make_env_pre_post_processors(env_cfg, policy_cfg)
     return vec_env, env_cfg, env_pre, env_post
-
-
-# ── obs → policy batch ────────────────────────────────────────────────────────
-
-
-def _apply_rename_map(obs: dict[str, torch.Tensor], rename_map: dict[str, str]) -> dict[str, torch.Tensor]:
-    """Rename observation keys per ``rename_map``. Keys not present pass through."""
-    if not rename_map:
-        return obs
-    return {rename_map.get(k, k): v for k, v in obs.items()}
-
-
-def _build_sim_batch(
-    env_obs: dict[str, np.ndarray],
-    *,
-    env_preprocessor,
-    obs_preprocessor,
-    rename_map: dict[str, str],
-    device: str,
-    task_description: str | None,
-    guidance_chunk: np.ndarray | None,
-) -> dict[str, torch.Tensor]:
-    """env_obs (gym vec env format) → policy-ready preprocessed batch.
-
-    Mirrors the lerobot_eval.py sequence:
-    preprocess_observation → env_preprocessor → rename_map → obs_preprocessor.
-    Optionally injects ``task`` and the guidance chunk.
-
-    Also imported by ``augment_dataset_with_blending.py``.
-    """
-    obs = preprocess_observation(env_obs)
-    obs = env_preprocessor(obs) if env_preprocessor is not None else obs
-    obs = _apply_rename_map(obs, rename_map)
-    obs = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in obs.items()}
-    # Task must be injected *before* the policy preprocessor (PI0.5 tokenizes it there).
-    if task_description is not None:
-        obs["task"] = [task_description]
-    obs = obs_preprocessor(obs)
-    if guidance_chunk is not None:
-        chunk_t = torch.tensor(guidance_chunk, dtype=torch.float32, device=device).unsqueeze(0)
-        obs["observation.policy_guidance_chunk"] = chunk_t
-    return obs
-
-
-# ── shared sim-loop helpers ───────────────────────────────────────────────────
-
-
-def _run_filler_phase(
-    wrapper,
-    obs_preprocessor,
-    env_preprocessor,
-    env_obs: dict,
-    *,
-    guidance_chunk: np.ndarray,
-    rename_map: dict[str, str],
-    device: str,
-    task_description: str | None,
-    seed_joint_state: np.ndarray,
-) -> None:
-    """Drain the inner policy's first throwaway chunk so the obs queue has the
-    right history before the real phase begins. Does NOT step the env.
-
-    Also snaps ``wrapper._desired_q`` to ``seed_joint_state`` after filler so the
-    wrapper's IK anchor isn't polluted by the throwaway chunk's actions.
-
-    Imported by ``augment_dataset_with_blending.py``.
-    """
-    n_obs_steps: int = wrapper.config.n_obs_steps
-    n_action_steps: int = wrapper.config.n_action_steps
-    n_filler_drain = n_action_steps - (n_obs_steps - 1)
-    for _ in range(n_filler_drain):
-        batch = _build_sim_batch(
-            env_obs,
-            env_preprocessor=env_preprocessor,
-            obs_preprocessor=obs_preprocessor,
-            rename_map=rename_map,
-            device=device,
-            task_description=task_description,
-            guidance_chunk=guidance_chunk,
-        )
-        wrapper.select_action(batch)
-    for _ in range(n_obs_steps - 1):
-        batch = _build_sim_batch(
-            env_obs,
-            env_preprocessor=env_preprocessor,
-            obs_preprocessor=obs_preprocessor,
-            rename_map=rename_map,
-            device=device,
-            task_description=task_description,
-            guidance_chunk=guidance_chunk,
-        )
-        wrapper.select_action(batch)
-    wrapper._desired_q = np.asarray(seed_joint_state, dtype=np.float32)[: wrapper.num_dofs].copy()
 
 
 # ── action chunk collection ───────────────────────────────────────────────────
@@ -279,118 +308,49 @@ def get_sim_action_chunk_for_ratio(
     episode_index_for_seed: int,
     guidance_actions_raw: np.ndarray,
     ratio: float,
-    drain_chunk: bool,
-    base_noise: torch.Tensor,
+    blend_interval_frac: float,
+    base_noise: torch.Tensor | None,
     total_steps: int,
     rename_map: dict[str, str],
     device: str,
     task_description: str | None,
+    progress_guidance: bool = False,
+    progress_guidance_window: int = 45,
+    demo_states_raw: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
-    """Sim-in-the-loop variant: seed env, run filler, then loop
-    ``env.step`` ↔ ``wrapper.select_action`` for ``total_steps`` iterations.
-
-    ``episode_index_for_seed`` is forwarded to ``vec_env.reset(seed=[...])`` so the
-    server loads the matching benchmark scenario. For local in-process envs the robot
-    is also teleported to ``seed_joint_state``; for ZMQ envs it starts at the
-    episode-initial pose.
+    """Thin adapter over :func:`lib_sa_rollout.run_blended_rollout` — the SAME
+    core the sweep's blend step (``augment_dataset_with_blending``) executes.
+    This wrapper only (a) derives the blend mode from ``--blend_interval_frac``
+    (1.0 → ONCE_PER_CHUNK; anything below → EVERY_STEP, whose re-blend cadence
+    the rollout core throttles to every
+    ``ceil(blend_interval_frac * n_action_steps)`` ticks) and (b) pins the
+    benchmark scenario on EVERY per-ratio reset via
+    ``benchmark_start_index`` (a bare seeded reset would let the server's
+    EVAL_BENCHMARK counter advance one scenario per reset).
     """
-    n_action_steps: int = wrapper.config.n_action_steps
-    if total_steps <= 0:
-        raise ValueError(f"total_steps must be positive, got {total_steps}")
-
-    wrapper.reset()
-    wrapper.forward_flow_ratio = ratio
-    wrapper.blend_mode = BlendMode.ONCE_PER_CHUNK if drain_chunk else BlendMode.EVERY_STEP
-
-    env_obs = seed_splatsim_env_to_state(
-        vec_env,
-        joint_state=seed_joint_state,
-        num_dofs=wrapper.num_dofs,
-        seed=[episode_index_for_seed],
-    )
-
-    # ─── Filler phase ────────────────────────────────────────────────────────
-    _run_filler_phase(
-        wrapper,
-        obs_preprocessor,
-        env_preprocessor,
-        env_obs,
-        guidance_chunk=guidance_actions_raw,
+    result = run_blended_rollout(
+        wrapper=wrapper,
+        obs_preprocessor=obs_preprocessor,
+        vec_env=vec_env,
+        env_preprocessor=env_preprocessor,
+        env_postprocessor=env_postprocessor,
+        seed_joint_state=seed_joint_state,
+        guidance_actions_raw=guidance_actions_raw,
+        ratio=ratio,
+        blend_mode=BlendMode.ONCE_PER_CHUNK if blend_interval_frac >= 1.0 else BlendMode.EVERY_STEP,
+        blend_interval_frac=blend_interval_frac,
+        total_steps=total_steps,
         rename_map=rename_map,
         device=device,
         task_description=task_description,
-        seed_joint_state=seed_joint_state,
+        seed=[episode_index_for_seed],
+        benchmark_start_index=episode_index_for_seed,
+        base_noise=base_noise,
+        progress_guidance=progress_guidance,
+        progress_guidance_window=progress_guidance_window,
+        demo_states_raw=demo_states_raw,
     )
-
-    # ─── Real phase ──────────────────────────────────────────────────────────
-    raw_actions: list[np.ndarray] = []
-    decoded_guidance_full: np.ndarray | None = None
-    success = False
-    hold_action: np.ndarray | None = None
-
-    for t in range(total_steps):
-        # ── Hold mode: episode succeeded, don't step env again ────────────────
-        # Stepping after termination triggers AutoresetMode.NEXT_STEP and would
-        # bring in the next scene's images, causing a sharp visual transition.
-        if success:
-            assert hold_action is not None
-            raw_actions.append(hold_action)
-            continue
-
-        at_chunk_boundary = t % n_action_steps == 0
-        suppress_guidance = drain_chunk and not at_chunk_boundary and ratio not in (0.0, 1.0)
-        guidance_chunk = None if suppress_guidance else guidance_actions_raw[t:]
-
-        batch = _build_sim_batch(
-            env_obs,
-            env_preprocessor=env_preprocessor,
-            obs_preprocessor=obs_preprocessor,
-            rename_map=rename_map,
-            device=device,
-            task_description=task_description,
-            guidance_chunk=guidance_chunk,
-        )
-
-        action_norm = wrapper.select_action(batch, base_noise=base_noise)
-        raw_action = wrapper.postprocessor(action_norm)
-
-        if env_postprocessor is not None:
-            from lerobot.utils.constants import ACTION
-
-            _post_out = env_postprocessor({ACTION: raw_action})
-            if _post_out is not None:
-                raw_action = _post_out[ACTION]
-
-        action_numpy = raw_action.detach().to("cpu").numpy()
-        env_obs, _reward, _term, _trunc, _info = vec_env.step(action_numpy)
-        raw_actions.append(action_numpy.reshape(-1))
-
-        if at_chunk_boundary and wrapper._last_decoded_guidance_chunk is not None:
-            chunk_decode = wrapper._last_decoded_guidance_chunk[0]
-            if decoded_guidance_full is None:
-                decoded_guidance_full = np.zeros(
-                    (total_steps, chunk_decode.shape[1]), dtype=chunk_decode.dtype
-                )
-            end_t = min(t + n_action_steps, total_steps)
-            decoded_guidance_full[t:end_t] = chunk_decode[: end_t - t]
-
-        # Check for success / termination.
-        terminated = bool(_term[0]) if hasattr(_term, "__len__") else bool(_term)
-        if terminated and not success:
-            success = True
-            agent_pos = env_obs.get("agent_pos")
-            hold_action = (
-                np.asarray(agent_pos[0], dtype=np.float32)
-                if agent_pos is not None
-                else action_numpy.reshape(-1)
-            )
-            print(
-                f"[ratio={ratio}] Episode succeeded at t={t + 1}/{total_steps}. "
-                f"Holding for {total_steps - t - 1} remaining steps.",
-                flush=True,
-            )
-
-    return np.stack(raw_actions), decoded_guidance_full
+    return result.raw_actions, result.decoded_guidance_full
 
 
 @torch.no_grad()
@@ -408,19 +368,32 @@ def get_sim_action_chunks_for_ratios(
     rename_map: dict[str, str],
     device: str,
     task_description: str | None,
-    drain_chunk: bool,
+    blend_interval_frac: float,
     total_steps: int,
+    fixed_base_noise: bool = True,
+    progress_guidance: bool = False,
+    progress_guidance_window: int = 45,
+    demo_states_raw: np.ndarray | None = None,
 ) -> tuple[dict[float, np.ndarray], dict[float, np.ndarray]]:
-    """Run :func:`get_sim_action_chunk_for_ratio` for each ratio with a shared base_noise."""
+    """Run :func:`get_sim_action_chunk_for_ratio` for each ratio.
+
+    ``fixed_base_noise=True`` (default) pins ONE noise draw shared across all
+    ratios AND all ticks — the tool's historical cross-ratio comparability
+    mode. ``False`` matches the sweep's blend default: the wrapper draws a
+    FRESH torch.randn internally on every denoise (base_noise=None), so
+    consecutive every_step samples are independent — expect shake.
+    """
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
-    if getattr(wrapper.config, "max_action_dim", None) is not None:
-        noise_shape = (1, wrapper.config.chunk_size, wrapper.config.max_action_dim)
-    else:
-        action_dim = wrapper.config.output_features["action"].shape[0]
-        noise_shape = (1, wrapper.config.horizon, action_dim)
-    base_noise = torch.randn(noise_shape, device=device)
+    base_noise: torch.Tensor | None = None
+    if fixed_base_noise:
+        if getattr(wrapper.config, "max_action_dim", None) is not None:
+            noise_shape = (1, wrapper.config.chunk_size, wrapper.config.max_action_dim)
+        else:
+            action_dim = wrapper.config.output_features["action"].shape[0]
+            noise_shape = (1, wrapper.config.horizon, action_dim)
+        base_noise = torch.randn(noise_shape, device=device)
 
     results: dict[float, np.ndarray] = {}
     decoded_guidance_by_ratio: dict[float, np.ndarray] = {}
@@ -443,12 +416,15 @@ def get_sim_action_chunks_for_ratios(
             episode_index_for_seed=episode_index_for_seed,
             guidance_actions_raw=guidance_actions_raw,
             ratio=ratio,
-            drain_chunk=drain_chunk,
+            blend_interval_frac=blend_interval_frac,
             base_noise=base_noise,
             total_steps=total_steps,
             rename_map=rename_map,
             device=device,
             task_description=task_description,
+            progress_guidance=progress_guidance,
+            progress_guidance_window=progress_guidance_window,
+            demo_states_raw=demo_states_raw,
         )
         results[ratio] = actions
         if decoded is not None:
@@ -458,6 +434,32 @@ def get_sim_action_chunks_for_ratios(
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
+
+
+def _parse_bool(s: str) -> bool:
+    """Accept the same `--flag=true/false` spelling the blend script's draccus CLI uses."""
+    v = s.strip().lower()
+    if v in ("1", "true", "yes", "y"):
+        return True
+    if v in ("0", "false", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean, got {s!r}")
+
+
+def _parse_blend_interval_frac(s: str) -> float:
+    """Blend cadence in [0, 1]; also accepts legacy true/false spellings."""
+    v = s.strip().lower()
+    if v in ("true", "yes", "y"):
+        return 1.0
+    if v in ("false", "no", "n"):
+        return 0.0
+    try:
+        f = float(s)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"Expected a float in [0, 1] or true/false, got {s!r}") from e
+    if not 0.0 <= f <= 1.0:
+        raise argparse.ArgumentTypeError(f"--blend_interval_frac must be in [0, 1], got {s!r}")
+    return f
 
 
 def parse_args():
@@ -490,10 +492,12 @@ def parse_args():
     parser.add_argument(
         "--frame_index",
         type=int,
-        default=None,
+        default=0,
         help=(
-            "Starting frame within episode for guidance slice. For ZMQ envs the robot "
-            "always starts at the episode-initial pose regardless of this value."
+            "Starting frame within episode: guidance is sliced from here AND the robot is "
+            "teleported to the demo's pose at this frame (works over ZMQ — the SplatSim "
+            "server dispatches teleport_joint_state). Default 0 = replay from the episode "
+            "start (sweep-parity). -1 = random."
         ),
     )
     parser.add_argument(
@@ -505,21 +509,105 @@ def parse_args():
         choices=["stretch", "letterbox"],
         help="Parquet column lookup and rename_map default.",
     )
-    parser.add_argument("--camera_names", nargs="+", default=["base_rgb", "wrist_rgb"])
+    parser.add_argument(
+        "--camera_names",
+        nargs="+",
+        default=None,
+        help=(
+            "Defaults to the checkpoint train_config's env.camera_names "
+            "(may be empty for state-only policies), falling back to "
+            "['base_rgb', 'wrist_rgb']."
+        ),
+    )
     parser.add_argument("--rename_map", type=json.loads, default=None)
-    parser.add_argument("--robot_name", default="robot_iphone_w_engine_new")
-    parser.add_argument("--num_dofs", type=int, default=6)
+    parser.add_argument(
+        "--robot_name",
+        default=None,
+        help=(
+            "Defaults to the checkpoint train_config's env.robot_name, "
+            "falling back to 'robot_iphone_w_engine_curtain'."
+        ),
+    )
+    parser.add_argument(
+        "--num_dofs",
+        type=int,
+        default=None,
+        help="Defaults to the checkpoint train_config's env.num_dofs, falling back to 6.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--n_action_steps", type=int, default=None)
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--no_show", action="store_true")
-    parser.add_argument("--drain_chunk", action="store_true")
+    parser.add_argument(
+        "--blend_interval_frac",
+        "--drain_chunk",  # deprecated alias
+        dest="blend_interval_frac",
+        type=_parse_blend_interval_frac,
+        nargs="?",
+        const=1.0,
+        default=0.0,
+        help=(
+            "Interval between guidance re-blends, as a fraction of the executed chunk "
+            "(n_action_steps): 1.0 (or the bare flag) = blend once per chunk, 0.0 (default) = "
+            "re-blend every step, fraction f = re-blend every ceil(f * n_action_steps) ticks "
+            "(e.g. 0.5 = twice per chunk). --drain_chunk is a deprecated alias; legacy "
+            "true/false spellings accepted."
+        ),
+    )
     parser.add_argument("--blend_strategy", default="denoise", choices=["denoise", "interpolate"])
     parser.add_argument("--guidance_repr", default="absolute_pos", choices=["absolute_pos", "delta"])
     parser.add_argument("--n_anchor_steps", type=int, default=0)
+    parser.add_argument(
+        "--total_steps",
+        type=int,
+        default=None,
+        help=(
+            "Rollout length in ticks. Default: the remaining episode length from --frame_index "
+            "(sweep-parity: the blend script replays whole episodes). The pre-parity behavior "
+            "was one chunk length (pass --total_steps=64 to recover it)."
+        ),
+    )
+    # ── Sweep-parity blend knobs (same names/semantics as augment_dataset_with_blending) ──
+    parser.add_argument(
+        "--progress_guidance",
+        type=_parse_bool,
+        default=False,
+        help=(
+            "Re-index the demo by robot progress (monotonic windowed nearest-state match) "
+            "instead of wall-clock, exactly as the blend script does. Requires "
+            "observation.state in the dataset for state-grid matching (falls back to the "
+            "action matrix with a +1 shift)."
+        ),
+    )
+    parser.add_argument("--progress_guidance_window", type=int, default=45)
+    parser.add_argument(
+        "--fixed_base_noise",
+        type=_parse_bool,
+        default=True,
+        help=(
+            "true (default): pin ONE noise draw shared across all ratios and ticks — the "
+            "tool's historical cross-ratio comparability mode. false: sweep-parity — the "
+            "wrapper draws fresh noise every denoise (independent every_step samples)."
+        ),
+    )
+    parser.add_argument(
+        "--clip_sample",
+        type=_parse_bool,
+        default=None,
+        help=(
+            "DEBUG: override the checkpoint's DDPM clip_sample (None = keep trained value). "
+            "The sweep's blend step often runs --clip_sample=false."
+        ),
+    )
 
     # ── Env / simulator config ────────────────────────────────────────────────
-    parser.add_argument("--env_task", default="upright_small_engine_new")
+    parser.add_argument(
+        "--env_task",
+        default=None,
+        help=(
+            "Defaults to the checkpoint train_config's env.task, falling back to 'upright_small_engine_new'."
+        ),
+    )
     parser.add_argument("--env_robot_name", default=None, help="Defaults to --robot_name.")
     parser.add_argument("--env_camera_names", nargs="+", default=None, help="Defaults to --camera_names.")
     parser.add_argument(
@@ -544,22 +632,73 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Load the checkpoint's train_config.json once — used to auto-resolve both
+    # the dataset repo id and the env/robot settings below.
+    train_cfg_path = Path(args.policy_path) / "train_config.json"
+    train_cfg: dict = {}
+    if train_cfg_path.is_file():
+        try:
+            train_cfg = json.loads(train_cfg_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            train_cfg = {}
+
+    # Auto-resolve env/robot settings from the checkpoint's env section.
+    # Explicit CLI flags win; the historical hardcoded defaults are the
+    # last-resort fallback for checkpoints without an env section.
+    env_json = train_cfg.get("env") or {}
+
+    def _auto(flag: str, cli_value, cfg_key: str, fallback):
+        if cli_value is not None:
+            return cli_value
+        value = env_json.get(cfg_key)
+        if value is None:
+            return fallback
+        print(f"Auto-resolved --{flag} from checkpoint: {value}")
+        return value
+
+    args.env_task = _auto("env_task", args.env_task, "task", "upright_small_engine_new")
+    args.robot_name = _auto("robot_name", args.robot_name, "robot_name", "robot_iphone_w_engine_curtain")
+    args.num_dofs = _auto("num_dofs", args.num_dofs, "num_dofs", 6)
+    args.camera_names = _auto("camera_names", args.camera_names, "camera_names", ["base_rgb", "wrist_rgb"])
+
     env_robot_name = args.env_robot_name or args.robot_name
+    if args.env_robot_name is None and env_robot_name in _STALE_ENV_ROBOT_NAMES:
+        _remapped = _STALE_ENV_ROBOT_NAMES[env_robot_name]
+        print(
+            f"env robot_name '{env_robot_name}' is a stale splat — using "
+            f"'{_remapped}' for the sim (pass --env_robot_name to override)."
+        )
+        env_robot_name = _remapped
     env_camera_names = args.env_camera_names or list(args.camera_names)
     env_image_resize_modes = args.env_image_resize_modes or [args.image_resize_mode]
+
+    # Remind how to start the sim this script needs, then fail fast if it isn't
+    # up yet (a bare ZMQ connect to a dead port hangs with no error).
+    sim_launch_hint = format_sim_launch_command(
+        env_task=args.env_task,
+        robot_name=env_robot_name,
+        port=args.env_external_port,
+        eval_benchmark_repo_id=env_json.get("eval_benchmark_repo_id"),
+    )
+    print(
+        f"\nThis script requires a splatsim server already running on "
+        f"{args.env_external_host}:{args.env_external_port}. To launch it for "
+        f"this policy (in another terminal):\n\n{sim_launch_hint}\n"
+    )
+    check_sim_server_reachable(args.env_external_host, args.env_external_port, sim_launch_hint)
 
     # Auto-resolve dataset_repo_id from the checkpoint if not passed. Prevents
     # the silent dataset-mismatch bug (e.g. dataset-11 checkpoint visualized
     # against dataset-7 frames).
     dataset_repo_id = args.dataset_repo_id
     if dataset_repo_id is None:
-        train_cfg_path = Path(args.policy_path) / "train_config.json"
-        if train_cfg_path.is_file():
-            try:
-                _cfg = json.loads(train_cfg_path.read_text())
-                dataset_repo_id = _cfg.get("dataset", {}).get("repo_id")
-            except (json.JSONDecodeError, OSError):
-                dataset_repo_id = None
+        _ds_cfg = train_cfg.get("dataset", {})
+        # Weighted-sampling checkpoints leave repo_id empty and list their
+        # sub-datasets in repo_ids; source[0] is the base dataset by
+        # orchestrator convention.
+        dataset_repo_id = _ds_cfg.get("repo_id") or None
+        if dataset_repo_id is None and _ds_cfg.get("repo_ids"):
+            dataset_repo_id = _ds_cfg["repo_ids"][0]
         if dataset_repo_id is None:
             raise SystemExit(
                 f"Could not auto-resolve --dataset_repo_id from "
@@ -587,18 +726,19 @@ def main():
     wrapper.policy_guidance_representation = PolicyGuidanceRepresentation(args.guidance_repr)
     wrapper.n_anchor_steps = args.n_anchor_steps
     wrapper.skip_collision = True
+    apply_clip_sample_override(wrapper, args.clip_sample)
     if args.n_action_steps is not None:
         prev = wrapper.config.n_action_steps
         wrapper.config.n_action_steps = args.n_action_steps
         print(f"Overrode n_action_steps: {prev} → {args.n_action_steps}")
     n_obs_steps = wrapper.config.n_obs_steps
     n_action_steps = wrapper.config.n_action_steps
-    total_steps = getattr(wrapper.config, "chunk_size", None) or getattr(wrapper.config, "horizon", None)
-    if total_steps is None:
+    chunk_len = getattr(wrapper.config, "chunk_size", None) or getattr(wrapper.config, "horizon", None)
+    if chunk_len is None:
         raise ValueError("Could not determine policy chunk length (chunk_size/horizon).")
     print(
         f"Policy: {wrapper.config.type}, n_obs_steps={n_obs_steps}, "
-        f"n_action_steps={n_action_steps}, total_steps={total_steps}"
+        f"n_action_steps={n_action_steps}, chunk_len={chunk_len}"
     )
 
     # Pick episode + frame.
@@ -612,7 +752,6 @@ def main():
         episode_index = args.episode_index
         print(f"Using episode: {episode_index}")
 
-    n_needed = n_obs_steps + total_steps
     parquet_files = find_parquet_files(dataset_dir)
     ep_df_list = [
         pd.read_parquet(
@@ -627,25 +766,61 @@ def main():
     ep_length = len(ep_info)
     print(f"Episode {episode_index} has {ep_length} frames.")
 
-    max_start = ep_length - n_needed
-    if max_start < 0:
-        raise ValueError(f"Episode {episode_index} too short ({ep_length} frames); need {n_needed}.")
-    if args.frame_index is None:
+    if args.frame_index == -1:
+        n_needed_min = n_obs_steps + chunk_len
+        max_start = ep_length - n_needed_min
+        if max_start < 0:
+            raise ValueError(f"Episode {episode_index} too short ({ep_length} frames); need {n_needed_min}.")
         frame_index = random.randint(0, max_start)
         print(f"Selected random frame_index: {frame_index}")
     else:
         frame_index = args.frame_index
+        if not frame_index >= 0 or frame_index + n_obs_steps + 1 > ep_length:
+            raise ValueError(
+                f"frame_index={frame_index} leaves no guidance frames in episode "
+                f"{episode_index} ({ep_length} frames, n_obs_steps={n_obs_steps})."
+            )
         print(f"Using frame_index: {frame_index}")
+    if frame_index > 0:
+        print(
+            f"NOTE: frame_index={frame_index} — the robot will be TELEPORTED to the demo's "
+            f"pose at this frame after the scenario reset (SplatSim servers dispatch "
+            f"teleport_joint_state over ZMQ), so guidance stays aligned with the robot. "
+            f"Non-SplatSim servers without that method fall back to the scenario-initial "
+            f"pose (watch for a large initial guidance\u2194robot gap in the plots)."
+        )
+
+    # Rollout length: default = the remaining episode (sweep-parity — the blend
+    # script replays whole episodes and its guidance is the FULL action matrix).
+    if args.total_steps is not None:
+        total_steps = args.total_steps
+    else:
+        total_steps = ep_length - n_obs_steps - frame_index
+    n_avail = ep_length - frame_index
+    n_needed = min(n_obs_steps + total_steps, n_avail)
 
     frames_df = load_episode_frames(dataset_dir, episode_index, frame_index, n_needed)
     obs_frames = frames_df.iloc[:n_obs_steps]
-    guidance_frames = frames_df.iloc[n_obs_steps : n_obs_steps + total_steps]
+    guidance_frames = frames_df.iloc[n_obs_steps:]
     guidance_actions_raw = np.stack(
         [np.array(row["action"], dtype=np.float32) for _, row in guidance_frames.iterrows()]
     )
+    demo_states_raw = None
+    if "observation.state" in guidance_frames.columns:
+        demo_states_raw = np.stack(
+            [np.array(row["observation.state"], dtype=np.float32) for _, row in guidance_frames.iterrows()]
+        )
     print(
-        f"Loaded {len(obs_frames)} obs + {len(guidance_frames)} guidance frames (action_dim={guidance_actions_raw.shape[1]})."
+        f"Loaded {len(obs_frames)} obs + {len(guidance_frames)} guidance frames "
+        f"(action_dim={guidance_actions_raw.shape[1]}, "
+        f"demo_states={'yes' if demo_states_raw is not None else 'no'}); "
+        f"rollout total_steps={total_steps}."
     )
+    if args.progress_guidance and demo_states_raw is None:
+        print(
+            "NOTE: --progress_guidance without observation.state in the dataset — matching "
+            "against the action matrix with a +1 shift (same fallback as the blend script)."
+        )
 
     # Task resolution chain: --task_description override → per-episode lookup
     # in task_map → --env_task fallback. PI0.5 requires a non-empty task; the
@@ -671,12 +846,34 @@ def main():
             wrapper, seed_joint_state, guidance_actions_raw
         )
 
+    # Benchmark scenario: prefer the episode's recorded source_scenario_idx
+    # (written by intervention recording; the blend script resolves it the same
+    # way) so the rollout runs in the SAME scene geometry the demo was recorded
+    # in. Identity fallback (scenario = episode_index) for plain training
+    # datasets without the metadata.
+    scenario_index = episode_index
+    episodes_meta = load_episodes_meta(dataset_dir)
+    if not episodes_meta.empty and "source_scenario_idx" in episodes_meta.columns:
+        _row = episodes_meta.loc[episodes_meta["episode_index"] == episode_index, "source_scenario_idx"]
+        if not _row.empty and pd.notna(_row.iloc[0]):
+            scenario_index = int(_row.iloc[0])
+            print(f"Resolved benchmark scenario from dataset meta: source_scenario_idx={scenario_index}")
+    if scenario_index == episode_index:
+        print(
+            f"Benchmark scenario = episode_index = {scenario_index} (no source_scenario_idx "
+            f"metadata; make sure the server's benchmark scenario {scenario_index} matches "
+            f"this episode's scene geometry)."
+        )
+
     # Connect to the external simulator. The server is already running in
     # EVAL_BENCHMARK mode; we select scenarios via reset(seed=[episode_index]).
     print(
         f"Connecting to splatsim at {args.env_external_host}:{args.env_external_port} "
         f"(task={args.env_task}) …"
     )
+    # Feature dims from the checkpoint's env config (see build_splatsim_env's
+    # docstring — the UR5-shaped defaults break non-UR5 servers at reset).
+    # Fallback for checkpoints without an env section: joints + gripper.
     vec_env, _env_cfg, env_pre, env_post = build_splatsim_env(
         task=args.env_task,
         robot_name=env_robot_name,
@@ -688,8 +885,13 @@ def main():
         external_host=args.env_external_host,
         eval_benchmark_repo_id=None,  # configured on the server side
         eval_benchmark_subset=None,
+        num_dofs=args.num_dofs,
+        state_dim=env_json.get("state_dim") or args.num_dofs + 1,
+        action_dim=env_json.get("action_dim") or args.num_dofs + 1,
+        env_state_dim=env_json.get("env_state_dim") or 0,
         policy_cfg=wrapper.config,
     )
+    warn_if_sim_physics_unsynced(vec_env)
 
     try:
         print(f"Computing sim rollouts for ratios: {args.forward_flow_ratios} …")
@@ -700,14 +902,18 @@ def main():
             env_pre,
             env_post,
             seed_joint_state=seed_joint_state,
-            episode_index_for_seed=episode_index,
+            episode_index_for_seed=scenario_index,
             guidance_actions_raw=guidance_actions_raw,
             ratios=args.forward_flow_ratios,
             rename_map=rename_map,
             device=args.device,
             task_description=task_description,
-            drain_chunk=args.drain_chunk,
+            blend_interval_frac=args.blend_interval_frac,
             total_steps=total_steps,
+            fixed_base_noise=args.fixed_base_noise,
+            progress_guidance=args.progress_guidance,
+            progress_guidance_window=args.progress_guidance_window,
+            demo_states_raw=demo_states_raw,
         )
         print("Done computing rollouts.")
     finally:
@@ -737,20 +943,24 @@ def main():
         joint_names.append("gripper")
 
     if args.output_dir is None:
-        import json as _json
-
-        train_cfg = args.policy_path.rstrip("/") + "/train_config.json"
-        try:
-            with open(train_cfg) as f:
-                policy_tag = _json.load(f)["policy"]["type"]
-        except Exception:
-            policy_tag = "policy"
+        policy_tag = (train_cfg.get("policy") or {}).get("type") or "policy"
         repr_tag = "delta" if args.guidance_repr == "delta" else "abspos"
-        drain_tag = "onestep" if args.drain_chunk else "everystep"
+        if args.blend_interval_frac >= 1.0:
+            blend_interval_tag = "onestep"
+        elif args.blend_interval_frac <= 0.0:
+            blend_interval_tag = "everystep"
+        else:
+            blend_interval_tag = f"blendint{int(round(args.blend_interval_frac * 100)):03d}"
         anchor_tag = f"anchor{args.n_anchor_steps}" if args.n_anchor_steps > 0 else "noanchor"
         nas_tag = f"nas{n_action_steps}"
+        noise_tag = "" if args.fixed_base_noise else "_freshnoise"
+        pg_tag = "_pg" if args.progress_guidance else ""
+        clip_tag = "" if args.clip_sample is None else ("_clip" if args.clip_sample else "_noclip")
         parent = f"shared_autonomy_sim_ep{episode_index}_frame{frame_index}"
-        name = f"{policy_tag}_{args.blend_strategy}_{repr_tag}_{drain_tag}_{anchor_tag}_{nas_tag}_sim"
+        name = (
+            f"{policy_tag}_{args.blend_strategy}_{repr_tag}_{blend_interval_tag}_{anchor_tag}_{nas_tag}"
+            f"{noise_tag}{pg_tag}{clip_tag}_sim"
+        )
         output_dir: Path = Path("outputs/viz") / parent / name
     else:
         output_dir = Path(args.output_dir)

@@ -111,7 +111,7 @@ def plot_joint_angles(
             ax.plot(
                 dg_ts,
                 decoded_guidance_raw[:, dim_idx],
-                color="orange",
+                color="#20c8c8",  # aqua: between guidance green and ratio-0.0 blue
                 linewidth=1.8,
                 linestyle="--",
                 marker="s",
@@ -129,7 +129,22 @@ def plot_joint_angles(
 
         if n_obs > 0:
             ax.axvline(0, color="gray", linewidth=0.8, linestyle=":", alpha=0.6)
-        ax.set_title(joint_names[dim_idx], fontsize=9)
+
+        # Near-constant dim guard: a dim whose whole plotted range is float
+        # dust (e.g. the excluded-but-still-predicted planar gripper, constant
+        # 0 ± ~1e-15) would be autoscaled into what LOOKS like violent noise.
+        # Pin a sane symmetric range and say so instead.
+        _all_vals = np.concatenate([action_chunks_by_ratio[r][:, dim_idx].reshape(-1) for r in ratios])
+        _span = float(np.nanmax(_all_vals) - np.nanmin(_all_vals)) if _all_vals.size else 0.0
+        if _span < 1e-9:
+            _center = float(np.nanmean(_all_vals)) if _all_vals.size else 0.0
+            ax.set_ylim(_center - 0.05, _center + 0.05)
+            ax.set_title(
+                f"{joint_names[dim_idx]} (constant ≈{_center:.3g}; span {_span:.1e} = float noise)",
+                fontsize=9,
+            )
+        else:
+            ax.set_title(joint_names[dim_idx], fontsize=9)
         ax.set_xlabel("timestep")
         ax.set_ylabel("joint angle (rad)")
         ax.grid(True, alpha=0.3)
@@ -258,8 +273,8 @@ def plot_ee_trajectories_3d(
                 z=decoded_guidance_ee_positions[:, 2],
                 mode="lines+markers",
                 name="decoded guidance_chunk",
-                line={"color": "orange", "width": 3, "dash": "dash"},
-                marker={"color": "orange", "size": sizes_dg, "symbol": symbols_dg, "opacity": 0.9},
+                line={"color": "#20c8c8", "width": 3, "dash": "dash"},
+                marker={"color": "#20c8c8", "size": sizes_dg, "symbol": symbols_dg, "opacity": 0.9},
             )
         )
 

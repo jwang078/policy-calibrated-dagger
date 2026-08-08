@@ -34,6 +34,7 @@ def load_wrapped_policy(
     num_dofs: int = 6,
     device: str = "cpu",
     action_names_dataset_hint: str | Path | None = None,
+    pb_gui: bool = False,
 ):
     """Load inner policy and wrap with ``SharedAutonomyPolicyWrapper`` (no slider).
 
@@ -43,6 +44,20 @@ def load_wrapped_policy(
     Returns ``(wrapper, obs_preprocessor)``.
     """
     policy_path = Path(policy_path)
+    # Accept a training dir (or a bare checkpoint-step dir) and descend to the
+    # actual pretrained_model dir — mirrors the training-dir positional-path
+    # convenience the dagger bash tooling already has. Explicit
+    # pretrained_model paths hit the first branch's config.json and pass
+    # through unchanged.
+    if not (policy_path / "config.json").is_file():
+        for candidate in (
+            policy_path / "checkpoints" / "last" / "pretrained_model",
+            policy_path / "pretrained_model",
+        ):
+            if (candidate / "config.json").is_file():
+                print(f"Auto-resolved --policy_path to checkpoint: {candidate}")
+                policy_path = candidate
+                break
     with open(policy_path / "config.json") as f:
         config_data = json.load(f)
     policy_type = config_data["type"]
@@ -61,6 +76,7 @@ def load_wrapped_policy(
             enabled=True,
             forward_flow_ratio=forward_flow_ratio,
             show_slider=False,
+            pybullet_gui=pb_gui,
             start_paused=False,
             robot_name=robot_name,
             num_dofs=num_dofs,
@@ -176,3 +192,33 @@ def _backfill_rel_step_action_names(
         f"converted to relative actions, and recorded blend actions will leak "
         f"the gripper state into the action column."
     )
+
+
+def apply_clip_sample_override(wrapper, clip_sample: bool | None) -> None:
+    """DEBUG: override the checkpoint's DDPM/DDIM ``clip_sample`` on a live wrapper.
+
+    ``None`` is a no-op (keep the trained value). The scheduler was CONSTRUCTED
+    with the checkpoint's clip_sample and reads ``self.config.clip_sample`` at
+    every ``step()`` — mutating the policy config alone does nothing, so the
+    scheduler's FrozenDict config is updated via ``register_to_config`` (the
+    sanctioned diffusers API for post-hoc overrides). Eval-mismatched — for
+    blend debugging only. Shared by ``augment_dataset_with_blending`` and
+    ``visualize_shared_autonomy_sim`` so the two debug paths cannot drift.
+    """
+    if clip_sample is None:
+        return
+    inner = wrapper.inner_policy
+    prev_clip = getattr(inner.config, "clip_sample", None)
+    inner.config.clip_sample = clip_sample
+    sched = getattr(getattr(inner, "diffusion", None), "noise_scheduler", None)
+    if sched is not None and hasattr(sched, "register_to_config"):
+        sched.register_to_config(clip_sample=clip_sample)
+        print(
+            f"[debug] clip_sample override: {prev_clip} → {clip_sample} (policy config + live "
+            f"noise scheduler). Eval-mismatched — for blend debugging only."
+        )
+    else:
+        print(
+            f"[debug] clip_sample={clip_sample} requested but no diffusion noise_scheduler found "
+            f"on the inner policy (non-DDPM policy?); override NOT applied."
+        )

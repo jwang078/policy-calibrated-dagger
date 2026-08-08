@@ -17,7 +17,14 @@ def compute_ee_from_states(wrapper, states_raw: np.ndarray) -> np.ndarray:
     """Run FK on a sequence of raw joint states. Returns ``[N, 3]`` EE positions."""
     positions = []
     for q in states_raw:
-        wrapper._sync_joints(q[: wrapper.num_dofs])
+        q_arm = np.asarray(q[: wrapper.num_dofs], dtype=np.float64)
+        # NaN rows mark "no data" ticks (e.g. the decoded-guidance overlay's
+        # post-termination gap) — map to NaN EE points (plotly/matplotlib draw
+        # a gap) instead of pushing NaN into pybullet's joint state.
+        if not np.all(np.isfinite(q_arm)):
+            positions.append(np.full(3, np.nan))
+            continue
+        wrapper._sync_joints(q_arm)
         pos, _ = wrapper._get_ee_pose()
         positions.append(pos.copy())
     return np.array(positions)

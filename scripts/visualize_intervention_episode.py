@@ -6,8 +6,10 @@ Inputs:
     training_dir   path to a DAgger training output dir, e.g.
                    outputs/training/diffusion_<...>_ft_dag<N>
     episode_idx    0-indexed episode to visualize. Maps directly to the
-                   `eval_episode_<idx>.mp4` filename AND to
-                   `scenario_idx == <idx>` in intervention_per_scenario.csv.
+                   `eval_episode_<idx>.mp4` filename AND to the <idx>-th ROW
+                   of intervention_per_scenario.csv (recording order). The
+                   row's `scenario_idx` column is the benchmark scenario id,
+                   which differs from <idx> when the eval ran a subset.
 
 Output (default):  <training_dir>/dagger/interventions/videos/splatsim_0/
                        eval_episode_<idx>_annotated.mp4
@@ -105,15 +107,25 @@ def _draw_label(frame: np.ndarray, text: str, color: tuple[int, int, int]) -> No
     )
 
 
-def _find_csv_row(csv_path: Path, scenario_idx: int) -> dict[str, str]:
-    """Locate the row where `scenario_idx` matches the requested episode."""
+def _find_csv_row(csv_path: Path, episode_idx: int) -> dict[str, str]:
+    """Return the `episode_idx`-th ROW of the CSV (recording order).
+
+    Rows are written one per scenario in the order they were run, which is
+    exactly the order lerobot-eval numbers `eval_episode_<N>.mp4` — so the
+    positional row is the one matching the video. The row's `scenario_idx`
+    COLUMN holds the BENCHMARK scenario id, which under
+    `--env.eval_benchmark_subset` differs from the position (e.g. subset
+    [2,3,5]: eval_episode_0.mp4 = row 0 = scenario 2). Matching by the
+    column value (the old behavior) silently annotated the wrong episode.
+    """
     with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if int(row["scenario_idx"]) == scenario_idx:
-                return row
+        rows = list(csv.DictReader(f))
+    if 0 <= episode_idx < len(rows):
+        return rows[episode_idx]
+    scenarios = ",".join(r.get("scenario_idx", "?") for r in rows)
     raise ValueError(
-        f"No row with scenario_idx={scenario_idx} in {csv_path}. "
+        f"episode_idx={episode_idx} out of range: {csv_path} has {len(rows)} row(s) "
+        f"(episodes 0..{len(rows) - 1}, scenario_idx column: [{scenarios}]). "
         f"The CSV may not cover this episode (e.g. a partial recording)."
     )
 
@@ -379,6 +391,10 @@ def annotate(
         raise FileNotFoundError(f"Intervention CSV not found: {csv_path}")
 
     row = _find_csv_row(csv_path, episode_idx)
+    # Benchmark scenario id for this episode (differs from episode_idx when
+    # the eval ran a subset) — used for blend `source_scenario_idx` lookup
+    # and display.
+    scenario_idx = int(row["scenario_idx"])
     triggers_raw = row.get("triggers", "")
     trigger_steps = _parse_int_list(row.get("trigger_steps", ""))
     rrt_steps_executed = _parse_int_list(row.get("rrt_steps_executed", ""))
@@ -401,7 +417,7 @@ def annotate(
         )
     if not (len(triggers) == len(trigger_steps) == len(rrt_steps_executed)):
         raise ValueError(
-            f"CSV cycle columns are not parallel for scenario {episode_idx}: "
+            f"CSV cycle columns are not parallel for episode {episode_idx} (scenario {scenario_idx}): "
             f"triggers={len(triggers)} trigger_steps={len(trigger_steps)} "
             f"rrt_steps_executed={len(rrt_steps_executed)}"
         )
@@ -441,7 +457,7 @@ def annotate(
             )
         blend_frames_by_cycle = _load_blend_frames_for_scenario(
             blend_dataset_path=blend_dataset_path,
-            scenario_idx=episode_idx,
+            scenario_idx=scenario_idx,
             rrt_steps_executed=rrt_steps_executed,
             camera_col=blend_camera_col,
         )
@@ -521,7 +537,10 @@ def annotate(
         print(f"[viz]   camera column: {blend_camera_col}")
         print(f"[viz]   blend frames per cycle: {[len(f) for f in blend_frames_by_cycle]}")
         print(f"[viz]   output canvas: {out_width}x{out_height}")
-    print(f"[viz] CSV row scenario_idx={episode_idx}, cycles={len(triggers)}:")
+    print(
+        f"[viz] episode {episode_idx} (eval_episode_{episode_idx}.mp4) = CSV row {episode_idx} "
+        f"= benchmark scenario_idx {scenario_idx}, cycles={len(triggers)}:"
+    )
     for i, (t, ts, L) in enumerate(zip(triggers, trigger_steps, rrt_steps_executed, strict=True)):
         end = ts + L if L > 0 else None
         if end is not None:
@@ -715,7 +734,10 @@ def main() -> None:
     p.add_argument(
         "episode_idx",
         type=int,
-        help="0-indexed episode (matches eval_episode_<N>.mp4 AND scenario_idx in the CSV).",
+        help=(
+            "0-indexed episode: matches eval_episode_<N>.mp4 and the N-th CSV row "
+            "(NOT the scenario_idx column, which is the benchmark scenario id)."
+        ),
     )
     p.add_argument(
         "--pause_frames",

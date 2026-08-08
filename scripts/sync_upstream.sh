@@ -88,6 +88,36 @@ python -c "
 import lerobot, lerobot.scripts.lerobot_train, lerobot.scripts.lerobot_eval
 import lerobot.datasets.factory, lerobot.policies.factory, lerobot.envs.factory
 print('  imports OK')"
+
+# Dependency drift. A sync moves you onto upstream code that may REQUIRE newer
+# deps than your env has, and nothing about the merge reveals it — you find out
+# when a specific call fails at runtime. (Real example: upstream moved to
+# draccus>=0.11.6, whose `encode(obj, declared_type)` takes a second argument;
+# on the pinned-but-stale 0.10.0 every run trained fine and then died at the
+# FIRST CHECKPOINT with "encode() takes 1 positional argument but 2 were given".)
+python - <<'PYEOF'
+import tomllib, importlib.metadata as md
+from packaging.requirements import Requirement
+from packaging.version import Version
+bad = []
+for line in tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]:
+    try:
+        r = Requirement(line)
+    except Exception:
+        continue
+    if r.marker and not r.marker.evaluate():
+        continue
+    try:
+        v = md.version(r.name)
+    except md.PackageNotFoundError:
+        bad.append(f"{r.name}: NOT INSTALLED (need {r.specifier})")
+        continue
+    if r.specifier and not r.specifier.contains(Version(v), prereleases=True):
+        bad.append(f"{r.name}: have {v}, need {r.specifier}")
+print("  deps OK" if not bad else "  DEPENDENCY DRIFT (pip install -U the following):")
+for b in bad:
+    print("   ", b)
+PYEOF
 pre-commit run --all-files || echo "  (pre-commit reported issues — fix before pushing)"
 
 cat <<MSG

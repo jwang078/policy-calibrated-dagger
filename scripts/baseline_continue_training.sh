@@ -69,6 +69,11 @@ DRY_RUN=false
 # shell, or this is the second baseline against a shared sim).
 MANAGE_SPLATSIM=true
 HEADLESS_LOCAL=false
+# Gate sim physics on client commands (see lib_splatsim_manage.sh). Inline
+# eval runs a slow diffusion policy against the external sim — without sync
+# the sim races ahead in wallclock time during inference and eval looks
+# jumpy / off-policy. Matches dagger_orchestrate.sh's default.
+: "${SPLATSIM_SYNC_PHYSICS:=true}"
 # Pass-through args go straight to resume_training.sh.
 PASSTHROUGH=()
 while (( $# > 0 )); do

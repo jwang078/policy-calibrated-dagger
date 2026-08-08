@@ -49,12 +49,22 @@ _LIB_SPLATSIM_MANAGE_LOADED=1
 : "${ENV_EXTERNAL_PORT:=6001}"
 : "${ENV_EXTERNAL_HOST:=127.0.0.1}"
 : "${SPLATSIM_ROBOT:=sim_ur_pybullet_small_engine_new_interactive}"
+# When "true", launch the sim with --sync_physics_to_client: physics steps
+# ONLY in response to client commands, so a slow policy (diffusion U-Net at
+# chunk boundaries) doesn't let the sim race ahead in wallclock time —
+# the cause of frame-forward "jumpy" glitches in eval videos recorded
+# against an external sim. Empty (default) = legacy async behavior, for
+# callers that predate the knob.
+: "${SPLATSIM_SYNC_PHYSICS:=}"
 # Empty by default — `launch_nodes.py` resolves to the robot server
 # class's `DEFAULT_ROBOT_NAME` when `--robot_name` isn't passed. Only
 # set this when overriding per-run; keeps SplatSim as the single source
 # of truth for the canonical splat/URDF name.
 : "${SPLATSIM_ROBOT_NAME:=}"
 : "${HEADLESS:=false}"
+# Image-observation source forwarded as --render_mode (env profiles set it:
+# small_engine=splat, planar=pybullet). Empty = launch_nodes env default.
+: "${RENDER_MODE:=}"
 : "${DRY_RUN:=false}"
 # Where to write the per-launch sim log. Callers should set this to a path
 # INSIDE their training/output dir (e.g., <train_dir>/dagger/) so the log
@@ -115,6 +125,8 @@ splat_start_sim() {
         [[ "$MANAGED_SIM_PID" == "DRYRUN" ]] && return 0
         local _hl=""
         [[ "$HEADLESS" == "true" ]] && _hl=" --headless"
+        [[ -n "$RENDER_MODE" ]] && _hl+=" --render_mode $RENDER_MODE"
+        [[ "$SPLATSIM_SYNC_PHYSICS" == "true" ]] && _hl+=" --sync_physics_to_client"
         local _subset_str=""
         [[ -n "${EVAL_BENCHMARK_SUBSET:-}" ]] && _subset_str=" --eval_benchmark_subset $EVAL_BENCHMARK_SUBSET"
         local _rn=""
@@ -163,10 +175,17 @@ splat_start_sim() {
     [[ -n "$SPLATSIM_ROBOT_NAME" ]] && launch_cmd+=( --robot_name "$SPLATSIM_ROBOT_NAME" )
     [[ "${#_subset_arg[@]}" -gt 0 ]] && launch_cmd+=( "${_subset_arg[@]}" )
     [[ "$HEADLESS" == "true" ]] && launch_cmd+=( --headless )
+    [[ -n "$RENDER_MODE" ]] && launch_cmd+=( --render_mode "$RENDER_MODE" )
+    [[ "$SPLATSIM_SYNC_PHYSICS" == "true" ]] && launch_cmd+=( --sync_physics_to_client )
     echo "Starting SplatSim:"
     echo "  cwd:     $SPLATSIM_ROOT"
     echo "  cmd:     ${launch_cmd[*]}"
     echo "  log:     $MANAGED_SIM_LOG"
+    if [[ "$SPLATSIM_SYNC_PHYSICS" == "true" ]]; then
+        echo "  sync_physics_to_client: ON — physics steps only on client commands (sim never races ahead of a slow policy)."
+    else
+        echo "  sync_physics_to_client: OFF — physics runs in wallclock time; slow policies may look jumpy. Set SPLATSIM_SYNC_PHYSICS=true (or the caller's --sync_physics_to_client flag) to gate stepping on client commands."
+    fi
     # Launch sim in background. setsid puts it in its own session so it survives
     # SIGINT to our shell (we kill it explicitly in splat_stop_sim / trap).
     (

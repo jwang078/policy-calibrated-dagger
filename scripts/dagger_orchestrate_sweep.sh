@@ -57,7 +57,17 @@
 #                           --finetune_*, etc.) is forwarded. Always passes
 #                           --resume to the create step so a fully-complete
 #                           source exits 0 quickly; partial source resumes;
-#                           missing source is created from scratch. Requires
+#                           missing source is created from scratch.
+#
+#                           ORDER: with --final_mode=scratch, the source's
+#                           post-loop from-scratch train is DEFERRED — the
+#                           create step runs with --final_mode=finetune (no
+#                           post-loop phase) and the sweep re-invokes the
+#                           orchestrator with --final_mode=scratch after the
+#                           last blend iteration, so the sequence is always
+#                           interventions → blends → final scratch.
+#
+#                           Requires
 #                           --rerun_blends_from=TAG (no `:BLENDS_TAG` form —
 #                           sources with their own blends would need a
 #                           separate spec we don't yet support).
@@ -88,6 +98,21 @@
 #                           Default "_rr". Has no effect when --run_tag is
 #                           explicitly set to something different from the
 #                           source's tag.
+#
+# Orchestrator passthrough:
+#   Every flag not listed above is forwarded VERBATIM to each
+#   dagger_orchestrate.sh invocation — including --num_workers=N, which sets
+#   the DataLoader worker count for every training in every lineage the sweep
+#   produces (round-0 base, per-round scratch, per-round finetune + `_nc`
+#   sibling, post-loop final scratch). The orchestrator defaults it to 16;
+#   lerobot's own default of 4 leaves a many-core CPU idle and stalls the GPU
+#   on batch assembly. Recording / blending / merge steps have no DataLoader,
+#   so the flag does not affect them.
+#   Likewise --video_backend=NAME, which the orchestrator defaults to
+#   torchcodec and emits as --dataset.video_backend into every training. It
+#   matters most for RESUMED/finetuned rounds: a train_config.json written
+#   while torchcodec was unloadable pins `pyav`, and without this flag every
+#   later round in the lineage would inherit that pin.
 #
 # Pre-flight name length validation (COMBINATION mode only):
 #   The wrapper predicts the merged-dataset name for every combination
@@ -209,6 +234,54 @@ if [[ -z "$SWEEP_BLENDS" && -z "$COMBINATION_POOL" ]]; then
     echo "    --sweep_blends='0.9 0.8 0.7'" >&2
     echo "    --combination_pool='0.1 0.3 0.5 0.7 0.9' --sweep_combinations_of=2" >&2
     exit 1
+fi
+
+# Default --target_intervention_volume to (max_K + 1) when the user didn't set
+# it, where max_K is the largest sweep combination size ("K" in
+# combinations_of=K) — 1 for --sweep_blends mode (each iteration has a single
+# ratio). This aligns per-round DAgger MASS across all sweep iterations AND
+# any --auto_create_source lineage (which has no blends):
+#   * Per-iteration (n_blends = K): raw_mult = max(1, TIV - K) = 1, blend_mult = 1
+#     → K+1 sub-datasets each with weight 1 → total DAgger mass ≡ (K+1) × raw
+#   * Source lineage (n_blends = 0):  raw_mult = TIV = K+1, no blends
+#     → single sub-dataset with weight K+1 → total DAgger mass ≡ (K+1) × raw
+# Both hit the same total per-batch DAgger mass at natural_share, so cross-
+# combination and source-vs-rerun comparisons stay apples-to-apples without
+# the user having to compute TIV by hand. Only injects if the user didn't
+# already pass --target_intervention_volume (explicit user value wins).
+_USER_SET_TIV=false
+for _a in "${ORCHESTRATOR_ARGS[@]}"; do
+    if [[ "$_a" == --target_intervention_volume=* ]]; then
+        _USER_SET_TIV=true
+        break
+    fi
+done
+if [[ "$_USER_SET_TIV" != "true" ]]; then
+    # Determine max K. Combination mode: parse SWEEP_COMBINATIONS_OF (accepts
+    # single value OR comma/space-separated list, mirroring the parser at
+    # line ~295 — kept lightweight here so we don't need to hoist the fuller
+    # validator up). --sweep_blends mode: each iteration is a single ratio, so
+    # K_eff = 1. Non-positive-int entries are ignored here; the fuller
+    # validator later will error clearly if the input is truly malformed.
+    _MAX_K=0
+    if [[ -n "$SWEEP_COMBINATIONS_OF" ]]; then
+        IFS=', ' read -ra _K_TMP <<< "$SWEEP_COMBINATIONS_OF"
+        for _k in "${_K_TMP[@]}"; do
+            if [[ "$_k" =~ ^[0-9]+$ ]] && (( _k > _MAX_K )); then
+                _MAX_K="$_k"
+            fi
+        done
+    fi
+    if (( _MAX_K < 1 )); then
+        _MAX_K=1   # --sweep_blends mode, or SWEEP_COMBINATIONS_OF parse fell through
+    fi
+    _DEFAULT_TIV=$(( _MAX_K + 1 ))
+    ORCHESTRATOR_ARGS+=( "--target_intervention_volume=$_DEFAULT_TIV" )
+    echo "[sweep] --target_intervention_volume not set; defaulting to max_K+1 = $_DEFAULT_TIV" \
+         "(K = ${SWEEP_COMBINATIONS_OF:-1 (--sweep_blends mode)})."
+    echo "[sweep]   Effect: per-round DAgger MASS ≡ $_DEFAULT_TIV × raw intervention across all iterations" \
+         "(and any --auto_create_source source lineage) — apples-to-apples."
+    echo "[sweep]   Pass --target_intervention_volume=N to override."
 fi
 
 # Auto-disambiguate rerun's --run_tag from source's tag. The orchestrator
@@ -702,19 +775,44 @@ if [[ "$AUTO_CREATE_SOURCE" == "true" ]]; then
     # and --resume. Any --blends caller had in ORCHESTRATOR_ARGS will also be
     # stripped (defensive — caller shouldn't pass --blends to the wrapper, but
     # belt-and-suspenders since the rerun's iteration tag has its own --blends).
+    # Ordering: the source's post-loop final-scratch train must come AFTER
+    # every blend iteration (interventions → blends → final scratch), so this
+    # create step suppresses it with --final_mode=finetune (= no post-loop
+    # phase) and the sweep re-invokes the orchestrator with the original
+    # --final_mode once the iteration loop is done. Deferral only applies when
+    # the original modes would run the post-loop at all — final=scratch AND
+    # intermediate!=scratch (mirrors do_final_scratch() in the orchestrator).
+    ORIG_FINAL_MODE="scratch"; ORIG_INTERMEDIATE_MODE="finetune"  # orchestrator defaults
+    for a in "${ORCHESTRATOR_ARGS[@]}"; do
+        case "$a" in
+            --final_mode=*)        ORIG_FINAL_MODE="${a#*=}" ;;
+            --intermediate_mode=*) ORIG_INTERMEDIATE_MODE="${a#*=}" ;;
+        esac
+    done
+    DEFER_SOURCE_FINAL_SCRATCH=false
+    [[ "$ORIG_FINAL_MODE" == "scratch" && "$ORIG_INTERMEDIATE_MODE" != "scratch" ]] \
+        && DEFER_SOURCE_FINAL_SCRATCH=true
     CREATE_ARGS=()
     for a in "${ORCHESTRATOR_ARGS[@]}"; do
         case "$a" in
-            --rerun_blends_from=*|--run_tag=*|--blends=*) continue ;;
+            --rerun_blends_from=*|--run_tag=*|--blends=*|--final_mode=*) continue ;;
             *) CREATE_ARGS+=( "$a" ) ;;
         esac
     done
     CREATE_ARGS+=( "--run_tag=$SOURCE_RUN_TAG" --resume )
+    if [[ "$DEFER_SOURCE_FINAL_SCRATCH" == "true" ]]; then
+        CREATE_ARGS+=( "--final_mode=finetune" )
+    else
+        CREATE_ARGS+=( "--final_mode=$ORIG_FINAL_MODE" )
+    fi
     [[ "$RETRAIN_ROUND0" == "true" ]] && CREATE_ARGS+=( --retrain_round0 )
 
     echo
     echo "════════════════════════════════════════════════════════════════════════════════"
     echo "Auto-create source lineage (--auto_create_source): run_tag='$SOURCE_RUN_TAG'"
+    if [[ "$DEFER_SOURCE_FINAL_SCRATCH" == "true" ]]; then
+        echo "  (source post-loop final-scratch DEFERRED until after all blend iterations)"
+    fi
     echo "  Invoking:"
     echo "    bash $ORCH ${CREATE_ARGS[*]}"
     echo "  (Idempotent: if the source is already fully complete, this exits 0 in seconds.)"
@@ -775,6 +873,38 @@ for i in "${!RATIO_LISTS_ARR[@]}"; do
 done
 
 done   # for ROUND in "${ROUND_VALUES[@]}" — outer interleave-rounds loop
+
+# Deferred source final-scratch: runs AFTER every blend iteration so the
+# ordering is interventions → blends → from-scratch train. CREATE_ARGS
+# persists from the source-create step above; swap its suppressing
+# --final_mode=finetune back to scratch and let the orchestrator's resume
+# detection jump straight to the post-loop phase. Skipped when iterations
+# failed — the command to run manually is printed instead.
+if [[ "$AUTO_CREATE_SOURCE" == "true" && "${DEFER_SOURCE_FINAL_SCRATCH:-false}" == "true" ]]; then
+    FINAL_CREATE_ARGS=()
+    for a in "${CREATE_ARGS[@]}"; do
+        [[ "$a" == --final_mode=* ]] && continue
+        FINAL_CREATE_ARGS+=( "$a" )
+    done
+    FINAL_CREATE_ARGS+=( "--final_mode=scratch" )
+    if (( n_fail == 0 )); then
+        echo "════════════════════════════════════════════════════════════════════════════════"
+        echo "Deferred source final-scratch (run_tag='$SOURCE_RUN_TAG'):"
+        echo "  bash $ORCH ${FINAL_CREATE_ARGS[*]}"
+        echo "════════════════════════════════════════════════════════════════════════════════"
+        if ! DAGGER_SWEEP_INVOCATION_ARGV_JSON="$SWEEP_ARGV_JSON_FOR_SIDECAR" \
+             DAGGER_SWEEP_INVOCATION_WRAPPER="my_scripts/dagger_orchestrate_sweep.sh" \
+             bash "$ORCH" "${FINAL_CREATE_ARGS[@]}"; then
+            n_fail=$((n_fail + 1))
+            failures+=( "source-final-scratch" )
+            echo "Deferred source final-scratch FAILED." >&2
+        fi
+    else
+        echo "Skipping deferred source final-scratch ($n_fail failed iteration(s))."
+        echo "  Run it manually once fixed:"
+        echo "    bash $ORCH ${FINAL_CREATE_ARGS[*]}"
+    fi
+fi
 
 echo "════════════════════════════════════════════════════════════════════════════════"
 echo "Sweep complete: $n_succ succeeded, $n_fail failed (total wall time: $(( $(date +%s) - sweep_start ))s)."

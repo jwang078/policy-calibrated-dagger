@@ -170,6 +170,29 @@ def format_blends_tag(blends: list[float]) -> str:
 
 _VALID_CAMERAS = ("basewrist", "base", "wrist", "state")
 
+# Camera-tag component inside a lineage, with the optional `os` (env_state
+# consumed) and `ng` (--exclude_gripper_from_state) suffixes and a trailing
+# `_` indicating a run tag follows. `basewrist` MUST precede `base`/`wrist`
+# in the alternation so it isn't shadowed. Mirrors dagger_progress.sh's
+# `_cam_tag_re` — keep the two in sync.
+_CAMERA_TAG_IN_LINEAGE_RE = re.compile(r"_(basewrist|base|wrist|state)(os)?(ng)?_")
+
+
+def base_lineage_of(lineage: str) -> str | None:
+    """Strip the trailing run tag from a lineage, leaving the base-policy lineage.
+
+    Lineages usually carry a run tag AFTER the camera tag that's only present
+    on the dag artifacts — the base policy dir is untagged. E.g.
+    `planar_3joint_4_delta_stateng_d100_05dag` → `planar_3joint_4_delta_stateng`,
+    `approach_lever_11_delta_basewrist_d30` → `approach_lever_11_delta_basewrist`.
+    Returns None when no `<camera tag>_<run tag>` pattern is present (the
+    lineage may already BE the untagged base name).
+    """
+    m = _CAMERA_TAG_IN_LINEAGE_RE.search(lineage)
+    if not m:
+        return None
+    return lineage[: m.end() - 1]  # keep everything through the camera tag
+
 
 def camera_name_tag(cameras: str, include_env_state: bool, exclude_gripper: bool) -> str:
     """Combine feature-source flags → the `_<tag>` suffix that goes into every

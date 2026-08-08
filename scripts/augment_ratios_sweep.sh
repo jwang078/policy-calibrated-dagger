@@ -189,7 +189,7 @@ for RATIO in "${RATIOS[@]}"; do
         --blend_strategy="${BLEND_STRATEGY}" \
         --guidance_repr="${GUIDANCE_REPR}" \
         --blend_mode="${BLEND_MODE}" \
-        --drain_chunk \
+        --blend_interval_frac=1.0 \
         --env_task="${ENV_TASK}" \
         --env_external_port="${ENV_EXTERNAL_PORT}" \
         ${PUSH_FLAG}

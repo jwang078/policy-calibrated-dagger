@@ -77,6 +77,32 @@
 #               `_nocoll` siblings whether this flag is set or not (rm is
 #               idempotent on missing paths), so this flag mainly serves
 #               to be recorded in the cleanup invocation's audit trail.
+#   --blends_only
+#               SURGICAL blend cleanup: delete ONLY the blend-derived
+#               artifacts of this lineage, preserving the intervention
+#               recordings (and, in rerun mode, everything source-owned).
+#               Specifically deletes:
+#                 - `_blend<NNN>` raw blend datasets + stats sidecars
+#                 - `_blend<NNN>_nocoll` siblings + stats sidecars
+#                 - `dagger/blend_collision_filter/` audit subdirs
+#                 - the lineage's merged datasets (`*_m`) + sidecars
+#                   (stale once blends change; absent in weighted mode)
+#                 - the lineage's per-round training dirs (`_dag<N>`,
+#                   `_ft_dag<N>`, `_ft_dag<N>_nc`, ...) + their
+#                   outputs/dagger eval dirs (trained on the blends →
+#                   stale once blends are regenerated)
+#               PRESERVED: intervention datasets + alias datasets +
+#               int-stats sidecars, the round-0 base policy, and (rerun
+#               mode) the entire source lineage. Re-running the
+#               orchestrator/sweep with --resume then re-blends (step 2)
+#               and re-trains (step 6) only.
+#               In rerun mode, blend datasets are SHARED across sibling
+#               reruns requesting the same ratio at the same source round
+#               — deleting them here means the next sibling sweep run
+#               re-blends once, then re-uses the result.
+#               Incompatible with --nc_only / --delete_episodes /
+#               --from_round / --also_delete_blends. Skips the
+#               keep-round-1-intervention prompt (interventions untouched).
 #   --nc_only
 #               SURGICAL collision-filter cleanup: delete ONLY the
 #               artifacts produced by --filter_blend_collisions (step 2's
@@ -180,6 +206,10 @@ FILTER_BLEND_COLLISIONS_FLAG=()
 # dirs, nocoll blend datasets + stats, blend_collision_filter audit subdirs).
 # Raw policies and raw blends are preserved. See the docstring above.
 NC_ONLY=false
+# --blends_only: surgical mode — wipe blend-derived artifacts (raw blends,
+# nocoll siblings, both sidecars, audit dirs, merged datasets, per-round
+# training dirs) while preserving interventions. See the docstring above.
+BLENDS_ONLY=false
 # --from_round=N: forwarded to dagger_orchestrate.sh's --from_round (the
 # orchestrator owns the per-round cleanup loop, so it owns the bounds).
 # Validated downstream; here we just pass through. Default empty = no
@@ -200,6 +230,7 @@ for arg in "$@"; do
         --also_delete_blends) ALSO_DELETE_BLENDS_FLAG=( --also_delete_blends ) ;;
         --filter_blend_collisions) FILTER_BLEND_COLLISIONS_FLAG=( --filter_blend_collisions ) ;;
         --nc_only)   NC_ONLY=true ;;
+        --blends_only) BLENDS_ONLY=true ;;
         --from_round=*) FROM_ROUND="${arg#*=}" ;;
         --delete_episodes=*) DELETE_EPISODES="${arg#*=}" ;;
         --skip_dataset_edit) SKIP_DATASET_EDIT=true ;;
@@ -220,6 +251,23 @@ done
 
 if [[ -z "$TRAIN_DIR" ]]; then
     echo "ERROR: training dir path required (run with --help for usage)" >&2; exit 1
+fi
+
+# --blends_only incompatibilities. It is its own surgical scope; combining it
+# with the other scoping flags would be ambiguous about what gets deleted.
+if [[ "$BLENDS_ONLY" == true ]]; then
+    if [[ "$NC_ONLY" == true ]]; then
+        echo "ERROR: --blends_only and --nc_only are mutually exclusive (blends_only is a superset of nc_only's scope)." >&2; exit 1
+    fi
+    if [[ -n "$DELETE_EPISODES" ]]; then
+        echo "ERROR: --delete_episodes is incompatible with --blends_only (they target different artifact categories)." >&2; exit 1
+    fi
+    if [[ -n "$FROM_ROUND" ]]; then
+        echo "ERROR: --from_round is incompatible with --blends_only (blends-only mode wipes all rounds' blend artifacts unconditionally)." >&2; exit 1
+    fi
+    if (( ${#ALSO_DELETE_BLENDS_FLAG[@]} > 0 )); then
+        echo "ERROR: --also_delete_blends is redundant with --blends_only (blends are the whole scope); drop it." >&2; exit 1
+    fi
 fi
 
 # --from_round validation. Lower-bound only; the orchestrator does the
@@ -309,8 +357,25 @@ fi
 # step instead of re-recording; deleting means re-record it from scratch.
 KEEP_ROUND_NUM="${FROM_ROUND:-1}"
 PRESERVE_R1_FLAG=()
+# Rerun lineages never own intervention data (it's source-owned and the
+# orchestrator's rerun-mode cleanup never touches it), so the
+# keep-intervention prompt below would be a no-op question — skip it.
+_target_is_rerun() {
+    local _cfg="$TRAIN_DIR/dagger/config.json"
+    [[ -f "$_cfg" ]] || return 1
+    python3 -c "
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+sys.exit(0 if cfg.get('rerun_mode') else 1)
+" "$_cfg" 2>/dev/null
+}
 if [[ "$NC_ONLY" == true ]]; then
     : # nc-only mode doesn't touch intervention data; the prompt is irrelevant.
+elif [[ "$BLENDS_ONLY" == true ]]; then
+    : # blends-only mode doesn't touch intervention data; the prompt is irrelevant.
+elif _target_is_rerun; then
+    echo "[cleanup] rerun lineage (sidecar has rerun_mode): intervention data is source-owned"
+    echo "[cleanup] and never deleted by cleanup — skipping the keep-intervention prompt."
 elif [[ -n "$DELETE_EPISODES" ]]; then
     : # surgical delete_episodes mode operates on a specific round; the
       # keep-intervention prompt is only meaningful for whole-lineage cleanups.
@@ -453,6 +518,13 @@ from collections import defaultdict
 training_root, target_basename, target_run_tag, target_blends_tag = sys.argv[1:5]
 target_blends_tag = target_blends_tag or ""
 
+# Target lineage name = basename minus the round suffix. Compared against
+# each candidate sidecar's `source_policy_basename` — run_tag alone is
+# AMBIGUOUS across sweep families (e.g. planar_3joint_3 and planar_3joint_4
+# lineages can share run_tag `d100_05dag`), and offering the wrong family's
+# reruns for cleanup is a data-loss hazard.
+target_lineage = re.sub(r"(?:_ft)?_dag\d+(?:_[A-Za-z][A-Za-z0-9_]*)?$", "", target_basename)
+
 by_lineage = defaultdict(list)
 for entry in sorted(os.listdir(training_root)):
     full = os.path.join(training_root, entry)
@@ -476,6 +548,13 @@ for entry in sorted(os.listdir(training_root)):
     if src_run != target_run_tag:
         continue
     if src_blends != target_blends_tag:
+        continue
+    # Family check: the sidecar's source_policy_basename must BE the target
+    # lineage. Pre-source_policy_basename sidecars (older reruns, before
+    # dagger_retrofit_rerun_sidecar.sh) lack the field — fall back to the
+    # tag-only match above for those.
+    src_policy = rr.get("source_policy_basename") or ""
+    if src_policy and src_policy != target_lineage:
         continue
     m = re.match(r"^(.+?)(?:_ft)?_dag\d+(?:_[A-Za-z][A-Za-z0-9_]*)?$", entry)
     if not m:
@@ -525,19 +604,38 @@ if [[ "$DETECT_SIBLINGS" != true && "$AUTO_CONFIRM" != true ]]; then
     done
     _TOTAL_OFFERED=$(( ${#_OTHER_SIBLINGS[@]} + ${#_OTHER_RERUN_CHILDREN[@]} ))
     if (( _TOTAL_OFFERED > 0 )); then
+        # On-disk dag round numbers for a lineage (both `_dagN` scratch and
+        # `_ft_dagN` finetune dirs, incl. `_nc`-style suffixed variants),
+        # echoed as a comma list ("1,2"). Empty output = no round dirs.
+        _rounds_on_disk() {
+            local _tr="$1" _lin="$2" _d _n _list=()
+            for _d in "$_tr/${_lin}"_dag[0-9]* "$_tr/${_lin}"_ft_dag[0-9]*; do
+                [[ -d "$_d" ]] || continue
+                _n="${_d##*_dag}"; _n="${_n%%_*}"
+                [[ "$_n" =~ ^[0-9]+$ ]] && _list+=( "$_n" )
+            done
+            (( ${#_list[@]} > 0 )) || return 0
+            printf '%s\n' "${_list[@]}" | sort -un | paste -sd,
+        }
+        _TRAINING_ROOT_FOR_LIST="$(dirname "$TRAIN_DIR")"
+        _fmt_lineage_line() {
+            local _label="$1" _lin="$2" _r
+            _r="$(_rounds_on_disk "$_TRAINING_ROOT_FOR_LIST" "$_lin")"
+            echo "    ${_label}: ${_lin}  (dag rounds on disk: ${_r:-none})"
+        }
         echo
         echo "Heads up — found $_TOTAL_OFFERED other lineage(s) on disk related to the target:"
         echo "  TARGET: $_TARGET_BASE"
         if (( ${#_OTHER_SIBLINGS[@]} > 0 )); then
             echo "  [K-siblings: same prefix + blend-count]"
             for s in "${_OTHER_SIBLINGS[@]}"; do
-                echo "    SIBLING: $s"
+                _fmt_lineage_line "SIBLING" "$s"
             done
         fi
         if (( ${#_OTHER_RERUN_CHILDREN[@]} > 0 )); then
-            echo "  [rerun children: sidecar's rerun_mode.source_run_tag points at target]"
+            echo "  [rerun children: sidecar's rerun_mode source points at target]"
             for s in "${_OTHER_RERUN_CHILDREN[@]}"; do
-                echo "    RERUN_CHILD: $s"
+                _fmt_lineage_line "RERUN_CHILD" "$s"
             done
         fi
         echo
@@ -545,6 +643,11 @@ if [[ "$DETECT_SIBLINGS" != true && "$AUTO_CONFIRM" != true ]]; then
         echo "sweep family or want to nuke the target's downstream reruns too, you can"
         echo "opt in to cleaning the related lineages above (equivalent to re-running"
         echo "with --detect_siblings)."
+        if [[ -n "$FROM_ROUND" ]]; then
+            echo "NOTE: --from_round=$FROM_ROUND applies to the related lineages too — only their"
+            echo "  rounds ${FROM_ROUND}.. (and, with --also_delete_blends, the blend datasets named"
+            echo "  after source rounds ${FROM_ROUND}..) are wiped; earlier rounds are preserved."
+        fi
         echo -n "Also clean up the $_TOTAL_OFFERED related lineage(s) above? [y/N]: "
         read -r _SIBLING_REPLY
         if [[ "$_SIBLING_REPLY" =~ ^[Yy]$ ]]; then
@@ -659,6 +762,16 @@ if [[ "$DETECT_SIBLINGS" == true ]]; then
             echo -n "Type 'delete-nc-all' to confirm nc-only cleanup of all ${#SIBLING_PATHS[@]} lineages above: "
             read -r CONFIRM
             [[ "$CONFIRM" == "delete-nc-all" ]] || { echo "Aborted."; exit 1; }
+        elif [[ "$BLENDS_ONLY" == true ]]; then
+            echo "MODE: --blends_only — only blend-derived artifacts will be deleted:"
+            echo "  * _blend<NNN> datasets (+ _nocoll siblings) + stats sidecars"
+            echo "  * dagger/blend_collision_filter/ audit subdirs"
+            echo "  * merged (*_m) datasets + sidecars"
+            echo "  * per-round training dirs (incl. _nc) + outputs/dagger eval dirs"
+            echo "  Intervention/alias datasets + int-stats and the round-0 base policy are PRESERVED."
+            echo -n "Type 'delete-blends-all' to confirm blends-only cleanup of all ${#SIBLING_PATHS[@]} lineages above: "
+            read -r CONFIRM
+            [[ "$CONFIRM" == "delete-blends-all" ]] || { echo "Aborted."; exit 1; }
         else
             echo -n "Type 'delete-all' to confirm cleanup of all ${#SIBLING_PATHS[@]} lineages above: "
             read -r CONFIRM
@@ -673,6 +786,8 @@ if [[ "$DETECT_SIBLINGS" == true ]]; then
     # gets a chance to be cleaned up too.
     NC_ONLY_FORWARD=()
     [[ "$NC_ONLY" == true ]] && NC_ONLY_FORWARD=( --nc_only )
+    BLENDS_ONLY_FORWARD=()
+    [[ "$BLENDS_ONLY" == true ]] && BLENDS_ONLY_FORWARD=( --blends_only )
     # --delete_episodes recursion: forward the episode list to every
     # sibling, but the lerobot-edit-dataset call must run exactly ONCE
     # (the source intervention dataset is shared across rerun siblings).
@@ -689,7 +804,7 @@ if [[ "$DETECT_SIBLINGS" == true ]]; then
         if [[ -n "$DELETE_EPISODES" && "$_is_first_sibling" != true ]]; then
             SKIP_EDIT_FORWARD=( --skip_dataset_edit )
         fi
-        bash "$0" "$p" -y "${DRY_RUN_FLAG[@]}" "${ALSO_DELETE_BLENDS_FLAG[@]}" "${FILTER_BLEND_COLLISIONS_FLAG[@]}" "${KEEP_R1_FORWARD[@]}" "${NC_ONLY_FORWARD[@]}" "${FROM_ROUND_FLAG[@]}" "${DELETE_EPISODES_FORWARD[@]}" "${SKIP_EDIT_FORWARD[@]}" && rc=0 || rc=$?
+        bash "$0" "$p" -y "${DRY_RUN_FLAG[@]}" "${ALSO_DELETE_BLENDS_FLAG[@]}" "${FILTER_BLEND_COLLISIONS_FLAG[@]}" "${KEEP_R1_FORWARD[@]}" "${NC_ONLY_FORWARD[@]}" "${BLENDS_ONLY_FORWARD[@]}" "${FROM_ROUND_FLAG[@]}" "${DELETE_EPISODES_FORWARD[@]}" "${SKIP_EDIT_FORWARD[@]}" && rc=0 || rc=$?
         if (( rc != 0 )); then
             overall_rc="$rc"
             echo "[detect_siblings] WARN: cleanup failed for $p (rc=$rc); continuing." >&2
@@ -843,6 +958,151 @@ for r in ratios:
     echo "[nc_only] Re-run dagger_orchestrate_sweep.sh with --filter_blend_collisions"
     echo "[nc_only] to re-produce _nocoll datasets (step 2's filter sub-step) and"
     echo "[nc_only] re-train _nc policies (step 6b)."
+    exit 0
+fi
+
+# ── --blends_only: surgical blend-artifact cleanup ────────────────────────────
+# Bypasses the orchestrator delegate. Deletes everything DERIVED from blends
+# while preserving the intervention recordings:
+#   1. `_blend<NNN>` raw blend datasets in the HF cache + stats sidecars.
+#   2. `_blend<NNN>_nocoll` siblings + stats sidecars.
+#   3. The lineage's merged datasets (`*_m`) + sidecars (contain blend frames
+#      in merge mode; glob simply misses in weighted mode).
+#   4. The lineage's per-round training dirs (`_dag<N>` / `_ft_dag<N>` incl.
+#      `_nc` and other suffix variants) + their outputs/dagger eval dirs —
+#      they were trained against the blends, so they're stale once the blends
+#      are regenerated. (This also removes the blend_collision_filter audit
+#      subdirs, which live inside the training dirs.)
+# PRESERVED: intervention datasets + alias datasets + int-stats sidecars, the
+# round-0 base policy, and (rerun mode) the entire source lineage.
+if [[ "$BLENDS_ONLY" == true ]]; then
+    LEROBOT_CACHE="${LEROBOT_CACHE:-$HOME/.cache/huggingface/lerobot}"
+    HF_USER="${HF_USER:-JennyWWW}"
+    STATS_BASE="$LEROBOT_ROOT/outputs/dataset_stats"
+    TRAINING_ROOT="$(dirname "$TRAIN_DIR")"
+    LINEAGE_BASE="$(basename "$TRAIN_DIR" | sed -E 's/(_ft)?_dag[0-9]+(_.*)?$//')"
+
+    CFG="$TRAIN_DIR/dagger/config.json"
+    if [[ ! -f "$CFG" ]]; then
+        echo "ERROR: --blends_only needs the round's dagger/config.json sidecar; not found at:" >&2
+        echo "  $CFG" >&2
+        echo "  (Pre-sidecar lineages aren't supported by --blends_only. Use the full cleanup," >&2
+        echo "   or rm the _blend<NNN> artifacts by hand.)" >&2
+        exit 1
+    fi
+    BL_META="$(python3 -c "
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+ratios = (cfg.get('config') or {}).get('blends') or []
+fmt = ((cfg.get('config') or {}).get('action_format') or 'rel').lower()
+infix = 'r' if fmt == 'rel' else 'a'
+rerun = cfg.get('rerun_mode') or {}
+# Blend datasets are named after the source intervention prefix in rerun
+# mode, or the lineage's own dag prefix otherwise (same rule as --nc_only).
+blend_prefix = (rerun.get('source_int_short_prefix') or '').strip() \
+    or (cfg.get('naming') or {}).get('base_dataset_short') or ''
+# Merged datasets are always named after the lineage's OWN dag prefix.
+lineage_prefix = (cfg.get('naming') or {}).get('base_dataset_short') or ''
+print(infix)
+print(blend_prefix)
+print(lineage_prefix)
+for r in ratios:
+    print(f'{int(round(float(r) * 100)):03d}')
+" "$CFG")"
+    ACTION_INFIX="$(printf '%s\n' "$BL_META" | sed -n 1p)"
+    BLEND_PREFIX="$(printf '%s\n' "$BL_META" | sed -n 2p)"
+    LINEAGE_PREFIX="$(printf '%s\n' "$BL_META" | sed -n 3p)"
+    mapfile -t BLEND_TAGS < <(printf '%s\n' "$BL_META" | sed -n '4,$p')
+    if [[ -z "$BLEND_PREFIX" || "${#BLEND_TAGS[@]}" -eq 0 ]]; then
+        echo "ERROR: sidecar at $CFG didn't yield a usable blend prefix or blend list." >&2
+        echo "  Got: blend_prefix='$BLEND_PREFIX', blend_tags=(${BLEND_TAGS[*]:-})" >&2
+        exit 1
+    fi
+
+    echo "[blends_only] target lineage: $LINEAGE_BASE"
+    echo "[blends_only] blend dataset prefix: $BLEND_PREFIX (action_infix=$ACTION_INFIX)"
+    echo "[blends_only] blend tags: ${BLEND_TAGS[*]}"
+
+    # 1 + 2. Blend datasets (+ nocoll siblings) + stats sidecars. The bare
+    # `_blend<NNN>` pattern has no trailing wildcard, so it can't swallow the
+    # `_nocoll` sibling — that's collected by its own explicit pattern.
+    declare -a BLEND_PATHS=()
+    for tag in "${BLEND_TAGS[@]}"; do
+        for pattern in \
+            "${BLEND_PREFIX}_${ACTION_INFIX}_dag[0-9]*_blend${tag}" \
+            "${BLEND_PREFIX}_${ACTION_INFIX}_dag[0-9]*_blend${tag}_nocoll"; do
+            while IFS= read -r p; do
+                [[ -z "$p" ]] && continue
+                BLEND_PATHS+=( "$p" )
+            done < <(ls -d "$LEROBOT_CACHE/$HF_USER/"$pattern "$STATS_BASE/"$pattern 2>/dev/null || true)
+        done
+    done
+
+    # 3. Merged datasets + sidecars (merge-mode lineages only; empty glob
+    # in weighted mode).
+    declare -a MERGED_PATHS=()
+    if [[ -n "$LINEAGE_PREFIX" ]]; then
+        while IFS= read -r p; do
+            [[ -z "$p" ]] && continue
+            MERGED_PATHS+=( "$p" )
+        done < <(ls -d "$LEROBOT_CACHE/$HF_USER/${LINEAGE_PREFIX}_${ACTION_INFIX}"_dag[0-9]*_m \
+                       "$STATS_BASE/${LINEAGE_PREFIX}_${ACTION_INFIX}"_dag[0-9]*_m 2>/dev/null || true)
+    fi
+
+    # 4. Per-round training dirs (all suffix variants) + outputs/dagger eval dirs.
+    declare -a TRAIN_PATHS=()
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        TRAIN_PATHS+=( "$p" )
+    done < <(ls -d "$TRAINING_ROOT/${LINEAGE_BASE}"_dag[0-9]* \
+                   "$TRAINING_ROOT/${LINEAGE_BASE}"_ft_dag[0-9]* \
+                   "$LEROBOT_ROOT/outputs/dagger/${LINEAGE_BASE}"_dag[0-9]* \
+                   "$LEROBOT_ROOT/outputs/dagger/${LINEAGE_BASE}"_ft_dag[0-9]* 2>/dev/null || true)
+
+    TOTAL=$(( ${#BLEND_PATHS[@]} + ${#MERGED_PATHS[@]} + ${#TRAIN_PATHS[@]} ))
+    if (( TOTAL == 0 )); then
+        echo "[blends_only] nothing to delete — no blend / merged / round-training artifacts found for this lineage."
+        exit 0
+    fi
+
+    echo
+    echo "Will DELETE (${TOTAL} item(s)):"
+    if (( ${#BLEND_PATHS[@]} > 0 )); then
+        echo "  [blend datasets + nocoll siblings + stats sidecars] (${#BLEND_PATHS[@]}):"
+        printf '    %s\n' "${BLEND_PATHS[@]}"
+    fi
+    if (( ${#MERGED_PATHS[@]} > 0 )); then
+        echo "  [merged datasets + sidecars] (${#MERGED_PATHS[@]}):"
+        printf '    %s\n' "${MERGED_PATHS[@]}"
+    fi
+    if (( ${#TRAIN_PATHS[@]} > 0 )); then
+        echo "  [per-round training dirs + eval dirs] (${#TRAIN_PATHS[@]}):"
+        printf '    %s\n' "${TRAIN_PATHS[@]}"
+    fi
+    echo
+    echo "PRESERVED: intervention datasets + alias datasets + int-stats sidecars,"
+    echo "           the round-0 base policy, and (rerun mode) the source lineage."
+
+    if (( ${#DRY_RUN_FLAG[@]} > 0 )); then
+        echo
+        echo "[--dry-run] would rm -rf the items above."
+        exit 0
+    fi
+
+    if [[ "$AUTO_CONFIRM" != true ]]; then
+        echo
+        echo -n "Type 'delete-blends' to confirm: "
+        read -r CONFIRM
+        [[ "$CONFIRM" == "delete-blends" ]] || { echo "Aborted."; exit 1; }
+    fi
+
+    for p in "${BLEND_PATHS[@]:-}" "${MERGED_PATHS[@]:-}" "${TRAIN_PATHS[@]:-}"; do
+        [[ -n "$p" ]] && rm -rf "$p"
+    done
+    echo "[blends_only] Deleted ${TOTAL} item(s)."
+    echo "[blends_only] Re-run dagger_orchestrate.sh / dagger_orchestrate_sweep.sh with"
+    echo "[blends_only] --resume to re-blend (step 2) and re-train (step 6) against the"
+    echo "[blends_only] preserved intervention data."
     exit 0
 fi
 

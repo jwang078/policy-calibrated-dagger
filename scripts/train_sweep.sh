@@ -54,6 +54,10 @@ set -euo pipefail
 #                           share a GPU with other SplatSim consumers (e.g. the
 #                           dagger_orchestrate.sh pipeline). User must launch
 #                           SplatSim on that port BEFORE invoking this script.
+#   --num_workers=N         DataLoader worker processes for lerobot-train.
+#                           Default 16 (lerobot's own default of 4 leaves the
+#                           CPU underutilized and starves the GPU). Pass an
+#                           empty value (--num_workers=) to omit the flag.
 #   --dry-run               Print commands without executing
 #
 # Example:
@@ -110,6 +114,22 @@ MULTI_DATASET_NORM_MODE=""
 # the policy carries SA config) into SHARED_ARGS. Default false → unchanged.
 # Forwarded from dagger_orchestrate.sh --headless via HEADLESS_TRAIN_SCRATCH_ARGS.
 HEADLESS=false
+# Modifiers for --headless (both no-ops without it), forwarded from
+# dagger_orchestrate.sh's flags of the same name:
+#   --control_gui → --env.control_gui=true: the in-process sim keeps SplatSim's
+#     Tk control panel over its p.DIRECT pybullet client.
+#   --keep_sa_gui → skip the show_slider=false injection: the SA wrapper keeps
+#     its ratio slider + its own pybullet GUI window.
+CONTROL_GUI=false
+KEEP_SA_GUI=false
+# --splat_shadows: route --env.splat_shadows=true into SHARED_ARGS so the
+# in-process inline-eval sim composites PyBullet shadows onto its splat
+# renders. INDEPENDENT of --headless (shadows are a rendering choice, not a
+# GUI one). Skipped when --env_external_port is set — that path renders on
+# the external sim, which owns its own --splat_shadows at launch. Forwarded
+# from dagger_orchestrate.sh --splat_shadows via SPLAT_SHADOW_TRAIN_ARGS so
+# eval imagery matches the shadow setting the datasets were recorded with.
+SPLAT_SHADOWS=false
 RATIOS=(0.2 0.4 0.6 0.8 1.0)
 ENV_EXTERNAL_PORT=""
 POLICY_PUSH_TO_HUB=""   # empty = use whatever the policy config default is
@@ -156,6 +176,14 @@ EVAL_BENCHMARK_REPO_ID=""
 # final-scratch training so the user defines eval knobs ONCE at the sweep
 # level, not once per training path).
 EXTRA_ARGS_STR=""
+# --num_workers=N: DataLoader worker processes (lerobot-train --num_workers).
+# lerobot's built-in default is 4, which leaves the CPU badly underutilized on
+# a many-core box — the GPU stalls waiting on batch assembly. Default here is
+# 16 (measured optimum on a 24-core machine; 20+ regresses). Emitted in SHARED_ARGS, so --extra_args
+# (and the DAgger orchestrator's --round0_extra_args) can still override it
+# via draccus last-wins. Set to empty (--num_workers=) to leave lerobot's
+# own default in place.
+NUM_WORKERS=16
 # --exclude_gripper_from_state: drop the gripper dim (last dim of
 # observation.state) from what the policy consumes. The dataset still
 # records the full [NUM_DOFS + 1] state — only the runtime policy input
@@ -196,6 +224,10 @@ for arg in "$@"; do
         --ratio_sweep)          RATIO_SWEEP=true ;;
         --no_relative)          USE_RELATIVE_ACTIONS=false ;;
         --headless)             HEADLESS=true ;;
+        --control_gui)          CONTROL_GUI=true ;;
+        --splat_shadows)        SPLAT_SHADOWS=true ;;
+        --splat_shadows=*)      SPLAT_SHADOWS="${arg#*=}" ;;
+        --keep_sa_gui)          KEEP_SA_GUI=true ;;
         --dataset_repo=*)       DATASET_REPO="${arg#*=}" ;;
         --ratios=*)             IFS=' ' read -ra RATIOS <<< "${arg#*=}" ;;
         --env_external_port=*)  ENV_EXTERNAL_PORT="${arg#*=}" ;;
@@ -209,6 +241,7 @@ for arg in "$@"; do
         --eval_benchmark_repo_id=*) EVAL_BENCHMARK_REPO_ID="${arg#*=}" ;;
         --eval_benchmark=*)         EVAL_BENCHMARK_REPO_ID="${arg#*=}" ;;  # short alias
         --extra_args=*)             EXTRA_ARGS_STR="${arg#*=}" ;;
+        --num_workers=*)            NUM_WORKERS="${arg#*=}" ;;
         --exclude_gripper_from_state)         EXCLUDE_GRIPPER_FROM_STATE=true ;;
         --exclude_gripper_from_state=*)       EXCLUDE_GRIPPER_FROM_STATE="${arg#*=}" ;;
         --multi_dataset_repo_ids=*)      MULTI_DATASET_REPO_IDS="${arg#*=}" ;;
@@ -366,16 +399,28 @@ DATASET_SHORT="${DATASET_SHORT#splatsim_}"
 # run_job picks the right one based on each policy's chunk_size.
 STATS_DIR=~/code/lerobot/outputs/dataset_stats/${DATASET_SHORT}
 
-# Resolve the chunk size (== n_action_steps for policies that consume their
-# full chunk) used to construct the relative-action stats sidecar path
-# (stats_rel${chunk}.json). Source of truth, in priority order:
-#   1. Explicit --policy.n_action_steps=N in the policy args array.
+# Resolve the chunk size used to construct the relative-action stats sidecar
+# path (stats_rel${chunk}.json). This MUST equal the policy's TRAINING horizon
+# (the length of the rel-action sequence the model is trained on), NOT its
+# inference-time n_action_steps. For pi0-family policies horizon == n_action_steps
+# so the two are equivalent, but diffusion typically has horizon=64 while
+# n_action_steps=32: only the first 32 predicted actions get executed per call,
+# but the model still trains on all 64 positions — and rel-actions at positions
+# 30-63 can be ~10× larger than at positions 0-7, so sizing stats to the
+# smaller window undershoots the true target range → up to ~half the training
+# targets normalize outside [-1,+1] and get clipped by clip_sample=True →
+# policy learns to output near-zero actions and barely moves at inference.
+#
+# Source of truth, in priority order:
+#   1. Explicit --policy.horizon=N in the policy args array.
 #   2. Explicit --policy.chunk_size=N in the policy args array.
-#   3. The policy class's default (per-prefix fallback): pi05/pi0 → 50,
-#      diffusion → 8.
+#   3. Explicit --policy.n_action_steps=N in the policy args array (used only
+#      as a final CLI override when horizon isn't set — assumes the user knows
+#      they're aligning to the same value).
+#   4. The policy class's default (per-prefix fallback): pi05/pi0 → 50,
+#      diffusion → 64.
 # Empty for policies that don't use the relative-action pipeline (e.g. act with
-# temporal ensembling — n_action_steps=1 but chunk_size=50, and the policy uses
-# absolute actions anyway).
+# temporal ensembling — the policy uses absolute actions anyway).
 #
 # Note: we can't read this from a train_config.json the way dagger_orchestrate
 # does for finetune, because run_job trains from scratch — no config exists yet.
@@ -383,17 +428,19 @@ STATS_DIR=~/code/lerobot/outputs/dataset_stats/${DATASET_SHORT}
 _chunk_size_for_job() {
     local prefix="$1"
     local -n args_ref="$2"
-    local override_nsteps="" override_chunk=""
+    local override_horizon="" override_chunk="" override_nsteps=""
     for a in "${args_ref[@]}"; do
         case "$a" in
-            --policy.n_action_steps=*) override_nsteps="${a#*=}" ;;
+            --policy.horizon=*)        override_horizon="${a#*=}" ;;
             --policy.chunk_size=*)     override_chunk="${a#*=}" ;;
+            --policy.n_action_steps=*) override_nsteps="${a#*=}" ;;
         esac
     done
-    if [[ -n "$override_nsteps" ]]; then echo "$override_nsteps"; return; fi
-    if [[ -n "$override_chunk"  ]]; then echo "$override_chunk";  return; fi
+    if [[ -n "$override_horizon" ]]; then echo "$override_horizon"; return; fi
+    if [[ -n "$override_chunk"   ]]; then echo "$override_chunk";   return; fi
+    if [[ -n "$override_nsteps"  ]]; then echo "$override_nsteps";  return; fi
     case "$prefix" in
-        diffusion*) echo 8 ;;
+        diffusion*) echo 64 ;;
         pi05*|pi0*) echo 50 ;;
         *)          echo "" ;;
     esac
@@ -404,7 +451,7 @@ _chunk_size_for_job() {
 # with the per-prefix defaults in _chunk_size_for_job.
 _chunk_size_for_prefix() {
     case "$1" in
-        diffusion*) echo 8 ;;
+        diffusion*) echo 64 ;;
         pi05*|pi0*) echo 50 ;;
         *)          echo "" ;;
     esac
@@ -516,6 +563,12 @@ SHARED_ARGS=(
     --eval.use_async_envs=false
     --dataset.image_transforms.enable=true
 )
+# DataLoader workers. Placed right after SHARED_ARGS so it sits BEFORE the
+# per-job extras / --extra_args passthrough in the emitted command line
+# (draccus last-wins ⇒ caller can still override).
+if [[ -n "$NUM_WORKERS" ]]; then
+    SHARED_ARGS+=( --num_workers="$NUM_WORKERS" )
+fi
 # Only pass --env.robot_name when the profile set it (empty = lerobot
 # SplatsimEnv's own default, preserving historical UR5 behavior).
 if [[ -n "${ROBOT_NAME:-}" ]]; then
@@ -545,10 +598,27 @@ fi
 # local pybullet client) and the external sim's GUI mode is the user's
 # concern.
 if [[ "$HEADLESS" == true ]]; then
-    SHARED_ARGS+=( "--policy.shared_autonomy_config.show_slider=false" )
+    # --keep_sa_gui: the SA wrapper's slider + pybullet GUI window live in the
+    # lerobot process (not the sim), so they can stay up over a headless sim.
+    # Explicit both ways so the emitted command documents the decision.
+    if [[ "$KEEP_SA_GUI" == true ]]; then
+        SHARED_ARGS+=( "--policy.shared_autonomy_config.show_slider=true" )
+    else
+        SHARED_ARGS+=( "--policy.shared_autonomy_config.show_slider=false" )
+    fi
     if [[ -z "$ENV_EXTERNAL_PORT" ]]; then
         SHARED_ARGS+=( "--env.headless=true" )
+        # --control_gui: in-process sim keeps the Tk control panel over its
+        # p.DIRECT pybullet client (SplatSimEnv.control_gui → show_control_gui).
+        [[ "$CONTROL_GUI" == true ]] && SHARED_ARGS+=( "--env.control_gui=true" )
     fi
+fi
+
+# --splat_shadows: rendering choice, so gated independently of --headless.
+# Same external-port exemption as above (the external sim renders, and it
+# owns its own --splat_shadows).
+if [[ "$SPLAT_SHADOWS" == true && -z "$ENV_EXTERNAL_PORT" ]]; then
+    SHARED_ARGS+=( "--env.splat_shadows=true" )
 fi
 
 # ── Policy-specific args ─────────────────────────────────────

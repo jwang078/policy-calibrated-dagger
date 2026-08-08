@@ -119,8 +119,26 @@
 #                                 to JennyWWW/eval_splatsim_approach_lever_benchmark_1000).
 #                                 When auto-launching the sim, this is also
 #                                 what the sim binds to.
-#   --task=TASK                   Override env.task (default reads from sidecar
-#                                 or falls back to upright_small_engine_new).
+#   --task=TASK                   Override env.task (default: sidecar argv →
+#                                 the round's train_config.json env.task →
+#                                 the resolved env profile's ENV_TASK →
+#                                 upright_small_engine_new).
+#   --env_profile=NAME            Env profile (my_scripts/env_profiles/NAME.sh)
+#                                 for the sim launch + defaults (task, sim
+#                                 robot variant, render mode, benchmark).
+#                                 Default: auto-resolved from the positional
+#                                 train dirs' dagger sidecars (`--env_profile=`
+#                                 in the recorded orchestrator argv).
+#   --port=N | --env_external_port=N
+#                                 ZMQ port for the (auto-launched) sim and
+#                                 lerobot-eval's --env.external_port. Both
+#                                 spellings accept `--flag N` and `--flag=N`.
+#   --no_sync_physics_to_client   Launch the sim with wallclock (async)
+#                                 physics instead of gating physics on client
+#                                 commands. Default is synced — an unsynced
+#                                 sim races ahead while the diffusion U-Net
+#                                 thinks, making re-eval videos jumpy and
+#                                 observations off-distribution.
 #   --dry-run                     Print commands without executing.
 #   --force_rerun                 Re-evaluate even if reeval eval_info.json
 #                                 already exists. (Alias: --override.)
@@ -197,6 +215,12 @@ DRY_RUN=false
 FORCE_RERUN=false
 EVAL_BENCHMARK_REPO_ID_OVERRIDE=""
 TASK_OVERRIDE=""
+# Env profile (my_scripts/env_profiles/<name>.sh). Empty = auto-resolve from
+# the first positional train dir's dagger sidecar (`--env_profile=` in the
+# orchestrator argv). Sourcing the profile supplies ENV_TASK, ROBOT_VARIANT
+# (launch_nodes --robot), ROBOT_NAME, RENDER_MODE and the env's benchmark —
+# without it, a planar lineage silently launched the small_engine sim.
+ENV_PROFILE=""
 KNOWN_MODEL_PREFIXES=(diffusion pi05 act)
 DEFAULT_EVAL_BENCHMARK_REPO_ID="JennyWWW/eval_splatsim_approach_lever_benchmark_1000"
 DEFAULT_TASK="upright_small_engine_new"
@@ -206,6 +230,14 @@ DEFAULT_TASK="upright_small_engine_new"
 # when there's already one running on the same port.
 MANAGE_SPLATSIM=true
 HEADLESS=false
+# Gate sim physics on client commands (launch_nodes --sync_physics_to_client),
+# matching dagger_orchestrate.sh's default. Training-time inline eval runs the
+# sim IN-PROCESS (physics inherently steps once per env.step); an external sim
+# WITHOUT this flag integrates in wallclock time while the diffusion U-Net
+# thinks at chunk boundaries — re-eval videos come out "jumpy" and the policy
+# sees observations it never saw during training eval. Opt out with
+# --no_sync_physics_to_client to reproduce legacy async behavior.
+SPLATSIM_SYNC_PHYSICS=true
 # Per-round failure handling. Default: ON — a single round's failure (eval
 # crash, set -e trip, sim hiccup) logs the failure and continues to the next
 # round instead of tearing down the entire multi-lineage run. Pass
@@ -222,15 +254,26 @@ while (( i < ${#args[@]} )); do
         --episode_length=*)            EPISODE_LENGTH="${arg#*=}" ;;
         --n_episodes=*)                N_EPISODES="${arg#*=}"; N_EPISODES_OVERRIDDEN=true ;;
         --seed=*)                      SEED="${arg#*=}" ;;
-        --env_external_port=*)         ENV_EXTERNAL_PORT="${arg#*=}" ;;
+        --env_external_port=*|--port=*) ENV_EXTERNAL_PORT="${arg#*=}" ;;
+        --env_external_port|--port)
+            i=$((i + 1))
+            ENV_EXTERNAL_PORT="${args[$i]:-}"
+            if ! [[ "$ENV_EXTERNAL_PORT" =~ ^[0-9]+$ ]]; then
+                echo "ERROR: $arg requires a port number (got '${ENV_EXTERNAL_PORT}')." >&2
+                exit 1
+            fi
+            ;;
         --model=*)                     MODEL_PREFIX="${arg#*=}" ;;
         --eval_benchmark_repo_id=*)    EVAL_BENCHMARK_REPO_ID_OVERRIDE="${arg#*=}" ;;
         --task=*)                      TASK_OVERRIDE="${arg#*=}" ;;
+        --env_profile=*)               ENV_PROFILE="${arg#*=}" ;;
         --training_root=*)             TRAINING_ROOT="${arg#*=}" ;;
         --dry-run)                     DRY_RUN=true ;;
         --force_rerun)                 FORCE_RERUN=true ;;
         --override)                    FORCE_RERUN=true ;;  # alias
         --no_manage_splatsim)          MANAGE_SPLATSIM=false ;;
+        --sync_physics_to_client)      SPLATSIM_SYNC_PHYSICS=true ;;
+        --no_sync_physics_to_client)   SPLATSIM_SYNC_PHYSICS=false ;;
         --headless)                    HEADLESS=true ;;
         --no_continue_on_error)        CONTINUE_ON_ERROR=false ;;
         --filter=*)
@@ -300,8 +343,10 @@ export DGR_KNOWN_MODEL_PREFIXES="${KNOWN_MODEL_PREFIXES[*]}"
 # resulting (model, kind, lineage_key) tuple populates POS_EXACT_LINEAGES
 # (round dirs) or POS_LINEAGE_PREFIXES (base-policy dirs). We also collect
 # the union of model prefixes so downstream we only scan the relevant ones.
+POS_RESOLVED_DIRS=()
 for _pos_path in "${POS_PATHS[@]}"; do
     _pos_resolved="$(dgr_normalize_train_dir "$_pos_path" "$TRAINING_ROOT")" || exit 1
+    POS_RESOLVED_DIRS+=( "$_pos_resolved" )
     _pos_meta="$(dgr_lineage_from_train_dir "$_pos_resolved")" || exit 1
     _pos_model="$(printf '%s\n' "$_pos_meta" | sed -n 1p)"
     _pos_kind="$(printf  '%s\n' "$_pos_meta" | sed -n 2p)"
@@ -587,10 +632,14 @@ except Exception:
     sys.exit(0)
 DERIVED = {
     'type', 'features', 'features_map',
-    'state_dim', 'action_dim',
     'observation_height', 'observation_width',
     'port', 'render_mode',
 }
+# NOTE: state_dim / action_dim are deliberately NOT in DERIVED. They look
+# derivable (num_dofs + 1) but SplatSimEnv treats them as plain config
+# fields with UR5 defaults (7/7) — features/agent_pos/action shapes are
+# built FROM them in __post_init__. Dropping them here made a planar
+# (4/4) reeval construct a 7-dim policy and fail state_dict loading.
 EXPLICIT = {
     'task', 'task_description',
     'fps', 'camera_names', 'image_resize_modes',
@@ -687,9 +736,49 @@ if src.get('pc_success') is None:
     avg = lambda xs: (sum(xs) / len(xs)) if xs else float('nan')
     print(f'$round_label\\t{succ:.0f}\\t{avg(pos):.3f}\\t{avg(ori):.1f}\\t{avg(coll):.1f}\\t{avg(trunc):.1f}')
 else:
-    print(f'$round_label\\t{src[\"pc_success\"]:.0f}\\t{src[\"avg_final_position_error_m\"]:.3f}\\t{src[\"avg_final_orientation_error_deg\"]:.1f}\\t{src.get(\"avg_in_collision\", float(\"nan\")):.1f}\\t{src.get(\"avg_truncated\", float(\"nan\")):.1f}')
+    # .get + nan for every metric an env may not emit — planar has no
+    # orientation error (position-only task), and older eval_info.json
+    # predate some metrics; a missing key must not kill the summary.
+    _g = lambda k: src.get(k, float('nan'))
+    print(f'$round_label\\t{src[\"pc_success\"]:.0f}\\t{_g(\"avg_final_position_error_m\"):.3f}\\t{_g(\"avg_final_orientation_error_deg\"):.1f}\\t{_g(\"avg_in_collision\"):.1f}\\t{_g(\"avg_truncated\"):.1f}')
 "
 }
+
+# ── Env-profile resolution. Priority: --env_profile CLI > the positional
+# train dirs' dagger sidecars (first one whose orchestrator argv recorded
+# `--env_profile=`). Sourcing the profile maps its env-specific values onto
+# this script's globals — the sim variant for launch_nodes (SPLATSIM_ROBOT),
+# the env task default, the env's benchmark, and RENDER_MODE — so a planar
+# lineage no longer launches the small_engine sim / task by default.
+# Filter-only runs with no sidecar keep the historical hardcoded defaults.
+_USER_RENDER_MODE="${RENDER_MODE:-}"   # captured before the profile overwrites it
+if [[ -z "$ENV_PROFILE" ]]; then
+    for _prof_dir in "${POS_RESOLVED_DIRS[@]}"; do
+        ENV_PROFILE="$(_resolve_sidecar_field "$_prof_dir" "env_profile")"
+        [[ -n "$ENV_PROFILE" ]] && { echo "Env profile (from dagger sidecar): $ENV_PROFILE"; break; }
+    done
+fi
+if [[ -n "$ENV_PROFILE" ]]; then
+    _PROFILE_FILE="$SCRIPT_DIR/env_profiles/${ENV_PROFILE}.sh"
+    if [[ ! -f "$_PROFILE_FILE" ]]; then
+        echo "ERROR: env profile '$ENV_PROFILE' not found at $_PROFILE_FILE" >&2
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    source "$_PROFILE_FILE"
+    [[ -n "${ROBOT_VARIANT:-}" ]] && SPLATSIM_ROBOT="$ROBOT_VARIANT"
+    [[ -n "${ROBOT_NAME:-}" ]]    && SPLATSIM_ROBOT_NAME="$ROBOT_NAME"
+    [[ -n "${ENV_TASK:-}" ]]      && DEFAULT_TASK="$ENV_TASK"
+    # Profile's benchmark becomes the default; --eval_benchmark_repo_id still wins.
+    [[ -n "${EVAL_BENCHMARK_REPO_ID:-}" ]] && DEFAULT_EVAL_BENCHMARK_REPO_ID="$EVAL_BENCHMARK_REPO_ID"
+    # RENDER_MODE: the profile pins the env's only valid image source (e.g.
+    # planar has no splat assets — pybullet only), so it beats an inherited
+    # RENDER_MODE env var; warn so a deliberate override isn't silent.
+    if [[ -n "$_USER_RENDER_MODE" && -n "${RENDER_MODE:-}" && "$_USER_RENDER_MODE" != "$RENDER_MODE" ]]; then
+        echo "WARN: RENDER_MODE=$_USER_RENDER_MODE (env var) conflicts with profile '$ENV_PROFILE' (RENDER_MODE=$RENDER_MODE); using the profile's." >&2
+    fi
+    echo "Env profile '$ENV_PROFILE': task=$DEFAULT_TASK  sim robot=$SPLATSIM_ROBOT  render_mode=${RENDER_MODE:-<default>}  benchmark default=$DEFAULT_EVAL_BENCHMARK_REPO_ID"
+fi
 
 # ── Launch our own SplatSim (unless --no_manage_splatsim). All re-evals in
 # this run share one sim process, so we pay the startup cost (~30s) once and
@@ -754,6 +843,15 @@ for prefix in "${MODEL_PREFIXES[@]}"; do
             | sed -E "s/^${prefix}_//; s/(_ft)?_dag[0-9]+(_[^/]*)?$//" \
             | sort -u
     )
+    # Positional base-policy paths must be evaluable even when the base has
+    # ZERO DAgger descendants on disk (fresh base training, nothing finetuned
+    # yet): the _dag[0-9]* glob above yields no lineage entry for them, which
+    # used to silently enumerate nothing. Append each positional base's
+    # lineage key for this prefix; sort -u below dedups against glob results.
+    for _pb_entry in "${POS_LINEAGE_PREFIXES[@]}"; do
+        [[ "${_pb_entry%%:*}" == "$prefix" ]] && _ps_lineages+=( "${_pb_entry#*:}" )
+    done
+    mapfile -t _ps_lineages < <(printf '%s\n' "${_ps_lineages[@]}" | sort -u)
     for _ps_lineage in "${_ps_lineages[@]}"; do
         [[ -n "$_ps_lineage" ]] || continue
         _lineage_filter_matches "$prefix" "$_ps_lineage" || continue
@@ -852,6 +950,15 @@ for prefix in "${MODEL_PREFIXES[@]}"; do
             | sed -E "s/^${prefix}_//; s/(_ft)?_dag[0-9]+(_[^/]*)?$//" \
             | sort -u
     )
+    # Positional base-policy paths must be evaluable even when the base has
+    # ZERO DAgger descendants on disk (fresh base training, nothing finetuned
+    # yet): the _dag[0-9]* glob above yields no lineage entry for them, which
+    # used to silently enumerate nothing. Append each positional base's
+    # lineage key for this prefix; sort -u below dedups against glob results.
+    for _pb_entry in "${POS_LINEAGE_PREFIXES[@]}"; do
+        [[ "${_pb_entry%%:*}" == "$prefix" ]] && lineages+=( "${_pb_entry#*:}" )
+    done
+    mapfile -t lineages < <(printf '%s\n' "${lineages[@]}" | sort -u)
     for lineage in "${lineages[@]}"; do
         [[ -n "$lineage" ]] || continue
         _lineage_filter_matches "$prefix" "$lineage" || continue
@@ -945,6 +1052,17 @@ for prefix in "${MODEL_PREFIXES[@]}"; do
             fi
             task="$TASK_OVERRIDE"
             [[ -z "$task" ]] && task=$(_resolve_sidecar_field "$train_dir" "env.task")
+            # The checkpoint's own train_config is the authoritative record of
+            # what env the policy trained against — prefer it over the
+            # profile/hardcoded default (covers filter-mode runs without a
+            # sidecar, and orchestrator argv that only recorded --env_profile).
+            if [[ -z "$task" ]]; then
+                _tc_path=$(_train_config_path "$train_dir")
+                [[ -n "$_tc_path" ]] && task=$(python3 -c "
+import json
+print((json.load(open('$_tc_path')).get('env') or {}).get('task') or '')
+" 2>/dev/null)
+            fi
             [[ -z "$task" ]] && task="$DEFAULT_TASK"
             # Subset JSON: the orchestrator computes the scenario subset at
             # startup from --intervention_sample_seed + --intervention_sample_from_first

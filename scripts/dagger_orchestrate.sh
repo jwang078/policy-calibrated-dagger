@@ -102,23 +102,41 @@ set -euo pipefail
 #                                 which is what you want for DAgger optimizing the
 #                                 same scenarios round over round.
 #   --target_intervention_volume=N
-#                                 (REQUIRED, positive integer.) Total
-#                                 intervention-related content per round, in
-#                                 units of "1× raw intervention". The merge
-#                                 composes:
+#                                 Total intervention-related content per round,
+#                                 in units of "1× raw intervention". Applied
+#                                 differently depending on mode:
+#
+#                                 MERGE mode (default; --use_weighted_sampling
+#                                 NOT set): REQUIRED, positive integer. Each
+#                                 round's merge composes:
 #                                     raw × (N - n_blends) + each_blend × 1
 #                                 so every condition (0 / 1 / 2 / … blends)
 #                                 ends up with N× raw_intervention worth of
-#                                 intervention-related content per round —
-#                                 apples-to-apples across blend counts. The
-#                                 1-blend case puts the leftover budget on
-#                                 raw (raw:blend = (N-1):1, so 67/33 at N=3).
-#                                 Must satisfy N >= n_blends (N == n_blends
-#                                 drops raw and merges blends only); startup
-#                                 errors if N < n_blends.
-#                                 Typical values 1-3. Each round's merge is
-#                                 ~N× the size of the raw intervention; watch
-#                                 disk usage.
+#                                 content per round — apples-to-apples across
+#                                 blend counts. Must satisfy N >= n_blends
+#                                 (N == n_blends drops raw and merges blends
+#                                 only); startup errors if N < n_blends.
+#
+#                                 WEIGHTED mode (--use_weighted_sampling): the
+#                                 SAME knob, applied as a per-sub-dataset
+#                                 WEIGHT MULTIPLIER on the raw intervention
+#                                 slot inside _py_weighted_sample_weights:
+#                                     raw_multiplier = max(1, N - n_blends)
+#                                     blend_multiplier = 1
+#                                 Net effect matches merge mode: total per-round
+#                                 DAgger MASS per batch ≡ N × raw. Use it to
+#                                 keep no-blend and with-blend sweep iterations
+#                                 comparable (e.g. --target_intervention_volume=2
+#                                 makes a 0-blend baseline weight raw 2×, same
+#                                 total DAgger mass as a 1-blend run at N=2).
+#                                 Optional in weighted mode; default 1 = no-op.
+#                                 Raw weight is CLAMPED at ≥ 1 in weighted mode
+#                                 (weighted mode never drops the raw sub-dataset,
+#                                 unlike merge mode's N == n_blends case).
+#
+#                                 Typical values 1-3. In merge mode, each
+#                                 round's on-disk merged dataset is ~N× the
+#                                 size of the raw intervention (watch disk).
 #
 #                                 REPLACES the prior --intervention_oversample;
 #                                 commands using the old flag name will fail
@@ -185,7 +203,7 @@ set -euo pipefail
 #                                 for every per-ratio invocation. Useful to override
 #                                 blend_strategy / guidance_repr / blend_mode away
 #                                 from the defaults (denoise / absolute_pos /
-#                                 once_per_chunk / drain_chunk), or for any future
+#                                 once_per_chunk / blend_interval_frac=1.0), or for any future
 #                                 blend-side filter flag.
 #   --filter_blend_collisions     Replay each blend dataset through a headless
 #                                 splatsim and drop / trim episodes that hit
@@ -206,15 +224,68 @@ set -euo pipefail
 #                                 Port for the auxiliary headless splatsim used
 #                                 by the filter step. Default: --env_external_port
 #                                 + 100, so the two sims don't collide.
+#   --num_workers=N               DataLoader worker processes for EVERY training
+#                                 invocation in the lineage: round-0 base,
+#                                 per-round scratch, per-round finetune (+ its
+#                                 step-6b `_nc` sibling), and the post-loop final
+#                                 scratch. Default 16 — lerobot's own default of
+#                                 4 leaves a many-core CPU idle and the GPU
+#                                 stalls waiting on batch assembly. Pass an empty
+#                                 value (--num_workers=) to fall back to
+#                                 train_sweep.sh / resume_training.sh defaults.
+#                                 An explicit --num_workers inside
+#                                 --round0_extra_args / --finetune_extra_args
+#                                 still wins (it lands later on the lerobot-train
+#                                 command line; draccus takes the last).
+#
 #   --finetune_extra_args=STR     Raw passthrough to resume_training.sh for the
 #                                 per-round FINETUNE training step (step 6 in
 #                                 --intermediate_mode=finetune). Multi-flag, word-
 #                                 split. Examples:
 #                                   --finetune_extra_args='--eval.n_episodes=30'
 #                                   --finetune_extra_args='--eval.n_episodes=20 --policy.use_amp=true'
-#                                 Note: does NOT apply to scratch trainings via
-#                                 train_sweep.sh (round 0 base, per-round scratch,
-#                                 post-loop final scratch). Empty → no extras.
+#                                 INHERITANCE: these are APPENDED AFTER
+#                                 --round0_extra_args, so shared settings are
+#                                 declared once there and anything repeated here
+#                                 WINS over the round0 value (later flag beats
+#                                 earlier at parse time) — but BOTH lose to the
+#                                 orchestrator's computed per-round flags; see
+#                                 the PRECEDENCE note under --round0_extra_args.
+#                                 Put only genuinely finetune-specific things
+#                                 here — e.g. --optimizer.lr=1e-6.
+#                                 Applies to the per-round finetune + its step-6b
+#                                 `_nc` sibling ONLY; from-scratch trainings
+#                                 (round 0, per-round scratch, post-loop final
+#                                 scratch) take --round0_extra_args instead.
+#                                 Empty → no extras.
+#
+#   --round0_extra_args=STR       Raw passthrough to train_sweep.sh for every
+#                                 FROM-SCRATCH training: round 0 base, per-round
+#                                 scratch, and the post-loop final scratch. Also
+#                                 the BASE of the finetune arg string (see the
+#                                 inheritance note above), so put everything
+#                                 shared by base + finetune here: --policy.*
+#                                 architecture (must match or checkpoints are
+#                                 incompatible), --dataset.observation_noise_std,
+#                                 and the eval knobs (--eval.n_episodes,
+#                                 --env.episode_length, --seed, ...) that keep
+#                                 round-0's inline eval comparable to every
+#                                 per-round eval.
+#                                 NO FALLBACK: --finetune_extra_args NEVER
+#                                 reaches a from-scratch training. If a setting
+#                                 belongs to both, declare it HERE — that is the
+#                                 point of the split. Empty → from-scratch
+#                                 trainings get no extras.
+#
+#   PRECEDENCE (lowest → highest): --round0_extra_args
+#                                  < --finetune_extra_args
+#                                  < flags the orchestrator computes per round
+#                                    (--steps / --eval_freq / --save_freq /
+#                                     --output_dir / --job_name /
+#                                     --policy.repo_id / --dataset.* / ...).
+#                                 The orchestrator's flags are emitted AFTER both
+#                                 user strings, so a stray --steps= in either can
+#                                 never clobber the computed per-round target.
 #   --use_weighted_sampling       Switch the per-round training pipeline from
 #                                 "merge then train on a fixed-share dataset" to
 #                                 "train on the per-source weighted union via
@@ -252,6 +323,34 @@ set -euo pipefail
 #                                 F must be a float in (0.0, 1.0); F=0 is
 #                                 rejected (defeats the purpose — for base-only
 #                                 use --combination_pool=1.0).
+#                                 See --dagger_data_fraction_mode to make F an EXACT
+#                                 target instead of a ceiling.
+#
+#   --dagger_data_fraction_mode=MODE   How --dagger_data_fraction=F is applied.
+#                                 * cap   (DEFAULT, historical): F is a CEILING.
+#                                   natural < F → fully proportional (no
+#                                   upsampling); natural > F → capped at F.
+#                                 * exact: F is a FIXED TARGET. DAgger gets
+#                                   exactly F of every batch regardless of its
+#                                   natural share, UPSAMPLING (sampling with
+#                                   replacement, via WeightedRandomSampler) when
+#                                   natural < F. Base gets exactly 1-F. Within
+#                                   DAgger the split stays proportional to frame
+#                                   counts (x target_intervention_volume
+#                                   multipliers), so blend-count comparisons stay
+#                                   apples-to-apples.
+#                                 Why this exists: with a large base dataset the
+#                                 natural DAgger share is often FAR below F (on
+#                                 planar_3joint_4 it ran 5%% at round 1 -> 24%% at
+#                                 round 10 against F=0.5, i.e. the cap NEVER
+#                                 engaged and --dagger_data_fraction had no
+#                                 effect at all). `exact` makes the knob actually
+#                                 control batch composition.
+#                                 CAUTION: upsampling repeats a small pool of
+#                                 DAgger frames many times per epoch; a large
+#                                 oversample ratio (logged as `oversample=Nx`)
+#                                 risks overfitting them. The mode is recorded in
+#                                 the dagger config sidecar for reproducibility.
 #                                 Only meaningful with --use_weighted_sampling.
 #                                 Default: 0.3.
 #
@@ -449,6 +548,55 @@ set -euo pipefail
 #                                 owns their sim; training connects via
 #                                 external_port and doesn't spawn pybullet).
 #                                 Default: false (interactive behavior).
+#   --control_gui                 Modifier for --headless: keep SplatSim's
+#                                 Tkinter "SplatSim Controls" panel while
+#                                 pybullet stays DIRECT (fast, no 3D window).
+#                                 Forwards --control_gui to launch_nodes.py for
+#                                 the managed main sim, and
+#                                 --env.control_gui=true to step-6 training so
+#                                 the in-process inline-eval sim keeps the panel
+#                                 too. Needs a display for Tkinter. No effect
+#                                 without --headless (GUI mode already shows the
+#                                 panel). The aux collision-filter sim stays
+#                                 fully headless regardless.
+#   --splat_shadows               Render PyBullet-computed shadows onto the
+#                                 Gaussian-splat images (the arm casts a visible
+#                                 shadow onto the table/objects — a depth cue
+#                                 that makes near-collisions readable). Applies
+#                                 to EVERY phase in one shot, which is the point:
+#                                 shadows change the images, so recording and
+#                                 eval must agree.
+#                                   * intervention recording + collision-filter
+#                                     sims  → launch_nodes.py --splat_shadows
+#                                   * round-0 / per-round scratch training
+#                                     → train_sweep.sh --splat_shadows
+#                                   * finetune training (round-N + _nc)
+#                                     → --env.splat_shadows=true
+#                                 The last two reach lerobot-train's IN-PROCESS
+#                                 inline-eval sim (managed mode omits
+#                                 --env.external_port from training), so this is
+#                                 what makes round-0 eval and every finetune eval
+#                                 render like the recorded data.
+#                                 Independent of --headless. Recorded in the
+#                                 round sidecar as `splat_shadows` so a lineage
+#                                 that mixed settings is detectable later.
+#                                 Default: false (no shadows, unchanged imagery).
+#                                 NOTE: a policy trained WITHOUT shadows and
+#                                 evaluated WITH them (or vice versa) sees an
+#                                 out-of-distribution scene — keep it constant
+#                                 across a lineage, including any --rerun_blends_from
+#                                 source lineage you branch from.
+#   --keep_sa_gui                 Modifier for --headless: inject
+#                                 --policy.shared_autonomy_config.show_slider=true
+#                                 (instead of =false; headless mode always sets
+#                                 the field explicitly so emitted commands are
+#                                 self-documenting), keeping the SA wrapper's ratio
+#                                 slider AND its own per-policy pybullet GUI
+#                                 window (a separate pybullet client in the
+#                                 lerobot process — works fine against a
+#                                 headless sim). Applies to step-1 intervention
+#                                 recording and step-6 training alike. No effect
+#                                 without --headless (the slider defaults on).
 #   --splatsim_root=PATH          Root of the SplatSim repo (default $HOME/code/SplatSim).
 #                                 launch_nodes.py is run from this dir.
 #   --splatsim_robot=NAME         --robot arg for launch_nodes.py
@@ -497,9 +645,11 @@ INTERVENTION_N_EPISODES="100"
 # to `$INTERVENTION_N_EPISODES` (single-source-of-truth ergonomic).
 # Auto-forwarded as:
 #   - `--eval.n_episodes=$EVAL_N_EPISODES` appended to the finetune step's
-#     lerobot-train invocation AFTER `$FINETUNE_EXTRA_ARGS` so it always wins
-#     over anything the user passed in finetune_extra_args (draccus uses
-#     the last occurrence).
+#     lerobot-train invocation AFTER the user's extra-arg strings so it always
+#     wins over anything passed in --round0_extra_args / --finetune_extra_args
+#     (draccus uses the last occurrence). As of the precedence rework this is
+#     no longer special-cased — EVERY orchestrator-computed flag is emitted
+#     after the user strings.
 #   - `--eval_n_episodes=$EVAL_N_EPISODES` + `--eval_benchmark_subset=...`
 #     forwarded to train_sweep.sh's new passthroughs in the final-scratch
 #     step (previously hardcoded at 5, leaving final-scratch evals
@@ -568,6 +718,28 @@ FILTER_COLLISION_ENV_PORT=""
 # path (step 6 in --intermediate_mode=finetune); scratch trainings via
 # train_sweep.sh aren't covered.
 FINETUNE_EXTRA_ARGS=""
+# --num_workers=N: DataLoader worker processes for EVERY training invocation in
+# the lineage — round-0 base (train_sweep.sh), per-round scratch, per-round
+# finetune + its _nc sibling (resume_training.sh), and the post-loop final
+# scratch. lerobot's built-in default is 4, which leaves a many-core CPU idle
+# and starves the GPU during batch assembly. Default 16 (measured optimum on a
+# 24-core box; 20+ regresses). Set empty (--num_workers=) to fall back to each script's own default.
+NUM_WORKERS=16
+# --video_backend=NAME: video decoder for EVERY training in the lineage,
+# emitted as `--dataset.video_backend=NAME` into both the from-scratch and
+# finetune arg strings. Default torchcodec: it decodes ~4.8x faster than pyav
+# on the AV1 datasets here (1.1 ms vs 5.5 ms per 2-frame request, bit-identical
+# output) and keeps an LRU decoder cache instead of reopening the container per
+# call. This is ALSO the fix for a stale pin: a train_config.json saved while
+# torchcodec was unloadable records `video_backend: pyav`, and resuming/
+# finetuning from that checkpoint would silently keep pyav forever. Set empty
+# (--video_backend=) to inherit whatever the checkpoint/lerobot default says.
+VIDEO_BACKEND=torchcodec
+# --round0_extra_args: passthrough for FROM-SCRATCH trainings (round 0 base,
+# per-round scratch, post-loop final scratch) AND the inherited base of the
+# finetune string. Empty = back-compat (from-scratch falls back to
+# FINETUNE_EXTRA_ARGS). See the --round0_extra_args help block above.
+ROUND0_EXTRA_ARGS_STR=""
 # Multi-dataset weighted-sampling mode. When true, step 4 (merge) and step 5
 # (merged-dataset rel-action stats) are SKIPPED — instead, step 6 trains
 # directly against the union of {base, all per-round raw intervention, all
@@ -584,6 +756,10 @@ FINETUNE_EXTRA_ARGS=""
 # startup (see mode-purity validation below).
 USE_WEIGHTED_SAMPLING=false
 DAGGER_DATA_FRACTION="0.3"
+# How DAGGER_DATA_FRACTION is applied: "cap" (ceiling; historical default) or
+# "exact" (fixed target, upsampling DAgger when its natural share is lower).
+# See the --dagger_data_fraction_mode help block above.
+DAGGER_DATA_FRACTION_MODE="cap"
 # --exclude_gripper_from_state: forwarded verbatim to every downstream
 # training + intervention invocation. See train_sweep.sh's flag docstring
 # for the rationale (dropping the constant-0 gripper dim from
@@ -738,6 +914,35 @@ MANAGE_SPLATSIM=true
 # is still injected — it controls a wrapper-side surface, not the sim.
 # Default false → byte-identical to today's interactive behavior.
 HEADLESS=false
+# --control_gui / --keep_sa_gui: opt-in modifiers that carve two GUI surfaces
+# back OUT of --headless's "kill everything" sweep:
+#   * CONTROL_GUI=true  → launch_nodes.py gets --control_gui (Tk control panel
+#     stays up over a p.DIRECT pybullet), and training gets
+#     --env.control_gui=true for the in-process inline-eval sim (wired through
+#     SplatSimEnv.control_gui → server ctor's show_control_gui).
+#   * KEEP_SA_GUI=true  → the show_slider=false injections (step-1 eval +
+#     step-6 training) are suppressed, keeping the SA wrapper's ratio slider
+#     and its own pybullet GUI window.
+# Both are no-ops without --headless. The aux collision-filter sim is
+# deliberately exempt: it's a non-interactive batch replay, always fully
+# headless.
+CONTROL_GUI=false
+KEEP_SA_GUI=false
+# --splat_shadows: composite PyBullet-computed shadows onto the Gaussian-splat
+# renders (the arm casts a visible shadow on the table/objects — a depth cue
+# that makes near-collisions readable). ONE flag drives every phase of the
+# lineage, because shadows change the IMAGES and a policy must eval on the
+# same imagery it trained on:
+#   * intervention recording (step 1) + blend collision filter → the managed
+#     external sims get `--splat_shadows` on launch_nodes.py.
+#   * round-0 / per-round scratch training → train_sweep.sh --splat_shadows.
+#   * finetune training → --env.splat_shadows=true (both resume_training.sh
+#     invocations), which the in-process inline-eval sim consumes.
+# Independent of --headless (rendering vs. GUI). In --no_manage_splatsim mode
+# the external sim's shadows are the user's own launch_nodes.py concern, but
+# the training-side injection still applies where training spawns its own
+# in-process eval sim. Default false → byte-identical to today's imagery.
+SPLAT_SHADOWS=false
 # Sync-physics-to-client: forward `--sync_physics_to_client` to
 # launch_nodes.py so the sim only steps physics in response to a client
 # command. Eliminates "sim races ahead while the policy is thinking"
@@ -805,18 +1010,47 @@ _py_dagger_name() {
 # Above-cap case (natural > F): DAgger is capped at F and split proportional
 # to frame counts within DAgger.
 _py_weighted_sample_weights() {
-    # args: F R n_blends dry_run base_repo r1_int r1_blend0... rR_blend_last
+    # args: F R n_blends target_intervention_volume dry_run base_repo r1_int r1_blend0... rR_blend_last
+    #
+    # target_intervention_volume (TIV): interpreted identically to merge mode
+    # for cross-mode fairness — total per-round DAgger content ≡ TIV × raw
+    # intervention. Applied here as a per-sub-dataset WEIGHT MULTIPLIER on the
+    # frame count before computing natural share and intra-DAgger weights:
+    #   raw_multiplier   = max(1, TIV - n_blends)
+    #   blend_multiplier = 1
+    # So a no-blend run with TIV=2 gives the raw intervention 2× weight, and a
+    # 1-blend run with TIV=2 gives raw × 1 + blend × 1 — same total DAgger mass
+    # per batch, apples-to-apples across the blend-count axis of a sweep.
+    # TIV=1 (the default sentinel) is a no-op (raw × 1) and preserves prior
+    # weighted-mode behavior byte-identically.
     python3 - "$@" <<'PY'
 import os, sys, json
 
 f       = float(sys.argv[1])
 R       = int(sys.argv[2])
-group_size = 1 + int(sys.argv[3])   # 1 raw int + n_blends sub-datasets per round
-dry_run = sys.argv[4] == 'true'
-repo_ids = sys.argv[5:]
+n_blends = int(sys.argv[3])
+group_size = 1 + n_blends            # 1 raw int + n_blends sub-datasets per round
+tiv     = int(sys.argv[4])
+dry_run = sys.argv[5] == 'true'
+# 'cap' (historical): f is a ceiling, f_eff = min(f, natural) — no upsampling.
+# 'exact': f is a fixed target, f_eff = f — DAgger is UPSAMPLED (sampled with
+# replacement by WeightedRandomSampler) when its natural share is below f.
+frac_mode = sys.argv[6]
+repo_ids = sys.argv[7:]
 assert len(repo_ids) == 1 + R * group_size, (
     f'repo_ids layout mismatch: got {len(repo_ids)}, expected 1 + {R}*{group_size}'
 )
+
+# Per-sub-dataset multiplier: base is always 1 (no upweighting), raw
+# intervention gets max(1, TIV - n_blends) (clamped so raw is never dropped —
+# it always exists as a distinct sub-dataset in weighted mode, unlike merge
+# mode where TIV==n_blends means "merged set contains blends only"), each
+# blend gets 1. Layout is: [base, r1_int, r1_blend0, ..., r1_blend_last, r2_int, ...].
+raw_multiplier = max(1, tiv - n_blends)
+multipliers = [1.0]
+for _ in range(R):
+    multipliers.append(float(raw_multiplier))       # raw intervention slot
+    multipliers.extend([1.0] * n_blends)            # blend slots
 
 CACHE = os.path.expanduser('~/.cache/huggingface/lerobot')
 def frames_for(repo):
@@ -827,18 +1061,19 @@ def frames_for(repo):
         raise FileNotFoundError(f'meta/info.json not found for {repo} at {p}')
     return int(json.load(open(p))['total_frames'])
 
-counts = [frames_for(r) for r in repo_ids]
+raw_counts = [frames_for(r) for r in repo_ids]
+counts = [rc * m for rc, m in zip(raw_counts, multipliers)]
 base_count = counts[0]
 dag_counts = counts[1:]
 dag_sum    = sum(dag_counts)
 total      = base_count + dag_sum
 if total <= 0:
-    raise ValueError(f'all sub-datasets are empty ({list(zip(repo_ids, counts))})')
+    raise ValueError(f'all sub-datasets are empty ({list(zip(repo_ids, raw_counts))})')
 if dag_sum <= 0:
     raise ValueError(f'all DAgger sub-datasets are empty ({list(zip(repo_ids[1:], dag_counts))})')
 
 natural = dag_sum / total
-f_eff   = min(f, natural)
+f_eff   = f if frac_mode == 'exact' else min(f, natural)
 
 weights = [1.0 - f_eff] + [f_eff * (c / dag_sum) for c in dag_counts]
 
@@ -852,11 +1087,32 @@ for i in range(len(weights) - 1, -1, -1):
 
 # Emit weights + a diagnostic line to stderr so the caller's log records what
 # happened (cap engaged vs fell back to natural). stderr keeps stdout clean for
-# `read -ra ...` parsing.
-mode = 'CAP@F' if natural > f else 'NATURAL<F'
+# `read -ra ...` parsing. Show the multiplier when it's != 1 so users can
+# verify the target_intervention_volume knob is actually engaged.
+if frac_mode == 'exact':
+    mode = 'EXACT@F'
+else:
+    mode = 'CAP@F' if natural > f else 'NATURAL<F'
+mult_note = f'  tiv={tiv}  raw_mult={raw_multiplier}x' if raw_multiplier != 1 else ''
+# In exact mode below the natural share, each DAgger frame is drawn
+# `oversample` times more often than proportional sampling would draw it.
+# Surface it (and warn when extreme) because heavy repetition of a small
+# DAgger pool is the main overfitting risk this mode introduces.
+over_note = ''
+if frac_mode == 'exact' and natural > 0:
+    oversample = f / natural
+    over_note = f'  oversample={oversample:.1f}x'
+    if oversample >= 5.0:
+        print(
+            f'  [weighted-weights] WARNING: exact mode repeats each DAgger frame '
+            f'~{oversample:.1f}x more often than proportional (natural share '
+            f'{natural:.3f} -> forced {f:.3f}). With a small DAgger pool this can '
+            f'overfit those frames; consider a lower --dagger_data_fraction.',
+            file=sys.stderr,
+        )
 print(
     f'  [weighted-weights] natural_dagger_share={natural:.4f}  '
-    f'F={f:.4f}  f_eff={f_eff:.4f}  mode={mode}',
+    f'F={f:.4f}  f_eff={f_eff:.4f}  mode={mode}{mult_note}{over_note}',
     file=sys.stderr,
 )
 print(' '.join(f'{w:.10f}' for w in weights))
@@ -894,8 +1150,18 @@ if [[ -n "$PROFILE_NAME" ]]; then
     # (ENV_TASK / NUM_DOFS / CAMERAS / EVAL_BENCHMARK_REPO_ID share names.)
     [[ -n "${ROBOT_VARIANT:-}" ]] && SPLATSIM_ROBOT="$ROBOT_VARIANT"
     [[ -n "${ROBOT_NAME:-}" ]]    && SPLATSIM_ROBOT_NAME="$ROBOT_NAME"
+    # Preserve the profile-declared cameras set (= what the SIM PUBLISHES)
+    # BEFORE any --cameras= CLI override below rewrites $CAMERAS. Downstream
+    # intervention recording uses this to decide what image obs to write into
+    # the dataset — INDEPENDENT of what the POLICY consumes at inference.
+    # Ensures base + intervention datasets share the same feature keys, which
+    # MultiSourceNormalizingDataset requires for stats aggregation.
+    # Only set inside the profile block — profile-less runs leave it empty and
+    # the intervention block falls back to $CAMERAS (backward compat).
+    PROFILE_ENV_CAMERAS="${CAMERAS}"
     echo "[dagger] Loaded env profile '$PROFILE_NAME' (task=$ENV_TASK, num_dofs=$NUM_DOFS, cameras=$CAMERAS, robot=$SPLATSIM_ROBOT)."
 fi
+PROFILE_ENV_CAMERAS="${PROFILE_ENV_CAMERAS:-}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -936,9 +1202,13 @@ for arg in "$@"; do
         --filter_blend_collisions)           FILTER_BLEND_COLLISIONS=true ;;
         --filter_collision_extra_args=*)     FILTER_COLLISION_EXTRA_ARGS="${arg#*=}" ;;
         --filter_collision_env_port=*)       FILTER_COLLISION_ENV_PORT="${arg#*=}" ;;
+        --num_workers=*)                     NUM_WORKERS="${arg#*=}" ;;
+        --video_backend=*)                   VIDEO_BACKEND="${arg#*=}" ;;
         --finetune_extra_args=*)             FINETUNE_EXTRA_ARGS="${arg#*=}" ;;
+        --round0_extra_args=*)               ROUND0_EXTRA_ARGS_STR="${arg#*=}" ;;
         --use_weighted_sampling)             USE_WEIGHTED_SAMPLING=true ;;
         --dagger_data_fraction=*)            DAGGER_DATA_FRACTION="${arg#*=}" ;;
+        --dagger_data_fraction_mode=*)       DAGGER_DATA_FRACTION_MODE="${arg#*=}" ;;
         --exclude_gripper_from_state)        EXCLUDE_GRIPPER_FROM_STATE=true ;;
         --exclude_gripper_from_state=*)      EXCLUDE_GRIPPER_FROM_STATE="${arg#*=}" ;;
         --norm_mode=*)                       NORM_MODE="${arg#*=}" ;;
@@ -970,6 +1240,10 @@ for arg in "$@"; do
         --manage_splatsim)            MANAGE_SPLATSIM=true ;;
         --no_manage_splatsim)         MANAGE_SPLATSIM=false ;;
         --headless)                   HEADLESS=true ;;
+        --control_gui)                CONTROL_GUI=true ;;
+        --splat_shadows)              SPLAT_SHADOWS=true ;;
+        --splat_shadows=*)            SPLAT_SHADOWS="${arg#*=}" ;;
+        --keep_sa_gui)                KEEP_SA_GUI=true ;;
         --sync_physics_to_client)     SYNC_PHYSICS=true ;;
         --no_sync_physics_to_client)  SYNC_PHYSICS=false ;;
         --splatsim_root=*)            SPLATSIM_ROOT="${arg#*=}" ;;
@@ -980,6 +1254,53 @@ for arg in "$@"; do
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
+
+# ── Effective extra-arg strings per training kind ─────────────────────────────
+# Two knobs, one inheritance direction: --round0_extra_args declares what base
+# and finetune SHARE, --finetune_extra_args adds/overrides on top.
+#
+#   from-scratch (round 0, per-round scratch, final scratch)
+#       = ROUND0_EXTRA_ARGS_STR
+#   finetune (step 6 + step 6b `_nc`)
+#       = ROUND0_EXTRA_ARGS_STR + FINETUNE_EXTRA_ARGS
+#
+# NO fallback between them: --finetune_extra_args NEVER reaches a from-scratch
+# training. (It used to, which silently leaked finetune-only flags — most
+# damagingly a 1e-6 LR — into training a base from zero.) If you want a setting
+# in both, put it in --round0_extra_args; that is the whole point of the split.
+#
+# PRECEDENCE, lowest → highest:
+#       round0 args  <  finetune args  <  orchestrator-computed flags
+# Within the string, concatenation order gives finetune the win over round0
+# (draccus/argparse take the LAST occurrence — round0 `--optimizer.lr=1e-5` +
+# finetune `--optimizer.lr=1e-6` ⇒ 1e-6 for finetunes, 1e-5 for the base).
+# The orchestrator's own per-round flags outrank BOTH: the invocations below
+# place $FINETUNE_EXTRA_ARGS_EFF FIRST and every computed flag after it, so a
+# stray `--steps=` in either user string can never clobber the computed
+# per-round target. (resume_training.sh honors this for known AND unknown
+# flags: it assigns known ones in argv order — last wins — and appends unknown
+# ones to lerobot-train in argv order, where draccus again takes the last.)
+ROUND0_EXTRA_ARGS_EFF="$ROUND0_EXTRA_ARGS_STR"
+if [[ -n "$ROUND0_EXTRA_ARGS_STR" && -n "$FINETUNE_EXTRA_ARGS" ]]; then
+    FINETUNE_EXTRA_ARGS_EFF="$ROUND0_EXTRA_ARGS_STR $FINETUNE_EXTRA_ARGS"
+else
+    FINETUNE_EXTRA_ARGS_EFF="${ROUND0_EXTRA_ARGS_STR}${FINETUNE_EXTRA_ARGS}"
+fi
+
+# Emit --dataset.video_backend into BOTH arg strings unless the user already
+# named one. Appending here (rather than at each invocation) means it rides the
+# same passthrough as every other user flag: train_sweep.sh splits it out of
+# --extra_args, resume_training.sh forwards it as an unknown --key=value. In
+# both cases draccus takes the last occurrence, so an explicit user setting in
+# --round0_extra_args / --finetune_extra_args still wins.
+if [[ -n "$VIDEO_BACKEND" ]]; then
+    if [[ "$ROUND0_EXTRA_ARGS_EFF" != *--dataset.video_backend* ]]; then
+        ROUND0_EXTRA_ARGS_EFF="${ROUND0_EXTRA_ARGS_EFF:+$ROUND0_EXTRA_ARGS_EFF }--dataset.video_backend=$VIDEO_BACKEND"
+    fi
+    if [[ "$FINETUNE_EXTRA_ARGS_EFF" != *--dataset.video_backend* ]]; then
+        FINETUNE_EXTRA_ARGS_EFF="${FINETUNE_EXTRA_ARGS_EFF:+$FINETUNE_EXTRA_ARGS_EFF }--dataset.video_backend=$VIDEO_BACKEND"
+    fi
+fi
 
 # --retrain_round0 is a source-lineage operation: rerun lineages never train
 # round 0 (they branch off the SOURCE's policies), so honoring it here would
@@ -1001,6 +1322,11 @@ fi
 ACTION_DIM=$((NUM_DOFS + 1))
 STATE_DIM="${STATE_DIM:-$ACTION_DIM}"
 ENV_STATE_DIM="${ENV_STATE_DIM:-0}"
+# Sim image-observation source (set by the env profile: small_engine=splat,
+# planar=pybullet). Empty = let launch_nodes.py resolve the env default.
+# Forwarded to the sim launch as --render_mode so eval/blend imagery is
+# pinned per-env instead of depending on launch-side defaults.
+RENDER_MODE="${RENDER_MODE:-}"
 # Whether the policy CONSUMES the oracle env_state (its width is the profile's
 # ENV_STATE_DIM). Default: on for state-only, off otherwise. User override:
 # --include_env_state_obs=true|false. Mirrors train_sweep.sh so the round-0 name
@@ -1023,6 +1349,31 @@ case "$EXCLUDE_GRIPPER_FROM_STATE" in
     true|false) ;;
     *) echo "ERROR: --exclude_gripper_from_state must be true or false (got '$EXCLUDE_GRIPPER_FROM_STATE')." >&2; exit 1 ;;
 esac
+# DataLoader workers, forwarded to every training invocation. Both
+# train_sweep.sh and resume_training.sh accept --num_workers=N, so ONE array
+# serves both call shapes. Empty --num_workers → array stays empty and each
+# script applies its own default.
+NUM_WORKERS_TRAIN_ARG=()   # from-scratch path (train_sweep.sh)
+NUM_WORKERS_FT_ARG=()      # finetune path (resume_training.sh)
+if [[ -n "$NUM_WORKERS" ]]; then
+    if ! [[ "$NUM_WORKERS" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: --num_workers must be a non-negative integer (got '$NUM_WORKERS')." >&2
+        exit 1
+    fi
+    # Yield to an explicit --num_workers in the user's passthrough strings.
+    # Needed because resume_training.sh now parses --num_workers as a KNOWN
+    # flag (last occurrence wins in its arg loop), so blindly appending ours
+    # after $FINETUNE_EXTRA_ARGS_EFF would silently beat the user's value —
+    # the opposite of the train_sweep.sh path, where --extra_args lands last
+    # on the lerobot-train command line and wins. Skipping our flag when the
+    # user set theirs makes both paths behave the same: user string wins.
+    if [[ "$ROUND0_EXTRA_ARGS_EFF" != *--num_workers* ]]; then
+        NUM_WORKERS_TRAIN_ARG=( --num_workers="$NUM_WORKERS" )
+    fi
+    if [[ "$FINETUNE_EXTRA_ARGS_EFF" != *--num_workers* ]]; then
+        NUM_WORKERS_FT_ARG=( --num_workers="$NUM_WORKERS" )
+    fi
+fi
 EXCLUDE_GRIPPER_TRAIN_ARG=()   # for train_sweep.sh / resume_training.sh (accept the flag)
 EXCLUDE_GRIPPER_EVAL_ARG=()    # for lerobot-eval (accepts the resolved slice JSON)
 if [[ "$EXCLUDE_GRIPPER_FROM_STATE" == "true" ]]; then
@@ -1306,12 +1657,16 @@ fi
 
 # Validate --target_intervention_volume now that BLENDS is built. Must be a
 # positive integer N with N >= n_blends. raw_count = N - n_blends; N == n_blends
-# is allowed and means the merge contains blends only (no raw intervention).
+# is allowed in MERGE mode and means the merge contains blends only (no raw
+# intervention).
 #
-# In weighted-sampling mode --target_intervention_volume is irrelevant (no
-# merge step happens) — silently default it to a sentinel that satisfies the
-# downstream invariants (must be >= n_blends) but is never used. Required ONLY
-# in merge mode.
+# In WEIGHTED-sampling mode TIV is now applied as a per-sub-dataset WEIGHT
+# MULTIPLIER inside _py_weighted_sample_weights (see that helper): the raw
+# intervention slot gets max(1, N - n_blends) × its natural frame count, each
+# blend slot gets 1×. Net effect: total per-round DAgger mass ≡ N × raw
+# intervention, matching merge mode's semantics — same knob, cross-mode fair.
+# TIV=1 (the default) is a no-op (raw × 1) and preserves prior weighted-mode
+# behavior. Optional in weighted mode; required in merge mode.
 if [[ "$USE_WEIGHTED_SAMPLING" != "true" ]]; then
     if [[ -z "$TARGET_INTERVENTION_VOLUME" ]]; then
         echo "ERROR: --target_intervention_volume=N is required (positive integer)." >&2
@@ -1319,7 +1674,8 @@ if [[ "$USE_WEIGHTED_SAMPLING" != "true" ]]; then
         echo "  Each round's merge = raw × (N - n_blends) + each_blend × 1." >&2
         echo "  Typical values: 1-3 (must be >= number of blend ratios; == drops raw)." >&2
         echo "  REPLACES the prior --intervention_oversample flag." >&2
-        echo "  (Not required when --use_weighted_sampling is set — weighted mode skips the merge entirely.)" >&2
+        echo "  (Optional in --use_weighted_sampling mode — there it's applied as a" >&2
+        echo "   weight multiplier on the raw intervention sub-dataset; defaults to 1 = no-op.)" >&2
         exit 1
     fi
     if ! [[ "$TARGET_INTERVENTION_VOLUME" =~ ^[0-9]+$ ]] || (( TARGET_INTERVENTION_VOLUME < 1 )); then
@@ -1333,9 +1689,27 @@ if [[ "$USE_WEIGHTED_SAMPLING" != "true" ]]; then
         exit 1
     fi
 else
-    # Default sentinel for sidecar logging / format strings. Never consumed by
-    # the merge path (which is gated off in weighted mode).
-    [[ -z "$TARGET_INTERVENTION_VOLUME" ]] && TARGET_INTERVENTION_VOLUME=1
+    # Weighted mode: TIV is now consumed as a weight multiplier. Default to 1
+    # (no-op = current behavior) when not explicitly set. Still validate an
+    # explicit value here so a typo like --target_intervention_volume=foo
+    # doesn't reach the helper as a bogus int.
+    if [[ -z "$TARGET_INTERVENTION_VOLUME" ]]; then
+        TARGET_INTERVENTION_VOLUME=1
+    else
+        if ! [[ "$TARGET_INTERVENTION_VOLUME" =~ ^[0-9]+$ ]] || (( TARGET_INTERVENTION_VOLUME < 1 )); then
+            echo "ERROR: --target_intervention_volume=$TARGET_INTERVENTION_VOLUME must be a positive integer." >&2
+            exit 1
+        fi
+        # In weighted mode we clamp raw_multiplier ≥ 1 internally, so TIV
+        # smaller than n_blends is not an error (unlike merge mode) — it just
+        # means "raw × 1, blends × 1". But flag it so the user knows their
+        # TIV isn't producing the multiplier they expect.
+        if (( TARGET_INTERVENTION_VOLUME <= ${#BLENDS[@]} )) && (( ${#BLENDS[@]} > 0 )); then
+            echo "  [notice] --target_intervention_volume=$TARGET_INTERVENTION_VOLUME <= n_blends=${#BLENDS[@]}: raw intervention weight" >&2
+            echo "           multiplier clamps to 1× (weighted mode never drops raw). To upweight raw," >&2
+            echo "           set TIV > n_blends (e.g. --target_intervention_volume=$(( ${#BLENDS[@]} + 1 )))." >&2
+        fi
+    fi
 fi
 
 # Validate --dagger_data_fraction (only meaningful in weighted mode). Must be
@@ -1363,6 +1737,18 @@ else:
         echo "  use --combination_pool=1.0 (pure-policy mode) instead." >&2
         exit 1
     fi
+    case "$DAGGER_DATA_FRACTION_MODE" in
+        cap|exact) ;;
+        *)
+            echo "ERROR: --dagger_data_fraction_mode='$DAGGER_DATA_FRACTION_MODE' must be 'cap' or 'exact'." >&2
+            echo "  cap   = --dagger_data_fraction is a CEILING (historical default): when the" >&2
+            echo "          natural DAgger frame share is below F, weights stay fully proportional." >&2
+            echo "  exact = --dagger_data_fraction is a FIXED TARGET: DAgger gets exactly F of" >&2
+            echo "          every batch, upsampling (with replacement) when its natural share is" >&2
+            echo "          lower. Use when a large base dataset would otherwise swamp DAgger." >&2
+            exit 1
+            ;;
+    esac
     # --norm_mode validation. per_source is rejected here (and again
     # inside the wrapper) — the option is reserved as a placeholder so
     # callers + sidecars know it exists, but the wrapper currently raises
@@ -1813,17 +2199,30 @@ if [[ "$RERUN_MODE_ENABLED" == "true" ]]; then
         for r in $(seq 1 "$NUM_ROUNDS"); do
             _src_int_dir="$LEROBOT_CACHE/${HF_USER}/${SOURCE_INT_SHORT_PREFIX}_${ACTION_INFIX}_dag${r}"
             if [[ ! -d "$_src_int_dir" ]]; then
-                echo "ERROR: source intervention missing on disk." >&2
-                echo "  Expected at: $_src_int_dir" >&2
-                exit 1
+                if [[ "$DRY_RUN" == true ]]; then
+                    # A dry-run of `--auto_create_source` sweeps hits this by
+                    # design: the source's interventions would be recorded by
+                    # the (not-executed) auto-create step. Warn and keep
+                    # printing the plan; the real run enforces the check.
+                    echo "[dry-run] WARN: source intervention not on disk yet (would be a fatal pre-flight error in a real run):"
+                    echo "          $_src_int_dir"
+                else
+                    echo "ERROR: source intervention missing on disk." >&2
+                    echo "  Expected at: $_src_int_dir" >&2
+                    exit 1
+                fi
             fi
         done
         for r in $(seq 2 "$NUM_ROUNDS"); do
             _src_pol_dir="$LEROBOT_ROOT/outputs/training/${SOURCE_POLICY_BASENAME}_ft_dag$((r - 1))"
             if [[ ! -d "$_src_pol_dir/checkpoints" ]]; then
-                echo "ERROR: source policy dir not found: $_src_pol_dir" >&2
-                echo "  Need source's _ft_dag$((r - 1)) for blending + training at round $r." >&2
-                exit 1
+                if [[ "$DRY_RUN" == true ]]; then
+                    echo "[dry-run] WARN: source policy dir not on disk yet (fatal in a real run): $_src_pol_dir"
+                else
+                    echo "ERROR: source policy dir not found: $_src_pol_dir" >&2
+                    echo "  Need source's _ft_dag$((r - 1)) for blending + training at round $r." >&2
+                    exit 1
+                fi
             fi
         done
     fi
@@ -1915,6 +2314,7 @@ write_dagger_config_sidecar() {
     DAG_CFG_BASE_REPO="${BASE_REPO:-}" \
     DAG_CFG_USE_WEIGHTED_SAMPLING="$USE_WEIGHTED_SAMPLING" \
     DAG_CFG_DAGGER_DATA_FRACTION="$DAGGER_DATA_FRACTION" \
+    DAG_CFG_DAGGER_DATA_FRACTION_MODE="$DAGGER_DATA_FRACTION_MODE" \
     DAG_CFG_NORM_MODE="$NORM_MODE" \
     DAG_CFG_RRT_OBSTACLE_CLEARANCE="$RRT_OBSTACLE_CLEARANCE" \
     DAG_CFG_RRT_SELF_COLLISION_CLEARANCE="$RRT_SELF_COLLISION_CLEARANCE" \
@@ -1923,6 +2323,9 @@ write_dagger_config_sidecar() {
     DAG_CFG_WEIGHTED_WEIGHTS_JSON="${DAG_CFG_WEIGHTED_WEIGHTS_JSON:-[]}" \
     DAG_CFG_WEIGHTED_STATS_PATHS_JSON="${DAG_CFG_WEIGHTED_STATS_PATHS_JSON:-[]}" \
     DAG_CFG_HEADLESS="$HEADLESS" \
+    DAG_CFG_CONTROL_GUI="$CONTROL_GUI" \
+    DAG_CFG_KEEP_SA_GUI="$KEEP_SA_GUI" \
+    DAG_CFG_SPLAT_SHADOWS="$SPLAT_SHADOWS" \
     DAG_CFG_SWEEP_INVOCATION_ARGV_JSON="${DAGGER_SWEEP_INVOCATION_ARGV_JSON:-}" \
     DAG_CFG_SWEEP_INVOCATION_WRAPPER="${DAGGER_SWEEP_INVOCATION_WRAPPER:-}" \
     python3 - <<'PY'
@@ -1968,6 +2371,7 @@ config = {
         "initial_policy_path":    os.environ["DAG_CFG_INITIAL_POLICY_PATH"],
         "use_weighted_sampling":  os.environ["DAG_CFG_USE_WEIGHTED_SAMPLING"] == "true",
         "dagger_data_fraction":   float(os.environ["DAG_CFG_DAGGER_DATA_FRACTION"]),
+        "dagger_data_fraction_mode":   os.environ.get("DAG_CFG_DAGGER_DATA_FRACTION_MODE", "cap"),
         "norm_mode":              os.environ["DAG_CFG_NORM_MODE"],
         "rrt_obstacle_clearance":      float(os.environ["DAG_CFG_RRT_OBSTACLE_CLEARANCE"]) if os.environ.get("DAG_CFG_RRT_OBSTACLE_CLEARANCE") else None,
         "rrt_self_collision_clearance": float(os.environ["DAG_CFG_RRT_SELF_COLLISION_CLEARANCE"]) if os.environ.get("DAG_CFG_RRT_SELF_COLLISION_CLEARANCE") else None,
@@ -1976,6 +2380,12 @@ config = {
         "weighted_sample_weights": json.loads(os.environ["DAG_CFG_WEIGHTED_WEIGHTS_JSON"]),
         "weighted_stats_paths":   json.loads(os.environ["DAG_CFG_WEIGHTED_STATS_PATHS_JSON"]),
         "headless":               os.environ["DAG_CFG_HEADLESS"] == "true",
+        "control_gui":            os.environ["DAG_CFG_CONTROL_GUI"] == "true",
+        "keep_sa_gui":            os.environ["DAG_CFG_KEEP_SA_GUI"] == "true",
+        # Recorded because it changes the IMAGES in the round's dataset:
+        # a lineage mixing shadowed and unshadowed rounds is a covariate
+        # shift you want to be able to spot after the fact.
+        "splat_shadows":          os.environ.get("DAG_CFG_SPLAT_SHADOWS", "false") == "true",
     },
     "orchestrator_invocation": {
         # Sort argv lexicographically so two sidecars whose user-side invocations
@@ -2180,21 +2590,64 @@ stats_exists() {
         return 0
     fi
     # Files are named by chunk size (stats_rel{N}.json), produced by
-    # compute_relative_stats.sh — currently chunks 50 (pi05) and 8 (diffusion).
-    # We check whichever sidecar corresponds to the active model's chunk size;
-    # the other one isn't needed but compute_relative_stats.sh writes both
-    # anyway, so a successful run yields both and either model is satisfied.
+    # compute_relative_stats.sh. The chunk that MATTERS is the one training
+    # will actually load — every training callsite reads
+    # stats_rel${FT_CHUNK}.json where FT_CHUNK = stats_horizon_from_policy_path
+    # (policy.horizon, falling back to n_action_steps). This predicate MUST
+    # agree with that or resume detection desyncs from reality.
+    #
+    # History: this used to hardcode `diffusion* → 8`, a stale horizon. No
+    # stats_rel8.json has ever been produced (compute_relative_stats.sh
+    # defaults to chunks "50,64"), so the check returned false for EVERY
+    # diffusion dataset — which silently (a) pinned the sequential resume
+    # counter at step 0 so rounds always reported "not started", (b) made
+    # raw/nocoll_blends_complete_for_round permanently false so a blend
+    # lineage could never be COMPLETE, and (c) defeated step 2's per-ratio
+    # skip, re-invoking the blend script on already-complete datasets — the
+    # root cause of the duplicated r_dag1_blend* datasets (2026-07-31).
     local needed_chunk
-    case "$TRAIN_OUTPUT_MODEL_PREFIX" in
-        diffusion*) needed_chunk=8 ;;
-        pi05*|pi0*) needed_chunk=50 ;;
-        *)          needed_chunk="" ;;
-    esac
+    needed_chunk="$(_resolve_rel_stats_chunk)"
     if [[ -z "$needed_chunk" ]]; then
         # No chunk applies (e.g. act → absolute actions only). Treat as present.
         return 0
     fi
     [[ -f "$STATS_BASE/$short/stats_rel${needed_chunk}.json" ]]
+}
+
+# Memoized rel-stats chunk size for resume predicates. Resolved from the
+# actual policy config (same source `FT_CHUNK` uses at train time) so the two
+# can't drift; falls back to per-model horizon defaults when no checkpoint is
+# on disk yet (fresh lineage whose base hasn't trained). Memoized because
+# stats_exists is called O(rounds x ratios) times and each miss costs a
+# readlink + python3.
+_REL_STATS_CHUNK_MEMO=""
+_resolve_rel_stats_chunk() {
+    if [[ -n "$_REL_STATS_CHUNK_MEMO" ]]; then
+        [[ "$_REL_STATS_CHUNK_MEMO" == "none" ]] && echo "" || echo "$_REL_STATS_CHUNK_MEMO"
+        return 0
+    fi
+    local h="" cand
+    # Candidate policies, most specific first: an explicit --initial_policy_path,
+    # then the round-0 base training dir (same expression BASE_TRAINING_DIR uses
+    # at line ~4010 — inlined because that variable is assigned AFTER the first
+    # stats_exists call in resume detection).
+    for cand in \
+        "${INITIAL_POLICY_PATH:-}" \
+        "$LEROBOT_ROOT/outputs/training/${TRAIN_OUTPUT_MODEL_PREFIX}_${BASE_SHORT}_${TRAIN_OUTPUT_ACTION_TAG}_${CAMERA_NAME_TAG}"
+    do
+        [[ -z "$cand" ]] && continue
+        h="$(stats_horizon_from_policy_path "$cand")"
+        [[ -n "$h" ]] && break
+    done
+    if [[ -z "$h" ]]; then
+        case "$TRAIN_OUTPUT_MODEL_PREFIX" in
+            diffusion*) h=64 ;;   # diffusion policy.horizon
+            pi05*|pi0*) h=50 ;;   # pi0 policy.horizon
+            *)          h="" ;;   # e.g. act → abs actions only, no rel sidecar
+        esac
+    fi
+    _REL_STATS_CHUNK_MEMO="${h:-none}"
+    echo "$h"
 }
 
 # Read the policy's n_action_steps (== chunk size for the relative-action stats
@@ -2216,6 +2669,50 @@ import json, sys
 c = json.load(open(sys.argv[1]))
 n = c.get('policy', {}).get('n_action_steps')
 print(n if n is not None else '')
+" "$cfg"
+            return 0
+        fi
+    done
+    echo ""
+}
+
+# stats_horizon_from_policy_path: reads the policy's training-time action-sequence
+# length ("horizon"), used to size stats_rel<N>.json chunk_size. Distinct from
+# n_action_steps (which is how many actions get EXECUTED per policy call before
+# re-planning). For diffusion policies, horizon > n_action_steps is common
+# (e.g. horizon=64, n_action_steps=32): the model trains on 64-step
+# rel-action sequences but only executes the first 32 at inference.
+#
+# Rel-action stats MUST cover the full training range: chunk_size=horizon
+# produces stats whose min/max/std reflect what the model actually LEARNS to
+# predict. Using chunk_size=n_action_steps (or worse, a small default like 8)
+# stats only positions 0..K-1 and undershoots the range at positions K..H-1;
+# combined with `clip_sample=True` in diffusion, that clips a large fraction
+# of training targets (up to 45% in the planar_3joint config) — so the model
+# effectively learns "always output near-zero" and the resulting policy barely
+# moves.
+#
+# Falls back to n_action_steps when the policy config doesn't expose `horizon`
+# (some policies where horizon == n_action_steps only publish the latter).
+stats_horizon_from_policy_path() {
+    local policy_path="$1"
+    local resolved cfg
+    resolved="$(readlink -f "$policy_path" 2>/dev/null || echo "$policy_path")"
+    for cfg in \
+        "$resolved/train_config.json" \
+        "$resolved/pretrained_model/train_config.json" \
+        "$resolved/checkpoints/last/pretrained_model/train_config.json"
+    do
+        if [[ -f "$cfg" ]]; then
+            python3 -c "
+import json, sys
+c = json.load(open(sys.argv[1])).get('policy', {})
+# Prefer horizon; fall back to n_action_steps for policies that don't publish
+# horizon (in those cases the two are equal by design).
+v = c.get('horizon')
+if v is None:
+    v = c.get('n_action_steps')
+print(v if v is not None else '')
 " "$cfg"
             return 0
         fi
@@ -2405,11 +2902,16 @@ start_sim() {
         [[ "$MANAGED_SIM_PID" == "DRYRUN" ]] && return 0
         local _hl=""
         [[ "$HEADLESS" == true ]] && _hl=" --headless"
+        [[ "$HEADLESS" == true && "$CONTROL_GUI" == true ]] && _hl+=" --control_gui"
         local _rn=""
         [[ -n "$SPLATSIM_ROBOT_NAME" ]] && _rn=" --robot_name $SPLATSIM_ROBOT_NAME"
         echo "[DRY-RUN] would start SplatSim on port $ENV_EXTERNAL_PORT:"
         echo "[DRY-RUN]   cwd: $SPLATSIM_ROOT"
-        echo "[DRY-RUN]   cmd: python -u scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $ENV_EXTERNAL_PORT --hostname $ENV_EXTERNAL_HOST$_rn --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID$_hl"
+        local _rm=""
+        [[ -n "$RENDER_MODE" ]] && _rm=" --render_mode $RENDER_MODE"
+        local _ss=""
+        [[ "$SPLAT_SHADOWS" == true ]] && _ss=" --splat_shadows"
+        echo "[DRY-RUN]   cmd: python -u scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $ENV_EXTERNAL_PORT --hostname $ENV_EXTERNAL_HOST$_rn --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID$_hl$_rm$_ss --strict_goal_tolerances"
         MANAGED_SIM_PID="DRYRUN"
         return 0
     fi
@@ -2465,14 +2967,43 @@ start_sim() {
     # --headless connects pybullet via p.DIRECT instead of p.GUI — no
     # visualizer window, ~50% less GPU memory, faster startup. Mirrors what
     # start_filter_sim() does unconditionally for the collision-filter sim.
+    # --control_gui keeps the Tk control panel up over the DIRECT client
+    # (launch_nodes.py documents it as headless-only, so gate on both).
     [[ "$HEADLESS" == true ]] && launch_cmd+=( --headless )
+    [[ "$HEADLESS" == true && "$CONTROL_GUI" == true ]] && launch_cmd+=( --control_gui )
+    # Pin the image-observation source per the env profile (RENDER_MODE).
+    # Splat envs must eval/record with the splat camera their datasets were
+    # recorded with; the planar env only has the PyBullet camera.
+    [[ -n "$RENDER_MODE" ]] && launch_cmd+=( --render_mode "$RENDER_MODE" )
+    # --splat_shadows: shadow compositing on the splat render. This sim
+    # RECORDS the intervention episodes, so its setting defines the imagery
+    # the policy trains on — the training-side injections below mirror it.
+    [[ "$SPLAT_SHADOWS" == true ]] && launch_cmd+=( --splat_shadows )
     # --sync_physics_to_client: sim only steps physics when the client
     # sends a command. Prevents "sim races ahead during inference" jumps.
     [[ "$SYNC_PHYSICS" == true ]] && launch_cmd+=( --sync_physics_to_client )
+    # --strict_goal_tolerances: unconditionally on for the orchestrator's
+    # sim launches because this sim is ONLY used for intervention recording
+    # (step 1 of every DAgger round). The default eval-time is_success
+    # thresholds are LOOSE (e.g. small_engine 30 mm / 10°, planar 60 mm)
+    # so a chunk of the RRT correction gets cut off when the arm crosses
+    # "close enough" — the trained policy then never sees the last-mile
+    # corrections. Strict tightens per-env: small_engine → 5 mm / 2°,
+    # planar → 1 cm, vine → 5 mm / 2° (see STRICT_POS_TOLERANCE_M /
+    # STRICT_QUAT_TOLERANCE_DEG on each server class). Not gated on any
+    # config — this sim is always for recording, and the trade-off
+    # (RRT runs to completion, so recording takes ~1-2s longer per
+    # intervention that finishes cleanly) is always favorable for DAgger.
+    launch_cmd+=( --strict_goal_tolerances )
     echo "Starting SplatSim:"
     echo "  cwd:     $SPLATSIM_ROOT"
     echo "  cmd:     ${launch_cmd[*]}"
     echo "  log:     $MANAGED_SIM_LOG"
+    if [[ "$SYNC_PHYSICS" == true ]]; then
+        echo "  sync_physics_to_client: ON — physics steps only on client commands (sim never races ahead of a slow policy)."
+    else
+        echo "  sync_physics_to_client: OFF — physics runs in wallclock time; slow policies may look jumpy (--sync_physics_to_client to re-enable)."
+    fi
     # Launch sim in background. setsid puts it in its own session so it survives
     # SIGINT to our shell (we kill it explicitly in stop_sim / trap).
     (
@@ -2576,7 +3107,9 @@ start_filter_sim() {
         [[ -n "$SPLATSIM_ROBOT_NAME" ]] && _dr_rn=" --robot_name $SPLATSIM_ROBOT_NAME"
         echo "[DRY-RUN] would start HEADLESS SplatSim on port $FILTER_COLLISION_ENV_PORT_RESOLVED:"
         echo "[DRY-RUN]   cwd: $SPLATSIM_ROOT"
-        echo "[DRY-RUN]   cmd: python -u scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $FILTER_COLLISION_ENV_PORT_RESOLVED --hostname $ENV_EXTERNAL_HOST$_dr_rn --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID --in_collision_obstacle_clearance $_dr_obs_clr --in_collision_self_collision_clearance $_dr_self_clr --headless"
+        local _dr_ss=""
+        [[ "$SPLAT_SHADOWS" == true ]] && _dr_ss=" --splat_shadows"
+        echo "[DRY-RUN]   cmd: python -u scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $FILTER_COLLISION_ENV_PORT_RESOLVED --hostname $ENV_EXTERNAL_HOST$_dr_rn --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID --in_collision_obstacle_clearance $_dr_obs_clr --in_collision_self_collision_clearance $_dr_self_clr --headless$_dr_ss"
         MANAGED_FILTER_SIM_PID="DRYRUN"
         return 0
     fi
@@ -2632,10 +3165,19 @@ start_filter_sim() {
         --in_collision_self_collision_clearance "$_filter_self_clr"
         --headless
     )
+    # Same physics-stepping mode as the main sim: the filter replays blend
+    # episodes closed-loop, so an unsynced (wallclock) filter sim would judge
+    # collisions on trajectories the main sim never produced.
+    [[ "$SYNC_PHYSICS" == true ]] && launch_cmd+=( --sync_physics_to_client )
     # Only pass --robot_name when overridden — mirror the pattern used at
     # the main sim launch site above so class DEFAULT_ROBOT_NAME flows
     # through for the collision-filter sim too.
     [[ -n "$SPLATSIM_ROBOT_NAME" ]] && launch_cmd+=( --robot_name "$SPLATSIM_ROBOT_NAME" )
+    # Keep the filter sim's rendering identical to the main sim's. It replays
+    # blend episodes to judge collisions (state-level work), so shadows don't
+    # change its verdicts — but matching avoids a config divergence that would
+    # bite the moment anything here starts consuming images.
+    [[ "$SPLAT_SHADOWS" == true ]] && launch_cmd+=( --splat_shadows )
     echo "Starting HEADLESS SplatSim (for collision filter):"
     echo "  cwd:     $SPLATSIM_ROOT"
     echo "  cmd:     ${launch_cmd[*]}"
@@ -2884,6 +3426,8 @@ if [[ "$HEADLESS" == true ]]; then
         echo "Headless mode ON: step-1 SA wrapper GUI disabled. (--no_manage_splatsim → orchestrator does not"
         echo "                  set --env.headless on training; the user's external sim's GUI is unchanged.)"
     fi
+    [[ "$CONTROL_GUI" == true ]] && echo "  --control_gui: SplatSim Tk control panel stays up (pybullet stays DIRECT)."
+    [[ "$KEEP_SA_GUI" == true ]] && echo "  --keep_sa_gui: SA wrapper ratio slider + its pybullet GUI window stay up."
     echo
 fi
 
@@ -3123,7 +3667,11 @@ if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
     echo "  4. (SKIPPED — --use_weighted_sampling) Cumulative merge"
     echo "  5. (SKIPPED — --use_weighted_sampling) Merged-dataset rel-action stats"
     echo "  6. Train policy ($INTERMEDIATE_MODE) on weighted union of {base + every round's intervention + every round's blends}"
-    echo "     → DataLoader weights: DAgger CAPPED at ${DAGGER_DATA_FRACTION}, else natural frame share; below cap → fully proportional (no upsampling)"
+    if [[ "$DAGGER_DATA_FRACTION_MODE" == "exact" ]]; then
+        echo "     → DataLoader weights: DAgger forced to EXACTLY ${DAGGER_DATA_FRACTION} of every batch (--dagger_data_fraction_mode=exact); upsampled with replacement when its natural share is lower"
+    else
+        echo "     → DataLoader weights: DAgger CAPPED at ${DAGGER_DATA_FRACTION}, else natural frame share; below cap → fully proportional (no upsampling)"
+    fi
     case "$NORM_MODE" in
         aggregated)
             echo "     → norm_mode=aggregated: policy normalizer/unnormalizer use min-of-mins / max-of-maxes / count-weighted mean+std over ALL sub-datasets."
@@ -3403,6 +3951,7 @@ elif [[ "$FORCE_RESTART" == true ]]; then
         # user opted in via --also_delete_blends. In non-rerun mode the
         # lineage owns its blends → always delete.
         if [[ "$RERUN_MODE_ENABLED" != "true" || "$ALSO_DELETE_BLENDS" == "true" ]]; then
+            _blend_deleted_any=false
             for R in "${BLENDS[@]}"; do
                 run_or_echo rm -rf "$LEROBOT_CACHE/$(blend_repo_for_round "$r" "$R")"
                 run_or_echo rm -rf "$STATS_BASE/$(blend_short_for_round "$r" "$R")"
@@ -3411,6 +3960,7 @@ elif [[ "$FORCE_RESTART" == true ]]; then
                 # whether --filter_blend_collisions was used).
                 run_or_echo rm -rf "$LEROBOT_CACHE/$(nocoll_repo_for_round "$r" "$R")"
                 run_or_echo rm -rf "$STATS_BASE/$(nocoll_short_for_round "$r" "$R")"
+                _blend_deleted_any=true
             done
             # Glob-based sweep of orphaned blends. The explicit BLENDS loop
             # above only catches blends THIS lineage was launched with —
@@ -3429,12 +3979,22 @@ elif [[ "$FORCE_RESTART" == true ]]; then
             for orphan in "$_BLEND_GLOB_BASE"*; do
                 [[ -e "$orphan" ]] || continue
                 run_or_echo rm -rf "$orphan"
+                _blend_deleted_any=true
             done
             _BLEND_STATS_GLOB_BASE="$STATS_BASE/$(int_short_for_round "$r")_blend"
             for orphan in "$_BLEND_STATS_GLOB_BASE"*; do
                 [[ -e "$orphan" ]] || continue
                 run_or_echo rm -rf "$orphan"
+                _blend_deleted_any=true
             done
+            # Round-scoped feedback so a silent round is distinguishable from
+            # "blends weren't considered at all" (they're named after the
+            # round: <int_short>_r_dag${r}_blend<NNN>). Without this, a
+            # --from_round dry-run where later rounds simply have no blends
+            # on disk looks like the blend cleanup ignored the flag.
+            if [[ "$_blend_deleted_any" != true ]]; then
+                echo "  [blends] round $r: no blend datasets on disk (glob: $(basename "$_BLEND_GLOB_BASE")*)"
+            fi
         fi
         # New layout nests interventions under the training dir
         # (<train>/dagger/...), so this rm already takes them out.
@@ -3635,9 +4195,20 @@ fi
 # invocations (scratch, finetune, post-loop final-scratch).
 HEADLESS_TRAIN_ARGS=()
 if [[ "$HEADLESS" == true ]]; then
-    HEADLESS_TRAIN_ARGS=( --policy.shared_autonomy_config.show_slider=false )
+    # --keep_sa_gui carves the SA wrapper's slider + pybullet GUI window back
+    # out of headless mode (they live in the lerobot process, not the sim).
+    # Explicit both ways so the emitted command documents the decision.
+    if [[ "$KEEP_SA_GUI" == true ]]; then
+        HEADLESS_TRAIN_ARGS=( --policy.shared_autonomy_config.show_slider=true )
+    else
+        HEADLESS_TRAIN_ARGS=( --policy.shared_autonomy_config.show_slider=false )
+    fi
     if [[ "$MANAGE_SPLATSIM" == true ]]; then
         HEADLESS_TRAIN_ARGS+=( --env.headless=true )
+        # --control_gui: the in-process inline-eval sim keeps the Tk control
+        # panel over its p.DIRECT pybullet client (SplatSimEnv.control_gui →
+        # server ctor's show_control_gui).
+        [[ "$CONTROL_GUI" == true ]] && HEADLESS_TRAIN_ARGS+=( --env.control_gui=true )
     fi
 fi
 # Scratch-mode training goes through train_sweep.sh, which has its own
@@ -3646,7 +4217,34 @@ fi
 # splatsim is managed + --policy.shared_autonomy_config.show_slider=false
 # defensively). One flag at the boundary, same downstream effect.
 HEADLESS_TRAIN_SCRATCH_ARGS=()
-[[ "$HEADLESS" == true ]] && HEADLESS_TRAIN_SCRATCH_ARGS=( --headless )
+if [[ "$HEADLESS" == true ]]; then
+    HEADLESS_TRAIN_SCRATCH_ARGS=( --headless )
+    # Same modifiers exist on train_sweep.sh's parser; forward them so the
+    # scratch path gates the identical surfaces as the finetune path above.
+    [[ "$CONTROL_GUI" == true ]] && HEADLESS_TRAIN_SCRATCH_ARGS+=( --control_gui )
+    [[ "$KEEP_SA_GUI" == true ]] && HEADLESS_TRAIN_SCRATCH_ARGS+=( --keep_sa_gui )
+fi
+# --splat_shadows propagation into training's INLINE-EVAL sim. Kept in its
+# own arrays (not folded into the HEADLESS_* ones) because shadows are a
+# rendering choice with nothing to do with GUI mode — they must apply whether
+# or not --headless is set. Two dialects, same as the headless pair above:
+#   * scratch  → train_sweep.sh's own `--splat_shadows` flag, which re-emits
+#                --env.splat_shadows=true (and skips it when the training
+#                shares the user's external sim via --env_external_port).
+#   * finetune → lerobot-train's `--env.splat_shadows=true` directly.
+# Both feed SplatSimEnv.splat_shadows → the in-process robot server's
+# `splat_shadows` ctor kwarg. This is what makes ROUND-0 EVAL and every
+# FINETUNE EVAL render the same imagery the intervention sim recorded.
+SPLAT_SHADOW_TRAIN_SCRATCH_ARGS=()
+SPLAT_SHADOW_TRAIN_ARGS=()
+if [[ "$SPLAT_SHADOWS" == true ]]; then
+    SPLAT_SHADOW_TRAIN_SCRATCH_ARGS=( --splat_shadows )
+    # Suppressed in --no_manage_splatsim mode for the same reason
+    # --env.headless is: training then talks to the user's external sim via
+    # --env.external_port and never spawns a local pybullet client, so the
+    # env-side toggle is a no-op that would only clutter the emitted command.
+    [[ "$MANAGE_SPLATSIM" == true ]] && SPLAT_SHADOW_TRAIN_ARGS=( --env.splat_shadows=true )
+fi
 # Offline-mode flag: when --push_to_hub is NOT set on the orchestrator (the
 # default), disable the trained policy's hub push.
 OFFLINE_POLICY_ARG=()
@@ -3767,16 +4365,23 @@ fi
 #   (b) actually invoke train_sweep.sh on the base dataset (only when starting
 #       from step 1 fresh AND no prior base training exists AND no
 #       --initial_policy_path was given).
-if (( EFFECTIVE_START_ROUND == 1 )); then
-    # Use CAMERA_NAME_TAG (matches train_sweep.sh's suffix rules — includes
-    # `os`/`ng` when env_state / gripper-exclusion apply) instead of raw
-    # CAMERAS. Otherwise the `training_exists` fallback would match the
-    # WRONG base — e.g. this sweep with --exclude_gripper_from_state expects
-    # `_stateng` but bare CAMERAS is `_state`, silently picking up a
-    # pre-existing full-obs base whose input dim doesn't match this sweep's
-    # sliced [3]-dim policy → shape mismatch at eval time.
-    BASE_TRAINING_DIR="$LEROBOT_ROOT/outputs/training/${TRAIN_OUTPUT_MODEL_PREFIX}_${BASE_SHORT}_${TRAIN_OUTPUT_ACTION_TAG}_${CAMERA_NAME_TAG}"
+# Use CAMERA_NAME_TAG (matches train_sweep.sh's suffix rules — includes
+# `os`/`ng` when env_state / gripper-exclusion apply) instead of raw
+# CAMERAS. Otherwise the `training_exists` fallback would match the
+# WRONG base — e.g. this sweep with --exclude_gripper_from_state expects
+# `_stateng` but bare CAMERAS is `_state`, silently picking up a
+# pre-existing full-obs base whose input dim doesn't match this sweep's
+# sliced [3]-dim policy → shape mismatch at eval time.
+#
+# Derived UNCONDITIONALLY (not just when round 0 runs): the post-loop
+# final-scratch step reads the base policy's horizon via
+# ${INITIAL_POLICY_PATH:-$BASE_TRAINING_DIR}, and a resume where every
+# round is already complete skips the round-0 block entirely
+# (EFFECTIVE_START_ROUND > 1) — under `set -u` an unhoisted assignment
+# means "unbound variable" right before the final scratch train.
+BASE_TRAINING_DIR="$LEROBOT_ROOT/outputs/training/${TRAIN_OUTPUT_MODEL_PREFIX}_${BASE_SHORT}_${TRAIN_OUTPUT_ACTION_TAG}_${CAMERA_NAME_TAG}"
 
+if (( EFFECTIVE_START_ROUND == 1 )); then
     # CURRENT_POLICY unset = "no valid base checkpoint yet — need to train".
     # We set it in the INITIAL_POLICY_PATH sub-branches below when the path
     # resolves to an actual pretrained_model dir. If it doesn't (either the
@@ -3961,8 +4566,8 @@ if (( EFFECTIVE_START_ROUND == 1 )); then
             ROUND0_EVAL_ARGS+=( --eval_benchmark_subset="$INTERVENTION_SUBSET_JSON" )
         fi
         ROUND0_EXTRA_ARGS=()
-        if [[ -n "$FINETUNE_EXTRA_ARGS" ]]; then
-            ROUND0_EXTRA_ARGS=( --extra_args="$FINETUNE_EXTRA_ARGS" )
+        if [[ -n "$ROUND0_EXTRA_ARGS_EFF" ]]; then
+            ROUND0_EXTRA_ARGS=( --extra_args="$ROUND0_EXTRA_ARGS_EFF" )
         fi
         run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
             --dataset_repo="$BASE_REPO" \
@@ -3975,7 +4580,9 @@ if (( EFFECTIVE_START_ROUND == 1 )); then
             "${ROUND0_ABS_ACTION_ARG[@]}" \
             "${TRAIN_EXT_PORT_SWEEP[@]}" \
             "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
+            "${SPLAT_SHADOW_TRAIN_SCRATCH_ARGS[@]}" \
             "${EXCLUDE_GRIPPER_TRAIN_ARG[@]}" \
+            "${NUM_WORKERS_TRAIN_ARG[@]}" \
             "${OFFLINE_POLICY_ARG[@]}"
         if [[ "$DRY_RUN" != true ]]; then
             CURRENT_POLICY="$(resolve_latest_checkpoint "$BASE_TRAINING_DIR")"
@@ -4044,7 +4651,13 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             # non-rerun's round 1. We don't bother resolving _ft_dag0 since
             # there is no such thing; source's round-1 training also branched
             # off --initial_policy_path.
-            if [[ -f "$INITIAL_POLICY_PATH/checkpoints/last/pretrained_model/config.json" ]]; then
+            if [[ -z "$INITIAL_POLICY_PATH" ]]; then
+                # No --initial_policy_path (auto/derived round-0 base). The
+                # round-0 block above already set CURRENT_POLICY to the base
+                # training dir's checkpoint — which is exactly the policy
+                # source's round 1 branched from. Keep it as-is.
+                echo "[rerun] Round 1: no --initial_policy_path; branching from the round-0 base checkpoint already resolved above."
+            elif [[ -f "$INITIAL_POLICY_PATH/checkpoints/last/pretrained_model/config.json" ]]; then
                 CURRENT_POLICY="$INITIAL_POLICY_PATH/checkpoints/last/pretrained_model"
             elif [[ -f "$INITIAL_POLICY_PATH/pretrained_model/config.json" ]]; then
                 CURRENT_POLICY="$INITIAL_POLICY_PATH/pretrained_model"
@@ -4178,9 +4791,16 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             # already checked round-by-round; this is the per-round guard
             # against datasets disappearing mid-run (rare).
             if [[ ! -d "$LEROBOT_CACHE/$INT_REPO" ]]; then
-                echo "ERROR: source intervention $INT_REPO missing on disk." >&2
-                echo "  Expected at: $LEROBOT_CACHE/$INT_REPO" >&2
-                exit 1
+                if [[ "$DRY_RUN" == true ]]; then
+                    # Auto-create-source dry-runs never record the source's
+                    # interventions, so this per-round guard hits by design.
+                    # Warn and keep printing the plan; real runs still abort.
+                    echo "[dry-run] WARN: source intervention $INT_REPO not on disk yet (fatal in a real run)."
+                else
+                    echo "ERROR: source intervention $INT_REPO missing on disk." >&2
+                    echo "  Expected at: $LEROBOT_CACHE/$INT_REPO" >&2
+                    exit 1
+                fi
             fi
             echo "--- Round $r, Step 1: REUSING source intervention $INT_REPO ---"
             # Stats sidecar: source-intervention sidecars are stable across
@@ -4272,9 +4892,16 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
         # show_slider field — see shared_autonomy_wrapper.py:240). The
         # external SplatSim was launched headless above; this kills the
         # last visualizer in the loop.
+        # In headless mode, pass show_slider EXPLICITLY both ways (=true with
+        # --keep_sa_gui, =false without) so the emitted command documents the
+        # SA-GUI decision rather than relying on the field's default.
         HEADLESS_EVAL_ARG=()
         if [[ "$HEADLESS" == true ]]; then
-            HEADLESS_EVAL_ARG=( --policy.shared_autonomy_config.show_slider=false )
+            if [[ "$KEEP_SA_GUI" == true ]]; then
+                HEADLESS_EVAL_ARG=( --policy.shared_autonomy_config.show_slider=true )
+            else
+                HEADLESS_EVAL_ARG=( --policy.shared_autonomy_config.show_slider=false )
+            fi
         fi
         # Dedicated RRT-clearance args forwarded as SA-config fields. Kept
         # separate from --intervention_extra_args so they're individually
@@ -4311,17 +4938,33 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
                 # act / anything else: leave the EnvConfig default alone.
             esac
         fi
-        # Auto-set --env.camera_names=[] when this is a state-only run.
-        # --cameras=state means the policy consumes only observation.state
-        # (+ environment_state), no image features. The sim server is
-        # launched without any explicit camera args and typically doesn't
-        # publish wrist_rgb / base_rgb; leaving env.camera_names at its
-        # default ['base_rgb', 'wrist_rgb'] makes teleop_recording expect
-        # image keys the sim never sends → RuntimeError at frame-build.
-        # Same user-priority rule as image_resize_modes.
+        # Auto-set --env.camera_names for the intervention recording env.
+        # Distinct from what the POLICY consumes: even a state-only sweep
+        # (--cameras=state, no image inputs to the policy) must still RECORD
+        # the images the sim publishes so the intervention dataset's feature
+        # keys match the base dataset's. Multi-source stats aggregation
+        # (MultiSourceNormalizingDataset._validate_consistency) requires
+        # identical feature sets across sub-datasets; a base recorded with
+        # base_rgb but an intervention recorded without images fails the
+        # sidecar check outright.
+        #
+        # Drive the decision off PROFILE_ENV_CAMERAS (captured from the
+        # profile BEFORE any --cameras= CLI override) — that reflects the
+        # SIM's publish set. Fall back to $CAMERAS for profile-less runs
+        # (backward compat with pre-profile invocations).
+        # User-priority rule: an explicit --env.camera_names in
+        # INTERVENTION_EXTRA_ARGS wins over this auto-set.
+        _RECORD_CAMERAS="${PROFILE_ENV_CAMERAS:-$CAMERAS}"
         AUTO_CAMERAS_ARG=()
-        if [ "$CAMERAS" = "state" ] && ! grep -q -- '--env.camera_names' <<< "$INTERVENTION_EXTRA_ARGS"; then
-            AUTO_CAMERAS_ARG=( "--env.camera_names=[]" )
+        if ! grep -q -- '--env.camera_names' <<< "$INTERVENTION_EXTRA_ARGS"; then
+            case "$_RECORD_CAMERAS" in
+                basewrist) AUTO_CAMERAS_ARG=( '--env.camera_names=["base_rgb","wrist_rgb"]' ) ;;
+                base)      AUTO_CAMERAS_ARG=( '--env.camera_names=["base_rgb"]' ) ;;
+                wrist)     AUTO_CAMERAS_ARG=( '--env.camera_names=["wrist_rgb"]' ) ;;
+                state)     AUTO_CAMERAS_ARG=( '--env.camera_names=[]' ) ;;
+                # unknown / empty: leave env default alone (mirrors old behavior
+                # for non-state runs — env config default is [base_rgb, wrist_rgb]).
+            esac
         fi
         # Persist the lerobot-eval output (the lerobot PROCESS — distinct from
         # the sim subprocess's splatsim_<ts>.log) to a per-recording file right
@@ -4434,12 +5077,13 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
                     --env_external_port="$ENV_EXTERNAL_PORT" \
                     --env_external_host="$ENV_EXTERNAL_HOST" \
                     --env_task="$ENV_TASK" \
+                    --env_robot_name="$SPLATSIM_ROBOT_NAME" \
                     --num_dofs="$NUM_DOFS" \
                     --eval_benchmark_repo_id="$EVAL_BENCHMARK_REPO_ID" \
                     --blend_strategy="denoise" \
                     --guidance_repr="absolute_pos" \
                     --blend_mode="once_per_chunk" \
-                    --drain_chunk \
+                    --blend_interval_frac=1.0 \
                     "${BLEND_PUSH_ARG[@]}" \
                     $BLEND_EXTRA_ARGS
                 # Stats sidecar for the blended dataset (mirrors step 1b for raw int).
@@ -4725,8 +5369,8 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             # explicit — it locks the input modality set and keeps the
             # output dir under `_basewrist`, matching `SCRATCH_RUN_NAME`.
             _PER_ROUND_SCRATCH_EXTRA_ARGS=()
-            if [[ -n "$FINETUNE_EXTRA_ARGS" ]]; then
-                _PER_ROUND_SCRATCH_EXTRA_ARGS=( --extra_args="$FINETUNE_EXTRA_ARGS" )
+            if [[ -n "$ROUND0_EXTRA_ARGS_EFF" ]]; then
+                _PER_ROUND_SCRATCH_EXTRA_ARGS=( --extra_args="$ROUND0_EXTRA_ARGS_EFF" )
             fi
             run_training_step bash "$SCRIPT_DIR/train_sweep.sh" \
                 --dataset_repo="$MERGED_REPO" \
@@ -4740,7 +5384,9 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
                 "${ABS_ACTION_ARG[@]}" \
                 "${TRAIN_EXT_PORT_SWEEP[@]}" \
                 "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
+                "${SPLAT_SHADOW_TRAIN_SCRATCH_ARGS[@]}" \
                 "${EXCLUDE_GRIPPER_TRAIN_ARG[@]}" \
+                "${NUM_WORKERS_TRAIN_ARG[@]}" \
                 "${OFFLINE_POLICY_ARG[@]}"
         else
             # Finetune mode. Two important details:
@@ -4770,6 +5416,15 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             if [[ -z "$CURRENT_STEP" ]]; then
                 if [[ "$DRY_RUN" == true && -n "${DRYRUN_NEXT_STEP:-}" ]]; then
                     CURRENT_STEP="$DRYRUN_NEXT_STEP"
+                elif [[ "$DRY_RUN" == true ]]; then
+                    # Round-0 policy isn't trained yet, so its checkpoints/last
+                    # symlink can't resolve to a numeric step dir. Use 0 so the
+                    # dry-run can print the rest of the plan (the real run
+                    # trains round 0 first and extracts the true step). Mirrors
+                    # the <unknown-in-dry-run> placeholder used for FT_CHUNK.
+                    CURRENT_STEP=0
+                    echo "  [dry-run] no numeric checkpoint under $CURRENT_POLICY (round 0 not trained yet);"
+                    echo "            using placeholder starting step 0 — printed --steps values are relative to round-0's end."
                 else
                     echo "ERROR: could not extract current step from policy path: $CURRENT_POLICY" >&2
                     echo "  (resolved as: $RESOLVED_POLICY)" >&2
@@ -4936,10 +5591,17 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
             FT_CHUNK=""
             if [[ "$ACTION_FORMAT" == "rel" ]]; then
                 # Read the chunk size straight off the resumed policy's
-                # train_config.json (`policy.n_action_steps`) — that's the
-                # authoritative source of truth for which sidecar to use, no
-                # per-model hardcoding required.
-                FT_CHUNK="$(n_action_steps_from_policy_path "$CURRENT_POLICY")"
+                # train_config.json — use `horizon` (the model's TRAINING
+                # action-sequence length), NOT `n_action_steps` (execution-only).
+                # For diffusion policies these differ (e.g. horizon=64,
+                # n_action_steps=32); the model trains on 64-step rel-action
+                # targets so the normalizer stats must cover that full range,
+                # otherwise ~half the training targets fall outside [-1,+1]
+                # and get clipped by `clip_sample=True`. See
+                # stats_horizon_from_policy_path's docstring for the full story.
+                # Fallback to n_action_steps for policies where horizon isn't
+                # a distinct config field.
+                FT_CHUNK="$(stats_horizon_from_policy_path "$CURRENT_POLICY")"
                 if [[ -z "$FT_CHUNK" ]]; then
                     if [[ "$DRY_RUN" == true ]]; then
                         # Dry-run for round >1 walks through synthetic policy
@@ -4950,9 +5612,9 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                         # is wrapped in <> to make it obvious it's not a real
                         # path that would resolve.
                         FT_CHUNK="<unknown-in-dry-run>"
-                        echo "  [dry-run] could not read policy.n_action_steps from $CURRENT_POLICY/train_config.json (round >1 dry-run); using <unknown-in-dry-run> placeholder in --dataset.stats_path."
+                        echo "  [dry-run] could not read policy.horizon from $CURRENT_POLICY/train_config.json (round >1 dry-run); using <unknown-in-dry-run> placeholder in --dataset.stats_path."
                     else
-                        echo "ERROR: could not read policy.n_action_steps from $CURRENT_POLICY/train_config.json" >&2
+                        echo "ERROR: could not read policy.horizon (or fallback policy.n_action_steps) from $CURRENT_POLICY/train_config.json" >&2
                         echo "  Needed to pick the right stats_rel{N}.json sidecar for finetune." >&2
                         exit 1
                     fi
@@ -4999,6 +5661,26 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                         W_STATS_PATHS+=( "$STATS_BASE/$_b_short/stats_rel${FT_CHUNK}.json" )
                     done
                 done
+                # Compute-on-demand for missing stats_rel${FT_CHUNK}.json sidecars.
+                # compute_relative_stats.sh's per-round callers above only
+                # produce the historical chunk sizes (8, 50). A checkpoint
+                # whose n_action_steps is neither (e.g. 32 for a diffusion
+                # policy resumed with --policy.n_action_steps=32) will land
+                # here with the sidecar absent — MultiSourceNormalizingDataset
+                # then raises FileNotFoundError. Rather than force users to
+                # re-run compute_relative_stats manually for the right chunk,
+                # detect missing paths and compute them now, once per
+                # dataset. Parallel arrays: W_REPO_IDS[i] ↔ W_STATS_PATHS[i].
+                for _i in "${!W_STATS_PATHS[@]}"; do
+                    _wsp="${W_STATS_PATHS[$_i]}"
+                    _wri="${W_REPO_IDS[$_i]}"
+                    if [[ ! -f "$_wsp" ]]; then
+                        echo "  [weighted-stats] missing stats_rel${FT_CHUNK}.json for $_wri; computing now..."
+                        run_or_echo bash "$SCRIPT_DIR/compute_relative_stats.sh" \
+                            --dataset_repo="$_wri" \
+                            --chunk_sizes="$FT_CHUNK"
+                    fi
+                done
                 # DAgger cap allotment (see --dagger_data_fraction help + the
                 # _py_weighted_sample_weights helper docstring):
                 #   * natural = sum(dag_counts) / total_frames
@@ -5012,7 +5694,7 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                 # disk locally.
                 _n_dag=$(( ${#W_REPO_IDS[@]} - 1 ))
                 _n_blends=${#BLENDS[@]}
-                read -ra W_WEIGHTS <<< "$(_py_weighted_sample_weights "$DAGGER_DATA_FRACTION" "$r" "$_n_blends" "$DRY_RUN" "${W_REPO_IDS[@]}")"
+                read -ra W_WEIGHTS <<< "$(_py_weighted_sample_weights "$DAGGER_DATA_FRACTION" "$r" "$_n_blends" "$TARGET_INTERVENTION_VOLUME" "$DRY_RUN" "$DAGGER_DATA_FRACTION_MODE" "${W_REPO_IDS[@]}")"
                 # Format draccus list strings as JSON arrays — draccus accepts
                 # both [a,b,c] and ['a','b','c']; we go with quoted/JSON so paths
                 # with slashes (which draccus might otherwise mishandle) round-trip
@@ -5076,7 +5758,7 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                     # would otherwise get upstream's EpisodeAwareSampler.
                     --dataset.use_weighted_sampling=true
                 )
-                echo "Weighted sampling: ${#W_REPO_IDS[@]} sub-datasets (1 base + $_n_dag DAgger); cap=${DAGGER_DATA_FRACTION} (per-frame proportional below cap; see [weighted-weights] diagnostic above); weights=${W_WEIGHTS[*]}; norm_mode=$NORM_MODE"
+                echo "Weighted sampling: ${#W_REPO_IDS[@]} sub-datasets (1 base + $_n_dag DAgger); dagger_fraction=${DAGGER_DATA_FRACTION} mode=${DAGGER_DATA_FRACTION_MODE} (see [weighted-weights] diagnostic above); weights=${W_WEIGHTS[*]}; norm_mode=$NORM_MODE"
             elif [[ "$ACTION_FORMAT" == "rel" ]]; then
                 # Merge-mode rel: point at the merged-dataset sidecar (default
                 # legacy behavior).
@@ -5149,9 +5831,10 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                     fi
                 fi
             fi
-            # shellcheck disable=SC2086  # FINETUNE_EXTRA_ARGS is word-split intentionally
+            # shellcheck disable=SC2086  # FINETUNE_EXTRA_ARGS_EFF is word-split intentionally
             if [[ "$_skip_step_6" != true ]]; then
             run_training_step bash "$SCRIPT_DIR/resume_training.sh" "$CURRENT_POLICY" \
+                $FINETUNE_EXTRA_ARGS_EFF \
                 "${FT_REPO_ID_ARG[@]}" \
                 "${FT_MULTI_DATASET_ARGS[@]}" \
                 "${FT_STATS_PATH_ARG[@]}" \
@@ -5167,9 +5850,10 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                 "${FT_SCHEDULER_NAME_ARG[@]}" \
                 "${FT_EVAL_BENCHMARK_ARG[@]}" \
                 "${HEADLESS_TRAIN_ARGS[@]}" \
+                "${SPLAT_SHADOW_TRAIN_ARGS[@]}" \
                 "${EXCLUDE_GRIPPER_TRAIN_ARG[@]}" \
+                "${NUM_WORKERS_FT_ARG[@]}" \
                 "${OFFLINE_POLICY_ARG[@]}" \
-                $FINETUNE_EXTRA_ARGS \
                 --eval.n_episodes="$EVAL_N_EPISODES"
             fi  # end of _skip_step_6 != true
         fi
@@ -5228,13 +5912,14 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                 done
                 _nc_n_blends=${#BLENDS[@]}
                 # Reuse step 6's algorithm via the shared helper.
-                read -ra NC_WEIGHTS <<< "$(_py_weighted_sample_weights "$DAGGER_DATA_FRACTION" "$r" "$_nc_n_blends" "$DRY_RUN" "${NC_REPO_IDS[@]}")"
+                read -ra NC_WEIGHTS <<< "$(_py_weighted_sample_weights "$DAGGER_DATA_FRACTION" "$r" "$_nc_n_blends" "$TARGET_INTERVENTION_VOLUME" "$DRY_RUN" "$DAGGER_DATA_FRACTION_MODE" "${NC_REPO_IDS[@]}")"
                 NC_REPO_IDS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${NC_REPO_IDS[@]}")
                 NC_STATS_PATHS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${NC_STATS_PATHS[@]}")
                 NC_WEIGHTS_JSON=$(python3 -c "import json,sys; print(json.dumps([float(x) for x in sys.argv[1:]], separators=(',', ':')))" "${NC_WEIGHTS[@]}")
-                echo "  [step 6b] Weighted sampling (nocoll): ${#NC_REPO_IDS[@]} sub-datasets; cap=${DAGGER_DATA_FRACTION} (per-frame proportional below cap; see [weighted-weights] diagnostic above); weights=${NC_WEIGHTS[*]}"
-                # shellcheck disable=SC2086  # FINETUNE_EXTRA_ARGS is word-split intentionally
+                echo "  [step 6b] Weighted sampling (nocoll): ${#NC_REPO_IDS[@]} sub-datasets; dagger_fraction=${DAGGER_DATA_FRACTION} mode=${DAGGER_DATA_FRACTION_MODE} (see [weighted-weights] diagnostic above); weights=${NC_WEIGHTS[*]}"
+                # shellcheck disable=SC2086  # FINETUNE_EXTRA_ARGS_EFF is word-split intentionally
                 run_training_step bash "$SCRIPT_DIR/resume_training.sh" "$CURRENT_POLICY" \
+                    $FINETUNE_EXTRA_ARGS_EFF \
                     --dataset.repo_id= \
                     --dataset.repo_ids="$NC_REPO_IDS_JSON" \
                     --dataset.sample_weights="$NC_WEIGHTS_JSON" \
@@ -5254,9 +5939,10 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                     "${FT_SCHEDULER_NAME_ARG[@]}" \
                     "${FT_EVAL_BENCHMARK_ARG[@]}" \
                     "${HEADLESS_TRAIN_ARGS[@]}" \
+                    "${SPLAT_SHADOW_TRAIN_ARGS[@]}" \
                     "${EXCLUDE_GRIPPER_TRAIN_ARG[@]}" \
+                    "${NUM_WORKERS_FT_ARG[@]}" \
                     "${OFFLINE_POLICY_ARG[@]}" \
-                    $FINETUNE_EXTRA_ARGS \
                     --eval.n_episodes="$EVAL_N_EPISODES"
                 write_dagger_config_sidecar "$r" "$NOCOLL_TRAIN_OUTPUT_DIR/dagger/config.json" "$NOCOLL_TRAIN_OUTPUT_DIR"
             fi
@@ -5399,18 +6085,34 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
                 echo "  (per-source sidecars are stats_rel{N}.json; abs path isn't wired)." >&2
                 exit 1
             fi
-            # FT_CHUNK source-of-truth for the from-scratch case: read off the
-            # base policy's n_action_steps (the policy we're comparing against
-            # was trained with this chunk; the from-scratch run will use the
-            # same). For finetune rounds, FT_CHUNK is read from the resumed
-            # policy — that's not available here, so go to the base directly.
-            FS_CHUNK="$(n_action_steps_from_policy_path "$INITIAL_POLICY_PATH")"
+            # FS_CHUNK source-of-truth for the from-scratch case: read off the
+            # base policy's `horizon` (the model's TRAINING action-sequence
+            # length; the policy we're comparing against was trained with this
+            # sequence length, and the from-scratch run will use the same).
+            # NOT n_action_steps — n_action_steps only governs how many actions
+            # get executed per policy call at inference; the loss (and thus
+            # the normalizer's job) is computed over all `horizon` positions.
+            # See stats_horizon_from_policy_path's docstring for the full
+            # rationale. Falls back to n_action_steps for policies where
+            # horizon isn't a distinct config field.
+            #
+            # For finetune rounds, FT_CHUNK is read from the resumed policy —
+            # that's not available here, so go to the base directly. Fall back
+            # to $BASE_TRAINING_DIR when --initial_policy_path wasn't given:
+            # the orchestrator auto-derives BASE_TRAINING_DIR to the same
+            # location where the base was trained (or already exists), and
+            # stats_horizon_from_policy_path walks common layouts
+            # (root / pretrained_model / checkpoints/last/pretrained_model) so
+            # passing the top-level dir works.
+            _FS_POLICY_PATH="${INITIAL_POLICY_PATH:-$BASE_TRAINING_DIR}"
+            FS_CHUNK="$(stats_horizon_from_policy_path "$_FS_POLICY_PATH")"
             if [[ -z "$FS_CHUNK" ]]; then
                 if [[ "$DRY_RUN" == true ]]; then
                     FS_CHUNK="<unknown-in-dry-run>"
                 else
-                    echo "ERROR: could not read policy.n_action_steps from $INITIAL_POLICY_PATH/train_config.json" >&2
+                    echo "ERROR: could not read policy.horizon (or fallback policy.n_action_steps) from $_FS_POLICY_PATH/train_config.json" >&2
                     echo "  Needed to pick the right stats_rel{N}.json sidecar for the multi-source training." >&2
+                    echo "  Tried root, pretrained_model/, and checkpoints/last/pretrained_model/ layouts." >&2
                     exit 1
                 fi
             fi
@@ -5438,7 +6140,7 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
             # identical algorithm to the per-round finetune step (step 6)
             # so the from-scratch run composes its training mix the SAME way
             # the finetune rounds do.
-            read -ra FS_W_WEIGHTS <<< "$(_py_weighted_sample_weights "$DAGGER_DATA_FRACTION" "$NUM_ROUNDS" "${#BLENDS[@]}" "$DRY_RUN" "${FS_W_REPO_IDS[@]}")"
+            read -ra FS_W_WEIGHTS <<< "$(_py_weighted_sample_weights "$DAGGER_DATA_FRACTION" "$NUM_ROUNDS" "${#BLENDS[@]}" "$TARGET_INTERVENTION_VOLUME" "$DRY_RUN" "$DAGGER_DATA_FRACTION_MODE" "${FS_W_REPO_IDS[@]}")"
             FS_REPO_IDS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${FS_W_REPO_IDS[@]}")
             FS_STATS_PATHS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${FS_W_STATS_PATHS[@]}")
             FS_WEIGHTS_JSON=$(python3 -c "import json,sys; print(json.dumps([float(x) for x in sys.argv[1:]], separators=(',', ':')))" "${FS_W_WEIGHTS[@]}")
@@ -5459,15 +6161,15 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
         # to the default benchmark) in train_sweep.sh, making final-scratch
         # + finetune rounds non-comparable in `dagger_progress`. Eval count
         # + other eval knobs (--eval.n_episodes, --env.episode_length, etc.)
-        # come from --extra_args below (from FINETUNE_EXTRA_ARGS).
+        # come from --extra_args below (from ROUND0_EXTRA_ARGS_EFF).
         FS_EVAL_ARGS=(
             --eval_benchmark_repo_id="$EVAL_BENCHMARK_REPO_ID"
         )
         if [[ -n "$INTERVENTION_SUBSET_JSON" ]]; then
             FS_EVAL_ARGS+=( --eval_benchmark_subset="$INTERVENTION_SUBSET_JSON" )
         fi
-        if [[ -n "$FINETUNE_EXTRA_ARGS" ]]; then
-            FS_EVAL_ARGS+=( --extra_args="$FINETUNE_EXTRA_ARGS" )
+        if [[ -n "$ROUND0_EXTRA_ARGS_EFF" ]]; then
+            FS_EVAL_ARGS+=( --extra_args="$ROUND0_EXTRA_ARGS_EFF" )
         fi
         if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
             # --dataset_repo intentionally OMITTED — train_sweep.sh defaults
@@ -5486,7 +6188,9 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
                 "${ABS_ACTION_ARG[@]}" \
                 "${TRAIN_EXT_PORT_SWEEP[@]}" \
                 "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
+                "${SPLAT_SHADOW_TRAIN_SCRATCH_ARGS[@]}" \
                 "${EXCLUDE_GRIPPER_TRAIN_ARG[@]}" \
+                "${NUM_WORKERS_TRAIN_ARG[@]}" \
                 "${OFFLINE_POLICY_ARG[@]}" \
                 "${MULTI_DATASET_ARGS[@]}" \
                 "${FS_EVAL_ARGS[@]}"
@@ -5501,7 +6205,9 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
                 "${ABS_ACTION_ARG[@]}" \
                 "${TRAIN_EXT_PORT_SWEEP[@]}" \
                 "${HEADLESS_TRAIN_SCRATCH_ARGS[@]}" \
+                "${SPLAT_SHADOW_TRAIN_SCRATCH_ARGS[@]}" \
                 "${EXCLUDE_GRIPPER_TRAIN_ARG[@]}" \
+                "${NUM_WORKERS_TRAIN_ARG[@]}" \
                 "${OFFLINE_POLICY_ARG[@]}" \
                 "${FS_EVAL_ARGS[@]}"
         fi

@@ -50,6 +50,13 @@
 #                       a row was sourced from a reeval, so provenance is
 #                       obvious. Pass --no_prefer_reeval to force-read from
 #                       the wandb log even when reeval files exist.
+#   --no_base_only      Hide base-only lineages. By default, a training dir
+#                       with NO `_dag<N>` rounds on disk yet (e.g. an
+#                       --auto_create_source round 0 that's still training)
+#                       gets its own one-row `dag0` table, so in-flight round-0
+#                       runs are visible before the first DAgger round exists.
+#                       Dirs that are already some lineage's dag0 row are not
+#                       repeated.
 #   --reeval_tag=TAG    Pin to a specific reeval tag (e.g. "eplen800_n5_seed0").
 #                       Default: use the most-recently-modified reeval subdir
 #                       per round. Implicitly enables the reeval cascade —
@@ -65,6 +72,7 @@ WATCH_SEC=""
 FILTERS=()
 PREFER_REEVAL=true     # default ON: reeval > wandb-log when reeval exists. Disable with --no_prefer_reeval.
 REEVAL_TAG=""          # empty = use most-recent reeval subdir; set via --reeval_tag to pin
+SHOW_BASE_ONLY=true    # default ON: show base-only (no-dag-rounds-yet) training dirs as a dag0 row. Disable with --no_base_only.
 # --reeval_seeds=S1,S2,S3 — when set, aggregates per-round reevals across the
 # listed seed values (matching reeval tag pattern `eplen*_n*_seed<S>`) and
 # displays each metric cell as `mean±std`. Useful for multi-seed eval
@@ -100,6 +108,8 @@ while (( i < ${#args[@]} )); do
         --watch=*)        WATCH_SEC="${arg#*=}" ;;
         --prefer_reeval)     PREFER_REEVAL=true ;;
         --no_prefer_reeval)  PREFER_REEVAL=false ;;
+        --base_only)         SHOW_BASE_ONLY=true ;;
+        --no_base_only)      SHOW_BASE_ONLY=false ;;
         --reeval_tag=*)      REEVAL_TAG="${arg#*=}"; PREFER_REEVAL=true ;;
         --reeval_seeds=*)
             IFS=',' read -ra _sparts <<< "${arg#*=}"
@@ -164,6 +174,63 @@ discover_lineages() {
         | while read -r d; do basename "$d"; done \
         | sed -E "s/^${MODEL_PREFIX}_//; s/(_ft)?_dag[0-9]+(_[^/]*)?$//" \
         | sort -u
+}
+
+# _resolve_base_dir: map a lineage key to its round-0 (base policy) training dir.
+# Args: $1=lineage. Echoes an absolute path (which may not exist).
+#
+# Lineage may include a run tag (e.g. `..._basewrist_d30`, `..._stateng_d100_05dag`)
+# that's only present on the dag artifacts — the actual base policy dir is
+# untagged (`..._basewrist`, `..._stateng`). Try the tagged path first, then
+# strip everything after the canonical camera tag and retry.
+#
+# Camera tags recognized (dagger_naming.camera_name_tag output vocabulary):
+#   {basewrist, base, wrist, state} × optional `os` (env_state consumed;
+#   never on `state` — state implies oracle) × optional `ng`
+#   (--exclude_gripper_from_state). Longest match first so `basewrist`
+#   isn't shadowed by `wrist`.
+_resolve_base_dir() {
+    local lineage="$1"
+    local base_dir="$TRAINING_ROOT/${MODEL_PREFIX}_${lineage}"
+    if [[ ! -d "$base_dir" ]]; then
+        local _cam_tag_re='_(basewrist|base|wrist|state)(os)?(ng)?_'
+        if [[ "$lineage" =~ $_cam_tag_re ]]; then
+            local _match="${BASH_REMATCH[0]}"          # e.g. "_stateng_"
+            local _cam_suffix="${_match%_}"            # strip trailing _
+            _cam_suffix="${_cam_suffix#_}"             # strip leading _
+            base_dir="$TRAINING_ROOT/${MODEL_PREFIX}_${lineage%_${_cam_suffix}_*}_${_cam_suffix}"
+        fi
+    fi
+    echo "$base_dir"
+}
+
+# discover_base_only_lineages: print training dirs that have NO dag rounds yet
+# and are not already the resolved round-0 dir of some discovered lineage.
+# These render as a single `dag0` row (see BASE_ONLY / print_table), which is
+# what you want while an --auto_create_source base is still training: the
+# lineage has no `_dag${N}` artifacts on disk, so discover_lineages can't see
+# it at all. Opt out with --no_base_only.
+discover_base_only_lineages() {
+    local -A _claimed=()
+    local lin
+    while read -r lin; do
+        [[ -z "$lin" ]] && continue
+        _claimed["$(basename "$(_resolve_base_dir "$lin")")"]=1
+    done < <(discover_lineages)
+
+    local d name
+    while read -r d; do
+        [[ -z "$d" ]] && continue
+        name="$(basename "$d")"
+        # Skip round dirs (they're covered by discover_lineages) and dirs
+        # already shown as some lineage's dag0 row.
+        [[ "$name" == *_dag[0-9]* ]] && continue
+        [[ -n "${_claimed[$name]:-}" ]] && continue
+        # Require it to look like a training dir — otherwise stray scratch
+        # dirs under outputs/training would each get their own table.
+        [[ -d "$d/checkpoints" || -d "$d/wandb" ]] || continue
+        echo "${name#${MODEL_PREFIX}_}"
+    done < <(ls -d "$TRAINING_ROOT/${MODEL_PREFIX}_"* 2>/dev/null) | sort -u
 }
 
 # Detect whether a lineage was trained with --env.terminate_on_collision=true.
@@ -343,47 +410,62 @@ print_row() {
 import json, math, statistics, sys
 paths = [ln for ln in sys.stdin.read().splitlines() if ln]
 def summarize(d):
+    # Key-name handling mirrors the single-seed parser below: position has
+    # two env-dependent spellings, orientation is optional (planar), and
+    # missing overall aggregates get recomputed from per_task.
     o = d.get('overall') or {}
     g = (d.get('per_group') or {}).get('splatsim') or {}
     src = o or g
+    POS_KEYS = ('final_position_error_m', 'final_distance_to_target_m')
+    def info_list(info, keys):
+        for k in keys:
+            v = info.get(k)
+            if v:
+                return v
+        return []
     succ_eplen_vals, fail_pos_err_vals, fail_ori_err_vals, fail_eplen_vals = [], [], [], []
+    succ_total, succ_n = 0, 0
+    pos_all, ori_all, coll_all, trunc_all, eplen_all = [], [], [], [], []
     for t in d.get('per_task') or []:
         m = t.get('metrics') or {}
         successes = m.get('successes') or []
         info = m.get('info_metrics') or {}
         eplen_task = info.get('episode_length') or []
-        pos_task   = info.get('final_position_error_m') or []
+        pos_task   = info_list(info, POS_KEYS)
         ori_task   = info.get('final_orientation_error_deg') or []
-        n = min(len(successes), len(eplen_task), len(pos_task), len(ori_task))
-        for s, L, P, O in zip(successes[:n], eplen_task[:n], pos_task[:n], ori_task[:n]):
+        succ_total += sum(1 for s in successes if s); succ_n += len(successes)
+        pos_all.extend(pos_task); ori_all.extend(ori_task)
+        coll_all.extend(info.get('in_collision') or [])
+        trunc_all.extend(info.get('truncated') or [])
+        eplen_all.extend(eplen_task)
+        for i, s in enumerate(successes):
+            L = eplen_task[i] if i < len(eplen_task) else float('nan')
+            P = pos_task[i]   if i < len(pos_task)   else float('nan')
+            O = ori_task[i]   if i < len(ori_task)   else float('nan')
             if s:
-                succ_eplen_vals.append(L)
+                if L == L: succ_eplen_vals.append(L)
             else:
-                fail_pos_err_vals.append(P); fail_ori_err_vals.append(O); fail_eplen_vals.append(L)
-    succ_eplen   = (sum(succ_eplen_vals)   / len(succ_eplen_vals))   if succ_eplen_vals   else float('nan')
-    fail_pos_err = (sum(fail_pos_err_vals) / len(fail_pos_err_vals)) if fail_pos_err_vals else float('nan')
-    fail_ori_err = (sum(fail_ori_err_vals) / len(fail_ori_err_vals)) if fail_ori_err_vals else float('nan')
-    fail_eplen   = (sum(fail_eplen_vals)   / len(fail_eplen_vals))   if fail_eplen_vals   else float('nan')
-    if src.get('pc_success') is None:
-        succ_total, succ_n = 0, 0
-        pos, ori, coll, trunc, eplen = [], [], [], [], []
-        for t in d.get('per_task') or []:
-            m = t.get('metrics') or {}
-            successes = m.get('successes') or []
-            succ_total += sum(1 for s in successes if s); succ_n += len(successes)
-            info = m.get('info_metrics') or {}
-            pos.extend(info.get('final_position_error_m') or [])
-            ori.extend(info.get('final_orientation_error_deg') or [])
-            coll.extend(info.get('in_collision') or [])
-            trunc.extend(info.get('truncated') or [])
-            eplen.extend(info.get('episode_length') or [])
+                if P == P: fail_pos_err_vals.append(P)
+                if O == O: fail_ori_err_vals.append(O)
+                if L == L: fail_eplen_vals.append(L)
+    avg = lambda xs: (sum(xs) / len(xs)) if xs else float('nan')
+    def agg(keys, computed):
+        for k in keys:
+            v = src.get(k)
+            if v is not None:
+                return v
+        return computed
+    succ = src.get('pc_success')
+    if succ is None:
         if succ_n == 0: return None
-        avg = lambda xs: (sum(xs) / len(xs)) if xs else float('nan')
-        return [100.0*succ_total/succ_n, avg(pos), avg(ori), avg(coll), avg(trunc), avg(eplen), succ_eplen, fail_pos_err, fail_ori_err, fail_eplen]
-    else:
-        return [src['pc_success'], src['avg_final_position_error_m'], src['avg_final_orientation_error_deg'],
-                src.get('avg_in_collision', float('nan')), src.get('avg_truncated', float('nan')),
-                src.get('avg_episode_length', float('nan')), succ_eplen, fail_pos_err, fail_ori_err, fail_eplen]
+        succ = 100.0 * succ_total / succ_n
+    return [succ,
+            agg(('avg_final_position_error_m', 'avg_final_distance_to_target_m'), avg(pos_all)),
+            agg(('avg_final_orientation_error_deg',), avg(ori_all)),
+            agg(('avg_in_collision',), avg(coll_all)),
+            agg(('avg_truncated',), avg(trunc_all)),
+            agg(('avg_episode_length',), avg(eplen_all)),
+            avg(succ_eplen_vals), avg(fail_pos_err_vals), avg(fail_ori_err_vals), avg(fail_eplen_vals)]
 per_seed = []
 for p in paths:
     try:
@@ -414,7 +496,9 @@ std_fmts  = ['±{:.0f}', '±{:.3f}', '±{:.1f}', '±{:.1f}', '±{:.1f}',
              '±{:.0f}', '±{:.0f}', '±{:.3f}', '±{:.1f}', '±{:.0f}']
 parts = []
 for mfmt, sfmt, (m, s, n) in zip(mean_fmts, std_fmts, agg):
-    if n <= 1:
+    if n == 0:
+        parts.append('-')
+    elif n == 1:
         parts.append(mfmt.format(m))
     else:
         parts.append(mfmt.format(m) + sfmt.format(s))
@@ -439,12 +523,26 @@ except Exception:
 o = d.get('overall') or {}
 g = (d.get('per_group') or {}).get('splatsim') or {}
 src = o or g
+# All envs now log final_position_error_m (planar renamed from
+# final_distance_to_target_m on 2026-07-30) — the old spelling is kept as a
+# fallback for pre-rename eval artifacts still on disk. Orientation is
+# optional (planar has no orientation metric). Same fallback logic for the
+# avg_* aggregate spellings in overall/per_group (planar's overall block
+# also lacks avg_in_collision / avg_truncated / avg_episode_length —
+# recompute those from per_task).
+POS_KEYS = ('final_position_error_m', 'final_distance_to_target_m')
+def info_list(info, keys):
+    for k in keys:
+        v = info.get(k)
+        if v:
+            return v
+    return []
 # Walk per_task for success/failure-conditioned metrics — the overall
 # aggregates don't preserve these. For each (success, metric_value) pair,
 # bucket by success status and average each bucket separately.
 #   succ_eplen     = mean episode_length when success
-#   fail_pos_err   = mean final_position_error_m when NOT success
-#   fail_ori_err   = mean final_orientation_error_deg when NOT success
+#   fail_pos_err   = mean position error when NOT success
+#   fail_ori_err   = mean orientation error when NOT success
 #   fail_eplen     = mean episode_length when NOT success (= how long the
 #                    policy thrashed before giving up; large value with
 #                    high fail_pos_err = policy fought the scenario for
@@ -453,47 +551,59 @@ succ_eplen_vals = []
 fail_pos_err_vals = []
 fail_ori_err_vals = []
 fail_eplen_vals = []
+succ_total, succ_n = 0, 0
+pos_all, ori_all, coll_all, trunc_all, eplen_all = [], [], [], [], []
 for t in d.get('per_task') or []:
     m = t.get('metrics') or {}
     successes = m.get('successes') or []
     info = m.get('info_metrics') or {}
     eplen_task = info.get('episode_length') or []
-    pos_task   = info.get('final_position_error_m') or []
+    pos_task   = info_list(info, POS_KEYS)
     ori_task   = info.get('final_orientation_error_deg') or []
-    n = min(len(successes), len(eplen_task), len(pos_task), len(ori_task))
-    for s, L, P, O in zip(successes[:n], eplen_task[:n], pos_task[:n], ori_task[:n]):
+    succ_total += sum(1 for s in successes if s)
+    succ_n += len(successes)
+    pos_all.extend(pos_task); ori_all.extend(ori_task)
+    coll_all.extend(info.get('in_collision') or [])
+    trunc_all.extend(info.get('truncated') or [])
+    eplen_all.extend(eplen_task)
+    # Per-metric index guards (not a min-length collapse) so one missing
+    # metric (planar has no orientation) doesn't blank out the others.
+    for i, s in enumerate(successes):
+        L = eplen_task[i] if i < len(eplen_task) else float('nan')
+        P = pos_task[i]   if i < len(pos_task)   else float('nan')
+        O = ori_task[i]   if i < len(ori_task)   else float('nan')
         if s:
-            succ_eplen_vals.append(L)
+            if L == L: succ_eplen_vals.append(L)
         else:
-            fail_pos_err_vals.append(P)
-            fail_ori_err_vals.append(O)
-            fail_eplen_vals.append(L)
-succ_eplen   = (sum(succ_eplen_vals)   / len(succ_eplen_vals))   if succ_eplen_vals   else float('nan')
-fail_pos_err = (sum(fail_pos_err_vals) / len(fail_pos_err_vals)) if fail_pos_err_vals else float('nan')
-fail_ori_err = (sum(fail_ori_err_vals) / len(fail_ori_err_vals)) if fail_ori_err_vals else float('nan')
-fail_eplen   = (sum(fail_eplen_vals)   / len(fail_eplen_vals))   if fail_eplen_vals   else float('nan')
-
-if src.get('pc_success') is None:
-    succ_total, succ_n = 0, 0
-    pos, ori, coll, trunc, eplen = [], [], [], [], []
-    for t in d.get('per_task') or []:
-        m = t.get('metrics') or {}
-        successes = m.get('successes') or []
-        succ_total += sum(1 for s in successes if s)
-        succ_n += len(successes)
-        info = m.get('info_metrics') or {}
-        pos.extend(info.get('final_position_error_m') or [])
-        ori.extend(info.get('final_orientation_error_deg') or [])
-        coll.extend(info.get('in_collision') or [])
-        trunc.extend(info.get('truncated') or [])
-        eplen.extend(info.get('episode_length') or [])
+            if P == P: fail_pos_err_vals.append(P)
+            if O == O: fail_ori_err_vals.append(O)
+            if L == L: fail_eplen_vals.append(L)
+avg = lambda xs: (sum(xs) / len(xs)) if xs else float('nan')
+succ_eplen   = avg(succ_eplen_vals)
+fail_pos_err = avg(fail_pos_err_vals)
+fail_ori_err = avg(fail_ori_err_vals)
+fail_eplen   = avg(fail_eplen_vals)
+def agg(keys, computed):
+    for k in keys:
+        v = src.get(k)
+        if v is not None:
+            return v
+    return computed
+succ = src.get('pc_success')
+if succ is None:
     if succ_n == 0:
         sys.exit()
     succ = 100.0 * succ_total / succ_n
-    avg = lambda xs: (sum(xs) / len(xs)) if xs else float('nan')
-    print(f'{succ:.0f} {avg(pos):.3f} {avg(ori):.1f} {avg(coll):.1f} {avg(trunc):.1f} {avg(eplen):.0f} {succ_eplen:.0f} {fail_pos_err:.3f} {fail_ori_err:.1f} {fail_eplen:.0f}')
-else:
-    print(f'{src[\"pc_success\"]:.0f} {src[\"avg_final_position_error_m\"]:.3f} {src[\"avg_final_orientation_error_deg\"]:.1f} {src.get(\"avg_in_collision\", float(\"nan\")):.1f} {src.get(\"avg_truncated\", float(\"nan\")):.1f} {src.get(\"avg_episode_length\", float(\"nan\")):.0f} {succ_eplen:.0f} {fail_pos_err:.3f} {fail_ori_err:.1f} {fail_eplen:.0f}')
+pos_err = agg(('avg_final_position_error_m', 'avg_final_distance_to_target_m'), avg(pos_all))
+ori_err = agg(('avg_final_orientation_error_deg',), avg(ori_all))
+in_coll = agg(('avg_in_collision',), avg(coll_all))
+trunc   = agg(('avg_truncated',), avg(trunc_all))
+eplen   = agg(('avg_episode_length',), avg(eplen_all))
+fmt = lambda v, spec: '-' if v != v else spec.format(v)
+print(' '.join([fmt(succ, '{:.0f}'), fmt(pos_err, '{:.3f}'), fmt(ori_err, '{:.1f}'),
+                fmt(in_coll, '{:.1f}'), fmt(trunc, '{:.1f}'), fmt(eplen, '{:.0f}'),
+                fmt(succ_eplen, '{:.0f}'), fmt(fail_pos_err, '{:.3f}'),
+                fmt(fail_ori_err, '{:.1f}'), fmt(fail_eplen, '{:.0f}')]))
 " 2>/dev/null || echo "")
         if [[ -n "$eval_summary" ]]; then
             read -r succ pos_err ori_err in_coll trunc ep_len succ_ep_len fail_pos_err fail_ori_err fail_ep_len <<< "$eval_summary"
@@ -518,12 +628,16 @@ m = re.search(r'(\{.*\})', line)
 if m:
     d = ast.literal_eval(m.group(1))
     succ = d.get('pc_success', float('nan'))
-    pos  = d.get('avg_final_position_error_m', float('nan'))
+    # avg_final_distance_to_target_m = planar's pre-2026-07-30 spelling; kept
+    # for old logs. Planar has no orientation metric (dash stays legitimate).
+    pos  = d.get('avg_final_position_error_m', d.get('avg_final_distance_to_target_m', float('nan')))
     ori  = d.get('avg_final_orientation_error_deg', float('nan'))
     coll = d.get('avg_in_collision', float('nan'))
     trunc= d.get('avg_truncated', float('nan'))
     eplen= d.get('avg_episode_length', float('nan'))
-    print(f'{succ:.0f} {pos:.3f} {ori:.1f} {coll:.1f} {trunc:.1f} {eplen:.0f}')
+    fmt = lambda v, spec: '-' if v != v else spec.format(v)
+    print(' '.join([fmt(succ, '{:.0f}'), fmt(pos, '{:.3f}'), fmt(ori, '{:.1f}'),
+                    fmt(coll, '{:.1f}'), fmt(trunc, '{:.1f}'), fmt(eplen, '{:.0f}')]))
 " 2>/dev/null || echo "")
         fi
         if [[ -n "$eval_summary" ]]; then
@@ -606,14 +720,25 @@ _print_table_header() {
 
 print_table() {
     local lineage="$1"
-    echo "DAgger progress for: ${MODEL_PREFIX}_${lineage}{,[_ft]_dag*}"
+    # $2="base_only" marks a lineage discovered with no `_dag${N}` dirs on
+    # disk — the table is a single dag0 row for the base policy.
+    local base_only="${2:-}"
+    if [[ "$base_only" == "base_only" ]]; then
+        echo "DAgger progress for: ${MODEL_PREFIX}_${lineage}  (base only — no DAgger rounds on disk yet)"
+    else
+        echo "DAgger progress for: ${MODEL_PREFIX}_${lineage}{,[_ft]_dag*}"
+    fi
     # Surface the plot path (whether it currently exists or not, so users can
     # ctrl-click as soon as `python my_scripts/dagger_plot.py` is run).
+    # (skipped for base-only lineages — dagger_plot.py has nothing to plot
+    # from a single round-0 point.)
     local plot_path="${HOME}/code/lerobot/outputs/dagger/dagger_progress_${MODEL_PREFIX}_${lineage}.png"
-    if [[ -f "$plot_path" ]]; then
-        echo "Plot: $plot_path"
-    else
-        echo "Plot: $plot_path  (not generated yet — run: python my_scripts/dagger_plot.py)"
+    if [[ "$base_only" != "base_only" ]]; then
+        if [[ -f "$plot_path" ]]; then
+            echo "Plot: $plot_path"
+        else
+            echo "Plot: $plot_path  (not generated yet — run: python my_scripts/dagger_plot.py)"
+        fi
     fi
     # Read once per lineage; print_row picks it up via dynamic scope.
     local hide_in_coll
@@ -631,19 +756,16 @@ print_table() {
             } | awk -F'_dag' '{print $NF"\t"$0}' | sort -n | cut -f2- )
 
     # Round 0: the base policy training dir for this lineage. Same naming
-    # scheme as the dag rounds but without any _dag${N} suffix. Only show it
-    # when at least one dag round exists, since otherwise every standalone
-    # base training dir would show up as "dag0" in its own one-row table.
+    # scheme as the dag rounds but without any _dag${N} suffix. Printed
+    # whenever it exists — including for base-only lineages with no rounds yet
+    # (an --auto_create_source round-0 still training), which render as a
+    # one-row dag0 table.
     #
-    # Lineage may include a run tag (e.g. `..._basewrist_d30`) that's only
-    # present on the dag artifacts — the actual base policy dir is untagged
-    # (`..._basewrist`). Try the tagged path first, then strip everything
-    # after `_basewrist` and retry.
-    local base_dir="$TRAINING_ROOT/${MODEL_PREFIX}_${lineage}"
-    if [[ -n "$dirs" && ! -d "$base_dir" && "$lineage" == *_basewrist_* ]]; then
-        base_dir="$TRAINING_ROOT/${MODEL_PREFIX}_${lineage%_basewrist_*}_basewrist"
-    fi
-    if [[ -n "$dirs" && -d "$base_dir" ]]; then
+    # Base-dir resolution (tagged path, then camera-tag strip) lives in
+    # _resolve_base_dir so discovery and rendering can't drift.
+    local base_dir
+    base_dir="$(_resolve_base_dir "$lineage")"
+    if [[ -d "$base_dir" ]]; then
         print_row "dag0" "$base_dir" && found=1
     fi
 
@@ -780,13 +902,18 @@ PYEOF
 # Per-prefix block: tables + plot. Caller must set MODEL_PREFIX before
 # invoking. Returns 0 if any lineages were found and printed; 1 if none.
 print_all_for_prefix() {
-    local lineages
+    local lineages base_only_lineages=""
     if [[ -n "$BASE_SHORT" ]]; then
         lineages="${BASE_SHORT}_${ACTION_TAG}_basewrist"
         [[ -n "$RUN_TAG" ]] && lineages="${lineages}_${RUN_TAG}"
     else
         lineages=$(discover_lineages)
-        if [[ -z "$lineages" ]]; then
+        # Base-only lineages (round 0 on disk, no `_dag${N}` rounds yet) are
+        # appended as one-row dag0 tables unless --no_base_only.
+        if [[ "$SHOW_BASE_ONLY" == "true" ]]; then
+            base_only_lineages=$(discover_base_only_lineages)
+        fi
+        if [[ -z "$lineages" && -z "$base_only_lineages" ]]; then
             return 1
         fi
     fi
@@ -797,7 +924,7 @@ print_all_for_prefix() {
     # "nothing matched in this prefix" upward so multi-prefix mode silently
     # skips.
     if (( ${#FILTERS[@]} > 0 )); then
-        local filtered=""
+        local filtered="" filtered_base=""
         for lin in $lineages; do
             for _f in "${FILTERS[@]}"; do
                 if [[ "$lin" == *"$_f"* ]]; then
@@ -806,8 +933,17 @@ print_all_for_prefix() {
                 fi
             done
         done
+        for lin in $base_only_lineages; do
+            for _f in "${FILTERS[@]}"; do
+                if [[ "$lin" == *"$_f"* ]]; then
+                    filtered_base+="${lin}"$'\n'
+                    break
+                fi
+            done
+        done
         lineages="${filtered%$'\n'}"
-        if [[ -z "$lineages" ]]; then
+        base_only_lineages="${filtered_base%$'\n'}"
+        if [[ -z "$lineages" && -z "$base_only_lineages" ]]; then
             return 1
         fi
     fi
@@ -820,6 +956,15 @@ print_all_for_prefix() {
             echo
         fi
         print_table "$lin"
+        first=0
+    done
+    for lin in $base_only_lineages; do
+        if (( first == 0 )); then
+            echo
+            echo "----------------------------------------------------------------------"
+            echo
+        fi
+        print_table "$lin" base_only
         first=0
     done
 
@@ -870,7 +1015,11 @@ print_all() {
         # doesn't use). In single-prefix mode (--model=X) we DO want the
         # error, so handle that at the end.
         if [[ -z "$BASE_SHORT" ]] && [[ -z "$(discover_lineages)" ]]; then
-            continue
+            # No dag rounds for this prefix — still print if base-only
+            # lineages are enabled and any exist.
+            if [[ "$SHOW_BASE_ONLY" != "true" || -z "$(discover_base_only_lineages)" ]]; then
+                continue
+            fi
         fi
 
         if (( first_block == 0 )); then

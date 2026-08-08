@@ -35,7 +35,7 @@ import matplotlib.pyplot as plt
 # they're now shared with the orchestrator + viz scripts via dagger_naming.py
 # so forward / inverse mappings can't drift.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dagger_naming import ROUND_SUFFIX_RE, lineage_of  # noqa: E402
+from dagger_naming import ROUND_SUFFIX_RE, base_lineage_of, lineage_of  # noqa: E402
 
 TRAINING_ROOT = Path.home() / "code" / "lerobot" / "outputs" / "training"
 DEFAULT_OUT_DIR = Path.home() / "code" / "lerobot" / "outputs" / "dagger"
@@ -73,6 +73,7 @@ def _parse_reeval_eval_info(json_path: Path) -> dict | None:
     o = d.get("overall") or {}
     g = (d.get("per_group") or {}).get("splatsim") or {}
     src = o or g
+
     # Success/failure-conditioned aggregates — only computable from per_task
     # data (the overall / per_group blocks only have unconditional means).
     # Walk per_task regardless of which aggregate path we use so the
@@ -81,61 +82,68 @@ def _parse_reeval_eval_info(json_path: Path) -> dict | None:
     #   succ_ep_len  = mean episode_length    on success
     #   fail_pos_err = mean position error    on failure
     #   fail_ori_err = mean orientation error on failure
-    succ_eplen_vals, fail_pos_vals, fail_ori_vals = [], [], []
-    for t in d.get("per_task") or []:
-        m = t.get("metrics") or {}
-        successes = m.get("successes") or []
-        info = m.get("info_metrics") or {}
-        eplen_task = info.get("episode_length") or []
-        pos_task = info.get("final_position_error_m") or []
-        ori_task = info.get("final_orientation_error_deg") or []
-        n = min(len(successes), len(eplen_task), len(pos_task), len(ori_task))
-        for s, L, P, O in zip(successes[:n], eplen_task[:n], pos_task[:n], ori_task[:n]):
-            if s:
-                succ_eplen_vals.append(L)
-            else:
-                fail_pos_vals.append(P)
-                fail_ori_vals.append(O)
-    succ_ep_len_val = (sum(succ_eplen_vals) / len(succ_eplen_vals)) if succ_eplen_vals else None
-    fail_pos_err_val = (sum(fail_pos_vals) / len(fail_pos_vals)) if fail_pos_vals else None
-    fail_ori_err_val = (sum(fail_ori_vals) / len(fail_ori_vals)) if fail_ori_vals else None
+    # All envs now log final_position_error_m (planar renamed from
+    # final_distance_to_target_m on 2026-07-30) — the old spelling is kept as
+    # a fallback for pre-rename eval artifacts. Orientation is optional
+    # (planar has no orientation metric). The planar overall block also lacks
+    # the avg_in_collision / avg_truncated / avg_episode_length aggregates,
+    # so per_task unconditional aggregates are always computed as a fallback
+    # per-key.
+    def _info_pos(info):
+        return info.get("final_position_error_m") or info.get("final_distance_to_target_m") or []
 
-    if src.get("pc_success") is not None:
-        return {
-            "succ": src.get("pc_success"),
-            "pos_err": src.get("avg_final_position_error_m"),
-            "ori_err": src.get("avg_final_orientation_error_deg"),
-            "in_coll": src.get("avg_in_collision"),
-            "trunc": src.get("avg_truncated"),
-            "ep_len": src.get("avg_episode_length"),
-            "succ_ep_len": succ_ep_len_val,
-            "fail_pos_err": fail_pos_err_val,
-            "fail_ori_err": fail_ori_err_val,
-        }
-    # Aggregate from per_task[].metrics.
+    succ_eplen_vals, fail_pos_vals, fail_ori_vals = [], [], []
     succ_total, succ_n = 0, 0
     pos, ori, coll, trunc, eplen = [], [], [], [], []
     for t in d.get("per_task") or []:
         m = t.get("metrics") or {}
         successes = m.get("successes") or []
+        info = m.get("info_metrics") or {}
+        eplen_task = info.get("episode_length") or []
+        pos_task = _info_pos(info)
+        ori_task = info.get("final_orientation_error_deg") or []
         succ_total += sum(1 for s in successes if s)
         succ_n += len(successes)
-        info = m.get("info_metrics") or {}
-        pos.extend(info.get("final_position_error_m") or [])
-        ori.extend(info.get("final_orientation_error_deg") or [])
+        pos.extend(pos_task)
+        ori.extend(ori_task)
         coll.extend(info.get("in_collision") or [])
         trunc.extend(info.get("truncated") or [])
-        eplen.extend(info.get("episode_length") or [])
-    if succ_n == 0:
-        return None
+        eplen.extend(eplen_task)
+        # Per-metric index guards (not a min-length collapse) so one missing
+        # metric (planar has no orientation) doesn't blank out the others.
+        for i, s in enumerate(successes):
+            if s:
+                if i < len(eplen_task):
+                    succ_eplen_vals.append(eplen_task[i])
+            else:
+                if i < len(pos_task):
+                    fail_pos_vals.append(pos_task[i])
+                if i < len(ori_task):
+                    fail_ori_vals.append(ori_task[i])
     avg = lambda xs: (sum(xs) / len(xs)) if xs else None
+    succ_ep_len_val = avg(succ_eplen_vals)
+    fail_pos_err_val = avg(fail_pos_vals)
+    fail_ori_err_val = avg(fail_ori_vals)
+
+    def _agg(computed, *keys):
+        for k in keys:
+            v = src.get(k)
+            if v is not None:
+                return v
+        return computed
+
+    succ = src.get("pc_success")
+    if succ is None:
+        if succ_n == 0:
+            return None
+        succ = 100.0 * succ_total / succ_n
     return {
-        "succ": 100.0 * succ_total / succ_n,
-        "pos_err": avg(pos),
-        "ori_err": avg(ori),
-        "in_coll": avg(coll),
-        "trunc": avg(trunc),
-        "ep_len": avg(eplen),
+        "succ": succ,
+        "pos_err": _agg(avg(pos), "avg_final_position_error_m", "avg_final_distance_to_target_m"),
+        "ori_err": _agg(avg(ori), "avg_final_orientation_error_deg"),
+        "in_coll": _agg(avg(coll), "avg_in_collision"),
+        "trunc": _agg(avg(trunc), "avg_truncated"),
+        "ep_len": _agg(avg(eplen), "avg_episode_length"),
         "succ_ep_len": succ_ep_len_val,
         "fail_pos_err": fail_pos_err_val,
         "fail_ori_err": fail_ori_err_val,
@@ -230,7 +238,12 @@ def scan_round(dir_path: Path, round_n: int | None = None, prefer_reeval: bool =
             d = parse_eval_dict(eval_lines[-1])
             if d:
                 row["succ"] = d.get("pc_success")
-                row["pos_err"] = d.get("avg_final_position_error_m")
+                # avg_final_distance_to_target_m = planar's pre-2026-07-30
+                # spelling; kept for old wandb logs
+                pos_err = d.get("avg_final_position_error_m")
+                if pos_err is None:
+                    pos_err = d.get("avg_final_distance_to_target_m")
+                row["pos_err"] = pos_err
                 row["ori_err"] = d.get("avg_final_orientation_error_deg")
                 row["in_coll"] = d.get("avg_in_collision")
                 row["trunc"] = d.get("avg_truncated")
@@ -377,9 +390,10 @@ def collect_lineage_rows(lineage: str, model: str, prefer_reeval: bool = True) -
     rows = [r for r in (scan_round(d, prefer_reeval=prefer_reeval) for d in dirs) if r is not None]
     if rows:
         base_dir = TRAINING_ROOT / f"{model}_{lineage}"
-        if not base_dir.is_dir() and "_basewrist_" in lineage:
-            untagged = lineage.rsplit("_basewrist_", 1)[0] + "_basewrist"
-            base_dir = TRAINING_ROOT / f"{model}_{untagged}"
+        if not base_dir.is_dir():
+            untagged = base_lineage_of(lineage)
+            if untagged:
+                base_dir = TRAINING_ROOT / f"{model}_{untagged}"
         if base_dir.is_dir():
             row0 = scan_round(base_dir, round_n=0, prefer_reeval=prefer_reeval)
             if row0 is not None:
@@ -616,6 +630,20 @@ def plot_comparison_metric(
                 and r.get("retrain_suffix") == "nc"
                 and r.get(metric) is not None
             ]
+            # Anchor the nc curve at the shared round-0 base point (same
+            # origin as its raw sibling — both branch from the base policy).
+            # Without it a single-round nc series floats as a disconnected
+            # marker with no visible slope.
+            _row0 = next(
+                (
+                    r
+                    for r in rows
+                    if r.get("variant", "ft") == "ft" and r.get("round") == 0 and r.get(metric) is not None
+                ),
+                None,
+            )
+            if _row0 is not None and ft_rows:
+                ft_rows = [_row0] + ft_rows
             scratch_rows: list[dict] = []  # scratch stars only apply to the raw ft curve
         else:
             ft_rows = [r for r in rows if r.get("variant", "ft") == "ft" and r.get(metric) is not None]
@@ -681,6 +709,134 @@ def plot_comparison_metric(
     all_xs = sorted({r["round"] for _, rows, _ in series for r in rows if r.get(metric) is not None})
     if all_xs:
         ax.set_xticks(all_xs)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best", fontsize=8, framealpha=0.9)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return drew_anything
+
+
+def plot_comparison_metric_delta(
+    source_lineage: str,
+    rerun_lineages: list[str],
+    model: str,
+    metric: str,
+    axis_label: str,
+    direction: str,
+    out_path: Path,
+    prefer_reeval: bool = True,
+) -> int:
+    """Per-round Δ(rerun − source) line plot for ONE metric.
+
+    Line-graph companion to ``plot_comparison_metric_avg_delta_bar``: instead
+    of collapsing to one mean bar per rerun, shows the difference to the
+    source run at EVERY common DAgger round, so you can see WHEN a blend
+    combination helps rather than just whether it helps on average.
+
+    Plots the RAW difference (rerun − source) — no sign flipping. The
+    metric's own direction applies and is stated in the title: for
+    "↑ better" metrics positive Δ = rerun beats source; for "↓ better"
+    metrics negative Δ does. The source is the y=0 reference line (black,
+    matching its color in the absolute plot). Rerun colors / markers /
+    linestyles (incl. the dotted hollow-marker `_nc` siblings) mirror
+    ``plot_comparison_metric``. Round 0 is the shared base policy, so every
+    curve anchors at Δ=0 there. Returns total points drawn.
+    """
+    src_rows = collect_lineage_rows(source_lineage, model, prefer_reeval=prefer_reeval)
+    src_by_round = {
+        r["round"]: r[metric]
+        for r in src_rows
+        if r.get("variant", "ft") == "ft" and r.get(metric) is not None
+    }
+    if not src_by_round:
+        return 0
+
+    color_by_lineage = _name_rainbow_colors(rerun_lineages)
+    rerun_markers = ["s", "^", "v", "D", "P", "X", "<", ">", "p", "h"]
+    fig, ax = plt.subplots(figsize=(13, 6))
+    drew_anything = 0
+    all_rounds_plotted: set[int] = set()
+    for i, rerun in enumerate(rerun_lineages):
+        rows = collect_lineage_rows(rerun, model, prefer_reeval=prefer_reeval)
+        marker = rerun_markers[i % len(rerun_markers)]
+        color = color_by_lineage[rerun]
+        for series_variant in ("ft", "nc"):
+            if series_variant == "ft":
+                sel = [r for r in rows if r.get("variant", "ft") == "ft" and r.get(metric) is not None]
+                style = {"linestyle": "--", "linewidth": 1.8, "marker": marker, "color": color, "zorder": 2}
+                label = rerun
+            else:
+                sel = [
+                    r
+                    for r in rows
+                    if r.get("variant") == "retrain"
+                    and r.get("retrain_suffix") == "nc"
+                    and r.get(metric) is not None
+                ]
+                if not sel:
+                    continue
+                # Anchor at the shared round-0 base point, mirroring the
+                # absolute comparison plot's nc handling.
+                _row0 = next(
+                    (
+                        r
+                        for r in rows
+                        if r.get("variant", "ft") == "ft"
+                        and r.get("round") == 0
+                        and r.get(metric) is not None
+                    ),
+                    None,
+                )
+                if _row0 is not None:
+                    sel = [_row0] + sel
+                style = {
+                    "linestyle": ":",
+                    "linewidth": 1.8,
+                    "marker": marker,
+                    "markerfacecolor": "white",
+                    "markeredgecolor": color,
+                    "color": color,
+                    "zorder": 2,
+                }
+                label = f"{rerun} (nc)"
+            pts = [
+                (r["round"], r[metric] - src_by_round[r["round"]]) for r in sel if r["round"] in src_by_round
+            ]
+            if not pts:
+                continue
+            xs = [x for x, _ in pts]
+            ys = [y for _, y in pts]
+            all_rounds_plotted.update(xs)
+            ax.plot(xs, ys, label=f"{label}   latest Δ={ys[-1]:+.3g}", **style)
+            for x, y in zip(xs, ys, strict=True):
+                ax.annotate(
+                    f"{y:+.3g}",
+                    xy=(x, y),
+                    xytext=(0, 6),
+                    textcoords="offset points",
+                    ha="center",
+                    fontsize=7,
+                    color=color,
+                )
+            drew_anything += len(xs)
+
+    if drew_anything == 0:
+        plt.close(fig)
+        return 0
+
+    ax.axhline(0.0, color="black", linewidth=2.2, zorder=1, label="source (Δ=0 reference)")
+    ax.set_xlabel("DAgger round")
+    ax.set_ylabel(f"Δ {axis_label}   (rerun − source)")
+    better_note = "positive Δ = rerun better" if "↑" in direction else "negative Δ = rerun better"
+    ax.set_title(
+        f"DAgger per-round Δ vs source ({direction}; {better_note})\n"
+        f"source = {model}_{source_lineage} (black y=0 line)",
+        fontsize=10,
+    )
+    if all_rounds_plotted:
+        ax.set_xticks(sorted(all_rounds_plotted))
     ax.grid(True, alpha=0.3)
     ax.legend(loc="best", fontsize=8, framealpha=0.9)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -856,14 +1012,16 @@ def plot_lineage(lineage: str, model: str, out_path: Path, prefer_reeval: bool =
     # dag round exists — otherwise a standalone base training would plot as
     # a single round-0 point.
     #
-    # Lineage may include a run tag (e.g. `..._basewrist_d30`) that's only
-    # present on the dag artifacts — the actual base policy dir is untagged
-    # (`..._basewrist`). Try the tagged path first, then strip the tag.
+    # Lineage may include a run tag (e.g. `..._basewrist_d30`,
+    # `..._stateng_d100_05dag`) that's only present on the dag artifacts —
+    # the actual base policy dir is untagged. Try the tagged path first,
+    # then strip everything after the camera tag (dagger_naming.base_lineage_of).
     if rows:
         base_dir = TRAINING_ROOT / f"{model}_{lineage}"
-        if not base_dir.is_dir() and "_basewrist_" in lineage:
-            untagged = lineage.rsplit("_basewrist_", 1)[0] + "_basewrist"
-            base_dir = TRAINING_ROOT / f"{model}_{untagged}"
+        if not base_dir.is_dir():
+            untagged = base_lineage_of(lineage)
+            if untagged:
+                base_dir = TRAINING_ROOT / f"{model}_{untagged}"
         if base_dir.is_dir():
             row0 = scan_round(base_dir, round_n=0, prefer_reeval=prefer_reeval)
             if row0 is not None:
@@ -1175,6 +1333,21 @@ def main():
                 )
                 if lines > 0:
                     print(f"  {out_path.resolve()}")
+                # Per-round Δ(rerun − source) line plot: same metric, same
+                # colors; source collapses to the y=0 reference.
+                delta_path = comp_dir / f"{metric_key}_delta.png"
+                deltas = plot_comparison_metric_delta(
+                    source_lin,
+                    sorted_reruns,
+                    args.model,
+                    metric_key,
+                    axis_label,
+                    direction,
+                    delta_path,
+                    prefer_reeval=prefer_reeval,
+                )
+                if deltas > 0:
+                    print(f"  {delta_path.resolve()}")
                 # Companion bar chart: per-rerun mean (rerun − source) across
                 # canonical ft rounds. Same metric, same colors.
                 bar_path = comp_dir / f"{metric_key}_avg_delta_bar.png"

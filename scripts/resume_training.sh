@@ -37,6 +37,10 @@ set -euo pipefail
 #   --dataset.stats_path=PATH  Override the sidecar relative-action stats path.
 #                              Required when changing --dataset.repo_id under a
 #                              policy that uses relative-action normalization.
+#   --num_workers=N            DataLoader worker processes. Default 16 (lerobot's
+#                              own default of 4 starves the GPU on a many-core
+#                              box). Empty (--num_workers=) inherits the value
+#                              stored in the resumed train_config.json.
 #   --env.external_port=N      Connect lerobot-train's inline eval to an external
 #                              SplatSim ZMQ server at this port (e.g. 6001) instead
 #                              of spawning a new one. Required when running this
@@ -191,6 +195,22 @@ POLICY_PUSH_TO_HUB=""   # empty = inherit from train_config.json
 OUTPUT_DIR=""
 JOB_NAME=""
 BATCH_SIZE=""           # empty = inherit from train_config.json
+# DataLoader workers (lerobot-train --num_workers). lerobot's own default is 4,
+# which underutilizes a many-core CPU and starves the GPU during batch assembly.
+# Default 16 here (measured optimum on a 24-core box; 20+ regresses); it is emitted BEFORE the unknown-arg
+# passthrough, so an explicit --num_workers inside a passthrough string still
+# wins (draccus last-wins). Set empty (--num_workers=) to inherit whatever the
+# resumed train_config.json holds.
+NUM_WORKERS=16
+# Video decoder (lerobot-train --dataset.video_backend). A train_config.json
+# saved while torchcodec was unloadable records `video_backend: pyav`, and a
+# resume inherits that pin forever — so default it explicitly here. torchcodec
+# decodes ~4.8x faster than pyav on these AV1 datasets (bit-identical output)
+# and caches decoders instead of reopening the container per call. Emitted
+# BEFORE the unknown-arg passthrough, so an explicit --dataset.video_backend
+# in a passthrough string still wins (draccus last-wins). Set empty
+# (--video_backend=) to inherit whatever the resumed train_config.json holds.
+VIDEO_BACKEND=torchcodec
 DRY_RUN=false
 # Unknown --key=value args are passed through to lerobot-train verbatim. Lets
 # callers (e.g. dagger_orchestrate.sh's --finetune_extra_args) override any
@@ -224,6 +244,8 @@ for arg in "$@"; do
         --output_dir=*)             OUTPUT_DIR="${arg#*=}" ;;
         --job_name=*)               JOB_NAME="${arg#*=}" ;;
         --batch_size=*)             BATCH_SIZE="${arg#*=}" ;;
+        --num_workers=*)            NUM_WORKERS="${arg#*=}" ;;
+        --video_backend=*)          VIDEO_BACKEND="${arg#*=}" ;;
         --dry-run)                  DRY_RUN=true ;;
         --exclude_gripper_from_state)         EXCLUDE_GRIPPER_FROM_STATE=true ;;
         --exclude_gripper_from_state=*)       EXCLUDE_GRIPPER_FROM_STATE="${arg#*=}" ;;
@@ -371,6 +393,8 @@ fi
 [[ -n "$OUTPUT_DIR" ]]                 && CMD_ARGS+=( --output_dir="$OUTPUT_DIR" )
 [[ -n "$JOB_NAME" ]]                   && CMD_ARGS+=( --job_name="$JOB_NAME" )
 [[ -n "$BATCH_SIZE" ]]                 && CMD_ARGS+=( --batch_size="$BATCH_SIZE" )
+[[ -n "$NUM_WORKERS" ]]                && CMD_ARGS+=( --num_workers="$NUM_WORKERS" )
+[[ -n "$VIDEO_BACKEND" ]]              && CMD_ARGS+=( --dataset.video_backend="$VIDEO_BACKEND" )
 # Forward any unknown --key=value args verbatim. Note: if an override here
 # duplicates one of the explicit flags above, lerobot-train uses the LAST
 # value seen, so passthrough takes precedence — caller can override e.g.
@@ -401,6 +425,8 @@ fi
 [[ -n "$OUTPUT_DIR" ]]         && echo "Override:      --output_dir=$OUTPUT_DIR"
 [[ -n "$JOB_NAME" ]]           && echo "Override:      --job_name=$JOB_NAME"
 [[ -n "$BATCH_SIZE" ]]         && echo "Override:      --batch_size=$BATCH_SIZE"
+[[ -n "$NUM_WORKERS" ]]        && echo "Override:      --num_workers=$NUM_WORKERS"
+[[ -n "$VIDEO_BACKEND" ]]      && echo "Override:      --dataset.video_backend=$VIDEO_BACKEND"
 echo "================================================================"
 echo
 echo "Command:"

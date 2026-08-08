@@ -1934,9 +1934,9 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # obs_state as the observation, then run the steps directly.
         actual_q_t = None
         try:
+            from lerobot.lerobot_types import TransitionKey
             from lerobot.processor.converters import create_transition
             from lerobot.processor.normalize_processor import UnnormalizerProcessorStep
-            from lerobot.types import TransitionKey
 
             transition = create_transition(observation={OBS_STATE: obs_state})
             for _step in self.inverse_preprocessor.steps:

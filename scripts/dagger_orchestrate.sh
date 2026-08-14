@@ -1131,9 +1131,17 @@ ORIG_ARGV=( "$@" )
 
 # Pre-scan for --env_profile so it sets env-specific defaults BEFORE the main
 # arg loop, which explicit flags then override (defaults < profile < flags).
+# Also pre-scan for --cleanup_only: cleanup replays the sidecar's recorded
+# argv (dagger_cleanup_lineage.sh), which may contain flags this script has
+# since removed. Deleting a lineage must not require its original flags to
+# still parse — downgrade unknown args to a warning in that mode. The flag
+# can appear anywhere in argv (the cleanup wrapper appends it LAST), which is
+# why the main loop's own CLEANUP_ONLY assignment can't be used for this.
+_CLEANUP_ONLY_PRESCAN=false
 for arg in "$@"; do
     case "$arg" in
         --env_profile=*) PROFILE_NAME="${arg#*=}" ;;
+        --cleanup_only)  _CLEANUP_ONLY_PRESCAN=true ;;
     esac
 done
 if [[ -n "$PROFILE_NAME" ]]; then
@@ -1251,7 +1259,13 @@ for arg in "$@"; do
         --splatsim_robot_name=*)      SPLATSIM_ROBOT_NAME="${arg#*=}" ;;
         --env_profile=*)              ;;  # consumed in the pre-scan above; no-op here
         --dry-run)                    DRY_RUN=true ;;
-        *) echo "Unknown argument: $arg" >&2; exit 1 ;;
+        *)
+            if [[ "$_CLEANUP_ONLY_PRESCAN" == true ]]; then
+                echo "WARNING: ignoring unknown argument in --cleanup_only mode (likely a flag from an older version of this script, replayed from the sidecar argv): $arg" >&2
+            else
+                echo "Unknown argument: $arg" >&2; exit 1
+            fi
+            ;;
     esac
 done
 

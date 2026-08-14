@@ -87,7 +87,8 @@ class RRTGuidanceSource:
         blocking_plan: bool = True,
         auto_pause_on_finish: bool = True,
         path_selection: PathSelectionStrategy | str | None = None,
-        segment_at_sharp_corners: bool = True,
+        path_score_joint_arc_weight: float = 0.0,
+        segment_at_sharp_corners: bool | None = None,
         ik_goal_selection: str | None = None,
         num_path_candidates_per_ik: int = 1,
         max_path_attempts_per_ik: int = 5,
@@ -102,20 +103,25 @@ class RRTGuidanceSource:
         ik_skip_gripper_obstacle_pairs: bool = False,
         escape_clearance_factor: float = 1.5,
         rewind_clearance_factor: float | None = None,
-        final_approach_dist: float = 0.0,
-        final_approach_vel_scale: float = 0.3,
-        final_approach_acc_scale: float = 0.25,
-        uniform_path_speed: bool = False,
+        final_approach_dist: float | None = None,
+        final_approach_vel_scale: float | None = None,
+        final_approach_acc_scale: float | None = None,
+        max_joint_vel: float | None = None,
+        max_joint_acc: float | None = None,
+        max_joint_jerk: float | None = None,
+        rrt_smooth_iterations: int | None = None,
+        rrt_elastic_smooth_passes: int | None = None,
+        uniform_path_speed: bool | None = None,
         # CHOMP-lite trajopt smoothing pass. See SharedAutonomyConfig for
         # semantics; forwarded to RRTToGoalPlanner in _ensure_planner.
         # Default 15 matches SharedAutonomyConfig / the planner ctor
         # (SplatSim's TrajectoryGenModeConfig uses 30).
-        trajopt_passes: int = 15,
-        trajopt_lr: float = 0.02,
-        trajopt_smoothness_weight: float = 1.0,
-        trajopt_collision_weight: float = 5.0,
-        trajopt_collision_threshold: float = 0.10,
-        trajopt_fd_step: float = 0.01,
+        trajopt_passes: int | None = None,
+        trajopt_lr: float | None = None,
+        trajopt_smoothness_weight: float | None = None,
+        trajopt_collision_weight: float | None = None,
+        trajopt_collision_threshold: float | None = None,
+        trajopt_fd_step: float | None = None,
     ) -> None:
         self._wrapper = wrapper
         # Same dataclass that used to live on the wrapper as `_rrt`. The
@@ -165,15 +171,21 @@ class RRTGuidanceSource:
             self.path_selection = PathSelectionStrategy(path_selection)
         else:
             self.path_selection = path_selection
-        # Flag forwarded to ruckig parametrization. When True (default),
-        # ruckig splits the path at sharp-angle waypoints and forces zero
+        # Joint-arc regularizer added to the base path score (m/rad for the
+        # arc-length strategies). 0 = off. See RRTToGoalPlanner ctor for the
+        # near-goal EE-arc degeneracy this breaks ties on.
+        self.path_score_joint_arc_weight = float(path_score_joint_arc_weight)
+        # Flag forwarded to time parametrization. When True (default),
+        # the parametrizer splits the path at sharp-angle waypoints and forces zero
         # velocity at each boundary — historical stop-and-go mode. When
-        # False, ruckig optimizes the full path in one call without forced
+        # False, it optimizes the full path in one call without forced
         # internal stops. Empirically the two modes produce indistinguishable
         # trajectories on typical manipulation RRT plans (which rarely have
         # sharp internal corners), so True is the conservative default. See
-        # `splatsim.utils.rrt_path_utils.ruckig_parametrize_path`.
-        self.segment_at_sharp_corners = bool(segment_at_sharp_corners)
+        # `splatsim.utils.rrt_path_utils.parametrize_path`.
+        self.segment_at_sharp_corners = (
+            None if segment_at_sharp_corners is None else bool(segment_at_sharp_corners)
+        )
         # Forwarded to the planner. When set, the planner picks IK
         # candidates by goal-state geometry alone (no path scoring) and
         # path_selection is unused. See IkGoalSelectionStrategy in
@@ -238,22 +250,39 @@ class RRTGuidanceSource:
         self.rewind_clearance_factor = (
             float(rewind_clearance_factor) if rewind_clearance_factor is not None else None
         )
-        # Final-approach taper (ruckig): brake to a stop `final_approach_dist`
+        # Final-approach taper: brake to a stop `final_approach_dist`
         # rad before the goal, then creep at the scaled limits so the tracked
         # robot doesn't overshoot the final waypoint. Mirrors SplatSim
         # traj-gen's TrajectoryGenModeConfig.final_approach_* so intervention
         # chunks and demos end with the same approach behavior. Forwarded to
         # the planner ctor; 0.0 = off.
-        self.final_approach_dist = float(final_approach_dist)
-        self.final_approach_vel_scale = float(final_approach_vel_scale)
-        self.final_approach_acc_scale = float(final_approach_acc_scale)
-        self.uniform_path_speed = bool(uniform_path_speed)
-        self.trajopt_passes = int(trajopt_passes)
-        self.trajopt_lr = float(trajopt_lr)
-        self.trajopt_smoothness_weight = float(trajopt_smoothness_weight)
-        self.trajopt_collision_weight = float(trajopt_collision_weight)
-        self.trajopt_collision_threshold = float(trajopt_collision_threshold)
-        self.trajopt_fd_step = float(trajopt_fd_step)
+        self.final_approach_dist = None if final_approach_dist is None else float(final_approach_dist)
+        self.final_approach_vel_scale = (
+            None if final_approach_vel_scale is None else float(final_approach_vel_scale)
+        )
+        self.final_approach_acc_scale = (
+            None if final_approach_acc_scale is None else float(final_approach_acc_scale)
+        )
+        self.max_joint_vel = None if max_joint_vel is None else float(max_joint_vel)
+        self.max_joint_acc = None if max_joint_acc is None else float(max_joint_acc)
+        self.max_joint_jerk = None if max_joint_jerk is None else float(max_joint_jerk)
+        self.rrt_smooth_iterations = None if rrt_smooth_iterations is None else int(rrt_smooth_iterations)
+        self.rrt_elastic_smooth_passes = (
+            None if rrt_elastic_smooth_passes is None else int(rrt_elastic_smooth_passes)
+        )
+        self.uniform_path_speed = None if uniform_path_speed is None else bool(uniform_path_speed)
+        self.trajopt_passes = None if trajopt_passes is None else int(trajopt_passes)
+        self.trajopt_lr = None if trajopt_lr is None else float(trajopt_lr)
+        self.trajopt_smoothness_weight = (
+            None if trajopt_smoothness_weight is None else float(trajopt_smoothness_weight)
+        )
+        self.trajopt_collision_weight = (
+            None if trajopt_collision_weight is None else float(trajopt_collision_weight)
+        )
+        self.trajopt_collision_threshold = (
+            None if trajopt_collision_threshold is None else float(trajopt_collision_threshold)
+        )
+        self.trajopt_fd_step = None if trajopt_fd_step is None else float(trajopt_fd_step)
         # Env handle for the pre-execution teleport. Set externally via the
         # wrapper's `set_env_for_teleport(env)`; None means teleport is a no-op.
         self._env_for_teleport: object | None = None
@@ -296,7 +325,7 @@ class RRTGuidanceSource:
             ctx: unused for RRT (it reads from the wrapper back-ref).
             no_lookback: when True, _do_plan skips the lookback sampling
                 and teleport entirely — q_start = wrapper._latest_actual_q
-                (the robot's current config) and ruckig's start_vel matches
+                (the robot's current config) and the parametrizer's start_vel matches
                 the robot's recent joint velocity. Used by the wrapper's
                 future-chunk predictive shield (future_chunk + hybrid
                 modes), and by the controller: for every trigger in
@@ -333,7 +362,7 @@ class RRTGuidanceSource:
         """Abort the current EXECUTING chunk and replan with the offending
         IK goal added to the exclusion list. Used when the controller
         observes `info["in_collision"]` mid-execution — typically because
-        ruckig smoothing curved the RRT-raw path through an obstacle the
+        time parametrization curved the RRT-raw path through an obstacle the
         raw path avoided.
 
         Sequence:
@@ -342,7 +371,7 @@ class RRTGuidanceSource:
           2. Force state back to PLANNING.
           3. Call `_do_plan` synchronously. This re-runs the IK solver,
              filters out excluded goals, runs RRT against remaining
-             candidates, and re-applies ruckig — same code path as the
+             candidates, and re-parametrizes — same code path as the
              original trigger, but with `no_lookback=True` forced (see
              below): the retry plans from the CURRENT joint state and no
              teleport-to-q_start fires (the escape teleport still can).
@@ -395,7 +424,7 @@ class RRTGuidanceSource:
             # the misleading "double lookback" log trail.
             # Setting no_lookback=True takes the no-lookback branch in
             # _do_plan: q_start = current state, no lookback sampling/log/
-            # teleport, ruckig starts at recent joint velocity for
+            # teleport, the trajectory starts at recent joint velocity for
             # continuity. The ESCAPE teleport (for q_start-in-collision)
             # still fires independently in the no_lookback branch — so the
             # wedge case where the new IK's start is in collision still
@@ -701,7 +730,7 @@ class RRTGuidanceSource:
                 upper_limits=np.asarray(wrapper.upper_limits, dtype=np.float64),
                 num_ik_candidates=self.num_ik_candidates,
                 path_selection=self.path_selection,
-                segment_at_sharp_corners=self.segment_at_sharp_corners,
+                path_score_joint_arc_weight=self.path_score_joint_arc_weight,
                 ik_goal_selection=self.ik_goal_selection,
                 num_path_candidates_per_ik=self.num_path_candidates_per_ik,
                 max_path_attempts_per_ik=self.max_path_attempts_per_ik,
@@ -713,16 +742,35 @@ class RRTGuidanceSource:
                 ik_skip_gripper_obstacle_pairs=self.ik_skip_gripper_obstacle_pairs,
                 escape_clearance_factor=self.escape_clearance_factor,
                 rewind_clearance_factor=self.rewind_clearance_factor,
-                final_approach_dist=self.final_approach_dist,
-                final_approach_vel_scale=self.final_approach_vel_scale,
-                final_approach_acc_scale=self.final_approach_acc_scale,
-                uniform_path_speed=self.uniform_path_speed,
-                trajopt_passes=self.trajopt_passes,
-                trajopt_lr=self.trajopt_lr,
-                trajopt_smoothness_weight=self.trajopt_smoothness_weight,
-                trajopt_collision_weight=self.trajopt_collision_weight,
-                trajopt_collision_threshold=self.trajopt_collision_threshold,
-                trajopt_fd_step=self.trajopt_fd_step,
+                # Forward only knobs explicitly set; each unset one keeps the
+                # planner's own default. The planner defaults come from ONE
+                # place — splatsim/configs/planner_defaults.py — shared with
+                # trajectory generation, so interventions and demos stay on
+                # the same smoothing pipeline unless deliberately overridden
+                # (the rrt_smooth_iterations=50-vs-200 / elastic=0-vs-30 drift
+                # this replaces put visible speed judder into DAgger chunks).
+                **{
+                    k: v
+                    for k, v in (
+                        ("max_joint_vel", self.max_joint_vel),
+                        ("max_joint_acc", self.max_joint_acc),
+                        ("max_joint_jerk", self.max_joint_jerk),
+                        ("rrt_smooth_iterations", self.rrt_smooth_iterations),
+                        ("elastic_smooth_passes", self.rrt_elastic_smooth_passes),
+                        ("segment_at_sharp_corners", self.segment_at_sharp_corners),
+                        ("final_approach_dist", self.final_approach_dist),
+                        ("final_approach_vel_scale", self.final_approach_vel_scale),
+                        ("final_approach_acc_scale", self.final_approach_acc_scale),
+                        ("uniform_path_speed", self.uniform_path_speed),
+                        ("trajopt_passes", self.trajopt_passes),
+                        ("trajopt_lr", self.trajopt_lr),
+                        ("trajopt_smoothness_weight", self.trajopt_smoothness_weight),
+                        ("trajopt_collision_weight", self.trajopt_collision_weight),
+                        ("trajopt_collision_threshold", self.trajopt_collision_threshold),
+                        ("trajopt_fd_step", self.trajopt_fd_step),
+                    )
+                    if v is not None
+                },
             )
         return self.state.planner
 
@@ -776,6 +824,10 @@ class RRTGuidanceSource:
             # stale True. (Retries via request_retry_after_collision re-set
             # it to True themselves before calling _do_plan directly.)
             st.no_lookback = False
+            # Historical obs window backing a lookback rewind (filled in the
+            # lookback branch below; stays empty on no-lookback paths where
+            # the robot never moves and the live obs history is already right).
+            obs_reseed_frames: list = []
             if no_lookback:
                 # Predictive-shield / future_chunk path: no rewind, no
                 # teleport. q_start = robot's CURRENT joint state. We're
@@ -846,8 +898,11 @@ class RRTGuidanceSource:
                     # fired the same tick a prior RRT cycle ended. There's
                     # no policy-driven history to rewind into, so degenerate
                     # to "use current state" (= the no-lookback path's
-                    # q_start choice). Subsequent escape-handling + ruckig
-                    # start_vel still apply; we just skip the teleport.
+                    # q_start choice). Flip the flag so the downstream gates
+                    # match: the parametrizer's start_vel applies and the
+                    # teleport (which would zero sim velocity and split the
+                    # recorder for a no-op position change) is skipped.
+                    no_lookback = True
                     if wrapper._latest_actual_q is not None:
                         q_start_full = wrapper._latest_actual_q.reshape(-1).copy()
                     else:
@@ -860,6 +915,13 @@ class RRTGuidanceSource:
                     q_start_full = wrapper._latest_actual_q.reshape(-1).copy()
                 else:
                     q_start_full = wrapper._desired_q.reshape(-1).copy()
+                # Snapshot the obs-history window matching this rewind NOW —
+                # planning takes many ticks during which fresh (stall-pose)
+                # frames keep shifting the deque, so slicing at teleport time
+                # would grab the wrong window. Handed to the wrapper after the
+                # teleport fires (see the case-(b) block below) so the inner
+                # policy's obs queue rewinds along with the robot.
+                obs_reseed_frames = wrapper.snapshot_obs_history_for_lookback(effective_lookback)
             q_start = q_start_full[: wrapper.num_dofs].copy()
 
             # Compute the robot's recent joint velocity from the trailing
@@ -867,12 +929,12 @@ class RRTGuidanceSource:
             # last few samples (comparable to the planner's leading-edge
             # window). Consumed by PathSelectionStrategy.JOINT_VELOCITY_MATCH
             # (other strategies ignore it) AND, in no-lookback mode, as the
-            # basis for ruckig's start_vel below. Pass `None` if the history
+            # basis for the parametrizer's start_vel below. Pass `None` if the history
             # is too short to derive a velocity — the planner will raise if
             # the strategy needs it.
             recent_vel = self._compute_recent_joint_velocity(wrapper)
 
-            # In no-lookback mode we want ruckig to begin at the robot's
+            # In no-lookback mode we want the trajectory to begin at the robot's
             # ACTUAL recent velocity instead of v=0 — otherwise the chunk
             # produces a dead-stop onset that contradicts the continuous
             # motion the robot is in. recent_vel may be None when the
@@ -881,12 +943,12 @@ class RRTGuidanceSource:
             #
             # UNITS: recent_vel is rad per CONTROL TICK (per-step delta; the
             # JOINT_VELOCITY_MATCH scorer consumes it in those units,
-            # direction-only). Ruckig's current_velocity is rad/SECOND (same
+            # direction-only). The parametrizer's start_vel is rad/SECOND (same
             # units as max_velocity) — scale by fps or the handoff velocity
             # arrives 1/fps (~30x) too small and every "velocity-continuous"
             # intervention still cold-starts from rest (observed in
             # planar_3_d100_05dag recordings, 2026-07-29).
-            _ruckig_start_vel = (
+            _start_vel = (
                 recent_vel * float(getattr(wrapper, "_fps", 30) or 30)
                 if (no_lookback and recent_vel is not None)
                 else None
@@ -911,7 +973,7 @@ class RRTGuidanceSource:
             # wide-open default that `set_robot_joint_positions` forces every
             # time the planner sets the robot to a new pose. Without this,
             # escape's rewind check (which snaps the actual gripper from
-            # q_full[num_dofs]) disagrees with BiRRT / ruckig checks (which
+            # q_full[num_dofs]) disagrees with BiRRT / parametrized checks (which
             # see wide-open fingers) — the exact mismatch that cascades to
             # 5-retry backoff on grasp tasks. None when the wrapper's obs.state
             # excludes the gripper dim (`exclude_gripper_from_state=True` or
@@ -929,7 +991,7 @@ class RRTGuidanceSource:
                 q_goal_bias,
                 recent_joint_velocity=recent_vel,
                 exclude_q_goals=list(self.state.excluded_q_goals),
-                ruckig_start_vel=_ruckig_start_vel,
+                start_vel=_start_vel,
                 actual_gripper_q=_actual_gripper_q,
             )
             # Capture the chosen IK goal so request_retry_after_collision()
@@ -953,7 +1015,7 @@ class RRTGuidanceSource:
             #       not a transferable skill). Now planner.plan() returns
             #       chunk WITHOUT the escape, and we land the env robot at
             #       the planner's escape end-state via a single teleport.
-            #       The recorded episode begins at the smooth ruckig start.
+            #       The recorded episode begins at the smooth parametrized start.
             #
             #   (b) No escape + lookback path (historical default): teleport
             #       to q_start_full (the lookback-sampled config). Unchanged.
@@ -971,6 +1033,17 @@ class RRTGuidanceSource:
                     self._teleport_env_to_q_start(teleport_target, 0)
                 elif not no_lookback:
                     self._teleport_env_to_q_start(q_start_full, effective_lookback)
+                    # Rewind the inner policy's obs history along with the
+                    # robot: schedule the pre-planning snapshot (real frames
+                    # around the rewound tick) to replace the queue on the
+                    # next select_action. Without this the queue keeps the
+                    # stall frames + a teleport-sized fake jump — a "parked"
+                    # history that biases the policy toward staying parked
+                    # wherever it next conditions a fresh chunk. Escape
+                    # teleports (case a) deliberately DON'T reseed: the
+                    # escape end-config is a planner-invented pose with no
+                    # historical obs window to restore.
+                    wrapper.schedule_inner_obs_reseed(obs_reseed_frames)
             # NOTE: The recorder split-on-teleport signal is now set INSIDE
             # `_teleport_env_to_q_start` (atomically with the actual env
             # mutation) instead of at this caller's bookkeeping level. So
@@ -1027,7 +1100,7 @@ class RRTGuidanceSource:
         Returns None when the history is too short to derive a velocity
         (need at least 2 entries). The planner consumes this value when
         `PathSelectionStrategy.JOINT_VELOCITY_MATCH` is active; _do_plan
-        also derives ruckig's start_vel from it for no-lookback plans.
+        also derives the parametrizer's start_vel from it for no-lookback plans.
         """
         history = wrapper._actual_q_history
         if len(history) < 2:
@@ -1127,7 +1200,7 @@ class RRTGuidanceSource:
             # ~zero velocity. Any reader in the gap before that decode would
             # otherwise see the stale PRE-teleport pose: a same-tick collision
             # retry's q_start (= _latest_actual_q), the gripper readback, or
-            # recent_joint_velocity (also ruckig's start_vel for no-lookback
+            # recent_joint_velocity (also the parametrizer's start_vel for no-lookback
             # plans). Mirror the episode split the recorder just received:
             # reset the rolling history to a single fresh sample rather than
             # appending, so recent-velocity reads ~0 (a teleported robot is at

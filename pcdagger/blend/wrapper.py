@@ -99,10 +99,13 @@ class BlendMode(Enum):
                     * DENOISE — a full denoising pass per call, conditioned on the
                       live obs queue (fresh torch.randn unless the caller pins
                       `base_noise`), so the policy component re-grounds every tick.
-                    * INTERPOLATE — only the guidance term and the linear mix are
-                      recomputed per call; the pure-policy anchor chunk is still
-                      generated ONCE per chunk (no extra model calls), so the
-                      policy component re-grounds only at chunk boundaries.
+                    * INTERPOLATE — the pure-policy anchor chunk is regenerated
+                      per call (one model call per tick, conditioned on the live
+                      obs queue) and linearly mixed with the re-encoded guidance,
+                      so the policy component re-grounds every tick — same
+                      observation feedback as DENOISE, without it the executed
+                      blend jerked by r·(1-r)·(guidance - policy) at every chunk
+                      boundary.
                     Allows continuous steering; temporal coherence depends on the
                     strategy and on whether `base_noise` is pinned.
     ONCE_PER_CHUNK: Blend only when a new anchor chunk is generated (chunk exhausted
@@ -122,10 +125,12 @@ class GuidanceBlendStrategy(Enum):
                  model's denoising from t≈ratio·T down to 0. The model's
                  conditioning can override guidance if it has a strong prior.
     INTERPOLATE: Glass-box debug stand-in for DENOISE. Linear interpolation in
-                 clean (normalized) action space against the STORED pure-policy
-                 anchor chunk: blended = ratio * anchor_chunk + (1-ratio) * guidance
+                 clean (normalized) action space against the pure-policy anchor
+                 chunk: blended = ratio * anchor_chunk + (1-ratio) * guidance
                  (constant-ratio — never mixed against its own previous output,
-                 which would geometrically collapse onto guidance). No denoising.
+                 which would geometrically collapse onto guidance; in EVERY_STEP
+                 the anchor chunk is a fresh model call per tick so the policy
+                 term tracks the live observation). No denoising.
                  Guarantees proportional guidance influence, but the result is
                  not "on-manifold". Implemented in ObservationTeleopGuidanceSource;
                  both strategies share one code path up to the final blend.
@@ -200,7 +205,8 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         rrt_teleport_to_q_start: bool = True,
         rrt_blocking_plan: bool = True,
         rrt_path_selection: str | None = None,
-        rrt_segment_at_sharp_corners: bool = True,
+        rrt_path_score_joint_arc_weight: float = 0.0,
+        rrt_segment_at_sharp_corners: bool | None = None,
         rrt_ik_goal_selection: str | None = None,
         rrt_num_path_candidates_per_ik: int = 1,
         rrt_max_path_attempts_per_ik: int = 5,
@@ -215,20 +221,25 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         rrt_ik_skip_gripper_obstacle_pairs: bool = False,
         rrt_escape_clearance_factor: float = 1.5,
         rrt_rewind_clearance_factor: float | None = None,
-        rrt_final_approach_dist: float = 0.0,
-        rrt_final_approach_vel_scale: float = 0.3,
-        rrt_final_approach_acc_scale: float = 0.25,
-        rrt_uniform_path_speed: bool = False,
+        rrt_final_approach_dist: float | None = None,
+        rrt_final_approach_vel_scale: float | None = None,
+        rrt_final_approach_acc_scale: float | None = None,
+        rrt_max_joint_vel: float | None = None,
+        rrt_max_joint_acc: float | None = None,
+        rrt_max_joint_jerk: float | None = None,
+        rrt_smooth_iterations: int | None = None,
+        rrt_elastic_smooth_passes: int | None = None,
+        rrt_uniform_path_speed: bool | None = None,
         # CHOMP-lite trajopt smoothing (soft collision + smoothness) on the
-        # RRT path before ruckig. See SharedAutonomyConfig.rrt_trajopt_* and
+        # RRT path before parametrization. See SharedAutonomyConfig.rrt_trajopt_* and
         # trajopt_smooth_path in SplatSim for cost formulation. 0 = disabled;
         # default 15 matches SharedAutonomyConfig / TrajectoryGenModeConfig.
-        rrt_trajopt_passes: int = 15,
-        rrt_trajopt_lr: float = 0.02,
-        rrt_trajopt_smoothness_weight: float = 1.0,
-        rrt_trajopt_collision_weight: float = 5.0,
-        rrt_trajopt_collision_threshold: float = 0.10,
-        rrt_trajopt_fd_step: float = 0.01,
+        rrt_trajopt_passes: int | None = None,
+        rrt_trajopt_lr: float | None = None,
+        rrt_trajopt_smoothness_weight: float | None = None,
+        rrt_trajopt_collision_weight: float | None = None,
+        rrt_trajopt_collision_threshold: float | None = None,
+        rrt_trajopt_fd_step: float | None = None,
         rrt_abort_on_drift_rad: float = 0.15,
         rrt_abort_on_drift_ticks: int = 8,
         rrt_drift_trigger: str = "lookback",
@@ -251,6 +262,16 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             if isinstance(guidance_blend_strategy, str)
             else guidance_blend_strategy
         )
+        # When set, EVERY blend-path model call (anchor-chunk predict and the
+        # DENOISE predict) runs with a freshly-seeded torch.Generator, so the
+        # entire sampling chain — prior draw AND per-step scheduler variance —
+        # uses identical randomness on every call. Consecutive per-tick samples
+        # then differ only through the (smoothly changing) observation, which
+        # removes the fresh-sample shake of EVERY_STEP re-blends and makes
+        # rollouts bitwise-reproducible. None (default) = legacy fresh
+        # randomness from the global RNG. Only effective for inner policies
+        # whose predict_action_chunk forwards a `generator` kwarg (diffusion).
+        self.sample_seed: int | None = None
         self._desired_q: np.ndarray | None = None  # raw joint-space IK seed [num_dofs]
         # Cached dummy-action template for `_lightweight_inner_call`'s
         # skip-forward-pass branch. Lazily populated on first use so we
@@ -280,10 +301,10 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # behavior (sized for the single fixed lookback value).
         # In future_chunk mode no lookback rewind happens, but we still need a
         # tiny history (few samples) so _compute_recent_joint_velocity can
-        # derive `start_vel` for the ruckig parametrization.
+        # derive `start_vel` for the time parametrization.
         if rrt_collision_detection == "future_chunk":
             # No lookback ever. Just enough history for a 2-3 sample
-            # velocity estimate (for ruckig start_vel).
+            # velocity estimate (for the parametrizer's start_vel).
             _effective_max_lookback = 4
         else:
             # pre_jump_lookback OR hybrid: stall/no-progress triggers
@@ -297,6 +318,31 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self._actual_q_history: collections.deque[np.ndarray] = collections.deque(
             maxlen=max(1, _effective_max_lookback + 1)
         )
+        # Parallel ring buffer of the OBSERVATION BATCHES those actual_q values
+        # were decoded from (observation.* keys only, tensor references — no
+        # copies). Appended in the same decode block as `_actual_q_history`, so
+        # entries at the same negative index describe the same tick. Used by
+        # the lookback-teleport flow to rewind the INNER POLICY's obs history
+        # queue alongside the robot: after a rewind to q(t−r), the policy's
+        # n_obs_steps window is reseeded with the REAL frames it saw around
+        # t−r (velocity-consistent), instead of keeping the stall frames plus
+        # a teleport-sized fake jump — a "parked" history biases the policy
+        # toward staying parked. Sized n_obs_steps deeper than the q history
+        # so a max-depth rewind still has a full window behind it. Only
+        # maintained when the inner policy keeps an obs queue (`_queues`) —
+        # PI0 / PI0.5 read obs straight from the batch, nothing to reseed.
+        # NOTE for image policies: entries hold references to per-tick image
+        # tensors, extending their lifetime by the deque depth (~lookback_max
+        # frames). State-only policies: negligible.
+        _n_obs_steps = int(getattr(getattr(inner_policy, "config", None), "n_obs_steps", 1) or 1)
+        self._obs_batch_history: collections.deque[dict[str, Tensor]] = collections.deque(
+            maxlen=max(1, _effective_max_lookback + 1) + _n_obs_steps
+        )
+        # Set by the RRT source (planner thread) right after a lookback
+        # teleport: the historical obs frames to reseed the inner policy's
+        # queue with. Consumed at the top of the NEXT select_action tick (main
+        # thread) so the queue mutation never races the per-tick obs pushes.
+        self._pending_obs_reseed_frames: list[dict[str, Tensor]] | None = None
         # Diagnostic: set by the RRT source's _teleport_env_to_q_start to the
         # arm-joint pose the robot was teleported to (= the planned chunk
         # start). On the NEXT real obs decode we measure how far the robot
@@ -403,6 +449,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             blocking_plan=bool(rrt_blocking_plan),
             auto_pause_on_finish=True,
             path_selection=rrt_path_selection,
+            path_score_joint_arc_weight=rrt_path_score_joint_arc_weight,
             segment_at_sharp_corners=rrt_segment_at_sharp_corners,
             ik_goal_selection=rrt_ik_goal_selection,
             num_path_candidates_per_ik=rrt_num_path_candidates_per_ik,
@@ -421,6 +468,11 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             final_approach_dist=rrt_final_approach_dist,
             final_approach_vel_scale=rrt_final_approach_vel_scale,
             final_approach_acc_scale=rrt_final_approach_acc_scale,
+            max_joint_vel=rrt_max_joint_vel,
+            max_joint_acc=rrt_max_joint_acc,
+            max_joint_jerk=rrt_max_joint_jerk,
+            rrt_smooth_iterations=rrt_smooth_iterations,
+            rrt_elastic_smooth_passes=rrt_elastic_smooth_passes,
             uniform_path_speed=rrt_uniform_path_speed,
             trajopt_passes=rrt_trajopt_passes,
             trajopt_lr=rrt_trajopt_lr,
@@ -1267,6 +1319,68 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
 
         populate_queues(queues, _batch)
 
+    def snapshot_obs_history_for_lookback(self, lookback_steps: int) -> list[dict[str, Tensor]]:
+        """The ``n_obs_steps`` observation batches ENDING one frame BEFORE the
+        frame ``lookback_steps`` ticks ago (= one before the rewound pose
+        ``_actual_q_history[-(lookback_steps+1)]``).
+
+        Ends one frame early on purpose: every select_action tick pushes its
+        own obs into the queue AFTER the reseed is consumed, and the first
+        post-teleport obs IS the rewound pose — so the seeded window plus that
+        push reads ``[…, f(t−r−1), obs≈q(t−r)]``, i.e. continuous motion at
+        the historical velocity into the rewound tick. Seeding up to f(t−r)
+        instead would pair two same-pose frames and read as parked again.
+
+        Called by the RRT source (planner thread) at lookback-sampling time,
+        BEFORE planning: planning takes multiple ticks during which new frames
+        keep being appended, so slicing later would shift the offsets. Same
+        shallow-buffer fallback as the q_start selection (degrade to the
+        oldest frames available). Returns [] when the history is empty (inner
+        policy keeps no obs queue, or no obs decoded yet).
+        """
+        hist = list(self._obs_batch_history)
+        if not hist:
+            return []
+        n_obs = int(getattr(getattr(self.inner_policy, "config", None), "n_obs_steps", 1) or 1)
+        end = max(1, len(hist) - int(lookback_steps) - 1)  # exclusive; hist[end-1] = frame at t-r-1
+        start = max(0, end - n_obs)
+        return hist[start:end]
+
+    def schedule_inner_obs_reseed(self, frames: list[dict[str, Tensor]]) -> None:
+        """Ask the main loop to replace the inner policy's obs-history queue
+        with ``frames`` (oldest → newest) at the start of the next
+        select_action tick. Thread-safe by construction: the planner thread
+        only writes the pending list; the queue itself is mutated on the main
+        thread, before that tick's own obs push. No-op on an empty list."""
+        if frames:
+            self._pending_obs_reseed_frames = frames
+
+    def _reseed_inner_obs_queues(self, frames: list[dict[str, Tensor]]) -> None:
+        """Replace the inner policy's observation history with ``frames``.
+
+        Clears the obs deques (ACTION queue untouched — staleness there is
+        `_flush_inner_action_queue`'s business) then re-pushes each frame via
+        `_maintain_inner_obs_history`. With fewer frames than n_obs_steps the
+        first one is duplicate-padded by populate_queues — same semantics as
+        episode start, but at the correct (rewound) pose."""
+        inner = self.inner_policy
+        queues = getattr(inner, "_queues", None)
+        if not isinstance(queues, dict):
+            return
+        from lerobot.utils.constants import ACTION as _A
+
+        for key, q in queues.items():
+            if key != _A and hasattr(q, "clear"):
+                q.clear()
+        for frame in frames:
+            self._maintain_inner_obs_history(frame)
+        logger.info(
+            "Reseeded inner policy obs history with %d historical frame(s) (lookback teleport): "
+            "the policy's next chunk conditions on the velocity it actually had at the rewound "
+            "tick, not on the stall/teleport frames.",
+            len(frames),
+        )
+
     def _lightweight_inner_call(self, batch: dict[str, Tensor]) -> Tensor:
         """Fast substitute for `inner_policy.select_action(batch)` used during
         RRT / oracle-goal EXECUTING mode, when the inner action would be
@@ -1544,8 +1658,8 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         """Sync the rel-action decode anchor (`_last_state`) to the newest observed state.
 
         Called by the obs-teleop source per its time-anchoring rule: every
-        tick for DENOISE + EVERY_STEP (the chunk is regenerated now-anchored
-        each call), otherwise only at fresh chunk builds (t0-anchored chunks
+        tick for EVERY_STEP (both strategies regenerate now-anchored policy
+        content each call), otherwise only at fresh chunk builds (t0-anchored chunks
         must keep the t0 anchor — refreshing per tick wrongly decodes them as an
         r-scaled extrapolation). Without the per-tick refresh, now-anchored
         chunks get decoded against an anchor up to n_action_steps-1 ticks
@@ -1562,6 +1676,25 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                     return bool(abs_step.relative_step.refresh_anchor())
                 break
         return False
+
+    def build_sample_generator(self, salt: int = 0) -> torch.Generator | None:
+        """Freshly-seeded generator for one blend-path model call, or None.
+
+        Returns a new `torch.Generator` seeded with `self.sample_seed + salt`
+        on the inner policy's device — call once per model call so every call
+        sees the identical noise sequence (see the `sample_seed` note in
+        __init__). ``salt`` decorrelates independent noise consumers that
+        would otherwise draw the same values (e.g. the x_tsw guidance noise
+        vs. the model call's prior draw — same seed + same shape = identical
+        tensors). Returns None when `sample_seed` is unset (legacy global-RNG
+        sampling).
+        """
+        if self.sample_seed is None:
+            return None
+        device = next(self.inner_policy.parameters()).device
+        gen = torch.Generator(device=device)
+        gen.manual_seed(self.sample_seed + salt)
+        return gen
 
     def _normalize_policy_guidance_action(self, policy_guidance_action: Tensor) -> Tensor:
         """Normalize raw policy guidance action to policy's internal space.
@@ -1601,7 +1734,11 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         return normalized
 
     def _build_guidance_noise_from_chunk(
-        self, guidance_chunk: Tensor, ratio: float, base_noise: Tensor | None = None
+        self,
+        guidance_chunk: Tensor,
+        ratio: float,
+        base_noise: Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> Tensor:
         """Build partially-noised guidance using the correct noise schedule.
 
@@ -1641,8 +1778,17 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             if base_noise is not None:
                 full_noise = base_noise.clone()
             else:
+                # `generator` (from sample_seed) pins this draw per tick —
+                # without it, every EVERY_STEP re-blend noises the guidance
+                # with an independent sample and the executed trajectory
+                # shakes (worse at higher ratios).
                 full_noise = torch.randn(
-                    batch_size, horizon, action_dim, dtype=guidance_chunk.dtype, device=device
+                    batch_size,
+                    horizon,
+                    action_dim,
+                    dtype=guidance_chunk.dtype,
+                    device=device,
+                    generator=generator,
                 )
             # guidance occupies [n_obs_steps-1, n_obs_steps-1+n_action_steps) in the horizon.
             # Fill non-guidance positions with plausible values (not pure noise) so the UNet
@@ -1694,7 +1840,15 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             for t in range(n_action_steps, chunk_size):
                 full_guidance[:, t, :] = guidance_chunk[:, -1, :]
             guidance_chunk = full_guidance
-        noise = base_noise.clone() if base_noise is not None else torch.randn_like(guidance_chunk)
+        if base_noise is not None:
+            noise = base_noise.clone()
+        else:
+            noise = torch.randn(
+                guidance_chunk.shape,
+                dtype=guidance_chunk.dtype,
+                device=guidance_chunk.device,
+                generator=generator,
+            )
         x_tsw = ratio * noise + (1.0 - ratio) * guidance_chunk
         return x_tsw
 
@@ -1705,6 +1859,8 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self._pending_teleport_landing = None
         self._pending_teleport_version = None
         self._actual_q_history.clear()
+        self._obs_batch_history.clear()
+        self._pending_obs_reseed_frames = None
         self._frames_since_last_rrt_end = 0
         self._prev_rrt_mode = RRTMode.IDLE
         self._shield_cooldown_ticks = 0
@@ -1762,6 +1918,30 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
     def select_action(self, batch: dict[str, Tensor], base_noise: Tensor | None = None) -> Tensor:
         self._run_event.wait()  # blocks while paused
         self._last_raw_action = None  # reset; set by get_full_teleop_action if called
+
+        # A lookback teleport happened since the last tick: rewind the inner
+        # policy's obs history to the frames it actually saw around the rewound
+        # tick, BEFORE this tick pushes any new obs. See _reseed_inner_obs_queues.
+        # Staleness gate: if this tick's obs predates the teleport (same
+        # state_version race the decode block guards against), HOLD the pending
+        # frames — consuming now would let the stale stall-pose obs land on top
+        # of the seeded window; next tick's post-teleport obs re-runs this and
+        # the reseed then replaces whatever the stale push left behind.
+        if self._pending_obs_reseed_frames is not None:
+            _obs_ver_raw = batch.get("state_version")
+            try:
+                _obs_ver_pre = int(_obs_ver_raw) if _obs_ver_raw is not None else None
+            except (TypeError, ValueError):
+                _obs_ver_pre = None
+            _stale = (
+                _obs_ver_pre is not None
+                and self._pending_teleport_version is not None
+                and _obs_ver_pre < self._pending_teleport_version
+            )
+            if not _stale:
+                _reseed_frames = self._pending_obs_reseed_frames
+                self._pending_obs_reseed_frames = None
+                self._reseed_inner_obs_queues(_reseed_frames)
 
         # Cache the oracle env config (obstacle geometry + task goal) sent by the
         # SplatSim server when env.include_oracle_info=true. Loading obstacles here
@@ -2015,6 +2195,13 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             # Also push into the rolling history so RRT can pull q_start from
             # N steps ago (pre-jump pose), not just the current actual_q.
             self._actual_q_history.append(self._latest_actual_q.copy())
+            # Keep the obs-batch history index-aligned with _actual_q_history
+            # (same tick ⇒ same negative index; see the ctor comment). Only
+            # when the inner policy maintains an obs queue worth reseeding.
+            if isinstance(getattr(self.inner_policy, "_queues", None), dict):
+                self._obs_batch_history.append(
+                    {k: v for k, v in batch.items() if k.startswith("observation")}
+                )
             # Teleport landing check. If a teleport fired on a previous tick,
             # `_pending_teleport_landing` holds the arm pose the robot was
             # teleported to (= the planned chunk start). This is the FIRST
@@ -2529,7 +2716,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             actual mesh overlap → RRT plans a chunk through that config
           * PyBullet's solver enforces non-penetration on ALL meshes,
             skipped or not → generates contact force → joint fails to
-            track the commanded ruckig path → drift accumulates → abort
+            track the commanded path → drift accumulates → abort
           * The diagnostic makes the offending pair visible so you can
             move it from SELF_COLLISION_SKIP_PAIRS to
             SELF_COLLISION_SKIP_PAIRS_EVAL_TERMINATE_EXTRA (planner

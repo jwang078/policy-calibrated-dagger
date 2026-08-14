@@ -83,14 +83,26 @@ OUTLINE_THICKNESS_EXTRA = 4  # outline is text-thickness + this
 
 
 def _draw_label(frame: np.ndarray, text: str, color: tuple[int, int, int]) -> None:
-    """Draw `text` on `frame` at LABEL_POS with a black outline for legibility."""
+    """Draw `text` on `frame` at LABEL_POS with a black outline for legibility.
+
+    The font shrinks when the text would otherwise run off the right edge —
+    SplatSim frames are only ~224px wide, so labels like
+    "TRIGGER: future_chunk_coll" get clipped mid-word at the nominal
+    FONT_SCALE and the reason becomes unreadable.
+    """
+    scale = FONT_SCALE
+    avail = frame.shape[1] - LABEL_POS[0] - 4  # 4px right margin
+    (text_w, _), _ = cv2.getTextSize(text, FONT, scale, FONT_THICKNESS)
+    if text_w > avail:
+        # Floor the scale so very long reasons stay legible rather than vanishing.
+        scale = max(FONT_SCALE * avail / text_w, 0.30)
     # Outline first, then fill on top.
     cv2.putText(
         frame,
         text,
         LABEL_POS,
         FONT,
-        FONT_SCALE,
+        scale,
         OUTLINE_COLOR,
         FONT_THICKNESS + OUTLINE_THICKNESS_EXTRA,
         cv2.LINE_AA,
@@ -100,7 +112,7 @@ def _draw_label(frame: np.ndarray, text: str, color: tuple[int, int, int]) -> No
         text,
         LABEL_POS,
         FONT,
-        FONT_SCALE,
+        scale,
         color,
         FONT_THICKNESS,
         cv2.LINE_AA,
@@ -376,6 +388,7 @@ def annotate(
     side_by_side_blend_repo_id: str | None = None,
     cache_dir: Path | None = None,
     blend_camera_col: str = "observation.images.base_rgb_stretch",
+    trigger_pause: bool = True,
 ) -> Path:
     interventions_dir = _resolve_interventions_dir(training_dir)
     video_path = interventions_dir / "videos" / "splatsim_0" / f"eval_episode_{episode_idx}.mp4"
@@ -561,6 +574,8 @@ def annotate(
 
     # ── main loop ──────────────────────────────────────────────────────── #
     cycle_idx = 0  # index of the next unhandled trigger
+    overlay_remaining = 0  # frames of trigger banner still owed (no-pause mode)
+    overlay_text = ""
     frame_idx = 0
     n_written = 0
 
@@ -599,6 +614,17 @@ def annotate(
         ret, frame = cap.read()
         if not ret:
             break
+        # Sticky trigger banner (only used when trigger_pause is False): the
+        # banner rides along on top of NORMAL playback for `pause_frames`
+        # frames instead of the video freezing for that long.
+        if not trigger_pause and cycle_idx < len(trigger_steps) and frame_idx == trigger_steps[cycle_idx]:
+            overlay_remaining = pause_frames
+            overlay_text = triggers[cycle_idx]
+            cycle_idx += 1
+        header_label = f"TRIGGER: {overlay_text}" if overlay_remaining > 0 else None
+        if overlay_remaining > 0:
+            overlay_remaining -= 1
+
         left_label, left_color = _build_phase_label(frame_idx, trigger_steps, rrt_steps_executed)
 
         if side_by_side_blend_repo_id is not None:
@@ -610,20 +636,27 @@ def annotate(
                 left_color=left_color,
                 right_label=right_label,
                 right_color=right_color,
-                # No header band on regular frames (cleaner); only during pauses.
-                header_label=None,
+                # No header band on regular frames (cleaner) — except in
+                # no-pause mode, where the banner rides on live playback.
+                header_label=header_label,
+                header_color=COLOR_TRIGGER,
             )
             writer.write(composed)
         else:
             annotated = frame.copy()
-            _draw_label(annotated, left_label, left_color)
+            if header_label is not None:
+                # Banner replaces the phase label for its duration, matching
+                # what the frozen-pause path shows.
+                _draw_label(annotated, header_label, COLOR_TRIGGER)
+            else:
+                _draw_label(annotated, left_label, left_color)
             writer.write(annotated)
         n_written += 1
 
         # If this frame index matches the next trigger, insert the pause
         # AFTER writing it (so the pause sits between this policy frame and
         # the first RRT frame at trigger_steps[i] + 1).
-        if cycle_idx < len(trigger_steps) and frame_idx == trigger_steps[cycle_idx]:
+        if trigger_pause and cycle_idx < len(trigger_steps) and frame_idx == trigger_steps[cycle_idx]:
             trigger_text = triggers[cycle_idx]
             for _ in range(pause_frames):
                 if side_by_side_blend_repo_id is not None:
@@ -746,6 +779,16 @@ def main() -> None:
         help="Frames to pause at each trigger moment (default 30 ≈ 1 s @ 30 fps).",
     )
     p.add_argument(
+        "--no_trigger_pause",
+        action="store_true",
+        help=(
+            "Don't freeze the video at each trigger. The 'TRIGGER: <reason>' banner "
+            "still shows for --pause_frames frames, but the episode keeps playing "
+            "underneath it instead of holding on one frame. Output is then exactly "
+            "as long as the source episode."
+        ),
+    )
+    p.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -789,6 +832,7 @@ def main() -> None:
         training_dir=args.training_dir,
         episode_idx=args.episode_idx,
         pause_frames=args.pause_frames,
+        trigger_pause=not args.no_trigger_pause,
         output_path=args.output,
         side_by_side_blend_repo_id=args.side_by_side,
         cache_dir=args.cache_dir,

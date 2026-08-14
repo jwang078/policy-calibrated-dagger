@@ -333,7 +333,7 @@ class InterventionController:
         # Joint-stall trigger state. Separate from _consecutive_stuck_ticks
         # so the trigger's threshold can differ from the wedge gate's, AND
         # so this counter can be scoped to POLICY mode only (RRT-mode stall
-        # is Ruckig deceleration, not a real stall). Reset on scenario
+        # is parametrizer deceleration, not a real stall). Reset on scenario
         # start AND on any RRT cycle (below), so the count reflects the
         # CURRENT policy phase's motion only.
         self._joint_stall_policy_ticks: int = 0
@@ -354,7 +354,7 @@ class InterventionController:
         # Debug telemetry for the mid-RRT collision WARNING — populated at
         # each IDLE→EXECUTING transition and read at the WARNING site to
         # report how far the robot has moved since the chunk started + the
-        # recent Δq pattern. Helps distinguish "real wedge" from "ruckig
+        # recent Δq pattern. Helps distinguish "real wedge" from "parametrizer
         # ramp-up false positive" by exposing whether the robot is actually
         # tracking the commanded waypoints.
         self._chunk_start_actual_q: np.ndarray | None = None
@@ -438,7 +438,7 @@ class InterventionController:
         # Rest-start triggers ("time stall", "no_progress", "no_progress_ori")
         # will start RRT from a stopped (or near-stopped) state: the robot
         # either timed out or stopped making progress, then lookback
-        # teleports back and ruckig defaults start_vel=0. Tell the teleop
+        # teleports back and the parametrizer defaults start_vel=0. Tell the teleop
         # recorder to drop the first n_obs_steps - 1 frames of this RRT
         # segment so the recorded dataset doesn't contain velocity-from-
         # rest artifacts that mismatch the policy's observation history at
@@ -699,7 +699,7 @@ class InterventionController:
                     # Joint-stall trigger is POLICY-mode-scoped: reset on
                     # every mode transition so RRT cycles never contribute
                     # to a stall count that then fires the moment policy
-                    # resumes (Ruckig deceleration would inflate it).
+                    # resumes (parametrizer deceleration would inflate it).
                     self._joint_stall_policy_ticks = 0
                     if _src_mode == RRTMode.EXECUTING:
                         self._chunk_start_actual_q = actual_q.copy()
@@ -835,11 +835,11 @@ class InterventionController:
             return "advance"
 
         # Mid-RRT-execution collision: the planned path collided when
-        # actually executed in sim — typically because ruckig smoothing
+        # actually executed in sim — typically because time parametrization
         # curved the RRT-raw path through an obstacle the raw path
         # avoided. Ask the source to abort the current chunk, add the
         # offending IK goal to its exclusion list, and replan to a
-        # different IK branch (with fresh ruckig). The source runs the
+        # different IK branch (with fresh parametrization). The source runs the
         # replan synchronously, so by the next tick the state will be
         # EXECUTING with a new chunk (or IDLE on planner failure, which
         # then flows through the existing plan-failed branch below).
@@ -898,7 +898,7 @@ class InterventionController:
             if not getattr(self, "_in_collision_during_rrt", False):
                 self._in_collision_during_rrt = True
                 # Debug telemetry: surface WHY the per-tick collision check
-                # fired so we can distinguish a real wedge from a ruckig
+                # fired so we can distinguish a real wedge from a parametrizer
                 # ramp-up false positive without rerunning with verbose=True.
                 #   pair  — closest violating link pair + actual distance
                 #   stuck — consecutive-tick stuck counter state + recent Δq
@@ -994,7 +994,7 @@ class InterventionController:
             # success predicate" mismatch, unrecoverable). But it also fires on
             # recoverable near-misses — teleport landing drift (see wrapper's
             # "RRT teleport landing error" log line — routinely 0.1–0.3 rad even
-            # when the plan itself is fine), ruckig smoothing rounding at the
+            # when the plan itself is fine), time parametrization rounding at the
             # chunk endpoint, and the joint-vs-EE tolerance gap where a small
             # joint-space offset accumulates into a sub-mm EE offset that just
             # exceeds `pos_tolerance_m`. When that happens with cycles_used=1

@@ -113,6 +113,12 @@
 #   matters most for RESUMED/finetuned rounds: a train_config.json written
 #   while torchcodec was unloadable pins `pyav`, and without this flag every
 #   later round in the lineage would inherit that pin.
+#   RRT path-scoring tuning rides --intervention_extra_args like the other
+#   SA-config fields, e.g.
+#   --policy.shared_autonomy_config.rrt_path_score_joint_arc_weight=0.03
+#   (joint-arc regularizer on the path score, m/rad; small values
+#   ~0.02-0.05 break near-goal EE-arc ties toward fast-to-execute
+#   candidates; 0 = off).
 #
 # Pre-flight name length validation (COMBINATION mode only):
 #   The wrapper predicts the merged-dataset name for every combination

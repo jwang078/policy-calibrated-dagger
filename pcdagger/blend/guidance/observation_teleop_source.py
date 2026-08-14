@@ -89,8 +89,10 @@ class ObservationTeleopGuidanceSource:
         self._last_decoded_guidance_chunk: np.ndarray | None = None
         # Per-tick state set by update().
         self._guidance_chunk_raw: Tensor | None = None
-        # Pure policy chunk from the last fresh build — INTERPOLATE's mixing
-        # base (see the collapse note at the build site).
+        # Pure policy chunk — INTERPOLATE's mixing base (see the collapse
+        # note at the build site). Refreshed per tick in EVERY_STEP so the
+        # policy term is conditioned on the live observation; per chunk
+        # otherwise.
         self._anchor_chunk_orig: Tensor | None = None
         self.has_guidance: bool = False
 
@@ -239,8 +241,9 @@ class ObservationTeleopGuidanceSource:
 
         SHARED-PATH CONTRACT — INTERPOLATE is the glass-box debug proxy for
         DENOISE. Both strategies run the IDENTICAL pipeline: cursor rule,
-        anchor-chunk generation cadence (one pure-policy model call per
-        chunk), rel-anchor refresh cadence, guidance encoding + fill,
+        per-tick observation feedback in EVERY_STEP (DENOISE via its
+        strategy-branch predict, INTERPOLATE via per-tick anchor-chunk
+        regeneration), rel-anchor refresh cadence, guidance encoding + fill,
         decoded-guidance diagnostic, ghost updates, x_tsw construction (and
         therefore rng-stream consumption), emission indexing. They differ at
         exactly ONE branch: how `blended` is produced from the shared inputs
@@ -262,17 +265,21 @@ class ObservationTeleopGuidanceSource:
         strategy = wrapper.guidance_blend_strategy
 
         # ── Time-anchoring predicate: the ONE fork that cadence hangs off ──
-        # DENOISE + EVERY_STEP re-generates the emitted chunk each call via
-        # predict_action_chunk conditioned on the live obs queue → the
-        # emitted chunk is re-anchored to "now" every tick (index 0 = the
-        # action for NOW, rel deltas relative to the CURRENT state). Every
-        # other combination emits from the chunk built at t0 (index k means
-        # "t0 + k", deltas relative to state_t0). This difference is FORCED,
-        # not stylistic: INTERPOLATE's policy content comes from one model
-        # call per chunk (now-anchoring it would cost a call per tick), while
-        # DENOISE's per-tick call is inherent and its output cannot be made
-        # t0-anchored. Two cadences follow from the predicate — both
-        # directions of getting either wrong produced observed bugs:
+        # EVERY_STEP re-anchors the emitted chunk to "now" on every call
+        # (index 0 = the action for NOW, rel deltas relative to the CURRENT
+        # state), for BOTH strategies: DENOISE regenerates the emitted chunk
+        # via its per-tick predict call, and INTERPOLATE regenerates its
+        # pure-policy anchor chunk per tick (see the anchor-chunk block
+        # below) — the policy component must never be blind to the live
+        # observation while re-blends execute. ONCE_PER_CHUNK emits from the
+        # chunk built at t0 (index k means "t0 + k", deltas relative to
+        # state_t0). Keeping the policy component t0-anchored across a whole
+        # EVERY_STEP chunk is NOT an option: the executed blend drags the
+        # robot (1-r) of the way toward guidance while the t0 plan gets no
+        # feedback, so every chunk boundary repaid the accumulated divergence
+        # as one r·(1-r)·(guidance - policy) jerk in the executed action.
+        # Two cadences follow from the predicate — both directions of
+        # getting either wrong produced observed bugs:
         #   * cursor: pinned to 0 when now-anchored (else: future-action
         #     sawtooth — "shakes at goal/obstacle"); advancing when
         #     t0-anchored (else: the t0 action re-emitted forever).
@@ -280,25 +287,38 @@ class ObservationTeleopGuidanceSource:
         #     builds when t0-anchored (else: decode adds state_now to
         #     t0-anchored deltas — an r-scaled extrapolation that pushed
         #     ratio 0.9 outside the [policy, guidance] envelope).
-        emits_now_anchored = (
-            wrapper.blend_mode == BlendMode.EVERY_STEP and strategy == GuidanceBlendStrategy.DENOISE
-        )
+        emits_now_anchored = wrapper.blend_mode == BlendMode.EVERY_STEP
         if emits_now_anchored:
             self._chunk_step = 0
         chunk_exhausted = self._chunk_exhausted()
         if emits_now_anchored or chunk_exhausted or self._guided_chunk is None:
             wrapper.refresh_relative_anchor()
 
-        # ── Anchor chunk: ONE pure-policy model call per chunk (shared) ────
+        # ── Anchor chunk: the pure-policy model call (shared) ──────────────
         # Stored as `_anchor_chunk_orig` and used as the policy component /
-        # guidance-fill base for BOTH strategies. Never replaced by the
-        # previous BLENDED chunk: mixing against one's own output is a
-        # geometric recursion whose fixed point is guidance — every ratio < 1
-        # collapsed onto the guidance trajectory before this was pinned.
-        # (predict_action_chunk reads the live obs queues — inner
-        # select_action already ran this tick.)
-        if chunk_exhausted or self._guided_chunk is None or self._anchor_chunk_orig is None:
+        # guidance-fill base for BOTH strategies. Regenerated at fresh chunk
+        # builds — and on EVERY tick for now-anchored INTERPOLATE, because
+        # there the anchor chunk IS the emitted policy content and must be
+        # conditioned on the live observation. (DENOISE gets its per-tick
+        # observation feedback from the predict call in the strategy branch;
+        # its anchor chunk only serves as the guidance-fill base, so
+        # once-per-chunk is enough.) Never replaced by the previous BLENDED
+        # chunk: mixing against one's own output is a geometric recursion
+        # whose fixed point is guidance — every ratio < 1 collapsed onto the
+        # guidance trajectory before this was pinned. (predict_action_chunk
+        # reads the live obs queues — inner select_action already ran this
+        # tick.)
+        interpolate_now_anchored = emits_now_anchored and strategy == GuidanceBlendStrategy.INTERPOLATE
+        if (
+            interpolate_now_anchored
+            or chunk_exhausted
+            or self._guided_chunk is None
+            or self._anchor_chunk_orig is None
+        ):
             noise_kwargs = {"noise": base_noise} if base_noise is not None else {}
+            sample_generator = wrapper.build_sample_generator()
+            if sample_generator is not None:
+                noise_kwargs["generator"] = sample_generator
             self._anchor_chunk_orig = wrapper.inner_policy.predict_action_chunk(ctx.batch, **noise_kwargs)
             self._chunk_step = 0
         base_chunk = self._anchor_chunk_orig
@@ -361,7 +381,11 @@ class ObservationTeleopGuidanceSource:
         # stream consumption IDENTICAL across strategies — a seeded
         # interpolate run stays noise-aligned with its denoise counterpart,
         # which is what makes like-for-like A/B debugging valid.
-        x_tsw = self._build_guidance_noise_from_chunk(guidance_chunk, ratio, base_noise=base_noise)
+        # salt=1: decorrelate the x_tsw noise from the model calls' prior draw
+        # (same seed + same shape would make them identical tensors).
+        x_tsw = self._build_guidance_noise_from_chunk(
+            guidance_chunk, ratio, base_noise=base_noise, generator=wrapper.build_sample_generator(salt=1)
+        )
 
         # ── n_anchor_steps slice (shared computation) ──────────────────────
         anchor_slice: Tensor | None = None
@@ -385,6 +409,9 @@ class ObservationTeleopGuidanceSource:
                 )
         elif strategy == GuidanceBlendStrategy.DENOISE:
             denoise_kwargs: dict = {"noise": x_tsw, "sa_noise_ratio": ratio}
+            denoise_generator = wrapper.build_sample_generator()
+            if denoise_generator is not None:
+                denoise_kwargs["generator"] = denoise_generator
             if anchor_slice is not None:
                 # In-loop inpainting: the sampler re-anchors these positions
                 # at EVERY denoising step so neighbouring steps stay coherent
@@ -523,7 +550,11 @@ class ObservationTeleopGuidanceSource:
                     guidance_chunk[:, t_abs, :action_dim] = step_norm
 
     def _build_guidance_noise_from_chunk(
-        self, guidance_chunk: Tensor, ratio: float, base_noise: Tensor | None = None
+        self,
+        guidance_chunk: Tensor,
+        ratio: float,
+        base_noise: Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> Tensor:
         """Construct DENOISE noise from the (normalized) guidance chunk + base noise.
 
@@ -532,7 +563,9 @@ class ObservationTeleopGuidanceSource:
         protocol level; the underlying math is wrapper-side because it can
         be shared with future sources that use the DENOISE path.
         """
-        return self._wrapper._build_guidance_noise_from_chunk(guidance_chunk, ratio, base_noise=base_noise)
+        return self._wrapper._build_guidance_noise_from_chunk(
+            guidance_chunk, ratio, base_noise=base_noise, generator=generator
+        )
 
     # Suppress unused-state warnings from the Protocol type checker.
     _ = (GuidanceMode, GuidanceSourceState)

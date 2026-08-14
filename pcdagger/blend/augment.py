@@ -198,6 +198,16 @@ class AugmentationConfig:
     # existing blend datasets. Mirrors visualize_shared_autonomy_sim.py, which
     # has always pinned a shared base_noise across ratios.
     fixed_base_noise: bool = False
+    # Seed a fresh torch.Generator for EVERY blend-path model call: the x_tsw
+    # guidance-noising draw, the denoiser's per-step scheduler variance
+    # (diffusion), the flow prior + anchor noise (PI0.5), and the anchor-chunk
+    # predict. Each call then consumes an IDENTICAL noise sequence, so
+    # consecutive every_step re-blends differ only through the (smoothly
+    # moving) observation — no fresh-sample shake — and rollouts are
+    # reproducible. Unlike --fixed_base_noise (which only pins the initial
+    # x_T draw, leaving the DDPM scheduler's per-step variance fresh), this
+    # pins the entire sampling chain. -1 disables (legacy global-RNG draws).
+    sample_seed: int = 42
     # DEBUG: override the checkpoint's DDPM/DDIM `clip_sample` (None = keep the
     # trained value). clip_sample=True clamps the predicted clean action to
     # ±clip_sample_range at EVERY denoising step — with out-of-distribution
@@ -815,15 +825,23 @@ def run_augmentation(
             "ticks that carry guidance, so the requested mid-chunk re-blends would silently "
             f"never happen (got --blend_mode={cfg.blend_mode})."
         )
-    if blend_mode_enum == BlendMode.EVERY_STEP and not cfg.fixed_base_noise:
+    if cfg.sample_seed >= 0:
+        wrapper.sample_seed = cfg.sample_seed
+        logger.info(
+            "Per-call sample generator enabled (sample_seed=%d): every blend-path model call "
+            "uses identical noise, so every_step re-blends stay temporally coherent.",
+            cfg.sample_seed,
+        )
+    if blend_mode_enum == BlendMode.EVERY_STEP and not cfg.fixed_base_noise and cfg.sample_seed < 0:
         logger.warning(
-            "blend_mode=every_step WITHOUT --fixed_base_noise: the wrapper re-runs a full "
-            "denoising pass with a FRESH torch.randn every tick, and only action[0] of that "
-            "chunk is executed — so consecutive executed actions are INDEPENDENT samples and "
-            "the recorded trajectory will shake (worse at higher ratios, where more of x_tsw "
-            "is noise). Pass --fixed_base_noise=true to pin one draw per episode, or use "
-            "blend_mode=once_per_chunk (which matches how the policy is actually evaluated: "
-            "one denoising pass per n_action_steps=%s ticks).",
+            "blend_mode=every_step WITHOUT --fixed_base_noise and WITH --sample_seed=-1: the "
+            "wrapper re-runs a full denoising pass with a FRESH torch.randn every tick, and "
+            "only action[0] of that chunk is executed — so consecutive executed actions are "
+            "INDEPENDENT samples and the recorded trajectory will shake (worse at higher "
+            "ratios, where more of x_tsw is noise). Use the default --sample_seed to pin the "
+            "entire sampling chain per call, --fixed_base_noise=true to pin one x_T draw per "
+            "episode, or blend_mode=once_per_chunk (one denoising pass per n_action_steps=%s "
+            "ticks).",
             getattr(wrapper.config, "n_action_steps", "?"),
         )
     wrapper.blend_mode = blend_mode_enum
@@ -1053,6 +1071,14 @@ def run_augmentation(
                 source_scenario_idx,
                 total_steps,
             )
+
+            # Per-episode sample seed: every model call WITHIN an episode uses
+            # the identical noise sequence (smooth, coherent every_step
+            # re-blends) while episodes get DIFFERENT seeds (dataset keeps
+            # sample diversity across episodes instead of locking the whole
+            # run to one noise realization).
+            if cfg.sample_seed >= 0:
+                wrapper.sample_seed = cfg.sample_seed + int(source_ep)
 
             # One pinned noise draw per (source_ep, ratio) rollout when
             # --fixed_base_noise is set: constant WITHIN the episode (kills the

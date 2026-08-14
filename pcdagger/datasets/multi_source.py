@@ -161,7 +161,13 @@ class _MetaProxy:
     def __getattr__(self, name: str):
         # `__getattr__` only fires when normal lookup fails, so it won't
         # shadow `_inner`, `_stats`, `stats`, `_multi`, or the count properties.
-        return getattr(self._inner, name)
+        # Fetch `_inner` via `__dict__` — during unpickling (spawn dataloader
+        # workers) pickle probes for `__setstate__` before `__dict__` is
+        # restored, and `self._inner` here would recurse infinitely.
+        inner = self.__dict__.get("_inner")
+        if inner is None:
+            raise AttributeError(name)
+        return getattr(inner, name)
 
 
 class MultiSourceNormalizingDataset(Dataset):
@@ -463,4 +469,10 @@ class MultiSourceNormalizingDataset(Dataset):
     def __getattr__(self, name: str):
         # `__getattr__` is only called when normal attribute lookup failed,
         # so this won't shadow `multi_dataset`, `_aggregated_stats`, etc.
-        return getattr(self.multi_dataset, name)
+        # Fetch via `__dict__` to stay pickle-safe: during unpickling in spawn
+        # dataloader workers, attribute probes arrive before `__dict__` is
+        # restored and `self.multi_dataset` would recurse infinitely.
+        inner = self.__dict__.get("multi_dataset")
+        if inner is None:
+            raise AttributeError(name)
+        return getattr(inner, name)

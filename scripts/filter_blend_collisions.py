@@ -82,6 +82,7 @@ from lib_dataset_episode_io import (  # type: ignore[import-not-found]  # noqa: 
 )
 
 from lerobot.configs import parser  # noqa: E402
+from lerobot.datasets.video_utils import decode_video_frames  # noqa: E402
 from lerobot.envs.factory import make_env, make_env_config  # noqa: E402
 from lerobot.utils.constants import DEFAULT_FEATURES  # noqa: E402
 from lerobot.utils.import_utils import register_third_party_plugins  # noqa: E402
@@ -288,16 +289,23 @@ def _row_to_frame(
     row: pd.Series,
     target_features: dict,
     task_for_index: dict[int, str],
+    video_frames: dict[str, np.ndarray] | None = None,
+    frame_pos: int = 0,
 ) -> dict:
     """Convert one parquet row to a frame dict ``add_frame`` will accept.
 
-    Three transforms vs. the raw parquet row:
+    Transforms vs. the raw parquet row:
       1. Drop columns in ``DEFAULT_FEATURES`` (``timestamp``, ``frame_index``,
          ``episode_index``, ``index``, ``task_index``). ``add_frame`` computes
          these and ``validate_frame`` rejects them as "extra features".
-      2. Decode columns with ``dtype == "image"`` from the parquet's
-         ``{'bytes': ...}`` encoding into ``PIL.Image`` objects (which
-         ``add_frame`` accepts directly per ``validate_feature_image_or_video``).
+      2. Image features come from one of two places depending on the source
+         dataset's storage mode. ``dtype == "image"`` (legacy, pre-2026-08-04
+         blends): decode the parquet's ``{'bytes': ...}`` encoding into a
+         ``PIL.Image``. ``dtype == "video"`` (current default): the parquet
+         has NO image columns at all — frames live in per-episode MP4
+         segments, pre-decoded once per episode by the caller and handed in
+         via ``video_frames`` (key → (T, H, W, C) uint8), indexed here by
+         ``frame_pos``.
       3. Look the task string up by ``task_index`` from the source dataset's
          ``meta/tasks.parquet`` mapping. The blend parquet stores
          ``task_index`` but not ``task``; ``add_frame`` requires ``task``.
@@ -306,8 +314,22 @@ def _row_to_frame(
     for key, spec in target_features.items():
         if key in _DEFAULT_FEATURE_KEYS:
             continue
-        value = row[key]
-        if spec.get("dtype") == "image" and isinstance(value, dict) and "bytes" in value:
+        # Source-side storage decides where the pixels come from: keys present
+        # in `video_frames` were decoded from the source's MP4 segments; any
+        # other key must be a parquet column (state/action/env_state, or
+        # legacy parquet-embedded image bytes).
+        if video_frames is not None and key in video_frames:
+            out[key] = video_frames[key][frame_pos]
+            continue
+        try:
+            value = row[key]
+        except KeyError:
+            raise KeyError(
+                f"Feature '{key}' is not a parquet column in the source dataset and no "
+                "decoded video frames were provided for it. If the source stores images "
+                "as video (image_dtype='video'), the caller must pass video_frames."
+            ) from None
+        if spec.get("dtype") in ("image", "video") and isinstance(value, dict) and "bytes" in value:
             value = PILImage.open(BytesIO(value["bytes"])).convert("RGB")
         out[key] = value
     # add_frame pops the "task" key separately and resolves it to task_index
@@ -317,10 +339,46 @@ def _row_to_frame(
     return out
 
 
+def _decode_episode_video_frames(
+    source_root_dir: Path,
+    source_info: dict,
+    ep_meta_row: pd.Series,
+    video_keys: list[str],
+    timestamps: list[float],
+) -> dict[str, np.ndarray]:
+    """Decode one episode's video frames into channel-last uint8 arrays.
+
+    Returns ``{video_key: (T, H, W, C) uint8}`` for the first
+    ``len(timestamps)`` frames — a format ``add_frame`` accepts. Video-backed datasets (the `image_dtype="video"` default in
+    splatsim's lerobot_utils since 2026-08-04) store frames in shared MP4
+    files; each episode's slice is addressed by
+    ``videos/<key>/{chunk_index,file_index,from_timestamp}`` in the episode
+    metadata, with the parquet ``timestamp`` column giving each frame's
+    offset within the slice — the same addressing `LeRobotDataset._query_videos`
+    uses.
+    """
+    fps = int(source_info["fps"])
+    tolerance_s = 1.0 / fps - 1e-4
+    out: dict[str, np.ndarray] = {}
+    for key in video_keys:
+        chunk_idx = int(ep_meta_row[f"videos/{key}/chunk_index"])
+        file_idx = int(ep_meta_row[f"videos/{key}/file_index"])
+        from_ts = float(ep_meta_row[f"videos/{key}/from_timestamp"])
+        video_path = source_root_dir / source_info["video_path"].format(
+            video_key=key, chunk_index=chunk_idx, file_index=file_idx
+        )
+        query_ts = [from_ts + ts for ts in timestamps]
+        # (T, C, H, W) uint8 → (T, H, W, C) uint8
+        frames = decode_video_frames(video_path, query_ts, tolerance_s, return_uint8=True)
+        out[key] = frames.permute(0, 2, 3, 1).contiguous().numpy()
+    return out
+
+
 def _load_task_mapping(source_root_dir: Path) -> dict[int, str]:
     """Load the source dataset's ``task_index → task_string`` map from
     ``meta/tasks.parquet``. Falls back to an empty dict if the file is
-    missing — callers can then default the task string at the call site."""
+    missing — callers can then default the task string at the call site.
+    """
     tasks_path = source_root_dir / "meta" / "tasks.parquet"
     if not tasks_path.is_file():
         return {}
@@ -440,6 +498,10 @@ def _run(
             _cams_seen.append(_cam)
     source_camera_names = _cams_seen
     source_image_resize_modes = _modes_seen if _modes_seen else ["letterbox"]
+    # Image features whose frames live in per-episode MP4 segments rather
+    # than parquet rows (`image_dtype="video"`, the default since 2026-08-04).
+    # These are decoded per kept episode via _decode_episode_video_frames.
+    source_video_keys = [k for k in _src_img_keys if _source_feats[k].get("dtype") == "video"]
     logger.info(
         "Source dataset feature shapes: state_dim=%d, action_dim=%d, env_state_dim=%d",
         source_state_dim,
@@ -703,12 +765,29 @@ def _run(
                 continue
 
             # KEPT: stream the first `trimmed_to` frames to the target dataset.
-            # ``_row_to_frame`` drops DEFAULT_FEATURES columns, decodes image
-            # bytes from the parquet's ``{'bytes': ...}`` encoding to PIL
-            # images, and looks up the task string by task_index — without
-            # those transforms, ``add_frame`` rejects the frame.
-            for _, row in frames_df.iloc[:trimmed_to].iterrows():
-                target_ds.add_frame(_row_to_frame(row, target_ds.meta.features, task_for_index))
+            # ``_row_to_frame`` drops DEFAULT_FEATURES columns, resolves image
+            # features (video-backed sources → the frames decoded below;
+            # legacy image-backed sources → parquet ``{'bytes': ...}``), and
+            # looks up the task string by task_index — without those
+            # transforms, ``add_frame`` rejects the frame.
+            ep_video_frames: dict[str, np.ndarray] | None = None
+            if source_video_keys:
+                _kept_ts = [
+                    float(np.asarray(v).reshape(-1)[0]) for v in frames_df["timestamp"].iloc[:trimmed_to]
+                ]
+                ep_video_frames = _decode_episode_video_frames(
+                    source_root_dir, _source_info, ep_meta_row, source_video_keys, _kept_ts
+                )
+            for _pos, (_, row) in enumerate(frames_df.iloc[:trimmed_to].iterrows()):
+                target_ds.add_frame(
+                    _row_to_frame(
+                        row,
+                        target_ds.meta.features,
+                        task_for_index,
+                        video_frames=ep_video_frames,
+                        frame_pos=_pos,
+                    )
+                )
             episode_metadata: dict[str, Any] = {
                 "source_episode_idx": source_episode_idx_meta,
                 "source_scenario_idx": source_scenario_idx,

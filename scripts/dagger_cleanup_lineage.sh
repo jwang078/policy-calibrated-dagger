@@ -100,6 +100,14 @@
 #               reruns requesting the same ratio at the same source round
 #               — deleting them here means the next sibling sweep run
 #               re-blends once, then re-uses the result.
+#               BASE-lineage targets: a base lineage recorded without
+#               --blends owns no blends itself (sidecar blends=[]), even
+#               though rerun children name their blend datasets after its
+#               intervention prefix. Targeting such a base delegates to
+#               each rerun child whose sidecar points at it (same detection
+#               as --detect_siblings), running --blends_only per child —
+#               which deletes the blends + the child's round training dirs
+#               and preserves the base lineage entirely.
 #               Incompatible with --nc_only / --delete_episodes /
 #               --from_round / --also_delete_blends. Skips the
 #               keep-round-1-intervention prompt (interventions untouched).
@@ -579,7 +587,7 @@ PY
 # family), show them and offer to clean them up too. Default is N so the
 # script behaves identically to before for users who say no (or who don't
 # notice the prompt — though Enter prints "Aborted" so it's hard to miss).
-if [[ "$DETECT_SIBLINGS" != true && "$AUTO_CONFIRM" != true ]]; then
+if [[ "$DETECT_SIBLINGS" != true && "$AUTO_CONFIRM" != true && -z "${DAGGER_CLEANUP_NO_SIBLING_PROMPT:-}" ]]; then
     _AUTO_SIBLINGS=()
     while IFS= read -r line; do
         _AUTO_SIBLINGS+=( "$line" )
@@ -1014,7 +1022,43 @@ for r in ratios:
     LINEAGE_PREFIX="$(printf '%s\n' "$BL_META" | sed -n 3p)"
     mapfile -t BLEND_TAGS < <(printf '%s\n' "$BL_META" | sed -n '4,$p')
     if [[ -z "$BLEND_PREFIX" || "${#BLEND_TAGS[@]}" -eq 0 ]]; then
-        echo "ERROR: sidecar at $CFG didn't yield a usable blend prefix or blend list." >&2
+        # The target's own sidecar declares no blends. That's the normal
+        # state for a BASE lineage recorded without --blends whose blend
+        # datasets were produced by rerun children: `--rerun_blends_from`
+        # lineages name their blends after THIS lineage's intervention
+        # prefix (for cross-rerun cache sharing), but ownership — the ratio
+        # list — lives in each child's sidecar. Delegate: find rerun
+        # children pointing at this target (same detection --detect_siblings
+        # uses) and run --blends_only on each. The child path deletes the
+        # blends + the child's own round training dirs and, being in rerun
+        # mode, preserves this (source) lineage entirely.
+        _BLEND_CHILDREN=()
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && _BLEND_CHILDREN+=( "$line" )
+        done < <(detect_rerun_child_paths)
+        if (( ${#_BLEND_CHILDREN[@]} > 0 )); then
+            echo "[blends_only] target's sidecar declares no blends of its own (blends=[]);"
+            echo "[blends_only] delegating to ${#_BLEND_CHILDREN[@]} rerun child lineage(s) that own blends"
+            echo "[blends_only] named after this lineage's intervention prefix:"
+            for p in "${_BLEND_CHILDREN[@]}"; do
+                echo "[blends_only]   $(basename "$p" | sed -E 's/(_ft)?_dag[0-9]+(_.*)?$//')"
+            done
+            AUTO_CONFIRM_FORWARD=()
+            [[ "$AUTO_CONFIRM" == true ]] && AUTO_CONFIRM_FORWARD=( -y )
+            overall_rc=0
+            for p in "${_BLEND_CHILDREN[@]}"; do
+                echo
+                echo "=== [blends_only] rerun child: $(basename "$p" | sed -E 's/(_ft)?_dag[0-9]+(_.*)?$//') ==="
+                DAGGER_CLEANUP_NO_SIBLING_PROMPT=1 bash "$0" "$p" --blends_only "${DRY_RUN_FLAG[@]}" "${AUTO_CONFIRM_FORWARD[@]}" && rc=0 || rc=$?
+                if (( rc != 0 )); then
+                    overall_rc="$rc"
+                    echo "[blends_only] WARN: child cleanup failed for $p (rc=$rc); continuing." >&2
+                fi
+            done
+            exit "$overall_rc"
+        fi
+        echo "ERROR: sidecar at $CFG didn't yield a usable blend prefix or blend list," >&2
+        echo "  and no rerun-child lineages pointing at this target were found on disk." >&2
         echo "  Got: blend_prefix='$BLEND_PREFIX', blend_tags=(${BLEND_TAGS[*]:-})" >&2
         exit 1
     fi

@@ -192,7 +192,8 @@ def format_sim_launch_command(
     eval_benchmark_repo_id: str | None,
 ) -> str:
     """The launch_nodes.py invocation that starts the splatsim server this
-    script expects to find on ``port`` (matching env task / robot / benchmark)."""
+    script expects to find on ``port`` (matching env task / robot / benchmark).
+    """
     variant = _TASK_TO_ROBOT_VARIANT.get(env_task, f"<launch_nodes.py robot variant for task '{env_task}'>")
     lines = [
         "cd ~/code/SplatSim && python -u scripts/launch_nodes.py \\",
@@ -213,7 +214,8 @@ def format_sim_launch_command(
 def check_sim_server_reachable(host: str, port: int, launch_hint: str) -> None:
     """Fail fast if nothing is listening on host:port. A ZMQ REQ socket never
     errors on a dead endpoint — the first reset request just queues forever,
-    so without this check a missing server looks like a silent freeze."""
+    so without this check a missing server looks like a silent freeze.
+    """
     import socket
 
     try:
@@ -317,6 +319,7 @@ def get_sim_action_chunk_for_ratio(
     progress_guidance: bool = False,
     progress_guidance_window: int = 45,
     demo_states_raw: np.ndarray | None = None,
+    frame_sink: dict[str, list[np.ndarray]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Thin adapter over :func:`lib_sa_rollout.run_blended_rollout` — the SAME
     core the sweep's blend step (``augment_dataset_with_blending``) executes.
@@ -327,7 +330,25 @@ def get_sim_action_chunk_for_ratio(
     benchmark scenario on EVERY per-ratio reset via
     ``benchmark_start_index`` (a bare seeded reset would let the server's
     EVAL_BENCHMARK counter advance one scenario per reset).
+
+    ``frame_sink``: when given, every tick's camera images (all non-``_stretch``
+    keys in ``env_obs['pixels']``) are appended to ``frame_sink[key]`` — one
+    RGB uint8 (H, W, 3) frame per tick, including frozen post-success hold
+    ticks, so video length always matches the plotted trajectory length.
     """
+    on_step = None
+    if frame_sink is not None:
+
+        def on_step(t: int, env_obs: dict, action_1d: np.ndarray, is_hold: bool) -> None:
+            del t, action_1d, is_hold
+            for key, img in (env_obs.get("pixels") or {}).items():
+                if key.endswith("_stretch") or img is None:
+                    continue
+                frame = np.asarray(img)
+                if frame.ndim == 4:  # vec-env batched (1, H, W, 3)
+                    frame = frame[0]
+                frame_sink.setdefault(key, []).append(frame.copy())
+
     result = run_blended_rollout(
         wrapper=wrapper,
         obs_preprocessor=obs_preprocessor,
@@ -349,6 +370,7 @@ def get_sim_action_chunk_for_ratio(
         progress_guidance=progress_guidance,
         progress_guidance_window=progress_guidance_window,
         demo_states_raw=demo_states_raw,
+        on_step=on_step,
     )
     return result.raw_actions, result.decoded_guidance_full
 
@@ -374,7 +396,8 @@ def get_sim_action_chunks_for_ratios(
     progress_guidance: bool = False,
     progress_guidance_window: int = 45,
     demo_states_raw: np.ndarray | None = None,
-) -> tuple[dict[float, np.ndarray], dict[float, np.ndarray]]:
+    record_videos: bool = False,
+) -> tuple[dict[float, np.ndarray], dict[float, np.ndarray], dict[float, dict[str, list[np.ndarray]]]]:
     """Run :func:`get_sim_action_chunk_for_ratio` for each ratio.
 
     ``fixed_base_noise=True`` (default) pins ONE noise draw shared across all
@@ -382,6 +405,10 @@ def get_sim_action_chunks_for_ratios(
     mode. ``False`` matches the sweep's blend default: the wrapper draws a
     FRESH torch.randn internally on every denoise (base_noise=None), so
     consecutive every_step samples are independent — expect shake.
+
+    ``record_videos=True`` additionally collects each rollout's camera frames
+    (every non-``_stretch`` key in the env's pixels dict) and returns them as
+    the third element: ``{ratio: {image_key: [frame, ...]}}``.
     """
     torch.manual_seed(42)
     if torch.cuda.is_available():
@@ -397,6 +424,7 @@ def get_sim_action_chunks_for_ratios(
 
     results: dict[float, np.ndarray] = {}
     decoded_guidance_by_ratio: dict[float, np.ndarray] = {}
+    frames_by_ratio: dict[float, dict[str, list[np.ndarray]]] = {}
 
     progress = tqdm(
         ratios,
@@ -406,6 +434,16 @@ def get_sim_action_chunks_for_ratios(
     )
     for ratio in progress:
         progress.set_postfix_str(f"ratio={ratio:.2f}")
+        # Re-seed the global RNG at the START of every rollout, not just once
+        # before the loop. DDPM's noise_scheduler.step() draws fresh variance
+        # noise from the global RNG at EVERY denoising step (base_noise only
+        # pins the initial sample), so without a per-rollout re-seed each
+        # ratio continues the stream where the previous rollout left it and
+        # blends against a DIFFERENT policy sample — breaking cross-ratio
+        # comparability (blends land outside the [guidance, policy] envelope).
+        torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(42)
         actions, decoded = get_sim_action_chunk_for_ratio(
             wrapper,
             obs_preprocessor,
@@ -425,12 +463,78 @@ def get_sim_action_chunks_for_ratios(
             progress_guidance=progress_guidance,
             progress_guidance_window=progress_guidance_window,
             demo_states_raw=demo_states_raw,
+            frame_sink=frames_by_ratio.setdefault(ratio, {}) if record_videos else None,
         )
         results[ratio] = actions
         if decoded is not None:
             decoded_guidance_by_ratio[ratio] = decoded
 
-    return results, decoded_guidance_by_ratio
+    return results, decoded_guidance_by_ratio, frames_by_ratio
+
+
+# ── video writing ─────────────────────────────────────────────────────────────
+
+
+def _write_rollout_mp4(frames: list[np.ndarray], fps: float, out_path: Path) -> None:
+    """Write RGB uint8 frames as an H.264 + yuv420p mp4 (VSCode/browser-safe).
+
+    Same encode pipeline as extract_dataset_videos.py: cv2 writes a temp mp4v
+    file, ffmpeg re-encodes to libx264 + yuv420p + faststart. If ffmpeg is not
+    on PATH, the mp4v temp file is kept as the output instead (still playable
+    in VLC, just not in VSCode's built-in viewer).
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    import cv2  # type: ignore[import-not-found]
+
+    if not frames:
+        raise ValueError(f"No frames collected for {out_path.name}")
+    height, width = frames[0].shape[:2]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = tempfile.mkdtemp(prefix="sa_sim_video_", dir=out_path.parent)
+    tmp_video = Path(tmp_dir) / "raw_mp4v.mp4"
+
+    writer = cv2.VideoWriter(str(tmp_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    if not writer.isOpened():
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise RuntimeError(f"Failed to open temp video writer: {tmp_video}")
+    try:
+        for frame in frames:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin is None:
+        shutil.move(str(tmp_video), str(out_path))
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        print(f"WARNING: ffmpeg not found — kept mp4v encoding for {out_path}")
+        return
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        str(tmp_video),
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-vf",
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-movflags",
+        "+faststart",
+        "-preset",
+        "veryfast",
+        str(out_path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg re-encode failed (exit {proc.returncode}):\n{proc.stderr.strip()}")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -591,6 +695,37 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--record_videos",
+        type=_parse_bool,
+        default=True,
+        help=(
+            "Record each ratio rollout's camera observations (every non-stretch image key the "
+            "env returns, e.g. base_rgb_letterbox / wrist_rgb_letterbox) as mp4 files in the "
+            "output dir. When the policy itself uses no cameras, --video_camera_names are "
+            "requested from the sim just for recording."
+        ),
+    )
+    parser.add_argument(
+        "--video_camera_names",
+        nargs="+",
+        default=None,
+        help=(
+            "Cameras to request from the sim for video recording when the env would otherwise "
+            "have none (state-only policies). Defaults to ['base_rgb', 'wrist_rgb']."
+        ),
+    )
+    parser.add_argument(
+        "--sample_seed",
+        type=int,
+        default=42,
+        help=(
+            "Seed a fresh torch.Generator for EVERY blend-path model call (prior draw + all "
+            "scheduler.step variance draws), so each call uses identical randomness and "
+            "consecutive per-tick samples differ only via the observation — no fresh-sample "
+            "shake, fully reproducible. Pass -1 to disable (legacy global-RNG sampling)."
+        ),
+    )
+    parser.add_argument(
         "--clip_sample",
         type=_parse_bool,
         default=None,
@@ -671,6 +806,13 @@ def main():
         env_robot_name = _remapped
     env_camera_names = args.env_camera_names or list(args.camera_names)
     env_image_resize_modes = args.env_image_resize_modes or [args.image_resize_mode]
+    if args.record_videos:
+        # Make sure the sim renders SOMETHING to record even when the policy is
+        # state-only (planar checkpoints auto-resolve camera_names=[]). Extra
+        # image keys in the obs are harmless to the policy — its preprocessor
+        # only consumes the features it was trained on.
+        video_cams = args.video_camera_names or ["base_rgb", "wrist_rgb"]
+        env_camera_names = env_camera_names + [c for c in video_cams if c not in env_camera_names]
 
     # Remind how to start the sim this script needs, then fail fast if it isn't
     # up yet (a bare ZMQ connect to a dead port hangs with no error).
@@ -723,6 +865,9 @@ def main():
         device=args.device,
     )
     wrapper.guidance_blend_strategy = GuidanceBlendStrategy(args.blend_strategy)
+    if args.sample_seed >= 0:
+        wrapper.sample_seed = args.sample_seed
+        print(f"Per-call sample generator enabled (seed={args.sample_seed}).")
     wrapper.policy_guidance_representation = PolicyGuidanceRepresentation(args.guidance_repr)
     wrapper.n_anchor_steps = args.n_anchor_steps
     wrapper.skip_collision = True
@@ -895,7 +1040,7 @@ def main():
 
     try:
         print(f"Computing sim rollouts for ratios: {args.forward_flow_ratios} …")
-        action_chunks, decoded_guidance_by_ratio = get_sim_action_chunks_for_ratios(
+        action_chunks, decoded_guidance_by_ratio, frames_by_ratio = get_sim_action_chunks_for_ratios(
             wrapper,
             obs_preprocessor,
             vec_env,
@@ -914,6 +1059,7 @@ def main():
             progress_guidance=args.progress_guidance,
             progress_guidance_window=args.progress_guidance_window,
             demo_states_raw=demo_states_raw,
+            record_videos=args.record_videos,
         )
         print("Done computing rollouts.")
     finally:
@@ -967,6 +1113,29 @@ def main():
     print(f"Output dir: {output_dir}")
     joint_angles_path = output_dir / "joint_angles.png"
     ee_traj_path = output_dir / "ee_trajectory.html"
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        output_dir / "rollout_data.npz",
+        guidance_actions_raw=guidance_actions_raw_for_plot,
+        decoded_guidance=decoded_guidance if decoded_guidance is not None else np.array([]),
+        obs_states_raw=obs_states_raw,
+        **{f"ratio_{r:.2f}": chunk for r, chunk in action_chunks.items()},
+    )
+    print(f"Saved raw rollout arrays → {output_dir / 'rollout_data.npz'}")
+
+    if frames_by_ratio:
+        print("Writing rollout videos …")
+        for ratio in sorted(frames_by_ratio):
+            for image_key, frames in sorted(frames_by_ratio[ratio].items()):
+                if not any(frame.any() for frame in frames):
+                    # The gym client zero-fills cameras the sim server doesn't
+                    # render (e.g. wrist_rgb on the planar arm) — skip them.
+                    print(f"Skipping {image_key} at ratio={ratio:.2f}: all-black (camera not rendered)")
+                    continue
+                video_path = output_dir / f"ratio_{ratio:.2f}_{image_key}.mp4"
+                _write_rollout_mp4(frames, fps=float(args.env_fps), out_path=video_path)
+                print(f"Saved video → {video_path}")
 
     print("Plotting joint angles …")
     plot_joint_angles(

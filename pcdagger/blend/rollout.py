@@ -319,7 +319,7 @@ def run_blended_rollout(
     base_noise: torch.Tensor | None = None,
     progress_guidance: bool = False,
     progress_guidance_window: int = 45,
-    progress_guidance_lead: int = 2,
+    progress_guidance_lag_tol: int = 2,
     seed_joint_velocity: np.ndarray | None = None,
     fps: float = 30.0,
     demo_states_raw: np.ndarray | None = None,
@@ -407,6 +407,7 @@ def run_blended_rollout(
         _demo_arm = np.asarray(guidance_actions_raw[:, :_num_arm], dtype=np.float32)
         _match_shift = 1
     _j_progress = 0
+    _j_clock = 0  # demo-pace playback cursor (see the progress block below)
 
     for t in range(total_steps):
         # ── Hold mode: episode succeeded, don't step env again ────────────────
@@ -430,30 +431,25 @@ def run_blended_rollout(
             # the demo where it actually is, so guidance and robot re-converge.
             _q_now = np.asarray(env_obs["agent_pos"], dtype=np.float32).reshape(-1)[: _demo_arm.shape[1]]
             _j_progress = progress_guidance_index(_demo_arm, _q_now, _j_progress, progress_guidance_window)
-            # LOOKAHEAD (progress_guidance_lead): command a point AHEAD of the
-            # matched step, pure-pursuit style. Commanding the matched step
-            # itself self-throttles: the cursor only advances after the obs
-            # confirms arrival, so with 1 tick of obs/PD lag the command
-            # repeats verbatim every other tick and the rollout executes the
-            # demo at 1/2-1/3 pace — measured on a ratio=0.0 rollout
-            # (move/freeze/freeze command cadence, dev vs the time-aligned
-            # demo growing linearly to 1.48 rad; 2026-08-18). A lead of 2
-            # keeps the command ~one control period ahead at demo pace while
-            # preserving the stall-hold semantics (a stuck robot still pins
-            # the cursor, just `lead` steps ahead of its pin point).
-            # Ramp the lead in at HALF rate (t//2): full lead at t=0
-            # commands `lead` demo steps ahead of a robot that is AT the
-            # demo start — a (lead+1)x catch-up lurch (measured 0.288 vs
-            # demo launch 0.102) — and even a per-tick ramp still advances
-            # the command ~2 steps/tick while the match advances underneath
-            # it (measured 0.209). Half-rate keeps the command's advance
-            # ~1 step/tick through the ramp, then holds the full pursuit
-            # lead.
-            _lead_eff = min(t // 2, max(0, int(progress_guidance_lead)))
-            _j_exec = min(
-                _j_progress + _match_shift + _lead_eff,
-                guidance_actions_raw.shape[0] - 1,
-            )
+            # DEMO-PACE CLOCK, gated by robot progress. Two prior designs
+            # both corrupted the demo's speed profile:
+            #   * commanding the matched step self-throttled (cursor advances
+            #     only after the obs confirms arrival -> 1/2-1/3 demo pace,
+            #     move/freeze command cadence);
+            #   * a pursuit lead (command j*+2) fixed the throttle but let
+            #     the robot COMPRESS the demo's deliberately-slow phases
+            #     (launch ramp, taper, curvature dips): pace 1.22, ratio-0
+            #     "faithful" replays finishing 124/155 frames (2026-08-18).
+            # The clock advances at most 1 demo index per wall tick (pace
+            # can never exceed 1.0 = the demo's own timing), holds when the
+            # robot lags more than `progress_guidance_lag_tol` behind it
+            # (stall-hold: a stuck robot pins the guidance), and snaps
+            # forward when the robot re-enters the demo ahead of it (a
+            # deviated rollout rejoins where it actually is).
+            _j_clock = max(_j_clock, _j_progress)
+            _j_exec = min(_j_clock + _match_shift, guidance_actions_raw.shape[0] - 1)
+            if _j_progress >= _j_clock - max(0, int(progress_guidance_lag_tol)):
+                _j_clock = min(_j_clock + 1, guidance_actions_raw.shape[0] - 1)
             guidance_chunk = None if suppress_guidance else guidance_actions_raw[_j_exec:]
         else:
             guidance_chunk = None if suppress_guidance else guidance_actions_raw[t:]

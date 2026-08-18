@@ -81,8 +81,10 @@ def main() -> None:
                 fails.append(f"{k}: frozen-command fraction {100 * frozen:.0f}% (> 5%)")
             if path_dev.mean() > 0.05:
                 fails.append(f"{k}: mean PATH deviation {path_dev.mean():.3f} rad (> 0.05)")
-            if not (0.8 <= pace <= 1.3):
-                fails.append(f"{k}: pace {pace:.2f}x demo (outside [0.8, 1.3])")
+            if not (0.95 <= pace <= 1.05):
+                # The demo-pace clock makes an exact-timing replay achievable
+                # (measured pace 1.00 on ep0, 2026-08-18) — hold the line.
+                fails.append(f"{k}: pace {pace:.2f}x demo (outside [0.95, 1.05])")
             if end_gap > 0.1:
                 fails.append(f"{k}: ends {end_gap:.3f} rad from the demo endpoint (> 0.1)")
             if g_launch > 0.05 and not (0.5 * g_launch <= launch <= 2.0 * g_launch):

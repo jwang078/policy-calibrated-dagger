@@ -494,6 +494,7 @@ def rollout_closed_loop_for_augmentation(
     env_preprocessor,
     env_postprocessor,
     seed_joint_state: np.ndarray,
+    seed_joint_velocity: np.ndarray | None = None,
     guidance_actions_raw: np.ndarray,
     ratio: float,
     blend_mode: BlendMode,
@@ -563,6 +564,7 @@ def rollout_closed_loop_for_augmentation(
         env_preprocessor=env_preprocessor,
         env_postprocessor=env_postprocessor,
         seed_joint_state=seed_joint_state,
+        seed_joint_velocity=seed_joint_velocity,
         guidance_actions_raw=guidance_actions_raw,
         ratio=ratio,
         blend_mode=blend_mode,
@@ -1137,6 +1139,18 @@ def run_augmentation(
                 source_data_dir, source_ep, frame_index=s0, n_frames=ep_length - s0
             )
             seed_joint_state = np.asarray(frames_df.iloc[n_obs_steps - 1]["action"], dtype=np.float32)
+            # Handoff velocity at the seed frame (rad/s, 3-frame FD like the
+            # intervention recorder's lookback restore): the source episode
+            # began with the policy's carried velocity, so the blend rollout
+            # must seed the sim AND the policy's obs history moving the same
+            # way — a rest seed lurches at its first command (0.67 rad/s
+            # first-step vs the source's 0.24-0.30) and conditions the policy
+            # on an at-rest history the source never had.
+            seed_joint_velocity = None
+            if "observation.state" in frames_df.columns and len(frames_df) > n_obs_steps + 2:
+                _s_lo = np.asarray(frames_df.iloc[n_obs_steps - 1]["observation.state"], dtype=np.float32)
+                _s_hi = np.asarray(frames_df.iloc[n_obs_steps + 2]["observation.state"], dtype=np.float32)
+                seed_joint_velocity = (_s_hi - _s_lo) / 3.0 * float(cfg.env_fps)
             guidance_actions_raw = np.stack(
                 [
                     np.asarray(row["action"], dtype=np.float32)
@@ -1213,6 +1227,7 @@ def run_augmentation(
                     env_preprocessor=env_pre,
                     env_postprocessor=env_post,
                     seed_joint_state=seed_joint_state,
+                    seed_joint_velocity=seed_joint_velocity,
                     guidance_actions_raw=guidance_actions_raw,
                     ratio=float(ratio),
                     blend_mode=blend_mode_enum,

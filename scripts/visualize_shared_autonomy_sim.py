@@ -324,6 +324,7 @@ def get_sim_action_chunk_for_ratio(
     env_postprocessor,
     *,
     seed_joint_state: np.ndarray,
+    seed_joint_velocity: np.ndarray | None = None,
     episode_index_for_seed: int,
     guidance_actions_raw: np.ndarray,
     ratio: float,
@@ -374,6 +375,7 @@ def get_sim_action_chunk_for_ratio(
         env_preprocessor=env_preprocessor,
         env_postprocessor=env_postprocessor,
         seed_joint_state=seed_joint_state,
+        seed_joint_velocity=seed_joint_velocity,
         guidance_actions_raw=guidance_actions_raw,
         ratio=ratio,
         blend_mode=BlendMode.ONCE_PER_CHUNK if blend_interval_frac >= 1.0 else BlendMode.EVERY_STEP,
@@ -402,6 +404,7 @@ def get_sim_action_chunks_for_ratios(
     env_postprocessor,
     *,
     seed_joint_state: np.ndarray,
+    seed_joint_velocity: np.ndarray | None = None,
     episode_index_for_seed: int,
     guidance_actions_raw: np.ndarray,
     ratios: list[float],
@@ -469,6 +472,7 @@ def get_sim_action_chunks_for_ratios(
             env_preprocessor,
             env_postprocessor,
             seed_joint_state=seed_joint_state,
+            seed_joint_velocity=seed_joint_velocity,
             episode_index_for_seed=episode_index_for_seed,
             guidance_actions_raw=guidance_actions_raw,
             ratio=ratio,
@@ -1057,6 +1061,15 @@ def main():
             print(f"No task in dataset for task_index={task_idx}; using --env_task='{task_description}'")
 
     seed_joint_state = np.array(obs_frames.iloc[-1]["action"], dtype=np.float32)
+    # Handoff velocity at the seed frame (3-frame FD, rad/s) — mirrors the
+    # blend script: seed the sim + policy obs history MOVING like the source
+    # episode's handoff instead of at rest (rest-seeding lurches the first
+    # command and contradicts the source's conditioning).
+    seed_joint_velocity = None
+    if "observation.state" in frames_df.columns and len(frames_df) > n_obs_steps + 2:
+        _s_lo = np.array(frames_df.iloc[n_obs_steps - 1]["observation.state"], dtype=np.float32)
+        _s_hi = np.array(frames_df.iloc[n_obs_steps + 2]["observation.state"], dtype=np.float32)
+        seed_joint_velocity = (_s_hi - _s_lo) / 3.0 * 30.0
 
     guidance_actions_raw_for_plot = guidance_actions_raw
     if args.guidance_repr == "delta":
@@ -1124,6 +1137,7 @@ def main():
             env_pre,
             env_post,
             seed_joint_state=seed_joint_state,
+            seed_joint_velocity=seed_joint_velocity,
             episode_index_for_seed=scenario_index,
             guidance_actions_raw=guidance_actions_raw,
             ratios=args.forward_flow_ratios,

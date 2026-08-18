@@ -202,11 +202,24 @@ def _run_filler_phase(
     device: str,
     task_description: str | None,
     seed_joint_state: np.ndarray,
+    seed_joint_velocity: np.ndarray | None = None,
+    fps: float = 30.0,
 ) -> None:
     """Drain the inner policy's first throwaway chunk. Does NOT step the env.
 
     Ensures the obs queue has the right history before the real phase
     begins.
+
+    ``seed_joint_velocity`` (rad/s): when the rollout seeds an episode that
+    began with a MOVING handoff, the policy's obs history must encode that
+    motion — a filler phase of identical frames tells the policy "you are at
+    rest", contradicting the source episode's conditioning and producing a
+    first-command lurch (measured 0.67 rad/s first-step vs the source's
+    carried 0.24-0.30, planar_12 blends, 2026-08-18). Each filler tick's
+    ``agent_pos`` is back-extrapolated along the seed velocity so the final
+    ``n_obs_steps`` queue entries arrive at ``seed_joint_state`` moving at
+    ``seed_joint_velocity``. Images stay the seeded frame (state carries the
+    velocity signal for these policies).
 
     Also snaps ``wrapper._desired_q`` to ``seed_joint_state`` after filler so the
     wrapper's IK anchor isn't polluted by the throwaway chunk's actions.
@@ -214,9 +227,22 @@ def _run_filler_phase(
     n_obs_steps: int = wrapper.config.n_obs_steps
     n_action_steps: int = wrapper.config.n_action_steps
     n_filler_drain = n_action_steps - (n_obs_steps - 1)
-    for _ in range(n_filler_drain + (n_obs_steps - 1)):
+    n_total = n_filler_drain + (n_obs_steps - 1)
+    for i in range(n_total):
+        tick_obs = env_obs
+        if seed_joint_velocity is not None:
+            v = np.asarray(seed_joint_velocity, dtype=np.float32).reshape(-1)
+            q0 = np.asarray(seed_joint_state, dtype=np.float32).reshape(-1)
+            ticks_back = float(n_total - 1 - i)
+            q_i = q0.copy()
+            n_arm = min(len(v), len(q_i))
+            q_i[:n_arm] = q0[:n_arm] - v[:n_arm] * (ticks_back / float(fps))
+            tick_obs = dict(env_obs)
+            ap = np.asarray(env_obs["agent_pos"], dtype=np.float32).copy()
+            ap[0, : len(q_i)] = q_i[: ap.shape[1]]
+            tick_obs["agent_pos"] = ap
         batch = _build_sim_batch(
-            env_obs,
+            tick_obs,
             env_preprocessor=env_preprocessor,
             obs_preprocessor=obs_preprocessor,
             rename_map=rename_map,
@@ -284,6 +310,9 @@ def run_blended_rollout(
     base_noise: torch.Tensor | None = None,
     progress_guidance: bool = False,
     progress_guidance_window: int = 45,
+    progress_guidance_lead: int = 2,
+    seed_joint_velocity: np.ndarray | None = None,
+    fps: float = 30.0,
     demo_states_raw: np.ndarray | None = None,
     pad_after_success: bool = True,
     on_step: Callable[[int, dict[str, Any], np.ndarray, bool], None] | None = None,
@@ -328,6 +357,7 @@ def run_blended_rollout(
     env_obs = seed_splatsim_env_to_state(
         vec_env,
         joint_state=seed_joint_state,
+        joint_velocities=seed_joint_velocity,
         num_dofs=wrapper.num_dofs,
         seed=seed,
         benchmark_start_index=benchmark_start_index,
@@ -343,6 +373,8 @@ def run_blended_rollout(
         device=device,
         task_description=task_description,
         seed_joint_state=seed_joint_state,
+        seed_joint_velocity=seed_joint_velocity,
+        fps=fps,
     )
 
     raw_actions: list[np.ndarray] = []
@@ -389,7 +421,21 @@ def run_blended_rollout(
             # the demo where it actually is, so guidance and robot re-converge.
             _q_now = np.asarray(env_obs["agent_pos"], dtype=np.float32).reshape(-1)[: _demo_arm.shape[1]]
             _j_progress = progress_guidance_index(_demo_arm, _q_now, _j_progress, progress_guidance_window)
-            _j_exec = min(_j_progress + _match_shift, guidance_actions_raw.shape[0] - 1)
+            # LOOKAHEAD (progress_guidance_lead): command a point AHEAD of the
+            # matched step, pure-pursuit style. Commanding the matched step
+            # itself self-throttles: the cursor only advances after the obs
+            # confirms arrival, so with 1 tick of obs/PD lag the command
+            # repeats verbatim every other tick and the rollout executes the
+            # demo at 1/2-1/3 pace — measured on a ratio=0.0 rollout
+            # (move/freeze/freeze command cadence, dev vs the time-aligned
+            # demo growing linearly to 1.48 rad; 2026-08-18). A lead of 2
+            # keeps the command ~one control period ahead at demo pace while
+            # preserving the stall-hold semantics (a stuck robot still pins
+            # the cursor, just `lead` steps ahead of its pin point).
+            _j_exec = min(
+                _j_progress + _match_shift + max(0, int(progress_guidance_lead)),
+                guidance_actions_raw.shape[0] - 1,
+            )
             guidance_chunk = None if suppress_guidance else guidance_actions_raw[_j_exec:]
         else:
             guidance_chunk = None if suppress_guidance else guidance_actions_raw[t:]

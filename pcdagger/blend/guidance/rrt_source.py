@@ -905,14 +905,26 @@ class RRTGuidanceSource:
                 # trigger often fires with the robot already too close to
                 # brake within nominal limits and clearances — but a few
                 # frames AGO it wasn't. Walk back through recent
-                # policy-driven history to the most recent state where an
-                # ordinary brake along the then-velocity fits, and plan from
-                # there instead: the recorded chunk starts at the policy's
-                # true velocity with no escalated limits or contact-level
+                # policy-driven history and plan from an earlier state
+                # instead: the recorded chunk starts at the policy's true
+                # velocity with no escalated limits or contact-level
                 # clearances, and the doomed frames get trimmed exactly like
-                # any other lookback. k=0 (current state feasible) keeps the
-                # plain no-lookback path; no feasible k keeps it too — the
-                # planner's emergency lead-in chain is the deeper fallback.
+                # any other lookback.
+                #
+                # TWO-TIER criterion. Preferred: the nearest state that is
+                # RUNWAY-FREE (`is_handoff_runway_free` — a braking spur
+                # along its velocity clears the FULL planning clearance),
+                # because that is the geometry the braking lead-in / curved
+                # redirect need: the plan then genuinely launches at the
+                # policy's speed. Merely brake-feasible states can still
+                # have every velocity-carry device blocked — planar
+                # scenario 14 (2026-08-17) rewound 4 frames to one, and the
+                # handoff braked in place carrying 0.054 of 0.45 rad/s.
+                # Fallback: the nearest brake-feasible state (previous
+                # behavior) when no runway state exists in the window.
+                # k=0 qualifying keeps the plain no-lookback path; nothing
+                # qualifying keeps it too — the planner's emergency lead-in
+                # chain is the deeper fallback.
                 _hist0 = getattr(wrapper, "_actual_q_history", None)
                 _cap = min(
                     30,
@@ -922,34 +934,55 @@ class RRTGuidanceSource:
                 if _hist0 is not None and _cap >= 1:
                     _planner0 = self._ensure_planner()
                     _fps0 = float(getattr(wrapper, "_fps", 30) or 30)
+
+                    def _state_at(k):
+                        qk = _hist0[-(k + 1)].reshape(-1)[: wrapper.num_dofs]
+                        qk_prev = _hist0[-(k + 4)].reshape(-1)[: wrapper.num_dofs]
+                        return qk, (qk - qk_prev) / 3.0 * _fps0
+
+                    _brake_k = None  # nearest merely-brake-feasible (fallback)
+                    _chosen = None  # (k, "criterion for the log")
                     for _k in range(0, _cap + 1):
-                        _qk = _hist0[-(_k + 1)].reshape(-1)[: wrapper.num_dofs]
-                        _qk_prev = _hist0[-(_k + 4)].reshape(-1)[: wrapper.num_dofs]
-                        _vk = (_qk - _qk_prev) / 3.0 * _fps0
+                        _qk, _vk = _state_at(_k)
                         try:
-                            _ok = _planner0.is_brake_feasible(_qk, _vk)
+                            if _planner0.is_handoff_runway_free(_qk, _vk):
+                                _chosen = (_k, "runway-free")
+                                break
+                            if _brake_k is None and _planner0.is_brake_feasible(_qk, _vk):
+                                _brake_k = _k
+                        except AttributeError:
+                            # Older planner without the runway check —
+                            # legacy brake-only walk.
+                            try:
+                                if _planner0.is_brake_feasible(_qk, _vk):
+                                    _chosen = (_k, "brake-feasible (legacy)")
+                                    break
+                            except Exception:
+                                break
                         except Exception:
-                            break  # feature unavailable — keep plain path
-                        if _ok:
-                            if _k > 0:
-                                # Flip this plan into a k-frame lookback and
-                                # do the FULL rewind bookkeeping here (the
-                                # else-branch history walk won't run): start
-                                # state, rewound-tick velocity, obs window.
-                                no_lookback = False
-                                effective_lookback = _k
-                                q_start_full = _hist0[-(_k + 1)].reshape(-1).copy()
-                                _lvt = (_qk - _qk_prev) / 3.0  # rad/tick, arm dims
-                                lookback_vel_per_tick = _lvt if float(np.linalg.norm(_lvt)) >= 1e-4 else None
-                                obs_reseed_frames = wrapper.snapshot_obs_history_for_lookback(_k)
-                                logger.info(
-                                    "Shield brake-feasible micro-rewind: current state "
-                                    "cannot brake within nominal limits; rewinding %d "
-                                    "frame(s) to a brake-feasible state (|v|=%.2f rad/s).",
-                                    _k,
-                                    float(np.linalg.norm(_vk)),
-                                )
-                            break
+                            break  # feature unavailable — keep what we have
+                    if _chosen is None and _brake_k is not None:
+                        _chosen = (_brake_k, "brake-feasible (no runway state in window)")
+                    if _chosen is not None and _chosen[0] > 0:
+                        # Flip this plan into a k-frame lookback and do the
+                        # FULL rewind bookkeeping here (the else-branch
+                        # history walk won't run): start state, rewound-tick
+                        # velocity, obs window.
+                        _k, _why = _chosen
+                        _qk, _vk = _state_at(_k)
+                        no_lookback = False
+                        effective_lookback = _k
+                        q_start_full = _hist0[-(_k + 1)].reshape(-1).copy()
+                        _lvt = _vk / _fps0  # rad/tick, arm dims
+                        lookback_vel_per_tick = _lvt if float(np.linalg.norm(_lvt)) >= 1e-4 else None
+                        obs_reseed_frames = wrapper.snapshot_obs_history_for_lookback(_k)
+                        logger.info(
+                            "Shield micro-rewind: rewinding %d frame(s) to the "
+                            "nearest %s state (|v|=%.2f rad/s).",
+                            _k,
+                            _why,
+                            float(np.linalg.norm(_vk)),
+                        )
                 if no_lookback:
                     logger.info(
                         "RRT plan (no-lookback): q_start = current robot state (skipping pre-jump teleport)."

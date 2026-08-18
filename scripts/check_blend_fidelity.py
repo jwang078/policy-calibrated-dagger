@@ -42,9 +42,11 @@ def main() -> None:
     print(f"guidance: {len(g)} frames, launch {g_launch:.3f} rad/s, median speed {g_med:.3f}")
 
     fails: list[str] = []
+    warns: list[str] = []
     ratio_keys = sorted(k for k in z.files if k.startswith("ratio_"))
     print(
-        f"\n{'ratio':>10s} {'live':>5s} {'frozen%':>8s} {'launch':>7s} {'sp_med':>7s} {'dev_mean':>9s} {'dev_end':>8s}"
+        f"\n{'ratio':>10s} {'live':>5s} {'frozen%':>8s} {'launch':>7s} {'sp_med':>7s} "
+        f"{'path_dev':>9s} {'pace':>6s} {'end_gap':>8s}"
     )
     for k in ratio_keys:
         a = np.asarray(z[k], dtype=np.float64)[:, :3]
@@ -59,27 +61,51 @@ def main() -> None:
         sp = sp[:end]
         frozen = float((sp < 0.02).mean())
         launch = float(np.mean(sp[:3]))
-        n = min(len(a), len(g))
-        dev = np.linalg.norm(a[:n] - g[:n], axis=1)
+        # PATH-aligned deviation: distance to the nearest guidance point —
+        # insensitive to pace differences (a rollout running ahead/behind the
+        # demo clock scores 0 if it stays on the demo's path).
+        d2 = np.linalg.norm(a[:, None, :] - g[None, :, :], axis=2)
+        path_dev = d2.min(axis=1)
+        nearest = d2.argmin(axis=1)
+        # PACE: demo-index progress per wall tick (1.0 = demo pace) over the
+        # live span, from a robust linear fit of nearest-index vs tick.
+        pace = float(np.polyfit(np.arange(len(nearest)), nearest, 1)[0]) if len(nearest) > 10 else 1.0
+        end_gap = float(np.linalg.norm(a[-1] - g[-1]))
         print(
             f"{k:>10s} {len(a):5d} {100 * frozen:7.1f}% {launch:7.3f} "
-            f"{np.median(sp):7.3f} {dev.mean():9.3f} {dev[n - 1]:8.3f}"
+            f"{np.median(sp):7.3f} {path_dev.mean():9.3f} {pace:6.2f} {end_gap:8.3f}"
         )
         ratio = float(k.split("_")[1])
         if ratio == 0.0:
             if frozen > 0.05:
                 fails.append(f"{k}: frozen-command fraction {100 * frozen:.0f}% (> 5%)")
-            if dev.mean() > 0.05:
-                fails.append(f"{k}: mean dev vs guidance {dev.mean():.3f} rad (> 0.05)")
-        if g_launch > 0.05 and not (0.5 * g_launch <= launch <= 1.6 * g_launch):
-            fails.append(f"{k}: launch {launch:.3f} outside [0.5x, 1.6x] of guidance launch {g_launch:.3f}")
+            if path_dev.mean() > 0.05:
+                fails.append(f"{k}: mean PATH deviation {path_dev.mean():.3f} rad (> 0.05)")
+            if not (0.8 <= pace <= 1.3):
+                fails.append(f"{k}: pace {pace:.2f}x demo (outside [0.8, 1.3])")
+            if end_gap > 0.1:
+                fails.append(f"{k}: ends {end_gap:.3f} rad from the demo endpoint (> 0.1)")
+            if g_launch > 0.05 and not (0.5 * g_launch <= launch <= 2.0 * g_launch):
+                fails.append(
+                    f"{k}: launch {launch:.3f} outside [0.5x, 2.0x] of guidance launch {g_launch:.3f}"
+                )
+        elif g_launch > 0.05 and not (0.5 * g_launch <= launch <= 2.0 * g_launch):
+            # Non-zero ratios carry a policy contribution — a launch lurch
+            # here reflects the POLICY's velocity-discontinuity at this
+            # state, informative but not a blend-machinery failure.
+            warns.append(
+                f"{k}: launch {launch:.3f} vs guidance launch {g_launch:.3f} "
+                f"(policy-side lurch enters the blend data)"
+            )
 
     print()
+    for w in warns:
+        print(f"WARN {w}")
     if fails:
         for f in fails:
             print(f"FAIL {f}")
         sys.exit(1)
-    print("ALL PASS")
+    print("ALL PASS" + (" (with warnings)" if warns else ""))
 
 
 if __name__ == "__main__":

@@ -364,21 +364,38 @@ class ObservationTeleopGuidanceSource:
 
         # ── Anchor chunk: the pure-policy model call (shared) ──────────────
         # Stored as `_anchor_chunk_orig` and used as the policy component /
-        # guidance-fill base for BOTH strategies. Regenerated at fresh chunk
-        # builds — and on EVERY tick for now-anchored INTERPOLATE, because
-        # there the anchor chunk IS the emitted policy content and must be
-        # conditioned on the live observation. (DENOISE gets its per-tick
-        # observation feedback from the predict call in the strategy branch;
-        # its anchor chunk only serves as the guidance-fill base, so
-        # once-per-chunk is enough.) Never replaced by the previous BLENDED
-        # chunk: mixing against one's own output is a geometric recursion
-        # whose fixed point is guidance — every ratio < 1 collapsed onto the
-        # guidance trajectory before this was pinned. (predict_action_chunk
-        # reads the live obs queues — inner select_action already ran this
-        # tick.)
-        interpolate_now_anchored = emits_now_anchored and strategy == GuidanceBlendStrategy.INTERPOLATE
+        # guidance-fill base for BOTH strategies. Regeneration cadence:
+        #   * now-anchored INTERPOLATE: every tick — the anchor chunk IS the
+        #     emitted policy content and must be conditioned on the live
+        #     observation.
+        #   * now-anchored DENOISE: every tick ONLY while the remaining
+        #     guidance is shorter than the chunk (the demo tail). Mid-demo
+        #     the guidance fill overwrites the base entirely (cursor 0), so
+        #     a stale base never reaches the output (verified: seeded A/B
+        #     bit-identical) and skipping the extra per-tick predict keeps
+        #     blend generation at one model call per tick. In the tail the
+        #     uncovered positions DO surface in x_tsw — and the previous
+        #     code never refreshed the base there at all: EVERY_STEP pins
+        #     the cursor to 0 before the exhausted check, so
+        #     `chunk_exhausted` never fired and DENOISE's anchor chunk was
+        #     generated ONCE and reused for the entire rollout — tail
+        #     positions came from an arbitrarily stale first-tick plan in a
+        #     long-gone anchor frame (found 2026-08-18). Freshly-generated,
+        #     the tail is the policy's CURRENT continuation, conditioned on
+        #     the actually-executed history via the live obs queues.
+        # Never replaced by the previous BLENDED chunk: mixing against one's
+        # own output is a geometric recursion whose fixed point is guidance —
+        # every ratio < 1 collapsed onto the guidance trajectory before this
+        # was pinned. (predict_action_chunk reads the live obs queues —
+        # inner select_action already ran this tick.)
+        _guidance_short = guidance_chunk_raw is None or guidance_chunk_raw.shape[1] < int(
+            wrapper.config.n_action_steps
+        )
+        _regen_now_anchored = emits_now_anchored and (
+            strategy == GuidanceBlendStrategy.INTERPOLATE or _guidance_short
+        )
         if (
-            interpolate_now_anchored
+            _regen_now_anchored
             or chunk_exhausted
             or self._guided_chunk is None
             or self._anchor_chunk_orig is None

@@ -432,12 +432,15 @@ def run_blended_rollout(
             # keeps the command ~one control period ahead at demo pace while
             # preserving the stall-hold semantics (a stuck robot still pins
             # the cursor, just `lead` steps ahead of its pin point).
-            # Ramp the lead in over the first `lead` ticks: full lead at
-            # t=0 commands `lead` demo steps ahead of a robot that is AT the
-            # demo start, producing a catch-up lurch of (lead+1)x the demo's
-            # per-tick delta (measured 0.288 vs demo launch 0.102 with
-            # lead=2). At t >= lead the full pursuit lead applies.
-            _lead_eff = min(t, max(0, int(progress_guidance_lead)))
+            # Ramp the lead in at HALF rate (t//2): full lead at t=0
+            # commands `lead` demo steps ahead of a robot that is AT the
+            # demo start — a (lead+1)x catch-up lurch (measured 0.288 vs
+            # demo launch 0.102) — and even a per-tick ramp still advances
+            # the command ~2 steps/tick while the match advances underneath
+            # it (measured 0.209). Half-rate keeps the command's advance
+            # ~1 step/tick through the ramp, then holds the full pursuit
+            # lead.
+            _lead_eff = min(t // 2, max(0, int(progress_guidance_lead)))
             _j_exec = min(
                 _j_progress + _match_shift + _lead_eff,
                 guidance_actions_raw.shape[0] - 1,

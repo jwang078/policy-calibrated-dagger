@@ -31,6 +31,7 @@ import numpy as np
 import torch
 
 from lerobot.envs.utils import preprocess_observation
+from lerobot.policies.shared_autonomy_wrapper import BlendMode
 from lerobot.utils.constants import ACTION
 from lerobot.utils.sim_seeding import seed_splatsim_env_to_state
 
@@ -486,7 +487,17 @@ def run_blended_rollout(
 
         # Decoded-guidance overlay: what the guidance source actually fed the
         # blend, decoded back to raw joints (plot diagnostic).
-        if at_chunk_boundary and wrapper._last_decoded_guidance_chunk is not None:
+        #
+        # Cadence matches the REBUILD cadence, not the chunk boundary:
+        # EVERY_STEP rebuilds (and re-decodes) the guidance every tick with
+        # an advancing progress cursor, so painting 32 ticks ahead from a
+        # boundary snapshot showed a projection up to n_action_steps-1 ticks
+        # stale — the plotted "guidance" stepped/spiked at every boundary
+        # and diverged from what the blend actually consumed (user-observed,
+        # 2026-08-18). Per tick we record THIS tick's decoded guidance entry;
+        # at boundaries (or ONCE_PER_CHUNK) we also paint the lookahead for
+        # ticks not yet written.
+        if wrapper._last_decoded_guidance_chunk is not None:
             chunk_decode = wrapper._last_decoded_guidance_chunk[0]
             if decoded_guidance_full is None:
                 # NaN-init, not zeros: ticks never written (post-termination
@@ -496,8 +507,12 @@ def run_blended_rollout(
                 decoded_guidance_full = np.full(
                     (total_steps, chunk_decode.shape[1]), np.nan, dtype=chunk_decode.dtype
                 )
-            end_t = min(t + n_action_steps, total_steps)
-            decoded_guidance_full[t:end_t] = chunk_decode[: end_t - t]
+            if blend_mode == BlendMode.EVERY_STEP:
+                # Now-anchored: entry 0 is the guidance for THIS tick.
+                decoded_guidance_full[t] = chunk_decode[0]
+            elif at_chunk_boundary:
+                end_t = min(t + n_action_steps, total_steps)
+                decoded_guidance_full[t:end_t] = chunk_decode[: end_t - t]
 
         # Check for success / termination.
         terminated = bool(_term[0]) if hasattr(_term, "__len__") else bool(_term)

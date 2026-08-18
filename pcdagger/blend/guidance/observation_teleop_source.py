@@ -5,11 +5,17 @@ every tick. When the chunk is non-NaN this source becomes active and produces
 the next action by either:
 
   * VERBATIM (`forward_flow_ratio == 0.0`): pure FK+IK teleop or hold action.
-  * BLENDED (`0 < forward_flow_ratio <= 1`): mix the guidance into the inner
-    policy's predicted chunk via DENOISE or INTERPOLATE (ratio=1.0 is a valid
-    policy-dominated blend — "blend100"). ONCE_PER_CHUNK drains the cached
-    `_guided_chunk` between rebuilds; EVERY_STEP re-blends every tick (see
-    `_build_and_emit_blended` for the per-strategy cursor/anchor rules).
+  * BLENDED (`0 < forward_flow_ratio < 1`): mix the guidance into the inner
+    policy's predicted chunk via DENOISE or INTERPOLATE. ONCE_PER_CHUNK
+    drains the cached `_guided_chunk` between rebuilds; EVERY_STEP re-blends
+    every tick (see `_build_and_emit_blended` for the per-strategy
+    cursor/anchor rules).
+  * PURE POLICY (`forward_flow_ratio == 1.0`, "blend100"): the blend
+    machinery is BYPASSED — plain unguided inner-policy chunks, emitted at
+    the same cadence/anchoring as the blend path. Ratio 1.0 must never route
+    through DENOISE/INTERPOLATE (0·NaN leakage; RTC divergence on the
+    near-zero-alpha_bar steps only a full-noise start executes) — see the
+    ratio>=1.0 branch in `_build_and_emit_blended`.
 
 This is fundamentally different in lifecycle from method-triggered sources
 (RRT, OracleGoal): it auto-activates from observation content rather than
@@ -84,6 +90,13 @@ class ObservationTeleopGuidanceSource:
         self.state: GuidanceSourceState = GuidanceSourceState()
         # Source-owned state migrated from the wrapper.
         self._guided_chunk: Tensor | None = None
+        # ABSOLUTE decode of `_guided_chunk`, stored at build time (only when
+        # rtc_prev_chunk_guidance is on). Mirrors RTC's ActionQueue, which
+        # keeps the processed/absolute actions so the prev-chunk leftover can
+        # be re-anchored against the CURRENT state at consumption time
+        # (reanchor_relative_rtc_prefix). Absolute coordinates are
+        # time-invariant; the model-space rel encoding is not.
+        self._guided_chunk_abs: Tensor | None = None
         self._chunk_step: int = 99_999_999_999
         self._had_guidance_last_step: bool = False
         self._last_decoded_guidance_chunk: np.ndarray | None = None
@@ -143,6 +156,7 @@ class ObservationTeleopGuidanceSource:
     def cancel(self) -> None:
         """Clear the cached blended chunk and reset cursors."""
         self._guided_chunk = None
+        self._guided_chunk_abs = None
         self._anchor_chunk_orig = None
         self._chunk_step = 99_999_999_999  # forces chunk_exhausted on next call
         self._had_guidance_last_step = False
@@ -150,6 +164,7 @@ class ObservationTeleopGuidanceSource:
     def reset(self) -> None:
         """Episode-boundary reset."""
         self._guided_chunk = None
+        self._guided_chunk_abs = None
         self._anchor_chunk_orig = None
         self._chunk_step = 0  # fresh-episode value (different from cancel's "force-exhausted")
         self._had_guidance_last_step = False
@@ -264,6 +279,59 @@ class ObservationTeleopGuidanceSource:
         ratio = wrapper.forward_flow_ratio
         strategy = wrapper.guidance_blend_strategy
 
+        # ── PURE-POLICY BYPASS (ratio == 1.0, "blend100") ──────────────────
+        # At r=1.0 the policy owns the entire sample — the (1-r)=0 guidance
+        # term contributes nothing — so NONE of the blend machinery below may
+        # run. Routing 1.0 through DENOISE/INTERPOLATE anyway has repeatedly
+        # produced real bugs: the 0-weight guidance term still propagates NaN
+        # (0·NaN = NaN in the interpolate mix), and a full-noise denoise start
+        # is the only case that executes the near-zero-alpha_bar timesteps,
+        # where add-on in-loop corrections (rtc_prev_chunk_guidance) diverge
+        # to NaN within a few chunks. Emit the inner policy's UNGUIDED chunk
+        # at the same cadence/anchoring as the blend path; guidance encode,
+        # x_tsw, RTC and n_anchor_steps are all skipped BY DESIGN.
+        # `base_noise` / sample_seed still pin the draw so cross-ratio
+        # comparability is preserved.
+        if ratio >= 1.0:
+            emits_now_anchored = wrapper.blend_mode == BlendMode.EVERY_STEP
+            if emits_now_anchored:
+                self._chunk_step = 0
+            if emits_now_anchored or self._chunk_exhausted() or self._guided_chunk is None:
+                wrapper.refresh_relative_anchor()
+                noise_kwargs = {"noise": base_noise} if base_noise is not None else {}
+                sample_generator = wrapper.build_sample_generator()
+                if sample_generator is not None:
+                    noise_kwargs["generator"] = sample_generator
+                chunk = wrapper.inner_policy.predict_action_chunk(ctx.batch, **noise_kwargs)
+                self._guided_chunk = chunk
+                self._guided_chunk_abs = None  # RTC is bypassed at ratio 1.0; keep the pair in sync
+                self._anchor_chunk_orig = chunk
+                self._chunk_step = 0
+            action = self._guided_chunk[:, self._chunk_step, :]
+            self._chunk_step += 1
+            return GuidanceStepResult(action=action, frame_source=FrameSource.POLICY)
+
+        # ── RTC-style previous-chunk leftover (captured BEFORE any cursor
+        # reset). `_chunk_step` counts emissions since the last build, so
+        # index `_chunk_step:` of the previous chunk is exactly the UNEXECUTED
+        # remainder whose index 0 is the action that would have executed THIS
+        # tick — RTC's `prev_chunk_left_over` alignment. Captured in ABSOLUTE
+        # coordinates (`_guided_chunk_abs`, decoded at build time with the
+        # anchor the chunk was encoded in) and re-anchored to the current
+        # rel-action frame below, AFTER `refresh_relative_anchor()` — exactly
+        # RTC's ActionQueue + reanchor_relative_rtc_prefix flow. Slicing the
+        # model-space `_guided_chunk` directly was WRONG for rel-action
+        # policies: its deltas are anchored at the PREVIOUS tick's state, so
+        # every target arrived inflated by the robot's last-tick motion — a
+        # positive-feedback speedup (measured 3.5-5x demo speed at ratio 0.7).
+        # Consumed only when `wrapper.rtc_prev_chunk_guidance` is on; cleared
+        # naturally by cancel()/reset() (they null both chunk buffers).
+        rtc_prev_leftover_abs: Tensor | None = None
+        if wrapper.rtc_prev_chunk_guidance and self._guided_chunk_abs is not None:
+            cur = min(self._chunk_step, self._guided_chunk_abs.shape[1])
+            if cur < self._guided_chunk_abs.shape[1]:
+                rtc_prev_leftover_abs = self._guided_chunk_abs[:, cur:, :].detach()
+
         # ── Time-anchoring predicate: the ONE fork that cadence hangs off ──
         # EVERY_STEP re-anchors the emitted chunk to "now" on every call
         # (index 0 = the action for NOW, rel deltas relative to the CURRENT
@@ -331,6 +399,21 @@ class ObservationTeleopGuidanceSource:
         device = base_chunk.device
         anchor_len = base_chunk.shape[1]
         action_dim = base_chunk.shape[2]
+
+        # ── Re-anchor the RTC leftover into the CURRENT model frame ────────
+        # SA-side reanchor_relative_rtc_prefix: `_normalize_policy_guidance_action`
+        # converts absolute → relative against the freshly-refreshed
+        # `_last_state` (the same anchor this tick's chunks are encoded in)
+        # and renormalizes — per step, matching the guidance-fill encode path.
+        rtc_prev_leftover: Tensor | None = None
+        if rtc_prev_leftover_abs is not None:
+            rtc_prev_leftover = torch.stack(
+                [
+                    wrapper._normalize_policy_guidance_action(rtc_prev_leftover_abs[:, t, :])
+                    for t in range(rtc_prev_leftover_abs.shape[1])
+                ],
+                dim=1,
+            ).to(device=device, dtype=base_chunk.dtype)
 
         # ── Guidance encode + fill (shared) ────────────────────────────────
         # Clone the pure-policy base and overwrite [cursor:] with the demo's
@@ -401,6 +484,18 @@ class ObservationTeleopGuidanceSource:
             blended = base_chunk.clone()
             g = guidance_chunk[:, :, :action_dim]
             blended[:, :, :action_dim] = ratio * base_chunk[:, :, :action_dim] + (1.0 - ratio) * g
+            if rtc_prev_leftover is not None:
+                # Glass-box analog of the RTC prev-chunk guidance: a prefix-
+                # weighted CONVEX pull toward the previous chunk's leftover.
+                # (The denoiser applies an annealed gradient correction per
+                # step; a linear mix with the same prefix weights is the
+                # closest non-iterative stand-in — approximate, but keeps the
+                # strategies' inputs and cadence identical for A/B debugging.)
+                n_l = min(rtc_prev_leftover.shape[1], blended.shape[1])
+                w = wrapper.rtc_prefix_weights(n_l).to(blended.dtype).to(blended.device).view(1, n_l, 1)
+                blended[:, :n_l, :action_dim] = (1.0 - w) * blended[:, :n_l, :action_dim] + w * (
+                    rtc_prev_leftover[:, :n_l, :action_dim]
+                )
             if anchor_slice is not None:
                 # Post-hoc snap = the non-iterative analogue of DENOISE's
                 # in-loop inpainting (no sampler exists to re-anchor inside).
@@ -418,10 +513,32 @@ class ObservationTeleopGuidanceSource:
                 # — cannot be replicated by post-assignment, hence the only
                 # mechanism difference beyond the mix itself.
                 denoise_kwargs["anchor_action"] = anchor_slice
+            if rtc_prev_leftover is not None:
+                # RTC-style consistency: the denoiser applies an annealed
+                # gradient correction toward the previous chunk's leftover at
+                # every denoising step (see DiffusionModel.conditional_sample).
+                # Additive to the x_tsw blend — ratio semantics unchanged.
+                n_l = rtc_prev_leftover.shape[1]
+                denoise_kwargs["rtc_prev_chunk"] = rtc_prev_leftover[:, :, :action_dim]
+                denoise_kwargs["rtc_prefix_weights"] = wrapper.rtc_prefix_weights(n_l)
+                denoise_kwargs["rtc_max_guidance_weight"] = wrapper.rtc_max_guidance_weight
             blended = wrapper.inner_policy.predict_action_chunk(ctx.batch, **denoise_kwargs)
         else:
             raise NotImplementedError(f"Unsupported guidance_blend_strategy: {strategy}")
         self._guided_chunk = blended
+        # Store the ABSOLUTE decode alongside (RTC's ActionQueue keeps the
+        # processed actions for the same reason): the anchor was refreshed at
+        # this build, so the postprocessor decodes with exactly the frame the
+        # chunk is encoded in, and next tick's re-anchor stays exact no matter
+        # how the robot moved in between.
+        if wrapper.rtc_prev_chunk_guidance:
+            with torch.no_grad():
+                self._guided_chunk_abs = torch.stack(
+                    [wrapper.postprocessor(blended[:, t, :action_dim]) for t in range(anchor_len)],
+                    dim=1,
+                ).detach()
+        else:
+            self._guided_chunk_abs = None
 
         action = self._guided_chunk[:, self._chunk_step, :]
         self._chunk_step += 1

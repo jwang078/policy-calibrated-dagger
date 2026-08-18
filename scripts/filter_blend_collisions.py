@@ -87,7 +87,7 @@ from lerobot.envs.factory import make_env, make_env_config  # noqa: E402
 from lerobot.utils.constants import DEFAULT_FEATURES  # noqa: E402
 from lerobot.utils.import_utils import register_third_party_plugins  # noqa: E402
 from lerobot.utils.lerobot_dataset_utils import resolve_dataset_dir  # noqa: E402
-from lerobot.utils.sim_seeding import set_env_benchmark_indices  # noqa: E402
+from lerobot.utils.sim_seeding import seed_splatsim_env_to_state, set_env_benchmark_indices  # noqa: E402
 from lerobot.utils.utils import init_logging  # noqa: E402
 
 # DEFAULT_FEATURES (timestamp, frame_index, episode_index, index, task_index)
@@ -106,6 +106,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class FilterCollisionsConfig:
+    """CLI config for the blend collision filter (draccus-parsed)."""
+
     # Source = the blend dataset to filter.
     source_repo_id: str = ""
     # Target = where the filtered (and possibly trimmed) episodes are written.
@@ -161,6 +163,9 @@ class FilterEpisodeResult:
     pre_filter_n_frames: int
     first_collision_frame: int | None  # None when no collision
     trimmed_to_n_frames: int
+    # Max abs joint deviation (rad) between the replayed and recorded
+    # trajectories — replay-fidelity check; None when agent_pos unavailable.
+    replay_max_div_rad: float | None
     kept: bool
     drop_reason: str | None
     elapsed_s: float
@@ -194,15 +199,39 @@ def _episode_length(parquet_files: list[Path], episode_idx: int) -> int:
 # ---------------------------------------------------------------------------
 
 
+# Replay-vs-recorded max joint deviation (rad) above which the collision
+# verdict is suspect — the replay is executing a visibly different trajectory
+# than the recorded one, so trims/drops describe the wrong rollout.
+_REPLAY_DIVERGENCE_WARN_RAD = 0.15
+
+
 def _find_first_collision_frame(
     vec_env,
     actions: np.ndarray,
     playlist_pos: int | None = None,
-) -> int | None:
-    """Reset env (advances the sim's pre-installed playlist by one slot),
-    then step through `actions` until either the trajectory ends (return None)
-    or `info["in_collision"]` is true for the first time (return that frame
-    index).
+    start_joint_state: np.ndarray | None = None,
+    num_dofs: int = 6,
+    recorded_states: np.ndarray | None = None,
+) -> tuple[int | None, float | None]:
+    """Replay one episode's actions and return its first collision frame.
+
+    Resets the env (advancing the sim's pre-installed playlist by one slot),
+    teleports the robot to ``start_joint_state``, then steps through
+    ``actions`` until either the trajectory ends or ``info["in_collision"]``
+    is true for the first time. Returns ``(first_collision_frame_or_None,
+    replay_max_divergence_rad_or_None)``.
+
+    THE TELEPORT IS LOAD-BEARING. Blend episodes start MID-SCENARIO (at the
+    source intervention's start pose — the recording pipeline resets and then
+    teleports via ``seed_splatsim_env_to_state``, see
+    lib_sa_rollout.run_blended_rollout). A bare ``reset()`` here leaves the
+    robot at the scenario's home pose, so the replay chases the recorded
+    absolute targets across the workspace on a transit the real rollout never
+    made — colliding with obstacles at a scenario-deterministic frame. That
+    exact bug silently dropped ~55% of planar dag5 blend episodes as
+    "collisions" whose recorded trajectories were 14-27 cm clear of every
+    obstacle (same-scenario episodes flagged at IDENTICAL frames — the
+    home→start transit signature).
 
     Scenario selection is DRIVEN BY THE PLAYLIST installed once in `_run`
     before the outer loop — NOT by any per-reset scenario arg. The old code
@@ -216,6 +245,15 @@ def _find_first_collision_frame(
     `benchmark_start_index` so the replay stays correct even if the server's
     counter drifted (e.g. a GUI interaction between resets).
 
+    Replay-tracking guard: when ``recorded_states`` (shape [T, state_dim]) is
+    given, the replayed ``agent_pos`` after step t is compared against the
+    recorded state of frame t+1 over the arm dims, and the max abs deviation
+    is returned. A large value means the replay does NOT reproduce the
+    recorded trajectory (wrong start pose, physics drift, wrong scenario) and
+    its collision verdicts describe a different rollout — the caller logs a
+    warning above ``_REPLAY_DIVERGENCE_WARN_RAD`` and records the value in
+    the report CSV so this class of bug can't silently return.
+
     Termination handling: SplatSim envs default to ``terminate_on_success=True``,
     so a blend episode that succeeded mid-rollout will trigger ``terminated``
     here. On the NEXT ``step()`` Gymnasium's vec-env auto-resets the sub-env
@@ -225,26 +263,45 @@ def _find_first_collision_frame(
     original episode is done from the env's point of view, anything past it
     is replay noise.
     """
-    reset_options = None if playlist_pos is None else {"benchmark_start_index": int(playlist_pos)}
-    vec_env.reset(options=reset_options)
+    # Reset to the playlist slot AND teleport to the episode's frame-0 pose —
+    # the same reset+teleport call the blend recording itself used.
+    seed_splatsim_env_to_state(
+        vec_env,
+        joint_state=start_joint_state,
+        num_dofs=num_dofs,
+        benchmark_start_index=playlist_pos,
+    )
+    max_div: float | None = None
+    first_collision: int | None = None
     for t in range(len(actions)):
         # vec_env is a Gymnasium vector env wrapping a single sub-env, so
         # the action tensor needs a leading batch axis. info is also batched.
         action_batched = actions[t : t + 1]
-        _obs, _reward, terminated, truncated, info = vec_env.step(action_batched)
+        obs, _reward, terminated, truncated, info = vec_env.step(action_batched)
+        # Track replay fidelity: post-step obs corresponds to recorded frame
+        # t+1 (frame t's state is the PRE-step obs of tick t). Arm dims only.
+        if recorded_states is not None and t + 1 < len(recorded_states):
+            agent_pos = obs.get("agent_pos") if isinstance(obs, dict) else None
+            if agent_pos is not None:
+                _replayed = np.asarray(agent_pos, dtype=np.float64).reshape(-1)[:num_dofs]
+                _recorded = np.asarray(recorded_states[t + 1], dtype=np.float64).reshape(-1)[:num_dofs]
+                _n = min(_replayed.shape[0], _recorded.shape[0])
+                _d = float(np.max(np.abs(_replayed[:_n] - _recorded[:_n]))) if _n else 0.0
+                max_div = _d if max_div is None else max(max_div, _d)
         # SplatSim's check_metrics() records per-step collision in info_metrics
         # (see sim_robot_pybullet_small_engine.py). The Gymnasium vector
         # wrapper folds per-env info dicts into "final_info" (terminated/
         # truncated frames) or the parent info dict. Try both.
         if _extract_in_collision_flag(info):
-            return t
+            first_collision = t
+            break
         # Stop on success / truncation — the next step() would auto-reset
         # the sub-env into a different scenario and any future in_collision
         # flag would be a false positive. terminated/truncated are batched
         # like other vec-env outputs (np.ndarray, shape (1,)).
         if bool(np.asarray(terminated).any()) or bool(np.asarray(truncated).any()):
-            return None
-    return None
+            break
+    return first_collision, max_div
 
 
 def _extract_in_collision_flag(info: dict[str, Any]) -> bool:
@@ -375,8 +432,9 @@ def _decode_episode_video_frames(
 
 
 def _load_task_mapping(source_root_dir: Path) -> dict[int, str]:
-    """Load the source dataset's ``task_index → task_string`` map from
-    ``meta/tasks.parquet``. Falls back to an empty dict if the file is
+    """Load the source dataset's ``task_index → task_string`` map.
+
+    Reads ``meta/tasks.parquet``. Falls back to an empty dict if the file is
     missing — callers can then default the task string at the call site.
     """
     tasks_path = source_root_dir / "meta" / "tasks.parquet"
@@ -394,7 +452,8 @@ def decide_trim(
     pre_collision_margin: int,
     min_episode_length: int,
 ) -> tuple[int, bool, str | None]:
-    """Returns `(trimmed_to, kept, drop_reason)` where:
+    """Return `(trimmed_to, kept, drop_reason)` for one replayed episode.
+
     - trimmed_to: number of leading frames to keep (0 if dropped).
     - kept: True if the episode should be written to the target dataset.
     - drop_reason: short string explaining why kept=False (else None).
@@ -671,6 +730,7 @@ def _run(
                 "pre_filter_n_frames",
                 "first_collision_frame",
                 "trimmed_to_n_frames",
+                "replay_max_div_rad",
                 "kept",
                 "drop_reason",
                 "elapsed_s",
@@ -718,9 +778,44 @@ def _run(
             actions = np.stack(
                 [np.asarray(row["action"], dtype=np.float32) for _, row in frames_df.iterrows()]
             )
+            recorded_states = np.stack(
+                [np.asarray(row["observation.state"], dtype=np.float64) for _, row in frames_df.iterrows()]
+            )
 
-            # Replay through env, find first collision.
-            first_collision = _find_first_collision_frame(vec_env, actions, playlist_pos=playlist_pos)
+            # Replay through env, find first collision. The teleport to the
+            # episode's frame-0 pose is essential: blend episodes start
+            # mid-scenario, and replaying from the scenario home pose used to
+            # produce phantom collisions on the home→start transit.
+            first_collision, replay_max_div = _find_first_collision_frame(
+                vec_env,
+                actions,
+                playlist_pos=playlist_pos,
+                start_joint_state=recorded_states[0],
+                num_dofs=int(cfg.num_dofs),
+                recorded_states=recorded_states,
+            )
+            # Warn only when divergence taints a COLLISION verdict: for flagged
+            # episodes the replay breaks at the collision, so max_div covers
+            # exactly the pre-collision segment — large values mean the "colliding"
+            # trajectory wasn't the recorded one. Kept episodes accumulate
+            # harmless open-loop drift over their full length (measured median
+            # ~0.8 rad on planar dag5), so a warning there would be pure noise;
+            # the per-episode CSV still records the value either way.
+            if (
+                first_collision is not None
+                and replay_max_div is not None
+                and replay_max_div > _REPLAY_DIVERGENCE_WARN_RAD
+            ):
+                logger.warning(
+                    "Episode %d: replay had diverged %.3f rad (> %.2f) from the recorded "
+                    "trajectory BEFORE its flagged collision at frame %d — the collision "
+                    "verdict may describe a different rollout. Check teleport support / "
+                    "scenario playlist alignment on the sim server.",
+                    source_ep,
+                    replay_max_div,
+                    _REPLAY_DIVERGENCE_WARN_RAD,
+                    first_collision,
+                )
             trimmed_to, kept, drop_reason = decide_trim(
                 ep_length, first_collision, cfg.pre_collision_margin, cfg.min_episode_length
             )
@@ -741,6 +836,7 @@ def _run(
                         pre_filter_n_frames=ep_length,
                         first_collision_frame=first_collision,
                         trimmed_to_n_frames=0,
+                        replay_max_div_rad=replay_max_div,
                         kept=False,
                         drop_reason=drop_reason,
                         elapsed_s=time.time() - t0,
@@ -756,6 +852,7 @@ def _run(
                             ep_length,
                             first_collision if first_collision is not None else "",
                             0,
+                            f"{replay_max_div:.4f}" if replay_max_div is not None else "",
                             False,
                             drop_reason or "",
                             f"{time.time() - t0:.2f}",
@@ -815,6 +912,7 @@ def _run(
                     pre_filter_n_frames=ep_length,
                     first_collision_frame=first_collision,
                     trimmed_to_n_frames=trimmed_to,
+                    replay_max_div_rad=replay_max_div,
                     kept=True,
                     drop_reason=None,
                     elapsed_s=time.time() - t0,
@@ -830,6 +928,7 @@ def _run(
                         ep_length,
                         first_collision if first_collision is not None else "",
                         trimmed_to,
+                        f"{replay_max_div:.4f}" if replay_max_div is not None else "",
                         True,
                         "",
                         f"{time.time() - t0:.2f}",
@@ -870,6 +969,7 @@ def _run(
 
 @parser.wrap()
 def main(cfg: FilterCollisionsConfig) -> None:
+    """Entry point: filter one blend dataset into its `_nocoll` sibling."""
     init_logging()
     register_third_party_plugins()
 

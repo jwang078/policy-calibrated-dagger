@@ -1,4 +1,4 @@
-"""Dataset augmentation via closed-loop blended-policy rollouts.
+r"""Dataset augmentation via closed-loop blended-policy rollouts.
 
 Loads source episodes from an intervention-style LeRobot dataset, replays each
 one through ``SharedAutonomyPolicyWrapper`` at one or more blend ratios in
@@ -99,6 +99,7 @@ from lib_sa_policy_loading import (  # type: ignore[import-not-found]  # noqa: E
     load_wrapped_policy,
 )
 from lib_sa_rollout import (  # type: ignore[import-not-found]  # noqa: E402,F401
+    check_sim_strict_goal_tolerances,
     progress_guidance_index,  # re-export kept for external importers
     run_blended_rollout,
     warn_if_sim_physics_unsynced,
@@ -131,6 +132,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class AugmentationConfig:
+    """CLI config for the blend-augmentation run (flag names shared with visualize_shared_autonomy_sim.py)."""
+
     # ── Shared with visualize_shared_autonomy_sim.py ──────────────────────────
     # Use the same flag names so commands are easy to copy between scripts.
 
@@ -208,6 +211,18 @@ class AugmentationConfig:
     # x_T draw, leaving the DDPM scheduler's per-step variance fresh), this
     # pins the entire sampling chain. -1 disables (legacy global-RNG draws).
     sample_seed: int = 42
+    # RTC-style previous-chunk guidance (Real-Time Chunking; see
+    # SharedAutonomyConfig.rtc_* for full docs). Passes the previous blended
+    # chunk's UNEXECUTED remainder into each re-blend's denoise, which pulls
+    # the fresh chunk toward the mode already being executed — cross-tick
+    # consistency WITHOUT pinning the noise (an alternative/complement to
+    # --sample_seed / --fixed_base_noise for the every_step shake). Additive
+    # to the x_tsw ratio blend; diffusion inner policies only.
+    rtc_prev_chunk: bool = False
+    rtc_max_guidance_weight: float = 10.0
+    rtc_execution_horizon: int | None = None
+    rtc_inference_delay: int = 0
+    rtc_prefix_attention_schedule: str = "linear"  # linear | exp | zeros | ones
     # DEBUG: override the checkpoint's DDPM/DDIM `clip_sample` (None = keep the
     # trained value). clip_sample=True clamps the predicted clean action to
     # ±clip_sample_range at EVERY denoising step — with out-of-distribution
@@ -238,6 +253,25 @@ class AugmentationConfig:
     # Forward search window (demo steps) for the progress match. Bounds both
     # compute and how far a single tick can jump ahead.
     progress_guidance_window: int = 45
+    # Post-success handling. The strict-tolerance sim can still terminate a
+    # blend rollout BEFORE the guidance runs out (the blended trajectory
+    # reaches the goal early). Historically the rollout then froze into hold
+    # mode — the terminal obs + a stay-put action duplicated until
+    # total_steps — so every early success injected a long block of
+    # stand-still (obs, action) pairs at the goal, teaching the policy to
+    # park. False (the default) TRUNCATES the episode at the success tick
+    # instead; if the truncated episode is shorter than --min_episode_length
+    # it is DROPPED entirely, mirroring how intervention recording drops
+    # short segments under --env.teleop_pad_short_episodes=false. True
+    # restores the legacy hold-padding (and the pad-to-min behavior for
+    # short source episodes). Dropped (source_ep, ratio) pairs are never
+    # written to the target, so a resumed run re-rolls (and re-drops) them.
+    pad_after_success: bool = False
+    # Minimum episode length for the pad_after_success=False drop check (and
+    # the legacy pad-to-min target). Mirrors teleop_min_episode_length
+    # (envs/configs.py) and filter_blend_collisions' min_episode_length.
+    min_episode_length: int = 60
+
     # Start the replay at this source-episode frame instead of frame 0. The
     # robot is teleported to the demo's pose at that frame (works over ZMQ —
     # the SplatSim server dispatches teleport_joint_state), so guidance and
@@ -279,6 +313,15 @@ class AugmentationConfig:
     # stays up across runs; only the augmentation script restarts.
     env_external_port: int = 6001
     env_external_host: str = "127.0.0.1"
+
+    # The sim MUST run --strict_goal_tolerances (recording-grade success:
+    # planar 1 cm vs the loose 60 mm eval threshold). Loose sims terminate
+    # blend rollouts "close enough" to the goal and cut off exactly the
+    # near-goal state coverage the blends exist to capture — the orchestrator
+    # always launches its managed sim strict, and this script fails fast when
+    # the server reports it is not. Set true to bypass (debug only; a server
+    # that predates the strict_goal_tolerances env-config field only warns).
+    allow_loose_goal_tolerances: bool = False
 
     # Frame schema for the new dataset. image_keys are derived as
     # ``[f"{cam}_{mode}" for cam in env_camera_names for mode in env_image_resize_modes]``
@@ -430,8 +473,16 @@ def _unbatch_obs(env_obs: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass
 class RolloutResult:
+    """One blend rollout's captured frames plus bookkeeping counters."""
+
     frames: list[dict[str, Any]]
-    n_steps: int
+    n_steps: int  # frame count BEFORE any drop (kept for logging when frames=[])
+    success: bool = False
+    success_t: int | None = None
+    # True when pad_after_success=False and the (possibly success-truncated)
+    # rollout came in under min_episode_length: frames is emptied and the
+    # caller must skip saving this episode.
+    dropped_short: bool = False
 
 
 @torch.no_grad()
@@ -458,6 +509,8 @@ def rollout_closed_loop_for_augmentation(
     playlist_pos: int | None = None,
     env_state_dim: int = 0,
     base_noise: torch.Tensor | None = None,
+    pad_after_success: bool = True,
+    min_episode_length: int = 60,
 ) -> RolloutResult:
     """Run one closed-loop rollout and capture (raw_obs, action) per step.
 
@@ -478,8 +531,6 @@ def rollout_closed_loop_for_augmentation(
     id) can move the counter between rollouts, silently replaying the wrong
     scenario. ``None`` falls back to counter-order.
     """
-    MIN_FRAMES = 60  # noqa: N806 - pad with hold frames if episode ends early
-
     frames: list[dict[str, Any]] = []
     terminal_raw_obs: dict | None = None
 
@@ -505,7 +556,7 @@ def rollout_closed_loop_for_augmentation(
             )
         )
 
-    run_blended_rollout(
+    result = run_blended_rollout(
         wrapper=wrapper,
         obs_preprocessor=obs_preprocessor,
         vec_env=vec_env,
@@ -526,21 +577,45 @@ def rollout_closed_loop_for_augmentation(
         progress_guidance=progress_guidance,
         progress_guidance_window=progress_guidance_window,
         demo_states_raw=demo_states_raw,
+        pad_after_success=pad_after_success,
         on_step=_on_step,
         on_success=_on_success,
         log=lambda msg: logger.info(msg),
     )
 
-    # Pad to MIN_FRAMES if the rollout was shorter (very short source episode).
-    # IMPORTANT: use dict copies, not the same reference. dataset_writer.add_frame
-    # does frame.pop("task") which mutates the dict in place — sharing references
-    # would cause the second add_frame call to fail with "Missing features: {'task'}".
-    if frames and len(frames) < MIN_FRAMES:
+    if not pad_after_success:
+        # No padding of any kind: the rollout was truncated at the success tick
+        # (or ran the full guidance length without succeeding). Episodes under
+        # min_episode_length are DROPPED — mirroring intervention recording's
+        # teleop_pad_short_episodes=false — instead of padded with stand-still
+        # frames.
+        n_real = len(frames)
+        if frames and n_real < min_episode_length:
+            return RolloutResult(
+                frames=[],
+                n_steps=n_real,
+                success=result.success,
+                success_t=result.success_t,
+                dropped_short=True,
+            )
+        return RolloutResult(
+            frames=frames, n_steps=n_real, success=result.success, success_t=result.success_t
+        )
+
+    # Legacy pad path: pad to min_episode_length if the rollout was shorter
+    # (very short source episode — the post-success hold already fills to
+    # total_steps). IMPORTANT: use dict copies, not the same reference.
+    # dataset_writer.add_frame does frame.pop("task") which mutates the dict in
+    # place — sharing references would cause the second add_frame call to fail
+    # with "Missing features: {'task'}".
+    if frames and len(frames) < min_episode_length:
         last_frame = frames[-1]
-        while len(frames) < MIN_FRAMES:
+        while len(frames) < min_episode_length:
             frames.append(dict(last_frame))
 
-    return RolloutResult(frames=frames, n_steps=len(frames))
+    return RolloutResult(
+        frames=frames, n_steps=len(frames), success=result.success, success_t=result.success_t
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -578,9 +653,11 @@ def _existing_provenance_pairs(target_root: Path) -> set[tuple[int, float]]:
 
 
 def _load_source_episodes_meta(source_dataset_dir: Path) -> pd.DataFrame:
-    """Read the source dataset's episodes parquet so we can copy through any
-    per-episode metadata (e.g. ``source_scenario_idx``) into the augmented
-    dataset's per-episode metadata.
+    """Read the source dataset's episodes parquet.
+
+    Lets us copy through any per-episode metadata (e.g.
+    ``source_scenario_idx``) into the augmented dataset's per-episode
+    metadata.
     """
     ep_files = sorted((source_dataset_dir / "meta" / "episodes").rglob("*.parquet"))
     if not ep_files:
@@ -604,6 +681,8 @@ def _episode_length(parquet_files: list[Path], episode_idx: int) -> int:
 
 @dataclass
 class AugmentedEpisodeResult:
+    """Provenance row for one written (source episode, ratio) output episode."""
+
     target_episode_idx: int
     source_episode_idx: int
     source_scenario_idx: int | None
@@ -617,8 +696,10 @@ def run_augmentation(
     *,
     csv_path: Path | None = None,
 ) -> list[AugmentedEpisodeResult]:
-    """Top-level loop. Builds env+wrapper once, then per (source_ep, ratio)
-    seeds, rolls out, captures frames, and saves to the target dataset.
+    """Top-level loop.
+
+    Builds env+wrapper once, then per (source_ep, ratio) seeds, rolls out,
+    captures frames, and saves to the target dataset.
     """
     from splatsim.utils.lerobot_utils import (
         build_lerobot_features,
@@ -772,6 +853,7 @@ def run_augmentation(
     env_dict = make_env(env_cfg_obj, n_envs=1, use_async_envs=False)
     vec_env = env_dict["splatsim"][0]
     warn_if_sim_physics_unsynced(vec_env, log=logger.info)
+    check_sim_strict_goal_tolerances(vec_env, required=not cfg.allow_loose_goal_tolerances, log=logger.info)
 
     # ── Build wrapped policy (acquires its own pybullet GUI in parent) ────
     logger.info("Loading wrapped policy from %s …", cfg.policy_path)
@@ -811,6 +893,22 @@ def run_augmentation(
     wrapper.guidance_blend_strategy = GuidanceBlendStrategy(cfg.blend_strategy)
     wrapper.policy_guidance_representation = PolicyGuidanceRepresentation(cfg.guidance_repr)
     wrapper.n_anchor_steps = cfg.n_anchor_steps
+    wrapper.rtc_prev_chunk_guidance = cfg.rtc_prev_chunk
+    wrapper.rtc_max_guidance_weight = cfg.rtc_max_guidance_weight
+    wrapper.rtc_execution_horizon = cfg.rtc_execution_horizon
+    wrapper.rtc_inference_delay = cfg.rtc_inference_delay
+    wrapper.rtc_prefix_attention_schedule = cfg.rtc_prefix_attention_schedule
+    if cfg.rtc_prev_chunk:
+        # Set post-init, so re-run the wrapper's init-time policy-type check.
+        if getattr(wrapper.inner_policy.config, "type", None) != "diffusion":
+            raise SystemExit("--rtc_prev_chunk requires a diffusion inner policy.")
+        logger.info(
+            "RTC prev-chunk guidance ON (max_gw=%.1f, exec_horizon=%s, delay=%d, schedule=%s).",
+            cfg.rtc_max_guidance_weight,
+            cfg.rtc_execution_horizon,
+            cfg.rtc_inference_delay,
+            cfg.rtc_prefix_attention_schedule,
+        )
     if cfg.n_action_steps is not None:
         prev = wrapper.config.n_action_steps
         wrapper.config.n_action_steps = cfg.n_action_steps
@@ -950,6 +1048,7 @@ def run_augmentation(
         csv_file.flush()
 
     results: list[AugmentedEpisodeResult] = []
+    n_dropped = 0
     target_ep_idx = int(target_ds.meta.total_episodes)
 
     def _resolve_source_scenario_idx(source_ep: int) -> int:
@@ -1129,8 +1228,30 @@ def run_augmentation(
                     playlist_pos=_playlist_pos,
                     env_state_dim=source_env_state_dim,
                     base_noise=_base_noise,
+                    pad_after_success=cfg.pad_after_success,
+                    min_episode_length=cfg.min_episode_length,
                 )
                 _playlist_pos += 1
+
+                if rollout.dropped_short:
+                    n_dropped += 1
+                    logger.warning(
+                        "DROPPED source_ep=%d ratio=%.2f: rollout %s at %d frames "
+                        "< min_episode_length=%d (pad_after_success=false). Not saved to "
+                        "the target — a resumed run will re-roll (and re-drop) this pair.",
+                        source_ep,
+                        ratio,
+                        (
+                            f"succeeded at t={rollout.success_t + 1}"
+                            if rollout.success and rollout.success_t is not None
+                            else "ended"
+                        ),
+                        rollout.n_steps,
+                        cfg.min_episode_length,
+                    )
+                    del rollout
+                    gc.collect()
+                    continue
 
                 # Commit one episode per (source_ep, ratio) pair.
                 # Pass a copy of each frame — dataset_writer.add_frame does
@@ -1190,9 +1311,18 @@ def run_augmentation(
 
     finalize_lerobot_dataset(target_ds)
 
+    if n_dropped:
+        logger.warning(
+            "%d (source_ep, ratio) pair(s) dropped for length < %d "
+            "(pad_after_success=false); %d episode(s) saved.",
+            n_dropped,
+            cfg.min_episode_length,
+            len(results),
+        )
+
     # Write a README / dataset card so the augmentation provenance is visible
     # on the HuggingFace dataset page when push_to_hub=True.
-    _write_dataset_readme(cfg, results)
+    _write_dataset_readme(cfg, results, n_dropped=n_dropped)
 
     if cfg.push_to_hub:
         logger.info("Pushing %s to Hub …", cfg.target_dataset_repo_id)
@@ -1200,7 +1330,9 @@ def run_augmentation(
     return results
 
 
-def _write_dataset_readme(cfg: AugmentationConfig, results: list["AugmentedEpisodeResult"]) -> None:
+def _write_dataset_readme(
+    cfg: AugmentationConfig, results: list["AugmentedEpisodeResult"], *, n_dropped: int = 0
+) -> None:
     """Write a README.md dataset card into the target dataset directory.
 
     HuggingFace renders this as the dataset page description. When push_to_hub=True
@@ -1259,6 +1391,8 @@ Augmented dataset generated by `augment_dataset_with_blending.py`.
 | `blend_mode` | `{cfg.blend_mode}` |
 | `n_anchor_steps` | `{cfg.n_anchor_steps}` |
 | `n_action_steps` | `{cfg.n_action_steps}` |
+| `pad_after_success` | `{cfg.pad_after_success}` |
+| `min_episode_length` | `{cfg.min_episode_length}` |
 
 ## Environment
 | Parameter | Value |
@@ -1271,6 +1405,7 @@ Augmented dataset generated by `augment_dataset_with_blending.py`.
 
 ## Output
 - **{n_episodes} output episode(s)** from {n_source} source episode(s) × {len(cfg.forward_flow_ratios)} ratio(s) ({ratios_str})
+{f"- **{n_dropped} pair(s) dropped** — shorter than `min_episode_length={cfg.min_episode_length}` after success-truncation (`pad_after_success=false`)" if n_dropped else ""}
 """
 
     readme_path = dataset_root / "README.md"
@@ -1285,6 +1420,7 @@ Augmented dataset generated by `augment_dataset_with_blending.py`.
 
 @parser.wrap()
 def augment_main(cfg: AugmentationConfig):
+    """Parsed-config entry point (see module docstring for examples)."""
     logging.info("Augmentation config:\n%s", pformat(cfg.__dict__))
 
     if not cfg.dataset_repo_id:
@@ -1315,6 +1451,7 @@ def augment_main(cfg: AugmentationConfig):
 
 
 def main():
+    """CLI entry point."""
     init_logging()
     register_third_party_plugins()
 

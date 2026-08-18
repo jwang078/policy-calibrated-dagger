@@ -537,12 +537,14 @@ set -euo pipefail
 #                                   * --headless to SplatSim's launch_nodes.py
 #                                     in start_sim() (pybullet via p.DIRECT)
 #                                   * --policy.shared_autonomy_config.show_slider=false
-#                                     to step 1's lerobot-eval (disables the
-#                                     Tkinter ratio slider AND the SA wrapper's
-#                                     per-policy pybullet GUI window)
+#                                     + pybullet_gui=false to step 1's
+#                                     lerobot-eval (disables the Tkinter ratio
+#                                     slider AND the SA wrapper's per-policy
+#                                     pybullet GUI window, respectively)
 #                                   * --env.headless=true and the same
-#                                     show_slider=false to step 6's training
-#                                     (in-process inline-eval sim → p.DIRECT)
+#                                     show_slider=false + pybullet_gui=false to
+#                                     step 6's training (in-process inline-eval
+#                                     sim → p.DIRECT)
 #                                 In --no_manage_splatsim mode, the training-side
 #                                 --env.headless=true is suppressed (the user
 #                                 owns their sim; training connects via
@@ -590,13 +592,17 @@ set -euo pipefail
 #                                 --policy.shared_autonomy_config.show_slider=true
 #                                 (instead of =false; headless mode always sets
 #                                 the field explicitly so emitted commands are
-#                                 self-documenting), keeping the SA wrapper's ratio
-#                                 slider AND its own per-policy pybullet GUI
-#                                 window (a separate pybullet client in the
-#                                 lerobot process — works fine against a
-#                                 headless sim). Applies to step-1 intervention
-#                                 recording and step-6 training alike. No effect
-#                                 without --headless (the slider defaults on).
+#                                 self-documenting), keeping ONLY the SA
+#                                 wrapper's Tkinter ratio slider (a Tk thread
+#                                 in the lerobot process — works fine against
+#                                 a headless sim). The wrapper's RRT-planner
+#                                 pybullet window stays closed: headless mode
+#                                 always injects pybullet_gui=false, which
+#                                 forces the wrapper's pybullet client to
+#                                 p.DIRECT even with the slider on. Applies to
+#                                 step-1 intervention recording and step-6
+#                                 training alike. No effect without --headless
+#                                 (the slider defaults on).
 #   --splatsim_root=PATH          Root of the SplatSim repo (default $HOME/code/SplatSim).
 #                                 launch_nodes.py is run from this dir.
 #   --splatsim_robot=NAME         --robot arg for launch_nodes.py
@@ -785,8 +791,9 @@ NORM_MODE="aggregated"
 # recording on round R reads the previous round's training-time eval_info.json
 # and runs ONLY on the scenarios that failed there — the policy already passed
 # the others, so recording on them is wasted work + dilutes the per-scenario
-# DAgger signal. Falls back to the full subset when:
-#   * round == 1 (no prior eval data)
+# DAgger signal. Round 1's "previous round" is the round-0 base training
+# (BASE_TRAINING_DIR — no _ft_dagN suffix); later rounds read _ft_dag(R-1).
+# Falls back to the full subset when:
 #   * the helper can't find / parse eval_info_step_*.json
 #   * the prior eval was 100% success (no failures to target)
 # Set to false to record interventions on every scenario in
@@ -898,13 +905,14 @@ MANAGE_SPLATSIM=true
 #   * `start_sim()` appends `--headless` to SplatSim's launch_nodes.py call
 #     (pybullet connects via p.DIRECT instead of p.GUI; no rendering window).
 #   * Step 1's lerobot-eval invocation appends
-#     `--policy.shared_autonomy_config.show_slider=false`, which gates BOTH
-#     the Tkinter ratio slider AND the SA wrapper's per-policy pybullet GUI
-#     client (one field, two surfaces — see shared_autonomy_wrapper.py:240).
+#     `--policy.shared_autonomy_config.show_slider=false` (Tkinter ratio
+#     slider) and `--policy.shared_autonomy_config.pybullet_gui=false` (the
+#     SA wrapper's per-policy pybullet GUI client — a tri-state override,
+#     see SharedAutonomyConfig.pybullet_gui).
 #   * Step 6 training (both scratch via train_sweep.sh and finetune via
 #     resume_training.sh) appends `--env.headless=true` so lerobot-train's
-#     in-process inline-eval sim connects via p.DIRECT, plus
-#     `--policy.shared_autonomy_config.show_slider=false` in case the policy
+#     in-process inline-eval sim connects via p.DIRECT, plus the same
+#     `show_slider=false` + `pybullet_gui=false` pair in case the policy
 #     has SA wrapper config (defensive — most training configs don't enable
 #     SA but a few that resume from intervention-recording dirs do).
 # In `--no_manage_splatsim` mode the user is responsible for the external
@@ -921,8 +929,10 @@ HEADLESS=false
 #     --env.control_gui=true for the in-process inline-eval sim (wired through
 #     SplatSimEnv.control_gui → server ctor's show_control_gui).
 #   * KEEP_SA_GUI=true  → the show_slider=false injections (step-1 eval +
-#     step-6 training) are suppressed, keeping the SA wrapper's ratio slider
-#     and its own pybullet GUI window.
+#     step-6 training) become show_slider=true, keeping the SA wrapper's Tk
+#     ratio slider ONLY. Headless mode always injects pybullet_gui=false
+#     alongside, so the wrapper's RRT-planner pybullet window never opens
+#     regardless of this flag.
 # Both are no-ops without --headless. The aux collision-filter sim is
 # deliberately exempt: it's a non-interactive batch replay, always fully
 # headless.
@@ -3155,7 +3165,7 @@ start_filter_sim() {
         echo "[DRY-RUN]   cwd: $SPLATSIM_ROOT"
         local _dr_ss=""
         [[ "$SPLAT_SHADOWS" == true ]] && _dr_ss=" --splat_shadows"
-        echo "[DRY-RUN]   cmd: python -u scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $FILTER_COLLISION_ENV_PORT_RESOLVED --hostname $ENV_EXTERNAL_HOST$_dr_rn --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID --in_collision_obstacle_clearance $_dr_obs_clr --in_collision_self_collision_clearance $_dr_self_clr --headless$_dr_ss"
+        echo "[DRY-RUN]   cmd: python -u scripts/launch_nodes.py --robot $SPLATSIM_ROBOT --robot_port $FILTER_COLLISION_ENV_PORT_RESOLVED --hostname $ENV_EXTERNAL_HOST$_dr_rn --eval_benchmark_repo_id $EVAL_BENCHMARK_REPO_ID --in_collision_obstacle_clearance $_dr_obs_clr --in_collision_self_collision_clearance $_dr_self_clr --headless$_dr_ss --strict_goal_tolerances"
         MANAGED_FILTER_SIM_PID="DRYRUN"
         return 0
     fi
@@ -3224,6 +3234,13 @@ start_filter_sim() {
     # change its verdicts — but matching avoids a config divergence that would
     # bite the moment anything here starts consuming images.
     [[ "$SPLAT_SHADOWS" == true ]] && launch_cmd+=( --splat_shadows )
+    # Same success tolerances as the main (recording/blend) sim. The replay
+    # loop in filter_blend_collisions.py BREAKS OUT on `terminated` (the next
+    # step would auto-reset into a different scenario), so a loose filter sim
+    # would end replays of strictly-recorded blend episodes at the loose
+    # "close enough" threshold and leave the trajectory tail UNCHECKED for
+    # collisions.
+    launch_cmd+=( --strict_goal_tolerances )
     echo "Starting HEADLESS SplatSim (for collision filter):"
     echo "  cwd:     $SPLATSIM_ROOT"
     echo "  cmd:     ${launch_cmd[*]}"
@@ -3473,7 +3490,7 @@ if [[ "$HEADLESS" == true ]]; then
         echo "                  set --env.headless on training; the user's external sim's GUI is unchanged.)"
     fi
     [[ "$CONTROL_GUI" == true ]] && echo "  --control_gui: SplatSim Tk control panel stays up (pybullet stays DIRECT)."
-    [[ "$KEEP_SA_GUI" == true ]] && echo "  --keep_sa_gui: SA wrapper ratio slider + its pybullet GUI window stay up."
+    [[ "$KEEP_SA_GUI" == true ]] && echo "  --keep_sa_gui: SA wrapper Tk ratio slider stays up (its pybullet window stays headless)."
     echo
 fi
 
@@ -4241,14 +4258,18 @@ fi
 # invocations (scratch, finetune, post-loop final-scratch).
 HEADLESS_TRAIN_ARGS=()
 if [[ "$HEADLESS" == true ]]; then
-    # --keep_sa_gui carves the SA wrapper's slider + pybullet GUI window back
-    # out of headless mode (they live in the lerobot process, not the sim).
+    # --keep_sa_gui carves the SA wrapper's Tk ratio slider back out of
+    # headless mode (it lives in the lerobot process, not the sim). The
+    # wrapper's RRT-planner pybullet window stays closed either way:
+    # pybullet_gui=false forces p.DIRECT even with the slider on (tri-state
+    # override — see SharedAutonomyConfig.pybullet_gui).
     # Explicit both ways so the emitted command documents the decision.
     if [[ "$KEEP_SA_GUI" == true ]]; then
         HEADLESS_TRAIN_ARGS=( --policy.shared_autonomy_config.show_slider=true )
     else
         HEADLESS_TRAIN_ARGS=( --policy.shared_autonomy_config.show_slider=false )
     fi
+    HEADLESS_TRAIN_ARGS+=( --policy.shared_autonomy_config.pybullet_gui=false )
     if [[ "$MANAGE_SPLATSIM" == true ]]; then
         HEADLESS_TRAIN_ARGS+=( --env.headless=true )
         # --control_gui: the in-process inline-eval sim keeps the Tk control
@@ -4781,8 +4802,16 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             EVAL_BENCHMARK_SUBSET_FOR_SIM=$(python3 -c "import json,sys; print(','.join(str(x) for x in json.loads(sys.argv[1])))" "$INTERVENTION_SUBSET_JSON")
         fi
         EFFECTIVE_N_EPISODES_FOR_INT="$INTERVENTION_N_EPISODES"
-        if [[ "$DAGGER_SKIP_SUCCEEDED_IN_PREV_EVAL" == "true" && "$r" -gt 1 ]]; then
-            PREV_TRAIN_OUTPUT_DIR=$(train_output_dir_for_round "$((r - 1))")
+        if [[ "$DAGGER_SKIP_SUCCEEDED_IN_PREV_EVAL" == "true" ]]; then
+            # Round 1's "previous round" is the round-0 base training. Its dir
+            # carries no _ft_dagN suffix (and may have been retargeted to a
+            # user-supplied --initial_policy_path), so map it explicitly —
+            # train_output_dir_for_round 0 would wrongly yield ..._ft_dag0.
+            if (( r == 1 )); then
+                PREV_TRAIN_OUTPUT_DIR="$BASE_TRAINING_DIR"
+            else
+                PREV_TRAIN_OUTPUT_DIR=$(train_output_dir_for_round "$((r - 1))")
+            fi
             FAILED_JSON=""
             FAILED_RC=0
             FAILED_JSON=$(python3 "$SCRIPT_DIR/dagger_failed_scenarios.py" \
@@ -4936,10 +4965,11 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
         # Other SA settings (forward_flow_ratio, blend_strategy, etc.) can
         # be added via --intervention_extra_args.
         # --headless mode: turn off the Tkinter ratio slider AND the SA
-        # wrapper's per-policy pybullet GUI client (both gated by the same
-        # show_slider field — see shared_autonomy_wrapper.py:240). The
-        # external SplatSim was launched headless above; this kills the
-        # last visualizer in the loop.
+        # wrapper's per-policy pybullet GUI client. show_slider gates only
+        # the Tk slider; pybullet_gui=false forces the wrapper's pybullet
+        # client to p.DIRECT regardless (tri-state override — see
+        # SharedAutonomyConfig.pybullet_gui). The external SplatSim was
+        # launched headless above; this kills the last visualizer in the loop.
         # In headless mode, pass show_slider EXPLICITLY both ways (=true with
         # --keep_sa_gui, =false without) so the emitted command documents the
         # SA-GUI decision rather than relying on the field's default.
@@ -4950,6 +4980,7 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             else
                 HEADLESS_EVAL_ARG=( --policy.shared_autonomy_config.show_slider=false )
             fi
+            HEADLESS_EVAL_ARG+=( --policy.shared_autonomy_config.pybullet_gui=false )
         fi
         # Dedicated RRT-clearance args forwarded as SA-config fields. Kept
         # separate from --intervention_extra_args so they're individually

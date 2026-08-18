@@ -37,6 +37,35 @@ from lerobot.utils.sim_seeding import seed_splatsim_env_to_state
 # ── sim physics-mode check ────────────────────────────────────────────────────
 
 
+def _fetch_sim_env_config(vec_env) -> dict | None:
+    """Best-effort fetch of the sim server's env-config dict.
+
+    Used for capability probes (sync_physics_to_client /
+    strict_goal_tolerances).
+
+    ``ZMQSplatSimGymEnv.get_env_config()`` returns None when the env was
+    built with ``include_oracle_info=False`` — that gate is an ORACLE-INFO
+    opt-in (obstacle geometry, task goal) and most blend/viz envs run with
+    it off, which used to make these probes report "undeterminable" for
+    every ZMQ run. Capability flags shouldn't be gated on oracle info, so
+    when the public method yields nothing we fall back to the env's raw ZMQ
+    client, which always supports the get_env_config RPC.
+    """
+    try:
+        single = vec_env.envs[0] if hasattr(vec_env, "envs") else vec_env
+        base = getattr(single, "unwrapped", single)
+        fn = getattr(base, "get_env_config", None)
+        cfg = fn() if callable(fn) else None
+        if isinstance(cfg, dict):
+            return cfg
+        zmq_client = getattr(base, "_zmq_client", None)
+        zfn = getattr(zmq_client, "get_env_config", None)
+        cfg = zfn() if callable(zfn) else None
+        return cfg if isinstance(cfg, dict) else None
+    except Exception:
+        return None
+
+
 def warn_if_sim_physics_unsynced(vec_env, log=print) -> bool | None:
     """Report whether the connected sim runs --sync_physics_to_client.
 
@@ -51,14 +80,9 @@ def warn_if_sim_physics_unsynced(vec_env, log=print) -> bool | None:
     "jumpy" trajectories that misrepresent the policy.
     """
     synced: bool | None = None
-    try:
-        single = vec_env.envs[0] if hasattr(vec_env, "envs") else vec_env
-        fn = getattr(single, "get_env_config", None)
-        cfg = fn() if callable(fn) else None
-        if isinstance(cfg, dict) and "sync_physics_to_client" in cfg:
-            synced = bool(cfg["sync_physics_to_client"])
-    except Exception:
-        synced = None
+    cfg = _fetch_sim_env_config(vec_env)
+    if isinstance(cfg, dict) and "sync_physics_to_client" in cfg:
+        synced = bool(cfg["sync_physics_to_client"])
     if synced is True:
         log("[sim] sync_physics_to_client=ON — sim physics is gated on this client's commands.")
     elif synced is False:
@@ -74,6 +98,57 @@ def warn_if_sim_physics_unsynced(vec_env, log=print) -> bool | None:
             "--sync_physics_to_client."
         )
     return synced
+
+
+def check_sim_strict_goal_tolerances(vec_env, *, required: bool = False, log=print) -> bool | None:
+    """Report whether the connected sim runs --strict_goal_tolerances.
+
+    Queries the server's get_env_config (same probe as
+    :func:`warn_if_sim_physics_unsynced`) for the ``strict_goal_tolerances``
+    flag. Returns True/False when the server reports it, None when
+    undeterminable (older SplatSim without the field, or no get_env_config
+    on this backend).
+
+    Why it matters: the default eval-time is_success thresholds are LOOSE
+    (planar 60 mm, small_engine 30 mm / 10°), so a rollout terminates — and
+    the recorder/visualizer freezes into post-success hold — as soon as the
+    arm gets "close enough". Intervention recording and blend rollouts exist
+    to capture the last-mile corrections and the state coverage near the
+    goal, which is exactly what a loose sim cuts off. The DAgger
+    orchestrator therefore always launches its managed sims with
+    --strict_goal_tolerances; standalone/blend/viz runs against a
+    user-managed sim should match it.
+
+    ``required=True`` escalates a definitive False to SystemExit (the flag
+    is applied at server __init__ — there is no runtime toggle, the server
+    must be relaunched with --strict_goal_tolerances).
+    """
+    strict: bool | None = None
+    cfg = _fetch_sim_env_config(vec_env)
+    if isinstance(cfg, dict) and "strict_goal_tolerances" in cfg:
+        strict = bool(cfg["strict_goal_tolerances"])
+    if strict is True:
+        log("[sim] strict_goal_tolerances=ON — success requires the strict (recording-grade) goal pose.")
+    elif strict is False:
+        msg = (
+            "[sim] strict_goal_tolerances=OFF — the sim terminates episodes at the LOOSE "
+            "eval-time success thresholds (e.g. planar 60 mm), cutting rollouts off far "
+            "from the goal pose. Relaunch launch_nodes.py with --strict_goal_tolerances "
+            "for recording-grade rollouts (no runtime toggle; a restart is required)."
+        )
+        if required:
+            raise SystemExit(
+                msg + "\nRefusing to record against a loose sim "
+                "(pass --allow_loose_goal_tolerances to override)."
+            )
+        log("WARNING: " + msg)
+    else:
+        log(
+            "[sim] NOTE: could not determine the sim's strict_goal_tolerances mode "
+            "(older SplatSim server without the get_env_config field?). If rollouts "
+            "terminate early near the goal, relaunch with --strict_goal_tolerances."
+        )
+    return strict
 
 
 # ── obs → policy batch ────────────────────────────────────────────────────────
@@ -128,8 +203,10 @@ def _run_filler_phase(
     task_description: str | None,
     seed_joint_state: np.ndarray,
 ) -> None:
-    """Drain the inner policy's first throwaway chunk so the obs queue has the
-    right history before the real phase begins. Does NOT step the env.
+    """Drain the inner policy's first throwaway chunk. Does NOT step the env.
+
+    Ensures the obs queue has the right history before the real phase
+    begins.
 
     Also snaps ``wrapper._desired_q`` to ``seed_joint_state`` after filler so the
     wrapper's IK anchor isn't polluted by the throwaway chunk's actions.
@@ -176,6 +253,8 @@ def progress_guidance_index(demo_arm: np.ndarray, q_now: np.ndarray, j_prev: int
 
 @dataclass
 class BlendRolloutResult:
+    """Arrays captured from one blended rollout (actions, overlays, success info)."""
+
     raw_actions: np.ndarray  # (total_steps, action_dim) executed action targets
     decoded_guidance_full: np.ndarray | None  # chunk-boundary decoded-guidance overlay
     success: bool
@@ -206,6 +285,7 @@ def run_blended_rollout(
     progress_guidance: bool = False,
     progress_guidance_window: int = 45,
     demo_states_raw: np.ndarray | None = None,
+    pad_after_success: bool = True,
     on_step: Callable[[int, dict[str, Any], np.ndarray, bool], None] | None = None,
     on_success: Callable[[dict[str, Any]], None] | None = None,
     log: Callable[[str], None] = print,
@@ -217,6 +297,10 @@ def run_blended_rollout(
     after success (with the frozen terminal obs and the hold action).
     ``on_success(terminal_env_obs_batched)`` fires exactly once at the success
     transition, after the terminating step.
+
+    ``pad_after_success=False`` returns immediately at the success transition
+    instead of emitting frozen hold ticks until ``total_steps`` — the result's
+    ``raw_actions`` is then ``success_t + 1`` rows, not ``total_steps``.
     """
     n_action_steps: int = wrapper.config.n_action_steps
     if total_steps <= 0:
@@ -371,15 +455,24 @@ def run_blended_rollout(
             hold_action = np.asarray(agent_pos[0], dtype=np.float32) if agent_pos is not None else action_1d
             if on_success is not None:
                 on_success(terminal_env_obs)
-            log(
-                f"[ratio={ratio}] Episode succeeded at t={t + 1}/{total_steps}. "
-                f"Holding for {total_steps - t - 1} remaining steps."
-            )
+            if pad_after_success:
+                log(
+                    f"[ratio={ratio}] Episode succeeded at t={t + 1}/{total_steps}. "
+                    f"Holding for {total_steps - t - 1} remaining steps."
+                )
+            else:
+                log(
+                    f"[ratio={ratio}] Episode succeeded at t={t + 1}/{total_steps}. "
+                    f"Truncating (pad_after_success=False); "
+                    f"{total_steps - t - 1} guidance steps unused."
+                )
+                break
 
     if progress_guidance:
+        n_ticks = len(raw_actions)
         log(
             f"[ratio={ratio}] progress-guidance final demo cursor {_j_progress}/{_demo_arm.shape[0]} "
-            f"(wall-clock ticks {total_steps}; lag {total_steps - _j_progress})"
+            f"(wall-clock ticks {n_ticks}; lag {n_ticks - _j_progress})"
         )
 
     return BlendRolloutResult(

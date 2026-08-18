@@ -108,18 +108,20 @@ MULTI_DATASET_REPO_IDS=""
 MULTI_DATASET_SAMPLE_WEIGHTS=""
 MULTI_DATASET_STATS_PATHS=""
 MULTI_DATASET_NORM_MODE=""
-# --headless: route both --env.headless=true (in-process PybulletRobotServerBase
-# in p.DIRECT mode) and --policy.shared_autonomy_config.show_slider=false
-# (defensive; gates the Tkinter slider + SA wrapper's pybullet GUI client if
-# the policy carries SA config) into SHARED_ARGS. Default false → unchanged.
+# --headless: route --env.headless=true (in-process PybulletRobotServerBase
+# in p.DIRECT mode) plus --policy.shared_autonomy_config.show_slider=false
+# (Tkinter slider) and pybullet_gui=false (SA wrapper's pybullet GUI client)
+# into SHARED_ARGS (defensive; only matters if the policy carries SA config).
+# Default false → unchanged.
 # Forwarded from dagger_orchestrate.sh --headless via HEADLESS_TRAIN_SCRATCH_ARGS.
 HEADLESS=false
 # Modifiers for --headless (both no-ops without it), forwarded from
 # dagger_orchestrate.sh's flags of the same name:
 #   --control_gui → --env.control_gui=true: the in-process sim keeps SplatSim's
 #     Tk control panel over its p.DIRECT pybullet client.
-#   --keep_sa_gui → skip the show_slider=false injection: the SA wrapper keeps
-#     its ratio slider + its own pybullet GUI window.
+#   --keep_sa_gui → inject show_slider=true instead of =false: the SA wrapper
+#     keeps its Tk ratio slider ONLY (pybullet_gui=false is always injected in
+#     headless mode, so its RRT-planner pybullet window never opens).
 CONTROL_GUI=false
 KEEP_SA_GUI=false
 # --splat_shadows: route --env.splat_shadows=true into SHARED_ARGS so the
@@ -598,14 +600,18 @@ fi
 # local pybullet client) and the external sim's GUI mode is the user's
 # concern.
 if [[ "$HEADLESS" == true ]]; then
-    # --keep_sa_gui: the SA wrapper's slider + pybullet GUI window live in the
-    # lerobot process (not the sim), so they can stay up over a headless sim.
+    # --keep_sa_gui: the SA wrapper's Tk slider lives in the lerobot process
+    # (not the sim), so it can stay up over a headless sim. The wrapper's
+    # RRT-planner pybullet window stays closed either way: pybullet_gui=false
+    # forces p.DIRECT even with the slider on (tri-state override — see
+    # SharedAutonomyConfig.pybullet_gui).
     # Explicit both ways so the emitted command documents the decision.
     if [[ "$KEEP_SA_GUI" == true ]]; then
         SHARED_ARGS+=( "--policy.shared_autonomy_config.show_slider=true" )
     else
         SHARED_ARGS+=( "--policy.shared_autonomy_config.show_slider=false" )
     fi
+    SHARED_ARGS+=( "--policy.shared_autonomy_config.pybullet_gui=false" )
     if [[ -z "$ENV_EXTERNAL_PORT" ]]; then
         SHARED_ARGS+=( "--env.headless=true" )
         # --control_gui: in-process sim keeps the Tk control panel over its

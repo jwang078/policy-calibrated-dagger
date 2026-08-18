@@ -201,6 +201,22 @@ class AugmentationConfig:
     # existing blend datasets. Mirrors visualize_shared_autonomy_sim.py, which
     # has always pinned a shared base_noise across ratios.
     fixed_base_noise: bool = False
+    # Horizon headroom for blend rollouts: total_steps = source length x this.
+    # On-path-but-slow blends (pace < 1) were truncated at the source length
+    # and scored as "diverged" purely from running out of steps (2026-08-18:
+    # pace 0.76 x 155 steps -> ends 0.5 rad short on the demo path). Strict-
+    # success truncation still ends converged episodes at their natural
+    # length, so the headroom only pays when it is needed.
+    total_steps_multiplier: float = 1.3
+    # Convergence gate: accept a blend rollout only if it hit strict success
+    # OR its final commanded state lands within this many rad (arm-joint L2)
+    # of the demo's final action. Divergent mid-ratio rollouts are a noise-
+    # draw lottery (mode escape locked in by RTC hysteresis) and their
+    # frames are anti-corrective label noise — retry with a fresh draw up to
+    # blend_end_gap_retries times, then DROP the pair (unlike intervention
+    # chunks, failed blends are not expert data). <= 0 disables the gate.
+    max_blend_end_gap: float = 0.15
+    blend_end_gap_retries: int = 2
     # Seed a fresh torch.Generator for EVERY blend-path model call: the x_tsw
     # guidance-noising draw, the denoiser's per-step scheduler variance
     # (diffusion), the flow prior + anchor noise (PI0.5), and the anchor-chunk
@@ -1157,7 +1173,7 @@ def run_augmentation(
                     for _, row in frames_df.iloc[n_obs_steps:].iterrows()
                 ]
             )
-            total_steps = guidance_actions_raw.shape[0]
+            total_steps = int(round(guidance_actions_raw.shape[0] * max(1.0, cfg.total_steps_multiplier)))
             # Demo STATES on the same index grid as guidance_actions_raw:
             # demo_states_raw[k] = the state at the time raw[k] should execute.
             # Used by progress-aware guidance to match the robot's CURRENT
@@ -1220,32 +1236,74 @@ def run_augmentation(
                     _playlist_pos += 1
                     continue
                 t0 = time.time()
-                rollout = rollout_closed_loop_for_augmentation(
-                    wrapper=wrapper,
-                    obs_preprocessor=obs_preprocessor,
-                    vec_env=vec_env,
-                    env_preprocessor=env_pre,
-                    env_postprocessor=env_post,
-                    seed_joint_state=seed_joint_state,
-                    seed_joint_velocity=seed_joint_velocity,
-                    guidance_actions_raw=guidance_actions_raw,
-                    ratio=float(ratio),
-                    blend_mode=blend_mode_enum,
-                    blend_interval_frac=cfg.blend_interval_frac,
-                    total_steps=total_steps,
-                    progress_guidance=cfg.progress_guidance,
-                    progress_guidance_window=cfg.progress_guidance_window,
-                    demo_states_raw=demo_states_raw,
-                    rename_map=rename_map,
-                    image_keys=image_keys,
-                    task_description=task_description,
-                    device=cfg.device,
-                    playlist_pos=_playlist_pos,
-                    env_state_dim=source_env_state_dim,
-                    base_noise=_base_noise,
-                    pad_after_success=cfg.pad_after_success,
-                    min_episode_length=cfg.min_episode_length,
-                )
+                _n_arm = max(1, guidance_actions_raw.shape[1] - 1)
+                _demo_end = np.asarray(guidance_actions_raw[-1, :_n_arm], dtype=np.float64)
+                rollout = None
+                _end_gap = float("nan")
+                for _attempt in range(1 + max(0, cfg.blend_end_gap_retries)):
+                    if _attempt > 0:
+                        # Fresh draw for the retry: re-salt the seeded stream
+                        # and (when pinned) redraw the base noise. The
+                        # lottery is decided by the draw — same draw, same
+                        # outcome.
+                        if cfg.sample_seed >= 0:
+                            wrapper.sample_seed = cfg.sample_seed + int(source_ep) + 100_000 * _attempt
+                        if cfg.fixed_base_noise and _base_noise is not None:
+                            _base_noise = torch.randn_like(_base_noise)
+                    rollout = rollout_closed_loop_for_augmentation(
+                        wrapper=wrapper,
+                        obs_preprocessor=obs_preprocessor,
+                        vec_env=vec_env,
+                        env_preprocessor=env_pre,
+                        env_postprocessor=env_post,
+                        seed_joint_state=seed_joint_state,
+                        seed_joint_velocity=seed_joint_velocity,
+                        guidance_actions_raw=guidance_actions_raw,
+                        ratio=float(ratio),
+                        blend_mode=blend_mode_enum,
+                        blend_interval_frac=cfg.blend_interval_frac,
+                        total_steps=total_steps,
+                        progress_guidance=cfg.progress_guidance,
+                        progress_guidance_window=cfg.progress_guidance_window,
+                        demo_states_raw=demo_states_raw,
+                        rename_map=rename_map,
+                        image_keys=image_keys,
+                        task_description=task_description,
+                        device=cfg.device,
+                        playlist_pos=_playlist_pos,
+                        env_state_dim=source_env_state_dim,
+                        base_noise=_base_noise,
+                        pad_after_success=cfg.pad_after_success,
+                        min_episode_length=cfg.min_episode_length,
+                    )
+                    if cfg.max_blend_end_gap <= 0 or rollout.dropped_short or not rollout.frames:
+                        break
+                    _last = np.asarray(rollout.frames[-1]["observation.state"][:_n_arm], dtype=np.float64)
+                    _end_gap = float(np.linalg.norm(_last - _demo_end))
+                    if rollout.success or _end_gap <= cfg.max_blend_end_gap:
+                        break
+                    logger.warning(
+                        "source_ep=%d ratio=%.2f attempt %d: rollout did not converge "
+                        "(success=False, end_gap=%.3f > %.3f) — %s.",
+                        source_ep,
+                        ratio,
+                        _attempt + 1,
+                        _end_gap,
+                        cfg.max_blend_end_gap,
+                        "retrying with a fresh draw"
+                        if _attempt < cfg.blend_end_gap_retries
+                        else "dropping the pair",
+                    )
+                else:
+                    n_dropped += 1
+                    rollout = None
+                    gc.collect()
+                    _playlist_pos += 1
+                    if cfg.sample_seed >= 0:
+                        wrapper.sample_seed = cfg.sample_seed + int(source_ep)
+                    continue
+                if cfg.sample_seed >= 0:
+                    wrapper.sample_seed = cfg.sample_seed + int(source_ep)
                 _playlist_pos += 1
 
                 if rollout.dropped_short:

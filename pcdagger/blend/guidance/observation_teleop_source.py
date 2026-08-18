@@ -589,8 +589,38 @@ class ObservationTeleopGuidanceSource:
         n_provided = guidance_chunk_raw.shape[1]
         n_remaining = anchor_len - self._chunk_step
         n_fill = min(n_provided, n_remaining)
+        # REJOIN RAMP (rel-action basin capture). The policy's rel encoding
+        # is guidance - CURRENT anchor: once the rollout deviates from the
+        # demo by d, every encoded delta carries a flat +d offset — a chunk
+        # whose per-position magnitudes are structurally unlike any training
+        # chunk (training deltas ramp ~k*v*dt from ~0), which the denoiser
+        # treats like noise and discards, making divergence absorbing (the
+        # blend "lottery", 2026-08-18; a global clamp cannot express this —
+        # pooled MIN_MAX stats keep the offset "in range"). Instead, shift
+        # the raw guidance toward the robot with a linearly decaying offset:
+        # position 0 steps FROM the robot's state, the chunk lands back ON
+        # the demo by its end — every per-position delta in-distribution,
+        # tail mode-committed to the demo. On-corridor the offset is ~0 and
+        # the fill is unchanged (exact-replay behavior preserved).
+        # MEASURED NEUTRAL on the ep0 divergence lottery (seeds 43/44,
+        # ratios 0.3/0.7: end gaps within noise of the un-ramped runs) —
+        # the dominant failure modes there were on-path-slow truncation and
+        # pre-escape mode commits, neither of which the ramp addresses.
+        # Default OFF; kept as a knob for large-deviation regimes.
+        offset = None
+        if getattr(wrapper, "guidance_rejoin_ramp", False) and n_fill > 1:
+            _anchor = wrapper.get_relative_anchor_state()
+            if _anchor is not None:
+                d = min(_anchor.shape[-1], guidance_chunk_raw.shape[-1])
+                offset = torch.zeros_like(guidance_chunk_raw[:, 0, :])
+                offset[:, :d] = (
+                    _anchor[:, :d].to(offset.dtype).to(offset.device) - guidance_chunk_raw[:, 0, :d]
+                )
         for t_rel in range(n_fill):
             step_raw = guidance_chunk_raw[:, t_rel, :]  # [B, action_dim]
+            if offset is not None:
+                _decay = max(0.0, 1.0 - (t_rel + 1) / float(n_fill))
+                step_raw = step_raw + _decay * offset
             step_norm = wrapper._normalize_policy_guidance_action(step_raw)
             t_abs = self._chunk_step + t_rel
             guidance_chunk[:, t_abs, :action_dim] = step_norm

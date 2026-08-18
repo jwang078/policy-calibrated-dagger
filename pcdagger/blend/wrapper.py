@@ -414,6 +414,9 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self.skip_collision: bool = False  # set True for visualization (dataset guidance is known-safe)
         self.policy_guidance_representation = policy_guidance_representation
         self.n_anchor_steps = n_anchor_steps
+        # Clamp for encoded (normalized, rel-space) guidance; None disables.
+        # See _normalize_policy_guidance_action for the rationale.
+        self.clip_encoded_guidance: float | None = 1.0
         # RTC-style previous-chunk guidance (see SharedAutonomyConfig.rtc_*).
         # Plain mutable attributes so debug scripts can flip them post-init,
         # mirroring how guidance_blend_strategy / sample_seed are handled.
@@ -1691,6 +1694,21 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         output strays from the guidance."""
         self._update_ghost("action", q_raw)
 
+    def get_relative_anchor_state(self) -> Tensor | None:
+        """The rel-action decode anchor (latest cached state), (B, D) or None.
+
+        Squeezes a stacked (B, n_obs, D) history to its newest frame.
+        """
+        for _step in self.postprocessor.steps:
+            if isinstance(_step, AbsoluteActionsProcessorStep):
+                if _step.enabled and _step.relative_step is not None:
+                    st = _step.relative_step._last_state
+                    if st is None:
+                        return None
+                    return st[..., -1, :] if st.ndim == 3 else st
+                break
+        return None
+
     def refresh_relative_anchor(self) -> bool:
         """Sync the rel-action decode anchor (`_last_state`) to the newest observed state.
 
@@ -1791,6 +1809,21 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 f"Check normalization stats for zero-variance dims."
             )
             normalized = normalized.masked_fill(bad, 0.0)
+        # Clamp into the training range. The policy is REL-action: encoded
+        # guidance = demo_target - CURRENT anchor, so once the rollout
+        # deviates from the demo by d, every encoded delta shifts by d —
+        # past ~the MIN_MAX stats range the denoiser sees implausible
+        # content, treats it like noise, and snaps to its prior: deviation
+        # grows, guidance becomes MORE OOD, divergence turns absorbing (the
+        # blend-ratio "lottery", 2026-08-18). Clamped guidance stays
+        # in-distribution while still pointing back toward the demo, so the
+        # model can actually follow it. On-corridor guidance normalizes
+        # inside the range and is untouched.
+        if self.clip_encoded_guidance is not None:
+            c = float(self.clip_encoded_guidance)
+            n_over = int((normalized.abs() > c).sum().item())
+            if n_over:
+                normalized = normalized.clamp(-c, c)
         return normalized
 
     def _build_guidance_noise_from_chunk(

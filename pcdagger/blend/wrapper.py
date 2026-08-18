@@ -417,6 +417,15 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # Clamp for encoded (normalized, rel-space) guidance; None disables.
         # See _normalize_policy_guidance_action for the rationale.
         self.clip_encoded_guidance: float | None = 1.0
+        # UNPINNED anchor experiment: base the blend on the previous BLENDED
+        # chunk (re-anchored) instead of a fresh pure-policy predict. This
+        # deliberately re-enables the "mixing against one's own output"
+        # recursion whose fixed point is the guidance trajectory — under the
+        # corrective-data objective that contraction is arguably the FEATURE
+        # (DART-style perturb-and-recover: bounded excursions with actions
+        # that pull back onto the demo), with `forward_flow_ratio` acting as
+        # perturbation strength. See _build_and_emit_blended.
+        self.anchor_from_prev_blend: bool = False
         # RTC-style previous-chunk guidance (see SharedAutonomyConfig.rtc_*).
         # Plain mutable attributes so debug scripts can flip them post-init,
         # mirroring how guidance_blend_strategy / sample_seed are handled.

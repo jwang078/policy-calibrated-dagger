@@ -795,6 +795,14 @@ def parse_args():
     parser.add_argument("--rtc_execution_horizon", type=int, default=None)
     parser.add_argument("--rtc_inference_delay", type=int, default=0)
     parser.add_argument(
+        "--anchor_from_prev_blend",
+        type=lambda x: str(x).lower() in ("1", "true", "yes"),
+        default=False,
+        help="UNPINNED anchor: base each re-blend on the previous BLENDED chunk "
+        "(re-anchored) instead of a fresh pure-policy predict — deliberate "
+        "contraction onto the guidance (DART-style perturb-and-recover).",
+    )
+    parser.add_argument(
         "--rtc_prefix_attention_schedule", choices=["linear", "exp", "zeros", "ones"], default="linear"
     )
 
@@ -938,6 +946,7 @@ def main():
     wrapper.rtc_max_guidance_weight = args.rtc_max_guidance_weight
     wrapper.rtc_execution_horizon = args.rtc_execution_horizon
     wrapper.rtc_inference_delay = args.rtc_inference_delay
+    wrapper.anchor_from_prev_blend = args.anchor_from_prev_blend
     wrapper.rtc_prefix_attention_schedule = args.rtc_prefix_attention_schedule
     if args.rtc_prev_chunk:
         # Set post-init, so re-run the wrapper's init-time policy-type check.

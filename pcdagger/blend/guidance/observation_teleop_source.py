@@ -326,6 +326,7 @@ class ObservationTeleopGuidanceSource:
         # positive-feedback speedup (measured 3.5-5x demo speed at ratio 0.7).
         # Consumed only when `wrapper.rtc_prev_chunk_guidance` is on; cleared
         # naturally by cancel()/reset() (they null both chunk buffers).
+        _entry_cursor = self._chunk_step  # BEFORE any cursor reset below
         rtc_prev_leftover_abs: Tensor | None = None
         if wrapper.rtc_prev_chunk_guidance and self._guided_chunk_abs is not None:
             cur = min(self._chunk_step, self._guided_chunk_abs.shape[1])
@@ -408,7 +409,30 @@ class ObservationTeleopGuidanceSource:
         _regen_now_anchored = emits_now_anchored and (
             strategy == GuidanceBlendStrategy.INTERPOLATE or _guidance_short
         )
-        if (
+        # UNPINNED anchor (wrapper.anchor_from_prev_blend): base = the
+        # previous BLENDED chunk, shifted past its executed step(s) and
+        # re-anchored into the current rel frame (same flow as the RTC
+        # leftover), tail-padded by repeating its last entry. This is the
+        # deliberate self-recursion (contraction onto guidance) — see the
+        # wrapper attr comment. First build (no prev) falls through to the
+        # pure-policy predict.
+        _prev_base: Tensor | None = None
+        if getattr(wrapper, "anchor_from_prev_blend", False) and self._guided_chunk_abs is not None:
+            _cur = min(_entry_cursor, self._guided_chunk_abs.shape[1] - 1)
+            _prev_abs = self._guided_chunk_abs[:, _cur:, :].detach()
+            _steps = [
+                wrapper._normalize_policy_guidance_action(_prev_abs[:, t, :])
+                for t in range(_prev_abs.shape[1])
+            ]
+            while len(_steps) < self._guided_chunk_abs.shape[1]:
+                _steps.append(_steps[-1])
+            _prev_base = torch.stack(_steps, dim=1)
+        if _prev_base is not None:
+            self._anchor_chunk_orig = _prev_base.to(
+                device=self._guided_chunk.device, dtype=self._guided_chunk.dtype
+            )
+            self._chunk_step = 0 if emits_now_anchored else self._chunk_step
+        elif (
             _regen_now_anchored
             or chunk_exhausted
             or self._guided_chunk is None
@@ -464,11 +488,31 @@ class ObservationTeleopGuidanceSource:
         else:
             max_action_dim = action_dim
 
+        # Under the unpinned anchor, DENOISE's init must actually CONTAIN the
+        # self-term: the plain fill overwrites the base with guidance, which
+        # would erase the recursion. Mix instead: filled = (1-r)*guidance +
+        # r*base(prev blend) — the interpolate-form init, then noised per
+        # ratio and denoised. INTERPOLATE keeps the plain fill (its strategy
+        # branch performs the same mix; mixing twice would square the decay).
+        _fill_self_mix = (
+            ratio
+            if (
+                getattr(wrapper, "anchor_from_prev_blend", False)
+                and strategy == GuidanceBlendStrategy.DENOISE
+            )
+            else None
+        )
         if (
             wrapper.policy_guidance_representation == PolicyGuidanceRepresentation.ABSOLUTE_POS
             and guidance_chunk_raw is not None
         ):
-            self._fill_chunk_absolute(guidance_chunk, guidance_chunk_raw, anchor_len, action_dim)
+            self._fill_chunk_absolute(
+                guidance_chunk,
+                guidance_chunk_raw,
+                anchor_len,
+                action_dim,
+                self_mix=_fill_self_mix,
+            )
         elif (
             wrapper.policy_guidance_representation == PolicyGuidanceRepresentation.DELTA
             and guidance_chunk_raw is not None
@@ -562,7 +606,7 @@ class ObservationTeleopGuidanceSource:
         # this build, so the postprocessor decodes with exactly the frame the
         # chunk is encoded in, and next tick's re-anchor stays exact no matter
         # how the robot moved in between.
-        if wrapper.rtc_prev_chunk_guidance:
+        if wrapper.rtc_prev_chunk_guidance or getattr(wrapper, "anchor_from_prev_blend", False):
             with torch.no_grad():
                 self._guided_chunk_abs = torch.stack(
                     [wrapper.postprocessor(blended[:, t, :action_dim]) for t in range(anchor_len)],
@@ -583,6 +627,7 @@ class ObservationTeleopGuidanceSource:
         guidance_chunk_raw: Tensor,
         anchor_len: int,
         action_dim: int,
+        self_mix: float | None = None,
     ) -> None:
         """ABSOLUTE_POS: full per-step guidance chunk; normalize each step and overwrite anchor."""
         wrapper = self._wrapper
@@ -623,7 +668,12 @@ class ObservationTeleopGuidanceSource:
                 step_raw = step_raw + _decay * offset
             step_norm = wrapper._normalize_policy_guidance_action(step_raw)
             t_abs = self._chunk_step + t_rel
-            guidance_chunk[:, t_abs, :action_dim] = step_norm
+            if self_mix is not None:
+                guidance_chunk[:, t_abs, :action_dim] = (
+                    1.0 - self_mix
+                ) * step_norm + self_mix * guidance_chunk[:, t_abs, :action_dim]
+            else:
+                guidance_chunk[:, t_abs, :action_dim] = step_norm
         # If guidance is shorter than remaining chunk, repeat last step.
         if n_fill < n_remaining:
             last_norm = guidance_chunk[:, self._chunk_step + n_fill - 1, :action_dim]

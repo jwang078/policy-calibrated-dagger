@@ -331,6 +331,20 @@ class ObservationTeleopGuidanceSource:
             cur = min(self._chunk_step, self._guided_chunk_abs.shape[1])
             if cur < self._guided_chunk_abs.shape[1]:
                 rtc_prev_leftover_abs = self._guided_chunk_abs[:, cur:, :].detach()
+        elif wrapper.rtc_prev_chunk_guidance and guidance_chunk_raw is not None:
+            # FIRST build (or first after reset/cancel): no previous chunk
+            # exists to commit against, so the launch was owned entirely by
+            # the policy's prior — which ignores a slow observed history
+            # (measured: first-chunk launch 0.497 rad/s vs the demo's 0.102
+            # with everything else fixed, 2026-08-18). Seed the RTC prefix
+            # with the GUIDANCE prefix instead: the demo IS the plan the
+            # rollout is joining, so treating it as the "previous chunk"
+            # velocity-commits the first build to the demo's motion exactly
+            # the way later builds commit to their predecessor. Same
+            # coordinates as the captured leftover (absolute raw actions;
+            # re-anchored/encoded below), index 0 = the action for NOW.
+            n_seed = min(guidance_chunk_raw.shape[1], int(wrapper.config.n_action_steps))
+            rtc_prev_leftover_abs = guidance_chunk_raw[:, :n_seed, :].detach()
 
         # ── Time-anchoring predicate: the ONE fork that cadence hangs off ──
         # EVERY_STEP re-anchors the emitted chunk to "now" on every call

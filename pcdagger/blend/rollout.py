@@ -253,6 +253,14 @@ def _run_filler_phase(
         )
         wrapper.select_action(batch)
     wrapper._desired_q = np.asarray(seed_joint_state, dtype=np.float32)[: wrapper.num_dofs].copy()
+    # Drop the filler's throwaway blend chunks: they were built on synthetic
+    # obs and would otherwise serve as the "previous chunk" for the first
+    # REAL build's RTC prev-chunk conditioning — committing the launch to
+    # filler garbage instead of letting the source's first-build guidance
+    # seed fire (the guidance prefix as the plan the rollout is joining).
+    _src = getattr(wrapper, "_obs_teleop_source", None)
+    if _src is not None and hasattr(_src, "cancel"):
+        _src.cancel()
 
 
 # ── progress-matched guidance ─────────────────────────────────────────────────

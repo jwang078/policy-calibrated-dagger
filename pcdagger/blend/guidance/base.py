@@ -63,6 +63,10 @@ class GuidanceSourceState:
     chunk: np.ndarray | None = None  # [T, num_dofs+gripper] joint waypoints
     step: int = 0
     target_steps: int | None = None  # caller hint for "executing X/Y waypoints" log
+    # Frames the most recent plan's lookback-rewind jumped back (0 = no
+    # rewind: no-lookback / escape / failed-before-teleport). Read by the
+    # intervention controller when it finalizes each cycle's CSV bookkeeping.
+    last_lookback_frames: int = 0
     cancel_requested: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 

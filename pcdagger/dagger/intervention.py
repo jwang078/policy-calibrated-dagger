@@ -39,6 +39,7 @@ Helpers in this module:
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import random
 from collections import deque
@@ -190,6 +191,14 @@ class ScenarioResult:
     # ranges: intervention spans [trigger_steps[i], trigger_steps[i] +
     # rrt_steps_executed[i]).
     rrt_steps_executed: str = ""
+    # Comma-separated frames each cycle's lookback-rewind jumped BACK before
+    # planning. Parallel to `triggers`. 0 = no rewind (no-lookback trigger,
+    # escape teleport, or the plan failed before the teleport). Non-zero L at
+    # trigger step T means the recorded intervention resumed from the state
+    # of step T-L: video frames (T-L, T] were effectively DELETED from the
+    # dataset by the rewind (visualize_intervention_episode.py --trim_lookback
+    # uses this to show the dataset-equivalent seam).
+    lookback_frames: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +395,8 @@ class InterventionController:
         # intervention" segments: cycle i runs the env for
         # ``rrt_steps_executed[i]`` ticks starting at ``trigger_steps[i]``.
         self.rrt_steps_executed: list[int] = []
+        # Parallel to trigger_reasons: frames each cycle's rewind jumped back.
+        self.lookback_frames: list[int] = []
         # Total ticks (policy + RRT phases) since the last scenario reset.
         # Incremented at the top of every ``tick()`` call so it's monotonic
         # within a scenario regardless of which phase is active.
@@ -476,6 +487,7 @@ class InterventionController:
         self.trigger_reasons = []
         self.trigger_steps = []
         self.rrt_steps_executed = []
+        self.lookback_frames = []
         self.total_step_count = 0
         if self._progress_tracker is not None:
             self._progress_tracker.reset()
@@ -560,6 +572,15 @@ class InterventionController:
         """
         if self.rrt_step_count > 0 and self.rrt_steps_executed and self.rrt_steps_executed[-1] == 0:
             self.rrt_steps_executed[-1] = self.rrt_step_count
+        self._sync_lookback_placeholder()
+
+    def _sync_lookback_placeholder(self) -> None:
+        """Copy the source's last plan's rewind depth into this cycle's
+        `lookback_frames` slot. Idempotent; safe when no cycle is in flight
+        or the source has no such state (oracle-goal)."""
+        if self.lookback_frames:
+            st = getattr(getattr(self, "_source", None), "state", None)
+            self.lookback_frames[-1] = int(getattr(st, "last_lookback_frames", 0) or 0)
 
     def tick(
         self,
@@ -629,6 +650,7 @@ class InterventionController:
             self.trigger_reasons.append("drift_stall")
             self.trigger_steps.append(self.total_step_count)
             self.rrt_steps_executed.append(0)
+            self.lookback_frames.append(0)
             self._source.state.target_steps = self.target_rrt_steps
             logger.info(
                 "Triggering RRT (drift_stall re-plan) at scenario step %d (no_lookback=%s).",
@@ -811,6 +833,7 @@ class InterventionController:
             self.trigger_reasons.append("future_chunk_coll")
             self.trigger_steps.append(self.total_step_count)
             self.rrt_steps_executed.append(0)
+            self.lookback_frames.append(0)
             # Seed _last_trigger_reason so a same-cycle retry (e.g., plan
             # failure → re-trigger) routes through the same no-lookback
             # dispatch the shield used. Without this, the retry's
@@ -977,6 +1000,7 @@ class InterventionController:
             # the controller-cancel branch above.
             if self.rrt_steps_executed:
                 self.rrt_steps_executed[-1] = self.rrt_step_count
+            self._sync_lookback_placeholder()
             self.policy_step_count = 0
             self.rrt_step_count = 0
             self.backoff_rounds = 0
@@ -1082,6 +1106,60 @@ class InterventionController:
             self.pending_rrt_trigger = False
             self.rrt_step_count += 1
             if not self.controller_initiated_cancel and self.rrt_step_count >= self.target_rrt_steps:
+                # SAFE-HANDBACK gate: the RRT path legitimately squeezes to
+                # 10-18 mm past obstacles mid-chunk, while the policy-mode
+                # shield trips at ~19 mm — cancelling inside that band hands
+                # the policy exactly one tick before the shield refires,
+                # whereupon the replanner (routing clearance 2 cm) declares
+                # the start "in collision" and escape-TELEPORTS the robot: a
+                # visible backward jump at every unlucky handback (measured:
+                # a 5-frame snap in eval ep1, cancel at 12.1 mm). Defer the
+                # cancel while the current state violates the shield's
+                # policy-mode clearance (+2 mm margin), up to +150 extra
+                # chunk steps (or chunk end, whichever first).
+                _defer = False
+                if self.rrt_step_count < self.target_rrt_steps + 150:
+                    try:
+                        _wrap = self.wrapper
+                        _fc = getattr(_wrap, "_future_chunk_config", None)
+                        _st = getattr(getattr(self, "_source", None), "state", None)
+                        _planner = getattr(_st, "planner", None)
+                        _chunk = getattr(_st, "chunk", None)
+                        _step = int(getattr(_st, "step", 0) or 0)
+                        if _fc is not None and _planner is not None and _chunk is not None:
+                            _clear = (_fc.obstacle_clearance or 0.0) + 0.002
+                            # Probe the CURRENT state and the chunk's next
+                            # ~1 s of waypoints (every 4th, 30-step window):
+                            # a cancel is only safe when the near-term
+                            # remainder of the plan is outside the shield
+                            # band — the current state alone was safe at
+                            # every measured mid-squeeze cancel while the
+                            # policy's very next steps were not, so the
+                            # shield refired within a second every time.
+                            _probe = list(_chunk[_step : _step + 30 : 4])
+                            _q_now = getattr(_wrap, "_latest_actual_q", None)
+                            if _q_now is not None:
+                                _probe.insert(0, np.asarray(_q_now))
+                            for _pq in _probe:
+                                _hit = _planner.is_q_in_collision(
+                                    np.asarray(_pq).reshape(-1)[: _wrap.num_dofs],
+                                    obstacle_clearance=_clear,
+                                )
+                                if isinstance(_hit, tuple):
+                                    _hit = _hit[0]
+                                if _hit:
+                                    _defer = True
+                                    break
+                    except Exception:
+                        _defer = False
+                if _defer:
+                    if self.rrt_step_count == self.target_rrt_steps:
+                        logger.info(
+                            "Deferring auto-cancel: the chunk's near-term remainder "
+                            "is still within the shield clearance band — continuing "
+                            "the CURRENT plan until it exits (max +150 steps).",
+                        )
+                    return "continue"
                 logger.info(
                     "Auto-cancelling %s after %d step(s) (random target=%d).",
                     self.cfg.method.upper(),
@@ -1089,6 +1167,13 @@ class InterventionController:
                     self.target_rrt_steps,
                 )
                 self._cancel()
+                # Sync the stored prev-mode NOW: it was read at the top of
+                # this tick (EXECUTING, pre-cancel). If the shield refires on
+                # the very next tick — measured: refire 1 tick after cancel —
+                # the external-trigger detection would see EXECUTING →
+                # EXECUTING and silently miss the cycle (no target sampling,
+                # no CSV row, chunk runs to full length).
+                self.prev_mode = RRTMode.IDLE
                 self.controller_initiated_cancel = True
                 self.cycles_used += 1
                 # Record this cycle's executed step count BEFORE resetting
@@ -1096,6 +1181,7 @@ class InterventionController:
                 # trigger fire. Mirrored in the natural-finish branch below.
                 if self.rrt_steps_executed:
                     self.rrt_steps_executed[-1] = self.rrt_step_count
+                self._sync_lookback_placeholder()
                 self.rrt_step_count = 0
                 self.policy_step_count = 0
                 # An intervention cycle just executed successfully — the planner
@@ -1220,6 +1306,12 @@ class InterventionController:
             # or natural-finish branches below). Stays 0 iff this trigger
             # never reaches EXECUTING — i.e. planning failed outright.
             self.rrt_steps_executed.append(0)
+            # Placeholder for this cycle's lookback-rewind depth — REQUIRED
+            # at every trigger site: the lists are written positionally into
+            # the CSV, and a missing slot shifts every later cycle's rewind
+            # onto the wrong trigger (observed: a time-stall's 72-frame
+            # rewind attributed to a no-lookback future_chunk_coll cycle).
+            self.lookback_frames.append(0)
             logger.info(
                 "Triggering %s (%s) at scenario step %d, after %d policy steps (cycle %d/%d, target=%d).",
                 self.cfg.method.upper(),
@@ -1269,6 +1361,10 @@ class InterventionContext:
     csv_path: Path
     _csv_file: object | None = field(default=None, repr=False, compare=False)
     _csv_writer: object | None = field(default=None, repr=False, compare=False)
+    # Cursor into the RRT source's process-lifetime `plan_diagnostics_log`:
+    # everything past it belongs to the scenario currently being recorded.
+    # Advanced in record_scenario_result when the row's `rrt_diag` is built.
+    _rrt_diag_cursor: int = field(default=0, repr=False, compare=False)
     # Index of the scenario being processed by the current rollout() call.
     # Incremented by lerobot_eval.rollout() each invocation; pushed to
     # `TeleopRecordingContext.source_scenario_idx` so the recorded dataset
@@ -1309,6 +1405,20 @@ class InterventionContext:
     # before any EXECUTING steps). Combined with `trigger_steps[i]` it gives
     # the exact [start, end) tick range of intervention i — useful for
     # mapping back to video frames.
+    # `rrt_diag`: JSON list with one condensed record per SUCCESSFUL RRT plan
+    # in this scenario, chronological (failed plans appear only in
+    # `plan_failures`). Each record is the planner's last_plan_diagnostics:
+    # {"n_ik": IK candidates found, "ik_dropped": removed by the
+    # collision-history filter, "ik_rank": 1-based position (in
+    # ik_goal_selection order) of the winning candidate, "ik_tried": how many
+    # candidates were attempted, "ik_score"/"path_score": the two scoring
+    # axes, "ee_arc"/"chord"/"arc_chord": winning path's EE arc length vs
+    # straight-line start→goal distance (arc_chord >> 1 = loop-around),
+    # "gate": ik_accept_arc_chord_ratio outcome — "pass" (early exit on a
+    # direct-enough path), "reject" (winner is the best-by-score fallback,
+    # no candidate passed), or null (gate off / no IK ordering),
+    # "escape": whether a collision-escape preceded planning}. Empty string
+    # when the scenario ran no successful plans (or method != "rrt").
     CSV_COLUMNS = (
         "scenario_idx",
         "success",
@@ -1319,6 +1429,8 @@ class InterventionContext:
         "triggers",
         "trigger_steps",
         "rrt_steps_executed",
+        "lookback_frames",
+        "rrt_diag",
     )
 
     def open_csv(self) -> None:
@@ -1353,6 +1465,17 @@ class InterventionContext:
         if self._csv_writer is None:
             raise RuntimeError("InterventionContext.record_scenario_result called before open_csv()")
         ctrl = self.controller
+        # Drain this scenario's slice of the RRT source's plan-diagnostics
+        # log. The log is process-lifetime and append-only, so a cursor keeps
+        # each row limited to the plans that ran since the previous scenario's
+        # row. Oracle-goal sources have no such log → empty column.
+        diag_json = ""
+        diag_log = getattr(getattr(ctrl, "_source", None), "plan_diagnostics_log", None)
+        if diag_log is not None:
+            new_diags = diag_log[self._rrt_diag_cursor :]
+            self._rrt_diag_cursor = len(diag_log)
+            if new_diags:
+                diag_json = json.dumps(new_diags, separators=(",", ":"))
         row = (
             self.resolve_scenario_idx(scenario_idx),
             int(bool(success)),
@@ -1363,6 +1486,11 @@ class InterventionContext:
             ",".join(ctrl.trigger_reasons),
             ",".join(str(s) for s in ctrl.trigger_steps),
             ",".join(str(s) for s in ctrl.rrt_steps_executed),
+            ",".join(
+                str(s)
+                for s in (ctrl.lookback_frames + [0] * len(ctrl.trigger_reasons))[: len(ctrl.trigger_reasons)]
+            ),
+            diag_json,
         )
         self._csv_writer.writerow(row)
         self._csv_file.flush()

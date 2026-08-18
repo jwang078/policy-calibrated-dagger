@@ -190,7 +190,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         inverse_preprocessor: PolicyProcessorPipeline,
         forward_flow_ratio: float,
         show_slider: bool = True,
-        pybullet_gui: bool = False,
+        pybullet_gui: bool | None = None,
         start_paused: bool = False,
         robot_name: str | None = None,
         num_dofs: int | None = None,
@@ -198,6 +198,11 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         blend_mode: BlendMode | str = BlendMode.EVERY_STEP,
         guidance_blend_strategy: GuidanceBlendStrategy | str = GuidanceBlendStrategy.DENOISE,
         n_anchor_steps: int = 0,
+        rtc_prev_chunk_guidance: bool = False,
+        rtc_max_guidance_weight: float = 10.0,
+        rtc_execution_horizon: int | None = None,
+        rtc_inference_delay: int = 0,
+        rtc_prefix_attention_schedule: str = "linear",
         fps: int = 30,
         rrt_collision_detection: str = "pre_jump_lookback",
         rrt_pre_jump_lookback: PreJumpLookbackConfig | None = None,
@@ -206,8 +211,12 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         rrt_blocking_plan: bool = True,
         rrt_path_selection: str | None = None,
         rrt_path_score_joint_arc_weight: float = 0.0,
+        rrt_camera_score_weight: float | None = None,
+        rrt_ik_camera_weight: float | None = None,
+        rrt_wrist_camera_link_name: str | None = None,
         rrt_segment_at_sharp_corners: bool | None = None,
         rrt_ik_goal_selection: str | None = None,
+        rrt_ik_accept_arc_chord_ratio: float | None = 3.0,
         rrt_num_path_candidates_per_ik: int = 1,
         rrt_max_path_attempts_per_ik: int = 5,
         rrt_path_perturbation_scale: float = 0.001,
@@ -405,6 +414,24 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self.skip_collision: bool = False  # set True for visualization (dataset guidance is known-safe)
         self.policy_guidance_representation = policy_guidance_representation
         self.n_anchor_steps = n_anchor_steps
+        # RTC-style previous-chunk guidance (see SharedAutonomyConfig.rtc_*).
+        # Plain mutable attributes so debug scripts can flip them post-init,
+        # mirroring how guidance_blend_strategy / sample_seed are handled.
+        self.rtc_prev_chunk_guidance: bool = rtc_prev_chunk_guidance
+        self.rtc_max_guidance_weight: float = rtc_max_guidance_weight
+        self.rtc_execution_horizon: int | None = rtc_execution_horizon
+        self.rtc_inference_delay: int = rtc_inference_delay
+        self.rtc_prefix_attention_schedule: str = rtc_prefix_attention_schedule
+        if rtc_prev_chunk_guidance and getattr(inner_policy.config, "type", None) != "diffusion":
+            # The per-step gradient-guidance correction is implemented in the
+            # diffusion policy's conditional_sample only. Flow-matching inner
+            # policies would need the equivalent hook in their sample loop
+            # (RTCProcessor.denoise_step already exists for that — wiring it
+            # through the PI0.5 SA path is future work).
+            raise NotImplementedError(
+                "rtc_prev_chunk_guidance is only implemented for diffusion inner "
+                f"policies (got policy type {getattr(inner_policy.config, 'type', None)!r})."
+            )
         self._fps = fps
 
         # All RRT-mode state — planning lifecycle, chunk playback, plan thread —
@@ -450,8 +477,12 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             auto_pause_on_finish=True,
             path_selection=rrt_path_selection,
             path_score_joint_arc_weight=rrt_path_score_joint_arc_weight,
+            camera_score_weight=rrt_camera_score_weight,
+            ik_camera_weight=rrt_ik_camera_weight,
+            wrist_camera_link_name=rrt_wrist_camera_link_name,
             segment_at_sharp_corners=rrt_segment_at_sharp_corners,
             ik_goal_selection=rrt_ik_goal_selection,
+            ik_accept_arc_chord_ratio=rrt_ik_accept_arc_chord_ratio,
             num_path_candidates_per_ik=rrt_num_path_candidates_per_ik,
             max_path_attempts_per_ik=rrt_max_path_attempts_per_ik,
             path_perturbation_scale=rrt_path_perturbation_scale,
@@ -505,12 +536,18 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # `select_action` receipt of `oracle_env_config["robot"]` (when the
         # env is configured with `--env.include_oracle_info=true`). `_urdf_loaded`
         # gates the lazy path.
-        self._pb_client = p.connect(p.GUI if (show_slider or pybullet_gui) else p.DIRECT)
+        # GUI-vs-DIRECT: `pybullet_gui` is a tri-state override — None follows
+        # show_slider (legacy coupling), True forces a window without the
+        # slider, False forces DIRECT even with the slider (Tk slider is its
+        # own thread and doesn't need a pybullet window).
+        _pb_use_gui = pybullet_gui if pybullet_gui is not None else show_slider
+        self._pb_client = p.connect(p.GUI if _pb_use_gui else p.DIRECT)
         self._show_slider = show_slider  # for the launch_ratio_slider guard below
         self._robot_id: int | None = None
         # Guidance-ghost visualization (opt-in via `show_guidance_ghost`,
         # set by callers like augment_dataset_with_blending). Lazy-created
-        # in the wrapper's OWN pybullet client (the --keep_sa_gui window).
+        # in the wrapper's OWN pybullet client (needs pybullet_gui=true /
+        # a slider-opened window to be visible).
         self.show_guidance_ghost: bool = False
         self._ghost_ids: dict[str, int] = {}
         self._ee_link: int | None = None
@@ -1696,6 +1733,29 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         gen.manual_seed(self.sample_seed + salt)
         return gen
 
+    def rtc_prefix_weights(self, total: int) -> Tensor:
+        """Per-position weights (1-D, length ``total``) for the RTC-style
+        previous-chunk guidance — RTC's prefix-attention schedule.
+
+        Position 0..rtc_inference_delay-1 → 1.0 (hard commit), annealed to 0
+        across rtc_execution_horizon, 0 beyond. Delegates to the canonical
+        ``RTCProcessor.get_prefix_weights`` so the schedule semantics stay
+        identical to the standalone RTC implementation.
+        """
+        from lerobot.configs import RTCAttentionSchedule
+        from lerobot.policies.rtc.configuration_rtc import RTCConfig
+        from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+
+        horizon = self.rtc_execution_horizon or int(self.config.n_action_steps)
+        processor = RTCProcessor(
+            RTCConfig(
+                prefix_attention_schedule=RTCAttentionSchedule(self.rtc_prefix_attention_schedule.upper()),
+                max_guidance_weight=self.rtc_max_guidance_weight,
+                execution_horizon=horizon,
+            )
+        )
+        return processor.get_prefix_weights(min(self.rtc_inference_delay, total), min(horizon, total), total)
+
     def _normalize_policy_guidance_action(self, policy_guidance_action: Tensor) -> Tensor:
         """Normalize raw policy guidance action to policy's internal space.
 
@@ -1751,10 +1811,16 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             x_tsw = ratio * noise + (1 - ratio) * guidance
             Denoising then starts from t=ratio instead of t=1.0.
 
-        ratio=0 never reaches this function (pure teleop is handled by the
-        obs-teleop source's ratio==0 branch). ratio=1 DOES reach it: t_sw lands
-        on the last timestep, so x_tsw is (almost) pure noise → a full-length
-        denoise ≈ the pure policy sample ("blend100" / pure-policy mode).
+        NEITHER endpoint reaches this function: ratio=0 is handled by the
+        obs-teleop source's ratio==0 branch (verbatim teleop), and ratio=1
+        ("blend100" / pure-policy mode) takes the source's pure-policy BYPASS
+        branch — a plain unguided predict_action_chunk call. Do NOT "fix"
+        ratio=1 to come back here: t_sw would land on the last timestep where
+        alpha_bar ~ 0, and the "≈ pure noise, so ≈ the policy's own sample"
+        approximation breaks as soon as anything else participates in the
+        denoise (0·NaN through the mix; RTC prev-chunk correction diverging
+        on the near-zero-alpha_bar steps). This exact route caused recurring
+        NaN-action bugs before the bypass existed.
 
         Returns x_tsw, to pass as (noise=x_tsw, sa_noise_ratio=ratio) kwargs to
         predict_action_chunk. Raises NotImplementedError when the inner policy

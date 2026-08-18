@@ -88,8 +88,12 @@ class RRTGuidanceSource:
         auto_pause_on_finish: bool = True,
         path_selection: PathSelectionStrategy | str | None = None,
         path_score_joint_arc_weight: float = 0.0,
+        camera_score_weight: float | None = None,
+        ik_camera_weight: float | None = None,
+        wrist_camera_link_name: str | None = None,
         segment_at_sharp_corners: bool | None = None,
         ik_goal_selection: str | None = None,
+        ik_accept_arc_chord_ratio: float | None = 3.0,
         num_path_candidates_per_ik: int = 1,
         max_path_attempts_per_ik: int = 5,
         path_perturbation_scale: float = 0.001,
@@ -175,6 +179,9 @@ class RRTGuidanceSource:
         # arc-length strategies). 0 = off. See RRTToGoalPlanner ctor for the
         # near-goal EE-arc degeneracy this breaks ties on.
         self.path_score_joint_arc_weight = float(path_score_joint_arc_weight)
+        self.camera_score_weight = float(camera_score_weight) if camera_score_weight is not None else None
+        self.ik_camera_weight = float(ik_camera_weight) if ik_camera_weight is not None else None
+        self.wrist_camera_link_name = wrist_camera_link_name
         # Flag forwarded to time parametrization. When True (default),
         # the parametrizer splits the path at sharp-angle waypoints and forces zero
         # velocity at each boundary — historical stop-and-go mode. When
@@ -191,6 +198,16 @@ class RRTGuidanceSource:
         # path_selection is unused. See IkGoalSelectionStrategy in
         # `lerobot.policies.rrt_to_goal`. None = no IK pre-selection.
         self.ik_goal_selection = ik_goal_selection
+        # Acceptance gate on the IK early exit (arc <= ratio*chord + slack);
+        # see SharedAutonomyConfig.rrt_ik_accept_arc_chord_ratio. None =
+        # legacy first-success-wins.
+        self.ik_accept_arc_chord_ratio = (
+            float(ik_accept_arc_chord_ratio) if ik_accept_arc_chord_ratio is not None else None
+        )
+        # One condensed dict per successful plan() this process has run
+        # (planner.last_plan_diagnostics copies, chronological). External
+        # consumers (InterventionController) drain slices of it per scenario.
+        self.plan_diagnostics_log: list[dict] = []
         # Per-IK multi-path-candidate scoring knobs. See planner ctor for
         # semantics. Default num=1 preserves single-attempt behavior.
         self.num_path_candidates_per_ik = int(num_path_candidates_per_ik)
@@ -719,7 +736,26 @@ class RRTGuidanceSource:
         """Lazy-init the planner (so the import / setup happens only when used)."""
         wrapper = self._wrapper
         if self.state.planner is None:
-            self.state.planner = RRTToGoalPlanner(
+            # LOWEST-priority defaults: the env's trajectory-generation
+            # config (configs/traj_configs/<robot>.json) — the same numbers
+            # demo generation runs with. Everything this source passes
+            # explicitly below (intervention-code values and user flags)
+            # overrides them; parameter names are shared verbatim between
+            # the JSON, TrajectoryGenModeConfig and the planner ctor.
+            try:
+                from splatsim.utils.rrt_to_goal import planner_kwargs_from_traj_config
+
+                _env_base = planner_kwargs_from_traj_config(str(wrapper.robot_name or ""))
+            except Exception:
+                _env_base = {}
+            if _env_base:
+                logger.info(
+                    "SA planner: inheriting %d lowest-priority default(s) from the env traj config (%s): %s",
+                    len(_env_base),
+                    wrapper.robot_name,
+                    sorted(_env_base.keys()),
+                )
+            _explicit = dict(
                 pb_client=wrapper._pb_client,
                 robot_id=wrapper._robot_id,
                 joint_indices=list(range(1, 1 + wrapper.num_dofs)),
@@ -731,7 +767,9 @@ class RRTGuidanceSource:
                 num_ik_candidates=self.num_ik_candidates,
                 path_selection=self.path_selection,
                 path_score_joint_arc_weight=self.path_score_joint_arc_weight,
+                wrist_camera_link_index=self._resolve_wrist_camera_link_index(),
                 ik_goal_selection=self.ik_goal_selection,
+                ik_accept_arc_chord_ratio=self.ik_accept_arc_chord_ratio,
                 num_path_candidates_per_ik=self.num_path_candidates_per_ik,
                 max_path_attempts_per_ik=self.max_path_attempts_per_ik,
                 path_perturbation_scale=self.path_perturbation_scale,
@@ -752,6 +790,8 @@ class RRTGuidanceSource:
                 **{
                     k: v
                     for k, v in (
+                        ("camera_score_weight", self.camera_score_weight),
+                        ("ik_camera_weight", self.ik_camera_weight),
                         ("max_joint_vel", self.max_joint_vel),
                         ("max_joint_acc", self.max_joint_acc),
                         ("max_joint_jerk", self.max_joint_jerk),
@@ -772,7 +812,30 @@ class RRTGuidanceSource:
                     if v is not None
                 },
             )
+            # Merge: env traj-config JSON (lowest) under everything this
+            # source sets explicitly (intervention code + user flags win).
+            self.state.planner = RRTToGoalPlanner(**{**_env_base, **_explicit})
         return self.state.planner
+
+    def _resolve_wrist_camera_link_index(self) -> int | None:
+        """Resolve `wrist_camera_link_name` to a joint index on the SA
+        wrapper's pybullet robot (same convention as SplatSim's
+        TrajectoryGenerator). None when unnamed / not found — the planner's
+        camera terms are then no-ops, matching legacy behavior."""
+        if not self.wrist_camera_link_name:
+            return None
+        wrapper = self._wrapper
+        try:
+            import pybullet as _p
+
+            n = _p.getNumJoints(wrapper._robot_id, physicsClientId=wrapper._pb_client)
+            for i in range(n):
+                info = _p.getJointInfo(wrapper._robot_id, i, physicsClientId=wrapper._pb_client)
+                if info[12].decode("utf-8") == self.wrist_camera_link_name:
+                    return i
+        except Exception:
+            return None
+        return None
 
     def _do_plan(self) -> None:
         """Worker entry: plan a trajectory, then transition to EXECUTING.
@@ -838,9 +901,59 @@ class RRTGuidanceSource:
                 else:
                     q_start_full = wrapper._desired_q.reshape(-1).copy()
                 effective_lookback = 0
-                logger.info(
-                    "RRT plan (no-lookback): q_start = current robot state (skipping pre-jump teleport)."
+                # Brake-feasible MICRO-REWIND (simulation-only): a shield
+                # trigger often fires with the robot already too close to
+                # brake within nominal limits and clearances — but a few
+                # frames AGO it wasn't. Walk back through recent
+                # policy-driven history to the most recent state where an
+                # ordinary brake along the then-velocity fits, and plan from
+                # there instead: the recorded chunk starts at the policy's
+                # true velocity with no escalated limits or contact-level
+                # clearances, and the doomed frames get trimmed exactly like
+                # any other lookback. k=0 (current state feasible) keeps the
+                # plain no-lookback path; no feasible k keeps it too — the
+                # planner's emergency lead-in chain is the deeper fallback.
+                _hist0 = getattr(wrapper, "_actual_q_history", None)
+                _cap = min(
+                    30,
+                    int(getattr(wrapper, "_frames_since_last_rrt_end", 0) or 0),
+                    (len(_hist0) - 4) if _hist0 is not None else 0,
                 )
+                if _hist0 is not None and _cap >= 1:
+                    _planner0 = self._ensure_planner()
+                    _fps0 = float(getattr(wrapper, "_fps", 30) or 30)
+                    for _k in range(0, _cap + 1):
+                        _qk = _hist0[-(_k + 1)].reshape(-1)[: wrapper.num_dofs]
+                        _qk_prev = _hist0[-(_k + 4)].reshape(-1)[: wrapper.num_dofs]
+                        _vk = (_qk - _qk_prev) / 3.0 * _fps0
+                        try:
+                            _ok = _planner0.is_brake_feasible(_qk, _vk)
+                        except Exception:
+                            break  # feature unavailable — keep plain path
+                        if _ok:
+                            if _k > 0:
+                                # Flip this plan into a k-frame lookback and
+                                # do the FULL rewind bookkeeping here (the
+                                # else-branch history walk won't run): start
+                                # state, rewound-tick velocity, obs window.
+                                no_lookback = False
+                                effective_lookback = _k
+                                q_start_full = _hist0[-(_k + 1)].reshape(-1).copy()
+                                _lvt = (_qk - _qk_prev) / 3.0  # rad/tick, arm dims
+                                lookback_vel_per_tick = _lvt if float(np.linalg.norm(_lvt)) >= 1e-4 else None
+                                obs_reseed_frames = wrapper.snapshot_obs_history_for_lookback(_k)
+                                logger.info(
+                                    "Shield brake-feasible micro-rewind: current state "
+                                    "cannot brake within nominal limits; rewinding %d "
+                                    "frame(s) to a brake-feasible state (|v|=%.2f rad/s).",
+                                    _k,
+                                    float(np.linalg.norm(_vk)),
+                                )
+                            break
+                if no_lookback:
+                    logger.info(
+                        "RRT plan (no-lookback): q_start = current robot state (skipping pre-jump teleport)."
+                    )
             else:
                 # Sample the per-trigger effective lookback. When max is
                 # None, this collapses to the fixed value (legacy
@@ -893,6 +1006,7 @@ class RRTGuidanceSource:
                 # buffer hasn't filled to the requested depth yet (e.g.
                 # trigger fires within the first few frames of a scenario).
                 _hist = wrapper._actual_q_history
+                lookback_vel_per_tick = None
                 if effective_lookback <= 0:
                     # Cap collapsed to zero — typically because this trigger
                     # fired the same tick a prior RRT cycle ended. There's
@@ -909,6 +1023,20 @@ class RRTGuidanceSource:
                         q_start_full = wrapper._desired_q.reshape(-1).copy()
                 elif len(_hist) > effective_lookback:
                     q_start_full = _hist[-(effective_lookback + 1)].reshape(-1).copy()
+                    # Velocity AT the rewound tick, from the frames the
+                    # policy drove immediately AFTER it (inside the rewind
+                    # window, so policy-driven by construction): the plan
+                    # and the physical teleport both restore it, so the
+                    # rewound intervention continues the motion the robot
+                    # was in instead of cold-starting from rest.
+                    _w = min(3, effective_lookback)
+                    if _w >= 1 and len(_hist) > effective_lookback:
+                        _later = _hist[-(effective_lookback + 1 - _w)].reshape(-1)
+                        lookback_vel_per_tick = (
+                            _later[: wrapper.num_dofs] - q_start_full[: wrapper.num_dofs]
+                        ) / float(_w)
+                        if float(np.linalg.norm(lookback_vel_per_tick)) < 1e-4:
+                            lookback_vel_per_tick = None  # effectively at rest
                 elif len(_hist) > 0:
                     q_start_full = _hist[0].reshape(-1).copy()
                 elif wrapper._latest_actual_q is not None:
@@ -922,6 +1050,11 @@ class RRTGuidanceSource:
                 # teleport fires (see the case-(b) block below) so the inner
                 # policy's obs queue rewinds along with the robot.
                 obs_reseed_frames = wrapper.snapshot_obs_history_for_lookback(effective_lookback)
+            if no_lookback:
+                lookback_vel_per_tick = None
+            # CSV bookkeeping: how far this plan's rewind actually jumped.
+            # 0 until (and unless) the lookback teleport below fires.
+            self.state.last_lookback_frames = 0
             q_start = q_start_full[: wrapper.num_dofs].copy()
 
             # Compute the robot's recent joint velocity from the trailing
@@ -948,11 +1081,18 @@ class RRTGuidanceSource:
             # arrives 1/fps (~30x) too small and every "velocity-continuous"
             # intervention still cold-starts from rest (observed in
             # planar_3_d100_05dag recordings, 2026-07-29).
-            _start_vel = (
-                recent_vel * float(getattr(wrapper, "_fps", 30) or 30)
-                if (no_lookback and recent_vel is not None)
-                else None
-            )
+            _fps = float(getattr(wrapper, "_fps", 30) or 30)
+            if no_lookback and recent_vel is not None:
+                _start_vel = recent_vel * _fps
+            elif not no_lookback and lookback_vel_per_tick is not None:
+                # Lookback plans start from the REWOUND state, so the handoff
+                # velocity is the one the policy had AT that tick (restored
+                # physically by the velocity-preserving teleport below) —
+                # not the pre-trigger velocity, which belongs to a state the
+                # robot is about to be rewound away from.
+                _start_vel = lookback_vel_per_tick * _fps
+            else:
+                _start_vel = None
             # Refresh the planner's policy-history context so its
             # highest-priority escape method (`_escape_via_policy_history_rewind`)
             # can walk the wrapper's recent `_actual_q_history` deque and
@@ -999,6 +1139,11 @@ class RRTGuidanceSource:
             # right before its return; copy out so source state is independent.
             if planner._last_chosen_q_goal is not None:
                 self.state.chosen_q_goal = planner._last_chosen_q_goal.copy()
+            # Accumulate the planner's condensed per-plan record (IK counts,
+            # chosen rank, arc/chord, acceptance-gate outcome). Drained per
+            # scenario by InterventionController for the rrt_diag CSV column.
+            if planner.last_plan_diagnostics is not None:
+                self.plan_diagnostics_log.append(dict(planner.last_plan_diagnostics))
             # Sim-only env teleport before chunk execution. Three cases:
             #
             #   (a) Escape happened (escape_end_q is not None): teleport
@@ -1032,7 +1177,20 @@ class RRTGuidanceSource:
                     teleport_target[: len(escape_end_q)] = escape_end_q
                     self._teleport_env_to_q_start(teleport_target, 0)
                 elif not no_lookback:
-                    self._teleport_env_to_q_start(q_start_full, effective_lookback)
+                    _tele_vel = (
+                        (lookback_vel_per_tick * _fps).tolist() if lookback_vel_per_tick is not None else None
+                    )
+                    self._teleport_env_to_q_start(
+                        q_start_full, effective_lookback, joint_velocities=_tele_vel
+                    )
+                    self.state.last_lookback_frames = int(effective_lookback)
+                    if _tele_vel is not None:
+                        # The rewound state is MOVING again — the recorder's
+                        # leading-frame trim exists to hide from-rest
+                        # artifacts that no longer exist.
+                        from lerobot.policies.teleop_recording import TeleopRecordingContext
+
+                        TeleopRecordingContext.get_instance().rrt_extra_leading_trim = 0
                     # Rewind the inner policy's obs history along with the
                     # robot: schedule the pre-planning snapshot (real frames
                     # around the rewound tick) to replace the queue on the
@@ -1119,7 +1277,12 @@ class RRTGuidanceSource:
         avg_delta = deltas.mean(axis=0)
         return avg_delta[: wrapper.num_dofs]
 
-    def _teleport_env_to_q_start(self, q_start_full: np.ndarray, lookback_used: int) -> None:
+    def _teleport_env_to_q_start(
+        self,
+        q_start_full: np.ndarray,
+        lookback_used: int,
+        joint_velocities: list[float] | None = None,
+    ) -> None:
         """Forward a joint-state teleport request to the gym env's robot
         server. Tolerant: silent no-op if no env handle has been provided or
         the env's robot_server doesn't expose teleport_joint_state (e.g. a
@@ -1168,7 +1331,14 @@ class RRTGuidanceSource:
                 np.array2string(q_start_full[: wrapper.num_dofs], precision=3),
                 type(target).__name__,
             )
-            _teleport_ret = target.teleport_joint_state(splatsim_robot, q_start_full.tolist())  # type: ignore[attr-defined]
+            try:
+                _teleport_ret = target.teleport_joint_state(  # type: ignore[attr-defined]
+                    splatsim_robot, q_start_full.tolist(), joint_velocities
+                )
+            except TypeError:
+                # Older backend without the joint_velocities parameter —
+                # position-only teleport (velocity zeroed, legacy behavior).
+                _teleport_ret = target.teleport_joint_state(splatsim_robot, q_start_full.tolist())  # type: ignore[attr-defined]
             logger.info("Teleport call returned.")
             # Post-teleport env-mutation-clock version (int) when the server
             # stamps observations; None on older servers / real-robot stubs.

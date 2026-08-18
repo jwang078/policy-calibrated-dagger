@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Sim-in-the-loop variant of visualize_shared_autonomy.py.
+r"""Sim-in-the-loop variant of visualize_shared_autonomy.py.
 
 The parquet-driven script (``visualize_shared_autonomy.py``) feeds the same frozen
 dataset frame to the policy every step, so observations go stale as soon as the policy
@@ -15,7 +15,8 @@ crash). Launch the simulator once:
             --robot sim_ur_pybullet_small_engine_new_interactive \\
             --robot_port 6001 \\
             --robot_name robot_iphone_w_engine_curtain \\
-            --eval_benchmark_repo_id <benchmark_dataset_repo_id>
+            --eval_benchmark_repo_id <benchmark_dataset_repo_id> \\
+            --strict_goal_tolerances
 
 Then point this script at it:
 
@@ -29,12 +30,16 @@ Then point this script at it:
         --env_external_port 6001
 
 For example:
-# 1. Launch splatsim out-of-process (once, stays up)
+# 1. Launch splatsim out-of-process (once, stays up). --strict_goal_tolerances
+#    matches the orchestrator's recording/blend sims (loose eval thresholds
+#    would end rollouts "close enough" to the goal and freeze the video into
+#    the post-success hold).
 cd ~/code/SplatSim && python scripts/launch_nodes.py \
     --robot sim_ur_pybullet_small_engine_new_interactive \
     --robot_port 6001 \
     --robot_name robot_iphone_w_engine_curtain \
-    --eval_benchmark_repo_id JennyWWW/eval_splatsim_approach_lever_benchmark_1000
+    --eval_benchmark_repo_id JennyWWW/eval_splatsim_approach_lever_benchmark_1000 \
+    --strict_goal_tolerances
 
 # 2. Run visualize (in another terminal)
 python my_scripts/visualize_shared_autonomy_sim.py \
@@ -148,6 +153,7 @@ from lib_sa_rollout import (  # type: ignore[import-not-found]  # noqa: E402,F40
     _apply_rename_map,
     _build_sim_batch,
     _run_filler_phase,
+    check_sim_strict_goal_tolerances,
     progress_guidance_index,
     run_blended_rollout,
     warn_if_sim_physics_unsynced,
@@ -191,8 +197,10 @@ def format_sim_launch_command(
     port: int,
     eval_benchmark_repo_id: str | None,
 ) -> str:
-    """The launch_nodes.py invocation that starts the splatsim server this
-    script expects to find on ``port`` (matching env task / robot / benchmark).
+    """The launch_nodes.py invocation this script expects.
+
+    It starts the splatsim server on ``port`` (matching env task / robot /
+    benchmark).
     """
     variant = _TASK_TO_ROBOT_VARIANT.get(env_task, f"<launch_nodes.py robot variant for task '{env_task}'>")
     lines = [
@@ -207,14 +215,23 @@ def format_sim_launch_command(
     # --sync_physics_to_client: physics steps only on client commands, so the
     # sim never races ahead in wallclock time while the policy is thinking.
     # Without it, slow policies produce jumpy rollouts that misrepresent them.
-    lines.append("    --headless --control_gui --sync_physics_to_client")
+    #
+    # --strict_goal_tolerances: recording-grade success thresholds (planar
+    # 1 cm vs the loose 60 mm eval default). Matches the sim the DAgger
+    # orchestrator launches for intervention recording + blending, so
+    # sweep-parity rollouts don't terminate (and freeze into post-success
+    # hold) as soon as the arm is merely "close enough" to the goal. Applied
+    # at server startup only — no runtime toggle.
+    lines.append("    --headless --control_gui --sync_physics_to_client --strict_goal_tolerances")
     return "\n".join(lines)
 
 
 def check_sim_server_reachable(host: str, port: int, launch_hint: str) -> None:
-    """Fail fast if nothing is listening on host:port. A ZMQ REQ socket never
-    errors on a dead endpoint — the first reset request just queues forever,
-    so without this check a missing server looks like a silent freeze.
+    """Fail fast if nothing is listening on host:port.
+
+    A ZMQ REQ socket never errors on a dead endpoint — the first reset
+    request just queues forever, so without this check a missing server
+    looks like a silent freeze.
     """
     import socket
 
@@ -321,9 +338,10 @@ def get_sim_action_chunk_for_ratio(
     demo_states_raw: np.ndarray | None = None,
     frame_sink: dict[str, list[np.ndarray]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
-    """Thin adapter over :func:`lib_sa_rollout.run_blended_rollout` — the SAME
-    core the sweep's blend step (``augment_dataset_with_blending``) executes.
-    This wrapper only (a) derives the blend mode from ``--blend_interval_frac``
+    """Thin adapter over :func:`lib_sa_rollout.run_blended_rollout`.
+
+    The SAME core the sweep's blend step (``augment_dataset_with_blending``)
+    executes. This wrapper only (a) derives the blend mode from ``--blend_interval_frac``
     (1.0 → ONCE_PER_CHUNK; anything below → EVERY_STEP, whose re-blend cadence
     the rollout core throttles to every
     ``ceil(blend_interval_frac * n_action_steps)`` ticks) and (b) pins the
@@ -537,6 +555,26 @@ def _write_rollout_mp4(frames: list[np.ndarray], fps: float, out_path: Path) -> 
         raise RuntimeError(f"ffmpeg re-encode failed (exit {proc.returncode}):\n{proc.stderr.strip()}")
 
 
+def _annotate_ratio(frame: np.ndarray, ratio: float) -> np.ndarray:
+    """Return a copy of an RGB frame with 'ratio=X.XX' stamped in the top-left corner."""
+    import cv2  # type: ignore[import-not-found]
+
+    annotated = frame.copy()
+    height = annotated.shape[0]
+    scale = max(0.5, height / 480.0)
+    thickness = max(1, int(round(2 * scale)))
+    origin = (int(10 * scale), int(30 * scale))
+    text = f"ratio={ratio:.2f}"
+    # Black outline behind white text so it reads on any background.
+    cv2.putText(
+        annotated, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA
+    )
+    cv2.putText(
+        annotated, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), thickness, cv2.LINE_AA
+    )
+    return annotated
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 
@@ -567,6 +605,7 @@ def _parse_blend_interval_frac(s: str) -> float:
 
 
 def parse_args():
+    """Build and parse the CLI."""
     parser = argparse.ArgumentParser(
         description=(
             "Sim-in-the-loop visualization of SharedAutonomyPolicyWrapper predictions. "
@@ -734,6 +773,26 @@ def parse_args():
             "The sweep's blend step often runs --clip_sample=false."
         ),
     )
+    parser.add_argument(
+        "--rtc_prev_chunk",
+        type=_parse_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help=(
+            "RTC-style previous-chunk guidance: pass the previous blended chunk's unexecuted "
+            "remainder into each re-blend's denoise (annealed gradient correction per step) so "
+            "consecutive chunks commit to the same mode — cross-tick consistency without pinning "
+            "the noise. Additive to the x_tsw ratio blend; diffusion policies only. "
+            "See SharedAutonomyConfig.rtc_* for the knobs below."
+        ),
+    )
+    parser.add_argument("--rtc_max_guidance_weight", type=float, default=10.0)
+    parser.add_argument("--rtc_execution_horizon", type=int, default=None)
+    parser.add_argument("--rtc_inference_delay", type=int, default=0)
+    parser.add_argument(
+        "--rtc_prefix_attention_schedule", choices=["linear", "exp", "zeros", "ones"], default="linear"
+    )
 
     # ── Env / simulator config ────────────────────────────────────────────────
     parser.add_argument(
@@ -765,6 +824,7 @@ def parse_args():
 
 
 def main():
+    """CLI entry point."""
     args = parse_args()
 
     # Load the checkpoint's train_config.json once — used to auto-resolve both
@@ -870,6 +930,20 @@ def main():
         print(f"Per-call sample generator enabled (seed={args.sample_seed}).")
     wrapper.policy_guidance_representation = PolicyGuidanceRepresentation(args.guidance_repr)
     wrapper.n_anchor_steps = args.n_anchor_steps
+    wrapper.rtc_prev_chunk_guidance = args.rtc_prev_chunk
+    wrapper.rtc_max_guidance_weight = args.rtc_max_guidance_weight
+    wrapper.rtc_execution_horizon = args.rtc_execution_horizon
+    wrapper.rtc_inference_delay = args.rtc_inference_delay
+    wrapper.rtc_prefix_attention_schedule = args.rtc_prefix_attention_schedule
+    if args.rtc_prev_chunk:
+        # Set post-init, so re-run the wrapper's init-time policy-type check.
+        if getattr(wrapper.inner_policy.config, "type", None) != "diffusion":
+            raise SystemExit("--rtc_prev_chunk requires a diffusion inner policy.")
+        print(
+            f"RTC prev-chunk guidance ON (max_gw={args.rtc_max_guidance_weight}, "
+            f"exec_horizon={args.rtc_execution_horizon}, delay={args.rtc_inference_delay}, "
+            f"schedule={args.rtc_prefix_attention_schedule})."
+        )
     wrapper.skip_collision = True
     apply_clip_sample_override(wrapper, args.clip_sample)
     if args.n_action_steps is not None:
@@ -1037,6 +1111,9 @@ def main():
         policy_cfg=wrapper.config,
     )
     warn_if_sim_physics_unsynced(vec_env)
+    # Warn-only here (the viz is a debug tool and inspecting loose-sim
+    # behavior is legitimate); the blend script hard-fails on a loose sim.
+    check_sim_strict_goal_tolerances(vec_env, required=False)
 
     try:
         print(f"Computing sim rollouts for ratios: {args.forward_flow_ratios} …")
@@ -1102,10 +1179,11 @@ def main():
         noise_tag = "" if args.fixed_base_noise else "_freshnoise"
         pg_tag = "_pg" if args.progress_guidance else ""
         clip_tag = "" if args.clip_sample is None else ("_clip" if args.clip_sample else "_noclip")
+        rtc_tag = "_rtc" if args.rtc_prev_chunk else ""
         parent = f"shared_autonomy_sim_ep{episode_index}_frame{frame_index}"
         name = (
             f"{policy_tag}_{args.blend_strategy}_{repr_tag}_{blend_interval_tag}_{anchor_tag}_{nas_tag}"
-            f"{noise_tag}{pg_tag}{clip_tag}_sim"
+            f"{noise_tag}{pg_tag}{clip_tag}{rtc_tag}_sim"
         )
         output_dir: Path = Path("outputs/viz") / parent / name
     else:
@@ -1126,6 +1204,7 @@ def main():
 
     if frames_by_ratio:
         print("Writing rollout videos …")
+        combined_frames: dict[str, list[np.ndarray]] = {}
         for ratio in sorted(frames_by_ratio):
             for image_key, frames in sorted(frames_by_ratio[ratio].items()):
                 if not any(frame.any() for frame in frames):
@@ -1136,6 +1215,15 @@ def main():
                 video_path = output_dir / f"ratio_{ratio:.2f}_{image_key}.mp4"
                 _write_rollout_mp4(frames, fps=float(args.env_fps), out_path=video_path)
                 print(f"Saved video → {video_path}")
+                combined_frames.setdefault(image_key, []).extend(
+                    _annotate_ratio(frame, ratio) for frame in frames
+                )
+        # One back-to-back compilation per camera: every ratio's rollout in
+        # ascending-ratio order, each frame stamped with its ratio.
+        for image_key, frames in sorted(combined_frames.items()):
+            combined_path = output_dir / f"combined_ratios_{image_key}.mp4"
+            _write_rollout_mp4(frames, fps=float(args.env_fps), out_path=combined_path)
+            print(f"Saved combined video → {combined_path}")
 
     print("Plotting joint angles …")
     plot_joint_angles(

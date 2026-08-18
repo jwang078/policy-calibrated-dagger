@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Annotate one intervention episode video with phase labels (policy / rrt /
-trigger reason at each cycle's start).
+r"""Annotate one intervention episode video with phase labels.
+
+Phase labels are policy / rrt / trigger reason at each cycle's start.
 
 Inputs:
     training_dir   path to a DAgger training output dir, e.g.
@@ -191,8 +192,9 @@ def _load_blend_frames_for_scenario(
     rrt_steps_executed: list[int],
     camera_col: str,
 ) -> list[list[np.ndarray]]:
-    """Decode the blend-dataset frames that correspond to each CSV cycle of
-    the requested source scenario.
+    """Decode the blend-dataset frames for each CSV cycle.
+
+    Covers the cycles of the requested source scenario.
 
     Returns a list of length len(rrt_steps_executed). Entry i is:
       * A list of `rrt_steps_executed[i]` BGR numpy frames (one per env tick
@@ -355,7 +357,9 @@ def _make_placeholder_frame(
 
 
 def _resolve_interventions_dir(root: Path) -> Path:
-    """Pick the directory under which we expect to find
+    """Pick the interventions output directory.
+
+    The directory under which we expect to find
     ``intervention_per_scenario.csv`` + ``videos/splatsim_0/eval_episode_*.mp4``.
 
     Two layouts are supported:
@@ -389,7 +393,9 @@ def annotate(
     cache_dir: Path | None = None,
     blend_camera_col: str = "observation.images.base_rgb_stretch",
     trigger_pause: bool = True,
+    trim_lookback: bool = False,
 ) -> Path:
+    """Annotate one episode's video from its intervention CSV row (see module docstring)."""
     interventions_dir = _resolve_interventions_dir(training_dir)
     video_path = interventions_dir / "videos" / "splatsim_0" / f"eval_episode_{episode_idx}.mp4"
     csv_path = interventions_dir / "intervention_per_scenario.csv"
@@ -411,6 +417,9 @@ def annotate(
     triggers_raw = row.get("triggers", "")
     trigger_steps = _parse_int_list(row.get("trigger_steps", ""))
     rrt_steps_executed = _parse_int_list(row.get("rrt_steps_executed", ""))
+    # Frames each cycle's lookback-rewind jumped back (newer CSVs; pad with
+    # zeros for older recordings so downstream zips stay parallel).
+    lookback_frames = _parse_int_list(row.get("lookback_frames", ""))
     # Renamed labels: map pre-rename CSV rows to the current names so the
     # rendered annotation matches what the controller emits now. Add new
     # entries here if labels get renamed again.
@@ -418,6 +427,16 @@ def annotate(
     triggers = (
         [_TRIGGER_REASON_ALIASES.get(t, t) for t in triggers_raw.split(",") if t] if triggers_raw else []
     )
+    lookback_frames = (lookback_frames + [0] * len(triggers))[: len(triggers)]
+    # Frames the rewind DELETED from the dataset: (T-L, T] for each cycle
+    # with lookback L > 0. With --trim_lookback these are dropped from the
+    # output so the video shows the dataset-equivalent seam — policy up to
+    # the rewound tick, then the RRT segment that resumed from it.
+    trimmed_frames: set[int] = set()
+    if trim_lookback:
+        for _ts, _lb in zip(trigger_steps, lookback_frames, strict=False):
+            if _lb > 0:
+                trimmed_frames.update(range(_ts - _lb + 1, _ts + 1))
 
     # Sanity: parallel lists. We require rrt_steps_executed to be present —
     # without it we can't draw RRT-phase frames. Older CSVs (pre this column)
@@ -556,10 +575,19 @@ def annotate(
     )
     for i, (t, ts, L) in enumerate(zip(triggers, trigger_steps, rrt_steps_executed, strict=True)):
         end = ts + L if L > 0 else None
+        lb = lookback_frames[i] if i < len(lookback_frames) else 0
+        lb_note = (
+            (
+                f", lookback rewound {lb} frames (dataset resumes from frame {ts - lb}"
+                + (", trimmed here)" if trim_lookback else ")")
+            )
+            if lb > 0
+            else ""
+        )
         if end is not None:
             print(
                 f"[viz]   cycle {i}: trigger='{t}' fires @ frame {ts} → "
-                f"RRT runs frames [{ts + 1}, {end}] ({L} frames)"
+                f"RRT runs frames [{ts + 1}, {end}] ({L} frames){lb_note}"
             )
         else:
             print(
@@ -570,6 +598,8 @@ def annotate(
         f"[viz] Pause length at each trigger: {pause_frames} frames "
         f"(~{pause_frames / fps:.2f} s @ {fps:.0f} fps)"
     )
+    if trim_lookback and trimmed_frames:
+        print(f"[viz] --trim_lookback: dropping {len(trimmed_frames)} rewound frame(s) from the output")
     print(f"[viz] Writing → {output_path}")
 
     # ── main loop ──────────────────────────────────────────────────────── #
@@ -610,24 +640,46 @@ def annotate(
         ph = _make_placeholder_frame(blend_w, blend_h, msg)
         return ph, "blend idle / diverged", COLOR_POLICY
 
+    last_kept_frame: np.ndarray | None = None
+    n_trimmed = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
+        dropped = frame_idx in trimmed_frames
         # Sticky trigger banner (only used when trigger_pause is False): the
         # banner rides along on top of NORMAL playback for `pause_frames`
-        # frames instead of the video freezing for that long.
+        # frames instead of the video freezing for that long. Armed even on
+        # trimmed frames (the trigger frame itself is inside the trimmed
+        # range) so the banner shows on the first kept frame after the seam.
         if not trigger_pause and cycle_idx < len(trigger_steps) and frame_idx == trigger_steps[cycle_idx]:
             overlay_remaining = pause_frames
-            overlay_text = triggers[cycle_idx]
+            _lb = lookback_frames[cycle_idx] if cycle_idx < len(lookback_frames) else 0
+            overlay_text = triggers[cycle_idx] + (f" (rewound {_lb}f)" if _lb > 0 and trim_lookback else "")
             cycle_idx += 1
+        if dropped:
+            n_trimmed += 1
+            # The frozen-pause path still needs to fire at the trigger frame
+            # even though the frame itself is not shown — handled below via
+            # `last_kept_frame`; fall through only for that check.
+            if not (
+                trigger_pause and cycle_idx < len(trigger_steps) and frame_idx == trigger_steps[cycle_idx]
+            ):
+                frame_idx += 1
+                continue
         header_label = f"TRIGGER: {overlay_text}" if overlay_remaining > 0 else None
-        if overlay_remaining > 0:
+        if overlay_remaining > 0 and not dropped:
             overlay_remaining -= 1
 
         left_label, left_color = _build_phase_label(frame_idx, trigger_steps, rrt_steps_executed)
+        if dropped:
+            # Reached only when the frozen-pause block below must run for a
+            # trimmed trigger frame — substitute the last shown frame.
+            frame = last_kept_frame if last_kept_frame is not None else frame
 
-        if side_by_side_blend_repo_id is not None:
+        if dropped:
+            pass  # trimmed frame: skip normal playback, pause block below still runs
+        elif side_by_side_blend_repo_id is not None:
             right_frame, right_label, right_color = _right_pane_for_frame(frame_idx)
             composed = _render_side_by_side_frame(
                 left_bgr=frame,
@@ -651,13 +703,16 @@ def annotate(
             else:
                 _draw_label(annotated, left_label, left_color)
             writer.write(annotated)
-        n_written += 1
+        if not dropped:
+            n_written += 1
+            last_kept_frame = frame
 
         # If this frame index matches the next trigger, insert the pause
         # AFTER writing it (so the pause sits between this policy frame and
         # the first RRT frame at trigger_steps[i] + 1).
         if trigger_pause and cycle_idx < len(trigger_steps) and frame_idx == trigger_steps[cycle_idx]:
-            trigger_text = triggers[cycle_idx]
+            _lb = lookback_frames[cycle_idx] if cycle_idx < len(lookback_frames) else 0
+            trigger_text = triggers[cycle_idx] + (f" (rewound {_lb}f)" if _lb > 0 and trim_lookback else "")
             for _ in range(pause_frames):
                 if side_by_side_blend_repo_id is not None:
                     # During the trigger pause, freeze BOTH panes on their
@@ -731,8 +786,9 @@ def annotate(
         raise RuntimeError(f"ffmpeg re-encode failed (exit {proc.returncode}):\n{proc.stderr.strip()}")
 
     print(
-        f"[viz] Done. Read {frame_idx} source frames; wrote {n_written} total "
-        f"(+{n_written - frame_idx} pause frames across {cycle_idx} trigger(s))."
+        f"[viz] Done. Read {frame_idx} source frames; kept {frame_idx - n_trimmed} "
+        f"(trimmed {n_trimmed} rewound); wrote {n_written} total "
+        f"(+{n_written - (frame_idx - n_trimmed)} pause frames across {cycle_idx} trigger(s))."
     )
     print(f"[viz] Final video → {output_path}")
     if cycle_idx < len(trigger_steps):
@@ -746,6 +802,7 @@ def annotate(
 
 
 def main() -> None:
+    """CLI entry point."""
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -777,6 +834,18 @@ def main() -> None:
         type=int,
         default=30,
         help="Frames to pause at each trigger moment (default 30 ≈ 1 s @ 30 fps).",
+    )
+    p.add_argument(
+        "--trim_lookback",
+        action="store_true",
+        help=(
+            "Drop the video frames each lookback-rewind DELETED from the "
+            "dataset ((T-L, T] per cycle, from the CSV's lookback_frames "
+            "column), so the output shows the dataset-equivalent seam: "
+            "policy motion up to the rewound tick, then the RRT segment "
+            "that resumed from it. Requires a CSV recorded after the "
+            "lookback_frames column was added; older CSVs show no trimming."
+        ),
     )
     p.add_argument(
         "--no_trigger_pause",
@@ -833,6 +902,7 @@ def main() -> None:
         episode_idx=args.episode_idx,
         pause_frames=args.pause_frames,
         trigger_pause=not args.no_trigger_pause,
+        trim_lookback=args.trim_lookback,
         output_path=args.output,
         side_by_side_blend_repo_id=args.side_by_side,
         cache_dir=args.cache_dir,

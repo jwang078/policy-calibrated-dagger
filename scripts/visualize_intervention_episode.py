@@ -428,15 +428,36 @@ def annotate(
         [_TRIGGER_REASON_ALIASES.get(t, t) for t in triggers_raw.split(",") if t] if triggers_raw else []
     )
     lookback_frames = (lookback_frames + [0] * len(triggers))[: len(triggers)]
-    # Frames the rewind DELETED from the dataset: (T-L, T] for each cycle
-    # with lookback L > 0. With --trim_lookback these are dropped from the
-    # output so the video shows the dataset-equivalent seam — policy up to
-    # the rewound tick, then the RRT segment that resumed from it.
+
+    # Frames the rewind DELETED from the dataset. With --trim_lookback these
+    # are dropped from the output so the video shows the dataset-equivalent
+    # seam — policy up to the rewound tick, then the RRT segment that
+    # resumed from it.
+    #
+    # Two trigger families, two frame accountings (verified empirically via
+    # teleport pixel-spikes, 2026-08-18):
+    #   * controller-tick triggers (time stall / stuck): fire AFTER frame T
+    #     is rendered — the rewind's obs-history newest entry is state(T),
+    #     resume pose = frame T-L. Trim (T-L, T]: L frames.
+    #   * shield triggers (future-chunk collision): fire INSIDE
+    #     select_action BEFORE frame T renders — the obs history's newest
+    #     entry is state(T-1), so a k-frame micro-rewind resumes from
+    #     state(T-1-k) and frame T is already post-teleport. Trim
+    #     [T-L, T-1]: L frames ending one earlier, keeping T-L-1 as the
+    #     seam. Without this the spliced video keeps frame T-L, one frame
+    #     AHEAD of the resume pose — a one-frame backward jump at every
+    #     shield seam.
+    def _is_shield_trigger(reason: str) -> bool:
+        return "coll" in reason.lower() or "shield" in reason.lower()
+
     trimmed_frames: set[int] = set()
     if trim_lookback:
-        for _ts, _lb in zip(trigger_steps, lookback_frames, strict=False):
+        for _ts, _lb, _reason in zip(trigger_steps, lookback_frames, triggers, strict=False):
             if _lb > 0:
-                trimmed_frames.update(range(_ts - _lb + 1, _ts + 1))
+                if _is_shield_trigger(_reason):
+                    trimmed_frames.update(range(_ts - _lb, _ts))
+                else:
+                    trimmed_frames.update(range(_ts - _lb + 1, _ts + 1))
 
     # Sanity: parallel lists. We require rrt_steps_executed to be present —
     # without it we can't draw RRT-phase frames. Older CSVs (pre this column)
@@ -576,9 +597,12 @@ def annotate(
     for i, (t, ts, L) in enumerate(zip(triggers, trigger_steps, rrt_steps_executed, strict=True)):
         end = ts + L if L > 0 else None
         lb = lookback_frames[i] if i < len(lookback_frames) else 0
+        # Shield cycles resume one frame earlier — see the trim-window
+        # comment above.
+        resume = (ts - lb - 1) if (lb > 0 and _is_shield_trigger(t)) else (ts - lb)
         lb_note = (
             (
-                f", lookback rewound {lb} frames (dataset resumes from frame {ts - lb}"
+                f", lookback rewound {lb} frames (dataset resumes from frame {resume}"
                 + (", trimmed here)" if trim_lookback else ")")
             )
             if lb > 0

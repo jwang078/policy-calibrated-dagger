@@ -1500,6 +1500,7 @@ def run_augmentation(
                 gc.collect()
                 episode_metadata: dict[str, Any] = {
                     "source_episode_idx": int(source_ep),
+                    "source_dataset_repo_id": str(cfg.dataset_repo_id),
                     "blend_ratio": float(ratio),
                     "blend_ratio_effective": float(ratio_eff),
                 }

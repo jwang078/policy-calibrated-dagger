@@ -701,6 +701,15 @@ RRT_SELF_COLLISION_SKIP_PAIRS=""
 # sampling at training time — see the BLENDS-parsing block below.
 BLENDS_STR=""
 BLEND_EXTRA_ARGS=""
+# --blend_labels=executed|dart. "executed" (default): blend datasets store the
+# rollout's executed mixture actions and training consumes them as-is.
+# "dart": blends are recorded with --relabel_actions=guidance (executed
+# actions + per-frame relabel_demo_index) and every finetune gets
+# --dataset.dart_relabel=true, so the dataloader replaces blend action chunks
+# with synthesized expert-response labels (DART; see
+# lerobot.datasets.dart_relabel). Requires --use_weighted_sampling: the
+# physical-merge path would strip the relabel metadata.
+BLEND_LABELS="executed"
 # Collision-free blend filtering. When true, each blend dataset produced in
 # step 2 gets a sibling `_nocoll` variant created by replaying its episodes
 # through a headless splatsim and dropping (or trimming) episodes that hit
@@ -1217,6 +1226,7 @@ for arg in "$@"; do
         --rrt_self_collision_skip_pairs=*)   RRT_SELF_COLLISION_SKIP_PAIRS="${arg#*=}" ;;
         --blends=*)                          BLENDS_STR="${arg#*=}" ;;
         --blend_extra_args=*)                BLEND_EXTRA_ARGS="${arg#*=}" ;;
+        --blend_labels=*)                    BLEND_LABELS="${arg#*=}" ;;
         --filter_blend_collisions)           FILTER_BLEND_COLLISIONS=true ;;
         --filter_collision_extra_args=*)     FILTER_COLLISION_EXTRA_ARGS="${arg#*=}" ;;
         --filter_collision_env_port=*)       FILTER_COLLISION_ENV_PORT="${arg#*=}" ;;
@@ -1309,6 +1319,20 @@ if [[ -n "$ROUND0_EXTRA_ARGS_STR" && -n "$FINETUNE_EXTRA_ARGS" ]]; then
     FINETUNE_EXTRA_ARGS_EFF="$ROUND0_EXTRA_ARGS_STR $FINETUNE_EXTRA_ARGS"
 else
     FINETUNE_EXTRA_ARGS_EFF="${ROUND0_EXTRA_ARGS_STR}${FINETUNE_EXTRA_ARGS}"
+fi
+
+# --blend_labels plumbing (see the declaration block above).
+BLEND_LABELS_ARG=""
+if [[ "$BLEND_LABELS" == "dart" ]]; then
+    if [[ "$USE_WEIGHTED_SAMPLING" != true ]]; then
+        echo "ERROR: --blend_labels=dart requires --use_weighted_sampling (the physical-merge path strips relabel metadata)." >&2
+        exit 1
+    fi
+    BLEND_LABELS_ARG="--relabel_actions=guidance"
+    FINETUNE_EXTRA_ARGS_EFF="$FINETUNE_EXTRA_ARGS_EFF --dataset.dart_relabel=true"
+elif [[ "$BLEND_LABELS" != "executed" ]]; then
+    echo "ERROR: --blend_labels must be 'executed' or 'dart', got '$BLEND_LABELS'." >&2
+    exit 1
 fi
 
 # Emit --dataset.video_backend into BOTH arg strings unless the user already
@@ -3547,6 +3571,11 @@ all_blends_complete_for_round() {
     return 0
 }
 
+# Per-round note of upstream inputs that are missing even though the round's
+# trained policy exists (see the completeness check below). Printed under the
+# resume-detection table so "COMPLETE" never silently hides absent source data.
+declare -A ROUND_MISSING_INPUTS=()
+
 for r in $(seq 1 "$NUM_ROUNDS"); do
     int_short="$(int_short_for_round "$r")"
     int_repo="$(int_repo_for_round "$r")"
@@ -3569,10 +3598,30 @@ for r in $(seq 1 "$NUM_ROUNDS"); do
     # existing name — the filter produces an ADDITIONAL sibling policy
     # in a new step (6b) named with a _nocoll suffix. That step has its
     # own completeness check; it doesn't affect step 6's resume detection.
-    if dataset_exists "$int_repo" \
-       && { training_exists "$ft_dir" || training_exists "$scratch_dir"; } \
-       && all_blends_complete_for_round "$r"; then
+    #
+    # The trained checkpoint is the round's TERMINAL artifact, so it — not the
+    # upstream data — is what decides "complete". Upstream inputs (the raw
+    # intervention dataset, its blends) can legitimately be gone by the time we
+    # look: in rerun-blends mode they are SOURCE-owned and read-only (a source
+    # lineage cleanup wipes them without touching this lineage), and blends are
+    # cross-rerun cache that `--also_delete_blends` may have removed. Requiring
+    # them here used to report every round as "0/6 — not started" for a lineage
+    # whose policies were all sitting on disk (and made --cleanup_only look like
+    # it had found nothing). We now mark the round complete and record a
+    # warning, since a resume that must RE-merge a later round will still need
+    # that missing data.
+    _int_present=false; dataset_exists "$int_repo" && _int_present=true
+    _train_present=false
+    { training_exists "$ft_dir" || training_exists "$scratch_dir"; } && _train_present=true
+    _blends_present=false; all_blends_complete_for_round "$r" && _blends_present=true
+    if [[ "$_train_present" == true ]]; then
         step=6
+        if [[ "$_int_present" != true ]]; then
+            ROUND_MISSING_INPUTS[$r]+=" intervention-dataset($int_repo)"
+        fi
+        if [[ "$_blends_present" != true ]]; then
+            ROUND_MISSING_INPUTS[$r]+=" blend-dataset(s)"
+        fi
         # Step 6b — collision-filtered sibling policy. Only meaningful when
         # --filter_blend_collisions is on. If its training output doesn't
         # exist yet, demote to step=5 so the orchestrator re-enters this
@@ -3765,6 +3814,10 @@ for r in $(seq 1 "$NUM_ROUNDS"); do
         verdict="not started"
     fi
     echo "  Round $r: $s/6 steps complete — $verdict"
+    if [[ -n "${ROUND_MISSING_INPUTS[$r]:-}" ]]; then
+        echo "    ⚠ policy on disk but upstream inputs are gone:${ROUND_MISSING_INPUTS[$r]}"
+        echo "      (fine for inspection/cleanup; a resume that must RE-merge this round would fail)"
+    fi
 done
 if do_final_scratch; then
     if [[ "$FINAL_SCRATCH_DONE" == true ]]; then
@@ -3774,9 +3827,11 @@ if do_final_scratch; then
     fi
 fi
 echo
-echo "Note: a round is only considered fully complete when BOTH its intervention"
-echo "      dataset (step 1, non-empty) AND its trained policy checkpoint (step 6,"
-echo "      with model.safetensors) are present on disk."
+echo "Note: a round counts as fully complete once its trained policy checkpoint"
+echo "      (step 6, with model.safetensors) is on disk — that is the round's"
+echo "      terminal artifact. Upstream inputs (intervention dataset, blends,"
+echo "      stats sidecars) may legitimately have been cleaned up since; when any"
+echo "      are missing the round is flagged with a ⚠ line above."
 echo
 
 # Restart-from-scratch handler. Prompts the user to confirm before deleting
@@ -4947,7 +5002,7 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
         # Intervention recording is driven by `lerobot-eval` with the
         # `--intervention.*` config field (see AGENTS.md / CLAUDE.md).
         #
-        # Three hard requirements that lerobot-eval validates at startup
+        # Two hard requirements that lerobot-eval validates at startup
         # when --intervention.method is set:
         #   1. --policy.shared_autonomy_config.enabled=true
         #      → both 'rrt' and 'oracle_goal' guidance sources live on the SA
@@ -4955,13 +5010,16 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
         #   2. --env.include_oracle_info=true
         #      → RRT/oracle_goal need target_ee_pos / q_goal_bias from
         #         oracle_env_config. Without it the planner refuses to plan.
-        #   3. --seed=0
-        #      → EvalPipelineConfig.seed defaults to 1000 (configs/eval.py:39).
-        #         splatsim's seed-pinned reset uses this to pick scenario 0,
-        #         1, 2, ... in order. With the default seed, the recorder
-        #         starts at a random scenario in the benchmark and counts
-        #         forward from there — which breaks DAgger's "keep training
-        #         on the same hard scenarios round over round" semantics.
+        # --seed=0 is convention, NOT a requirement, and does NOT pick
+        # scenarios: scenario selection in EVAL_BENCHMARK mode is positional
+        # (lerobot-eval passes options["benchmark_start_index"] = absolute
+        # episode index; the seed argument to env.reset is ignored for
+        # scenario choice — see SplatSim's _handle_reset docstring). The seed
+        # only feeds set_seed (policy/planner RNGs) and the per-episode seed
+        # bookkeeping in eval_info. Repeat studies vary rollout stochasticity
+        # by appending a different --seed via --intervention_extra_args
+        # (last-occurrence-wins over the --seed=0 emitted below), with
+        # identical scenario coverage across repetitions.
         # Other SA settings (forward_flow_ratio, blend_strategy, etc.) can
         # be added via --intervention_extra_args.
         # --headless mode: turn off the Tkinter ratio slider AND the SA
@@ -5164,6 +5222,7 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
                     --blend_mode="once_per_chunk" \
                     --blend_interval_frac=1.0 \
                     "${BLEND_PUSH_ARG[@]}" \
+                    $BLEND_LABELS_ARG \
                     $BLEND_EXTRA_ARGS
                 # Stats sidecar for the blended dataset (mirrors step 1b for raw int).
                 if [[ "$ACTION_FORMAT" == "rel" ]]; then

@@ -106,6 +106,7 @@ class ObservationTeleopGuidanceSource:
         # note at the build site). Refreshed per tick in EVERY_STEP so the
         # policy term is conditioned on the live observation; per chunk
         # otherwise.
+        self._rebuild_count = 0
         self._anchor_chunk_orig: Tensor | None = None
         self.has_guidance: bool = False
 
@@ -163,6 +164,7 @@ class ObservationTeleopGuidanceSource:
 
     def reset(self) -> None:
         """Episode-boundary reset."""
+        self._rebuild_count = 0
         self._guided_chunk = None
         self._guided_chunk_abs = None
         self._anchor_chunk_orig = None
@@ -326,6 +328,9 @@ class ObservationTeleopGuidanceSource:
         # positive-feedback speedup (measured 3.5-5x demo speed at ratio 0.7).
         # Consumed only when `wrapper.rtc_prev_chunk_guidance` is on; cleared
         # naturally by cancel()/reset() (they null both chunk buffers).
+        # Per-rebuild noise salt (see wrapper.noise_salt_per_rebuild).
+        self._rebuild_count += 1
+        _nsalt = 7919 * self._rebuild_count if getattr(wrapper, "noise_salt_per_rebuild", False) else 0
         _entry_cursor = self._chunk_step  # BEFORE any cursor reset below
         rtc_prev_leftover_abs: Tensor | None = None
         if wrapper.rtc_prev_chunk_guidance and self._guided_chunk_abs is not None:
@@ -439,7 +444,7 @@ class ObservationTeleopGuidanceSource:
             or self._anchor_chunk_orig is None
         ):
             noise_kwargs = {"noise": base_noise} if base_noise is not None else {}
-            sample_generator = wrapper.build_sample_generator()
+            sample_generator = wrapper.build_sample_generator(salt=_nsalt)
             if sample_generator is not None:
                 noise_kwargs["generator"] = sample_generator
             self._anchor_chunk_orig = wrapper.inner_policy.predict_action_chunk(ctx.batch, **noise_kwargs)
@@ -542,7 +547,10 @@ class ObservationTeleopGuidanceSource:
         # salt=1: decorrelate the x_tsw noise from the model calls' prior draw
         # (same seed + same shape would make them identical tensors).
         x_tsw = self._build_guidance_noise_from_chunk(
-            guidance_chunk, ratio, base_noise=base_noise, generator=wrapper.build_sample_generator(salt=1)
+            guidance_chunk,
+            ratio,
+            base_noise=base_noise,
+            generator=wrapper.build_sample_generator(salt=_nsalt + 1),
         )
 
         # ── n_anchor_steps slice (shared computation) ──────────────────────
@@ -579,7 +587,7 @@ class ObservationTeleopGuidanceSource:
                 )
         elif strategy == GuidanceBlendStrategy.DENOISE:
             denoise_kwargs: dict = {"noise": x_tsw, "sa_noise_ratio": ratio}
-            denoise_generator = wrapper.build_sample_generator()
+            denoise_generator = wrapper.build_sample_generator(salt=_nsalt)
             if denoise_generator is not None:
                 denoise_kwargs["generator"] = denoise_generator
             if anchor_slice is not None:

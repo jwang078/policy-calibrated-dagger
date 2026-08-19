@@ -795,6 +795,14 @@ def parse_args():
     parser.add_argument("--rtc_execution_horizon", type=int, default=None)
     parser.add_argument("--rtc_inference_delay", type=int, default=0)
     parser.add_argument(
+        "--noise_salt_per_rebuild",
+        type=lambda x: str(x).lower() in ("1", "true", "yes"),
+        default=False,
+        help="With --sample_seed set: give each re-blend a FRESH but "
+        "reproducible noise draw (salt the seed by a rebuild counter) instead "
+        "of every rebuild sharing one draw.",
+    )
+    parser.add_argument(
         "--anchor_from_prev_blend",
         type=lambda x: str(x).lower() in ("1", "true", "yes"),
         default=False,
@@ -947,6 +955,7 @@ def main():
     wrapper.rtc_execution_horizon = args.rtc_execution_horizon
     wrapper.rtc_inference_delay = args.rtc_inference_delay
     wrapper.anchor_from_prev_blend = args.anchor_from_prev_blend
+    wrapper.noise_salt_per_rebuild = args.noise_salt_per_rebuild
     wrapper.rtc_prefix_attention_schedule = args.rtc_prefix_attention_schedule
     if args.rtc_prev_chunk:
         # Set post-init, so re-run the wrapper's init-time policy-type check.

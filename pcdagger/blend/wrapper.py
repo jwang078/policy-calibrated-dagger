@@ -426,6 +426,14 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # that pull back onto the demo), with `forward_flow_ratio` acting as
         # perturbation strength. See _build_and_emit_blended.
         self.anchor_from_prev_blend: bool = False
+        # Seeded-noise cadence: with sample_seed set, every re-blend's
+        # generator is re-seeded identically, so all rebuilds in a rollout
+        # share ONE draw (fixed_base_noise=true does the same explicitly).
+        # This flag salts the seed by a per-rollout rebuild counter: each
+        # re-blend gets a FRESH but reproducible draw — noise varies across
+        # re-blend intervals (diversity) while staying constant within one
+        # (the drain executes a fixed plan) and across reruns.
+        self.noise_salt_per_rebuild: bool = False
         # RTC-style previous-chunk guidance (see SharedAutonomyConfig.rtc_*).
         # Plain mutable attributes so debug scripts can flip them post-init,
         # mirroring how guidance_blend_strategy / sample_seed are handled.

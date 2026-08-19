@@ -230,6 +230,15 @@ class AugmentationConfig:
     # executed path (inherent to DART) — filter_blend_collisions would
     # validate the label path, not the executed one.
     relabel_actions: str = "executed"  # "executed" | "guidance"
+    # Correction gain for relabeled actions (P-controller labels). 1.0 =
+    # full one-step correction: the label sits ON the corridor, so the
+    # chunk's first delta vs the conditioning state is the ENTIRE deviation
+    # at once (measured |action-state| p99 0.089 vs the demos' 0.015 — a
+    # 6x-convention jerk the policy would learn to reproduce). gain g keeps
+    # g*deviation per step: label = expert + (1-g)*(state - projection),
+    # completing the correction over ~1/g ticks at demo-convention step
+    # magnitudes while preserving the corrective direction exactly.
+    relabel_correction_gain: float = 0.3
     # Seed a fresh torch.Generator for EVERY blend-path model call: the x_tsw
     # guidance-noising draw, the denoiser's per-step scheduler variance
     # (diffusion), the flow prior + anchor noise (PI0.5), and the anchor-chunk
@@ -721,6 +730,7 @@ def _relabel_frames_with_guidance(
     index_window: int,
     rate_cap_steps: float = 3.0,
     clamp_scale: float = 1.5,
+    correction_gain: float = 0.3,
 ) -> None:
     """Overwrite each frame's ``action`` with the DART expert label, in place.
 
@@ -762,6 +772,15 @@ def _relabel_frames_with_guidance(
         idx = int(np.clip(np.searchsorted(cum, s_prev) - 1, 0, len(seg_len) - 1))
         f = float(np.clip((s_prev - cum[idx]) / max(seg_len[idx], 1e-9), 0.0, 1.0))
         a = (1.0 - f) * A[idx] + f * A[min(idx + 1, len(A) - 1)]
+        # Bounded-gain correction: carry (1-gain) of the state's offset
+        # from its corridor projection into the label, so the commanded
+        # first step removes only gain*deviation per tick (see
+        # relabel_correction_gain).
+        g = float(np.clip(correction_gain, 0.0, 1.0))
+        if g < 1.0:
+            proj_state = P[idx] + f * (P[min(idx + 1, len(P) - 1)] - P[idx])
+            a = a.copy()
+            a[:n_arm] = a[:n_arm] + (1.0 - g) * (q - proj_state)
         labels.append(a)
     cap = clamp_scale * med_step
     for k in range(1, len(labels)):
@@ -1418,6 +1437,7 @@ def run_augmentation(
                         guidance_actions_raw,
                         n_arm=_n_arm,
                         index_window=cfg.progress_guidance_window,
+                        correction_gain=cfg.relabel_correction_gain,
                     )
 
                 # Commit one episode per (source_ep, ratio) pair.

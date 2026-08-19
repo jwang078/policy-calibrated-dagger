@@ -840,7 +840,64 @@ def parse_args():
     )
     parser.add_argument("--env_external_host", default="127.0.0.1")
 
-    return parser.parse_args()
+    # WRAPPER PASSTHROUGH: unrecognized `--name=value` / `--name value`
+    # arguments are applied directly as `wrapper.<name> = <coerced value>`
+    # after the wrapper is built (see _apply_wrapper_passthrough) — new
+    # SharedAutonomyPolicyWrapper knobs work here without touching this
+    # script. Unknown attribute names and single-dash arguments still fail
+    # loudly, so typos are caught.
+    args, unknown = parser.parse_known_args()
+    passthrough: list[tuple[str, str]] = []
+    i = 0
+    while i < len(unknown):
+        tok = unknown[i]
+        if not tok.startswith("--"):
+            parser.error(f"unrecognized argument: {tok}")
+        name, eq, val = tok[2:].partition("=")
+        if not eq:
+            if i + 1 >= len(unknown) or unknown[i + 1].startswith("--"):
+                parser.error(f"passthrough argument --{name} needs a value")
+            val = unknown[i + 1]
+            i += 1
+        passthrough.append((name.replace("-", "_"), val))
+        i += 1
+    args._wrapper_passthrough = passthrough
+    return args
+
+
+def _apply_wrapper_passthrough(wrapper, passthrough: list[tuple[str, str]]) -> None:
+    """Set unrecognized CLI args as wrapper attributes.
+
+    Type-coerced from the attribute's current value (bool/int/float/str;
+    'none' -> None). Errors on names the wrapper does not already have —
+    typos must not pass silently.
+    """
+    for name, raw in passthrough:
+        if not hasattr(wrapper, name):
+            raise SystemExit(
+                f"--{name} is neither a script argument nor a SharedAutonomyPolicyWrapper "
+                f"attribute — typo, or the knob does not exist."
+            )
+        cur = getattr(wrapper, name)
+        low = raw.strip().lower()
+        value: object
+        if low in ("none", "null"):
+            value = None
+        elif isinstance(cur, bool):
+            value = low in ("1", "true", "yes")
+        elif isinstance(cur, int) and not isinstance(cur, bool):
+            value = int(raw)
+        elif isinstance(cur, float):
+            value = float(raw)
+        elif cur is None:
+            try:
+                value = float(raw) if "." in raw or "e" in low else int(raw)
+            except ValueError:
+                value = raw
+        else:
+            value = raw
+        setattr(wrapper, name, value)
+        print(f"[passthrough] wrapper.{name} = {value!r}")
 
 
 def main():
@@ -956,6 +1013,7 @@ def main():
     wrapper.rtc_inference_delay = args.rtc_inference_delay
     wrapper.anchor_from_prev_blend = args.anchor_from_prev_blend
     wrapper.resample_noise_per_reblend = args.resample_noise_per_reblend
+    _apply_wrapper_passthrough(wrapper, getattr(args, "_wrapper_passthrough", []))
     wrapper.rtc_prefix_attention_schedule = args.rtc_prefix_attention_schedule
     if args.rtc_prev_chunk:
         # Set post-init, so re-run the wrapper's init-time policy-type check.

@@ -433,7 +433,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # re-blend gets a FRESH but reproducible draw — noise varies across
         # re-blend intervals (diversity) while staying constant within one
         # (the drain executes a fixed plan) and across reruns.
-        self.noise_salt_per_rebuild: bool = False
+        self.resample_noise_per_reblend: bool = False
         # RTC-style previous-chunk guidance (see SharedAutonomyConfig.rtc_*).
         # Plain mutable attributes so debug scripts can flip them post-init,
         # mirroring how guidance_blend_strategy / sample_seed are handled.

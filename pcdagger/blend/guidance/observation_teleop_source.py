@@ -328,9 +328,9 @@ class ObservationTeleopGuidanceSource:
         # positive-feedback speedup (measured 3.5-5x demo speed at ratio 0.7).
         # Consumed only when `wrapper.rtc_prev_chunk_guidance` is on; cleared
         # naturally by cancel()/reset() (they null both chunk buffers).
-        # Per-rebuild noise salt (see wrapper.noise_salt_per_rebuild).
+        # Per-re-blend noise resampling (see wrapper.resample_noise_per_reblend).
         self._rebuild_count += 1
-        _nsalt = 7919 * self._rebuild_count if getattr(wrapper, "noise_salt_per_rebuild", False) else 0
+        _nsalt = 7919 * self._rebuild_count if getattr(wrapper, "resample_noise_per_reblend", False) else 0
         _entry_cursor = self._chunk_step  # BEFORE any cursor reset below
         rtc_prev_leftover_abs: Tensor | None = None
         if wrapper.rtc_prev_chunk_guidance and self._guided_chunk_abs is not None:

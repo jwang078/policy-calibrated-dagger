@@ -279,6 +279,11 @@ class DartChunkDataset:
 
     def __getattr__(self, name):
         """Delegate meta/stats/etc. so the wrapper is a drop-in for training."""
+        if name == "dataset":
+            # Only reachable when self.dataset is not yet set (e.g. during
+            # unpickling in a spawn-context DataLoader worker, before
+            # __dict__ is restored) — delegating would recurse forever.
+            raise AttributeError(name)
         return getattr(self.dataset, name)
 
     def __getitem__(self, idx: int) -> dict:

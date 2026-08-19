@@ -1330,6 +1330,11 @@ if [[ "$BLEND_LABELS" == "dart" ]]; then
     fi
     BLEND_LABELS_ARG="--relabel_actions=guidance"
     FINETUNE_EXTRA_ARGS_EFF="$FINETUNE_EXTRA_ARGS_EFF --dataset.dart_relabel=true"
+    # Scratch trainings (per-round scratch / final_mode=scratch) also train on
+    # blend data — without the flag they would silently consume executed
+    # labels. On blend-free trainings (round-0 base) the flag is a no-op:
+    # the wrapper only touches datasets carrying relabel_demo_index.
+    ROUND0_EXTRA_ARGS_EFF="$ROUND0_EXTRA_ARGS_EFF --dataset.dart_relabel=true"
 elif [[ "$BLEND_LABELS" != "executed" ]]; then
     echo "ERROR: --blend_labels must be 'executed' or 'dart', got '$BLEND_LABELS'." >&2
     exit 1

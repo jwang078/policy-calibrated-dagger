@@ -5192,6 +5192,18 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
                 if [[ "$ACTION_FORMAT" != "rel" ]] || stats_exists "$BLEND_SHORT"; then
                     _blend_complete=true
                 fi
+                # --blend_labels=dart must never reuse a cached blend that was
+                # recorded WITHOUT relabeling: it lacks relabel_demo_index, so
+                # the train-time DART wrapper passes it through untouched and
+                # the arm silently trains on executed labels. Stale caches are
+                # derived artifacts — delete and re-record.
+                if [[ "$BLEND_LABELS" == "dart" && "$_blend_complete" == true ]] \
+                    && ! grep -q '"relabel_demo_index"' "$LEROBOT_CACHE/$BLEND_REPO/meta/info.json" 2>/dev/null; then
+                    echo "  ratio=$R → $BLEND_REPO exists but was recorded WITHOUT relabeling (no relabel_demo_index);"
+                    echo "             deleting the stale cache and re-recording with --relabel_actions=guidance."
+                    run_or_echo rm -rf "$LEROBOT_CACHE/$BLEND_REPO"
+                    _blend_complete=false
+                fi
             fi
             if [[ "$_blend_complete" == true ]]; then
                 echo "  ratio=$R → $BLEND_REPO already on disk (with stats); skipping blend creation."
@@ -5242,6 +5254,17 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
                 if dataset_exists "$NOCOLL_REPO"; then
                     if [[ "$ACTION_FORMAT" != "rel" ]] || stats_exists "$NOCOLL_SHORT"; then
                         _nocoll_complete=true
+                    fi
+                    # Same stale-cache guard as the blend step: a dart run
+                    # must never reuse a _nocoll sibling filtered from a
+                    # pre-relabel blend (no relabel_demo_index -> silent
+                    # executed-label training).
+                    if [[ "$BLEND_LABELS" == "dart" && "$_nocoll_complete" == true ]] \
+                        && ! grep -q '"relabel_demo_index"' "$LEROBOT_CACHE/$NOCOLL_REPO/meta/info.json" 2>/dev/null; then
+                        echo "  ratio=$R → $NOCOLL_REPO exists but lacks relabel_demo_index (pre-dart filter output);"
+                        echo "             deleting the stale cache and re-filtering."
+                        run_or_echo rm -rf "$LEROBOT_CACHE/$NOCOLL_REPO"
+                        _nocoll_complete=false
                     fi
                 fi
                 if [[ "$_nocoll_complete" == true ]]; then

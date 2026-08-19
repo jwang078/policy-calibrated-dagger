@@ -17,9 +17,9 @@ synthesized where it is consumed (dataloader / visualizer) from two things:
 
 Synthesis (all quantities in the demo's own units — no per-env tuning):
 
-    i_k      = min(i0 + k, end)                    # demo clock: 1 index/tick
-    d_k      = max(0, d0 - (k+1)*rate*med_step)    # offset closes at cruise
-    label_k  = demo_action(i_k) + d_k * u          # u = offset direction
+    i_k      = min(i0 + k, end)                        # demo clock: 1 index/tick
+    d_k+1    = d_k - min(rate*med_step, ease_out*d_k)  # cruise-speed closure,
+    label_k  = demo_action(i_k) + d_k * u              #   C1 ease-out merge
 
 ``med_step`` is the demo's median per-tick joint step (fps/DOF/speed baked
 in), so ``rate=1.0`` means the label track rejoins at the demo's own cruise
@@ -120,14 +120,22 @@ def chunk_labels(
     geom: DemoGeometry,
     horizon: int,
     rate: float = 1.0,
+    ease_out: float = 0.3,
 ) -> np.ndarray:
     """Synthesize the expert's ``horizon``-step response from one state.
 
     Demo clock advances one index per tick from ``demo_index`` (holding at
     the demo's end); the state's offset from its corridor projection decays
-    by ``rate * med_step`` per tick to zero along a fixed direction. Returns
-    ``(horizon, adim)`` absolute-position labels; k=0 equals the validated
-    per-frame bounded-rate label.
+    along a fixed direction by ``min(rate * med_step, ease_out * d)`` per
+    tick: full-cruise pursuit while far (bounded first step), proportional
+    within ``rate * med_step / ease_out`` of the corridor so the closure
+    velocity fades geometrically instead of stopping dead — a hard-zero
+    linear decay would end with a one-tick velocity discontinuity of
+    ``rate * med_step * fps`` (~16 rad/s^2 at planar cruise, ~18x the
+    demo's own max accel) that a chunk-mimicking policy would learn.
+    Merge deceleration is bounded by ``ease_out * rate * med_step`` per
+    tick^2; residual offsets below 5% of a demo step snap closed. Returns
+    ``(horizon, adim)`` absolute-position labels.
     """
     q = np.asarray(state, dtype=np.float64)[: geom.n_arm]
     proj0 = _interp_rows(geom.P, demo_index)
@@ -135,11 +143,15 @@ def chunk_labels(
     d0 = float(np.linalg.norm(offset))
     u = offset / d0 if d0 > 1e-9 else np.zeros_like(offset)
     close = max(0.0, float(rate)) * geom.med_step
+    ease = float(np.clip(ease_out, 0.0, 1.0))
     labels = np.empty((horizon, geom.A.shape[1]), dtype=np.float64)
     end = float(len(geom.A) - 1)
+    d_k = d0
     for k in range(horizon):
         labels[k] = _interp_rows(geom.A, min(demo_index + k, end))
-        d_k = max(0.0, d0 - (k + 1) * close)
+        d_k = max(0.0, d_k - min(close, ease * d_k) if ease > 0.0 else d_k - close)
+        if d_k < 0.05 * geom.med_step:
+            d_k = 0.0
         if d_k > 0.0:
             labels[k, : geom.n_arm] += d_k * u
     return labels
@@ -201,10 +213,11 @@ class DartChunkDataset:
         ds = DartChunkDataset(ds, source_repo_id, n_arm=3, rate=1.0)
     """
 
-    def __init__(self, dataset, source_repo_id: str, n_arm: int, rate: float = 1.0):
+    def __init__(self, dataset, source_repo_id: str, n_arm: int, rate: float = 1.0, ease_out: float = 0.3):
         """Wrap ``dataset``, pairing its episodes to ``source_repo_id`` demos."""
         self.dataset = dataset
         self.rate = float(rate)
+        self.ease_out = float(ease_out)
         self.n_arm = int(n_arm)
         self.geoms = load_source_geometries(source_repo_id, n_arm=n_arm)
         self.ep_to_source = self._episode_pairing(dataset)
@@ -238,7 +251,9 @@ class DartChunkDataset:
         di = item["relabel_demo_index"]
         di = float(di.reshape(-1)[-1]) if isinstance(di, torch.Tensor) else float(np.reshape(di, -1)[-1])
         geom = self.geoms[self.ep_to_source[int(item["episode_index"])]]
-        labels = chunk_labels(q.cpu().numpy(), di, geom, horizon=action.shape[0], rate=self.rate)
+        labels = chunk_labels(
+            q.cpu().numpy(), di, geom, horizon=action.shape[0], rate=self.rate, ease_out=self.ease_out
+        )
         item["action"] = torch.as_tensor(
             labels[:, : action.shape[1]], dtype=action.dtype, device=action.device
         )

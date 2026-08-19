@@ -70,12 +70,16 @@ def _plot(
     n: int,
     horizon: int,
     rate: float,
+    ease_out: float,
     anchor_every: int,
     title: str,
     out: str,
 ) -> None:
     anchors = list(range(0, len(S) - 1, max(1, anchor_every)))
-    chunks = {t: chunk_labels(S[t], float(idxs[t]), geom, horizon=horizon, rate=rate) for t in anchors}
+    chunks = {
+        t: chunk_labels(S[t], float(idxs[t]), geom, horizon=horizon, rate=rate, ease_out=ease_out)
+        for t in anchors
+    }
     cmap = plt.get_cmap("plasma")
     colors = {t: cmap(i / max(1, len(anchors) - 1)) for i, t in enumerate(anchors)}
 
@@ -99,7 +103,7 @@ def _plot(
     fig.suptitle(
         f"{title}\nTHICK grey=demo  blue=executed  colored curves=synthesized H={horizon} label chunks "
         f"(land ON the demo, hiding it — see zoom)  ●=conditioning state  arrowheads=direction of time  "
-        f"(rate={rate} x med_step={geom.med_step:.4f})"
+        f"(rate={rate} x med_step={geom.med_step:.4f}, ease_out={ease_out})"
     )
 
     t_ax = np.arange(len(S))
@@ -219,6 +223,12 @@ def main() -> None:
     ap.add_argument("--source_episode_index", type=int, default=None)
     ap.add_argument("--horizon", type=int, default=32)
     ap.add_argument("--rate", type=float, default=1.0)
+    ap.add_argument(
+        "--ease_out",
+        type=float,
+        default=0.3,
+        help="proportional closure fraction near the corridor (C1 merge)",
+    )
     ap.add_argument("--anchor_every", type=int, default=15)
     ap.add_argument("--index_window", type=int, default=45, help="npz mode: projection window (demo steps)")
     ap.add_argument("--num_arm_joints", type=int, default=3)
@@ -239,7 +249,9 @@ def main() -> None:
         idxs = project_states(track, geom, index_window=args.index_window)
         title = f"DART chunks (on-the-fly) — {key} of {os.path.basename(os.path.dirname(args.npz))} (source ep {src_ep})"
         out = args.out or f"dart_chunks_npz_{key}.png"
-        _plot(track[:, :n], idxs, geom, n, args.horizon, args.rate, args.anchor_every, title, out)
+        _plot(
+            track[:, :n], idxs, geom, n, args.horizon, args.rate, args.ease_out, args.anchor_every, title, out
+        )
         return
 
     if not args.blend_repo_id:
@@ -262,7 +274,16 @@ def main() -> None:
     title = f"DART chunks — blend ep {args.episode_index} of {args.blend_repo_id} (source ep {src_ep})"
     out = args.out or f"dart_chunks_{args.blend_repo_id.split('/')[-1]}_ep{args.episode_index}.png"
     _plot(
-        bl["observation.state"][:, :n], idxs, geom, n, args.horizon, args.rate, args.anchor_every, title, out
+        bl["observation.state"][:, :n],
+        idxs,
+        geom,
+        n,
+        args.horizon,
+        args.rate,
+        args.ease_out,
+        args.anchor_every,
+        title,
+        out,
     )
 
 

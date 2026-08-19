@@ -608,6 +608,19 @@ class ObservationTeleopGuidanceSource:
             blended = wrapper.inner_policy.predict_action_chunk(ctx.batch, **denoise_kwargs)
         else:
             raise NotImplementedError(f"Unsupported guidance_blend_strategy: {strategy}")
+        # Hard prefix crossfade (see wrapper.rtc_hard_prefix_xfade): force
+        # seam continuity against the previous plan's leftover — position 0
+        # is mostly the old plan, ramping to fully-new over N positions.
+        _n_x = int(getattr(wrapper, "rtc_hard_prefix_xfade", 0) or 0)
+        if _n_x > 0 and rtc_prev_leftover is not None:
+            n_x = min(_n_x, rtc_prev_leftover.shape[1], blended.shape[1])
+            if n_x > 0:
+                w = torch.arange(1, n_x + 1, device=blended.device, dtype=blended.dtype) / (n_x + 1)
+                w = w.view(1, n_x, 1)
+                blended = blended.clone()
+                blended[:, :n_x, :action_dim] = w * blended[:, :n_x, :action_dim] + (
+                    1.0 - w
+                ) * rtc_prev_leftover[:, :n_x, :action_dim].to(blended.dtype)
         self._guided_chunk = blended
         # Store the ABSOLUTE decode alongside (RTC's ActionQueue keeps the
         # processed actions for the same reason): the anchor was refreshed at

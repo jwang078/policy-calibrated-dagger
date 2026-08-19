@@ -434,6 +434,14 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # re-blend intervals (diversity) while staying constant within one
         # (the drain executes a fixed plan) and across reruns.
         self.resample_noise_per_reblend: bool = False
+        # Hard seam smoothing at re-blend boundaries: crossfade the freshly
+        # built chunk's first N positions against the previous plan's
+        # re-anchored leftover (w_k = (k+1)/(N+1); position 0 is mostly the
+        # old plan). The RTC gradient pull alone cannot force seam
+        # continuity — with per-re-blend noise resampling, consecutive
+        # plans come from independent draws and the boundary accel measured
+        # ~2x mid-interval (7.5 vs 4, spikes to 24 rad/s^2). 0 disables.
+        self.rtc_hard_prefix_xfade: int = 0
         # RTC-style previous-chunk guidance (see SharedAutonomyConfig.rtc_*).
         # Plain mutable attributes so debug scripts can flip them post-init,
         # mirroring how guidance_blend_strategy / sample_seed are handled.

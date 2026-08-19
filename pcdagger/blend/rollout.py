@@ -512,8 +512,14 @@ def run_blended_rollout(
                     (total_steps, chunk_decode.shape[1]), np.nan, dtype=chunk_decode.dtype
                 )
             if blend_mode == BlendMode.EVERY_STEP:
-                # Now-anchored: entry 0 is the guidance for THIS tick.
-                decoded_guidance_full[t] = chunk_decode[0]
+                # Now-anchored: the decode refreshes at RE-BLEND ticks (every
+                # `blend_interval`); on drained ticks in between, this tick's
+                # guidance is the decode's entry at the drain offset — using
+                # entry 0 for every tick held a constant per interval and
+                # painted a staircase (user-observed at interval 0.5,
+                # 2026-08-18). At blend_interval=1 the offset is always 0.
+                _off = (t % n_action_steps) % max(1, int(blend_interval))
+                decoded_guidance_full[t] = chunk_decode[min(_off, chunk_decode.shape[0] - 1)]
             elif at_chunk_boundary:
                 end_t = min(t + n_action_steps, total_steps)
                 decoded_guidance_full[t:end_t] = chunk_decode[: end_t - t]

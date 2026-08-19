@@ -41,11 +41,12 @@ The output dataset preserves each kept episode's metadata
 fields recording the filtering outcome (`pre_filter_n_frames`,
 `first_collision_frame`, `trimmed_to_n_frames`).
 
-CAVEAT (relabeled blends): datasets recorded with
-augment_dataset_with_blending --relabel_actions=guidance store DART expert
-labels in `action` — replaying the action column reproduces the LABEL path
-(≈ the source demo), not the executed path the observations recorded. The
-collision verdict then applies to the labels, not the visited states.
+Relabeled blends (--relabel_actions=guidance) store EXECUTED actions plus a
+per-frame `relabel_demo_index` (train-time DART labels are synthesized by the
+dataloader, see lerobot.datasets.dart_relabel) — so replaying the action
+column reproduces the true executed path, and the `_nocoll` sibling carries
+`relabel_demo_index` and the `source_dataset_repo_id` metadata through so
+DART training keeps working on the filtered dataset.
 """
 
 # NOTE: no `from __future__ import annotations` — draccus reads annotations
@@ -394,6 +395,11 @@ def _row_to_frame(
             ) from None
         if spec.get("dtype") in ("image", "video") and isinstance(value, dict) and "bytes" in value:
             value = PILImage.open(BytesIO(value["bytes"])).convert("RGB")
+        if spec.get("dtype") in ("float32", "float64") and not isinstance(value, np.ndarray):
+            # Parquet round-trips single-element columns (e.g. the (1,)
+            # relabel_demo_index) as bare Python floats; add_frame requires
+            # an ndarray of the declared dtype.
+            value = np.asarray(value, dtype=spec["dtype"]).reshape(-1)
         out[key] = value
     # add_frame pops the "task" key separately and resolves it to task_index
     # on its own. Use the source row's task_index to look up the original
@@ -662,6 +668,11 @@ def _run(
         state_dim=source_state_dim,
         env_state_dim=source_env_state_dim,
     )
+    if "relabel_demo_index" in _source_feats:
+        # Relabeled blends: the per-frame DART projection index must survive
+        # filtering or train-time relabeling silently degrades to executed
+        # labels on the `_nocoll` sibling.
+        expected_features["relabel_demo_index"] = {"dtype": "float32", "shape": (1,), "names": None}
     existing = load_lerobot_dataset(cfg.target_repo_id)
     if existing is not None:
         _existing_feats = existing.meta.features
@@ -698,6 +709,11 @@ def _run(
             num_dofs=cfg.num_dofs,
             state_dim=source_state_dim,
             env_state_dim=source_env_state_dim,
+            extra_features=(
+                {"relabel_demo_index": expected_features["relabel_demo_index"]}
+                if "relabel_demo_index" in expected_features
+                else None
+            ),
         )
 
     # Idempotent-resume skip set: source_episode_idx values already committed
@@ -900,6 +916,14 @@ def _run(
             }
             if blend_ratio is not None:
                 episode_metadata["blend_ratio"] = float(blend_ratio)
+            if "blend_ratio_effective" in source_episodes_meta.columns and pd.notna(
+                ep_meta_row["blend_ratio_effective"]
+            ):
+                episode_metadata["blend_ratio_effective"] = float(ep_meta_row["blend_ratio_effective"])
+            if "source_dataset_repo_id" in source_episodes_meta.columns and pd.notna(
+                ep_meta_row["source_dataset_repo_id"]
+            ):
+                episode_metadata["source_dataset_repo_id"] = str(ep_meta_row["source_dataset_repo_id"])
             target_ds.save_episode(episode_metadata=episode_metadata)
 
             logger.info(

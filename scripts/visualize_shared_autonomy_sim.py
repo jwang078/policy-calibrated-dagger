@@ -336,6 +336,9 @@ def get_sim_action_chunk_for_ratio(
     task_description: str | None,
     progress_guidance: bool = False,
     progress_guidance_window: int = 45,
+    progress_guidance_soft_hold: float = 0.0,
+    progress_guidance_hard_lag: int = 8,
+    blend_ratio_goal_taper: int = 0,
     demo_states_raw: np.ndarray | None = None,
     frame_sink: dict[str, list[np.ndarray]] | None = None,
     expected_env_state: np.ndarray | None = None,
@@ -390,6 +393,9 @@ def get_sim_action_chunk_for_ratio(
         base_noise=base_noise,
         progress_guidance=progress_guidance,
         progress_guidance_window=progress_guidance_window,
+        progress_guidance_soft_hold=progress_guidance_soft_hold,
+        progress_guidance_hard_lag=progress_guidance_hard_lag,
+        blend_ratio_goal_taper=blend_ratio_goal_taper,
         demo_states_raw=demo_states_raw,
         expected_env_state=expected_env_state,
         on_step=on_step,
@@ -418,6 +424,9 @@ def get_sim_action_chunks_for_ratios(
     fixed_base_noise: bool = True,
     progress_guidance: bool = False,
     progress_guidance_window: int = 45,
+    progress_guidance_soft_hold: float = 0.0,
+    progress_guidance_hard_lag: int = 8,
+    blend_ratio_goal_taper: int = 0,
     demo_states_raw: np.ndarray | None = None,
     record_videos: bool = False,
     expected_env_state: np.ndarray | None = None,
@@ -487,6 +496,9 @@ def get_sim_action_chunks_for_ratios(
             task_description=task_description,
             progress_guidance=progress_guidance,
             progress_guidance_window=progress_guidance_window,
+            progress_guidance_soft_hold=progress_guidance_soft_hold,
+            progress_guidance_hard_lag=progress_guidance_hard_lag,
+            blend_ratio_goal_taper=blend_ratio_goal_taper,
             demo_states_raw=demo_states_raw,
             frame_sink=frames_by_ratio.setdefault(ratio, {}) if record_videos else None,
             expected_env_state=expected_env_state,
@@ -729,6 +741,24 @@ def parse_args():
             "observation.state in the dataset for state-grid matching (falls back to the "
             "action matrix with a +1 shift)."
         ),
+    )
+    parser.add_argument(
+        "--blend_ratio_goal_taper",
+        type=int,
+        default=0,
+        help="anneal the blend ratio to 0 over the last N demo indices (0 = off)",
+    )
+    parser.add_argument(
+        "--progress_guidance_soft_hold",
+        type=float,
+        default=0.0,
+        help="clock advance rate (x demo pace) while lag in (lag_tol, hard_lag); 0 = legacy hard hold",
+    )
+    parser.add_argument(
+        "--progress_guidance_hard_lag",
+        type=int,
+        default=8,
+        help="lag (demo indices) beyond which the clock hard-holds regardless of soft_hold",
     )
     parser.add_argument("--progress_guidance_window", type=int, default=45)
     parser.add_argument(
@@ -1229,6 +1259,9 @@ def main():
             fixed_base_noise=args.fixed_base_noise,
             progress_guidance=args.progress_guidance,
             progress_guidance_window=args.progress_guidance_window,
+            progress_guidance_soft_hold=args.progress_guidance_soft_hold,
+            progress_guidance_hard_lag=args.progress_guidance_hard_lag,
+            blend_ratio_goal_taper=args.blend_ratio_goal_taper,
             demo_states_raw=demo_states_raw,
             record_videos=args.record_videos,
             expected_env_state=(

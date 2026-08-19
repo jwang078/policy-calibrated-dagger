@@ -303,6 +303,21 @@ class AugmentationConfig:
     # Forward search window (demo steps) for the progress match. Bounds both
     # compute and how far a single tick can jump ahead.
     progress_guidance_window: int = 45
+    # Soft hold for the demo-pace clock (see lib_sa_rollout): advance rate
+    # while the robot lags in (lag_tol, hard_lag] demo indices. 0 = legacy
+    # hard hold (measured to cascade at small ratios: r=0.1 blends crawled
+    # at pace ~0.7 and came out 1.45x source length).
+    progress_guidance_soft_hold: float = 0.0
+    progress_guidance_hard_lag: int = 8
+    # Anneal the blend ratio to 0 over the last N demo indices (0 = off).
+    # DART validity: the noisy supervisor must still complete the task; a
+    # constant ratio leaves a r*(policy-expert) equilibrium offset at the
+    # goal that blocks strict success (episodes ballooned to 1.4-1.9x with
+    # slow near-goal hover). Guidance lands the rollout instead. Measured
+    # (r=0.1, round-0 policy): src4 102 -> 81 frames with success firing,
+    # src22 138 -> 129; combined with the progress-stall cut, src47
+    # 185 -> 124. Default 16 demo indices (scale-free).
+    blend_ratio_goal_taper: int = 16
     # Post-success handling. The strict-tolerance sim can still terminate a
     # blend rollout BEFORE the guidance runs out (the blended trajectory
     # reaches the goal early). Historically the rollout then froze into hold
@@ -552,6 +567,9 @@ def rollout_closed_loop_for_augmentation(
     total_steps: int,
     progress_guidance: bool = False,
     progress_guidance_window: int = 45,
+    progress_guidance_soft_hold: float = 0.0,
+    progress_guidance_hard_lag: int = 8,
+    blend_ratio_goal_taper: int = 0,
     demo_states_raw: np.ndarray | None = None,
     rename_map: dict[str, str],
     image_keys: list[str],
@@ -629,6 +647,9 @@ def rollout_closed_loop_for_augmentation(
         base_noise=base_noise,
         progress_guidance=progress_guidance,
         progress_guidance_window=progress_guidance_window,
+        progress_guidance_soft_hold=progress_guidance_soft_hold,
+        progress_guidance_hard_lag=progress_guidance_hard_lag,
+        blend_ratio_goal_taper=blend_ratio_goal_taper,
         demo_states_raw=demo_states_raw,
         pad_after_success=pad_after_success,
         expected_env_state=expected_env_state,
@@ -1367,6 +1388,9 @@ def run_augmentation(
                             total_steps=total_steps,
                             progress_guidance=cfg.progress_guidance,
                             progress_guidance_window=cfg.progress_guidance_window,
+                            progress_guidance_soft_hold=cfg.progress_guidance_soft_hold,
+                            progress_guidance_hard_lag=cfg.progress_guidance_hard_lag,
+                            blend_ratio_goal_taper=cfg.blend_ratio_goal_taper,
                             demo_states_raw=demo_states_raw,
                             rename_map=rename_map,
                             image_keys=image_keys,
@@ -1399,6 +1423,22 @@ def run_augmentation(
                                 ]
                             )
                             _t_star = int(np.argmin(np.linalg.norm(_states - _demo_end[None], axis=1)))
+                            # Progress-stall cut: hovering at the goal without
+                            # strict success (e.g. a last-mm contact push
+                            # creeping at near-zero speed) piles up slow
+                            # near-goal frames — measured 90 ticks covering
+                            # the demo's final 10% on src47 r0.1. Cut where
+                            # the projected demo index first comes within
+                            # 2.0 idx of its final value (+10 settle ticks).
+                            from dart_labels import demo_geometry as _dg, project_states as _ps
+
+                            _idxs = _ps(
+                                _states,
+                                _dg(demo_states_raw, guidance_actions_raw, n_arm=_n_arm),
+                                index_window=cfg.progress_guidance_window,
+                            )
+                            _stall = int(np.argmax(_idxs >= _idxs[-1] - 2.0)) + 10
+                            _t_star = min(_t_star, _stall)
                             if cfg.min_episode_length <= _t_star + 1 < len(rollout.frames):
                                 logger.info(
                                     "source_ep=%d ratio=%.3f: trimmed %d post-approach wander "

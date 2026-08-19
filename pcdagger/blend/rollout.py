@@ -320,6 +320,9 @@ def run_blended_rollout(
     progress_guidance: bool = False,
     progress_guidance_window: int = 45,
     progress_guidance_lag_tol: int = 2,
+    progress_guidance_soft_hold: float = 0.0,
+    progress_guidance_hard_lag: int = 8,
+    blend_ratio_goal_taper: int = 0,
     seed_joint_velocity: np.ndarray | None = None,
     fps: float = 30.0,
     demo_states_raw: np.ndarray | None = None,
@@ -434,7 +437,7 @@ def run_blended_rollout(
         _demo_arm = np.asarray(guidance_actions_raw[:, :_num_arm], dtype=np.float32)
         _match_shift = 1
     _j_progress = 0
-    _j_clock = 0  # demo-pace playback cursor (see the progress block below)
+    _j_clock = 0.0  # demo-pace playback cursor (float; see the progress block below)
 
     for t in range(total_steps):
         # ── Hold mode: episode succeeded, don't step env again ────────────────
@@ -473,10 +476,39 @@ def run_blended_rollout(
             # (stall-hold: a stuck robot pins the guidance), and snaps
             # forward when the robot re-enters the demo ahead of it (a
             # deviated rollout rejoins where it actually is).
-            _j_clock = max(_j_clock, _j_progress)
-            _j_exec = min(_j_clock + _match_shift, guidance_actions_raw.shape[0] - 1)
-            if _j_progress >= _j_clock - max(0, int(progress_guidance_lag_tol)):
-                _j_clock = min(_j_clock + 1, guidance_actions_raw.shape[0] - 1)
+            # SOFT HOLD (progress_guidance_soft_hold > 0): a hard stall-hold
+            # cascades at small blend ratios — the policy component keeps the
+            # robot perpetually ~lag_tol behind, every hold tick slows the
+            # commanded guidance, and the rollout crawls (measured: r=0.1
+            # blends of dag1 at pace ~0.7, episodes 1.45x source length,
+            # 2026-08-19). Instead of stopping, the clock advances at
+            # `soft_hold` x demo pace while moderately lagging, and only
+            # hard-holds beyond `hard_lag` indices (a truly stuck robot
+            # still pins the guidance).
+            _j_clock = max(_j_clock, float(_j_progress))
+            _j_exec = min(int(_j_clock) + _match_shift, guidance_actions_raw.shape[0] - 1)
+            _lag = _j_clock - _j_progress
+            if _lag <= max(0, int(progress_guidance_lag_tol)):
+                _rate = 1.0
+            elif _lag < max(int(progress_guidance_lag_tol) + 1, int(progress_guidance_hard_lag)):
+                _rate = float(np.clip(progress_guidance_soft_hold, 0.0, 1.0))
+            else:
+                _rate = 0.0
+            _j_clock = min(_j_clock + _rate, float(guidance_actions_raw.shape[0] - 1))
+            # GOAL TAPER (blend_ratio_goal_taper > 0): anneal the blend ratio
+            # to 0 over the last N demo indices. DART's own validity
+            # condition is that the noisy supervisor still completes the
+            # task; a constant ratio violates it at the goal — the blend's
+            # fixed point sits r*(policy - expert) short of the endpoint, so
+            # strict success never fires and the rollout hovers (measured:
+            # r=0.1 with the round-0 policy, ep47 still approaching at 2x
+            # budget, episodes 1.4-1.9x source length of slow near-goal
+            # data). Tapering hands the landing to the guidance.
+            if blend_ratio_goal_taper > 0 and ratio not in (0.0, 1.0):
+                _remaining = float(guidance_actions_raw.shape[0] - 1) - _j_clock
+                wrapper.forward_flow_ratio = ratio * min(
+                    1.0, max(0.0, _remaining) / float(blend_ratio_goal_taper)
+                )
             guidance_chunk = None if suppress_guidance else guidance_actions_raw[_j_exec:]
         else:
             guidance_chunk = None if suppress_guidance else guidance_actions_raw[t:]

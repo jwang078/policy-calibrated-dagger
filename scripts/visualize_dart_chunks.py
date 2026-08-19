@@ -39,7 +39,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from dart_labels import DemoGeometry, chunk_labels, demo_geometry, project_states
+from dart_labels import DemoGeometry, _interp_rows, chunk_labels, demo_geometry, project_states
 
 FPS = 30.0
 
@@ -79,22 +79,37 @@ def _plot(
     cmap = plt.get_cmap("plasma")
     colors = {t: cmap(i / max(1, len(anchors) - 1)) for i, t in enumerate(anchors)}
 
-    n_planes = max(1, n - 1)
-    ncols = max(n, n_planes + 2)
+    def _arrows_along(ax, C, jx, jy, color, ks, lw=1.4):
+        """Arrowheads along curve C at positions ks — direction of time."""
+        for k in ks:
+            if k + 1 >= len(C):
+                break
+            p0, p1 = C[k, [jx, jy]], C[k + 1, [jx, jy]]
+            if np.linalg.norm(p1 - p0) < 1e-6:
+                continue
+            ax.annotate(
+                "",
+                xy=p1,
+                xytext=p0,
+                arrowprops={"arrowstyle": "-|>", "color": color, "lw": lw, "shrinkA": 0, "shrinkB": 0},
+            )
+
+    ncols = max(n, 4)
     fig, axes = plt.subplots(2, ncols, figsize=(5.2 * ncols, 9))
     fig.suptitle(
-        f"{title}\ngrey=demo  blue=executed  colored=synthesized H={horizon} label chunks "
+        f"{title}\nTHICK grey=demo  blue=executed  colored curves=synthesized H={horizon} label chunks "
+        f"(land ON the demo, hiding it — see zoom)  ●=conditioning state  arrowheads=direction of time  "
         f"(rate={rate} x med_step={geom.med_step:.4f})"
     )
 
     t_ax = np.arange(len(S))
     for j in range(n):
         ax = axes[0][j]
-        ax.plot(np.arange(len(geom.P)), geom.P[:, j], color="0.6", lw=3, label="demo (source states)")
+        ax.plot(np.arange(len(geom.P)), geom.P[:, j], color="0.75", lw=6, label="demo (source states)")
         ax.plot(t_ax, S[:, j], color="tab:blue", lw=1.2, label="executed state")
         for t in anchors:
-            ax.plot(np.arange(t, t + horizon), chunks[t][:, j], color=colors[t], lw=0.9, alpha=0.85)
-            ax.plot([t], [S[t, j]], marker=".", color=colors[t], ms=5)
+            ax.plot(np.arange(t, t + horizon), chunks[t][:, j], color=colors[t], lw=1.1, alpha=0.9)
+            ax.plot([t], [S[t, j]], marker="o", color=colors[t], ms=6, mec="k", mew=0.6)
         ax.set_title(f"joint_{j + 1}")
         ax.set_xlabel("tick")
         if j == 0:
@@ -102,22 +117,53 @@ def _plot(
     for col in range(n, ncols):
         axes[0][col].axis("off")
 
-    for k in range(n_planes):
-        jx, jy = k, k + 1
-        ax = axes[1][k]
-        ax.plot(geom.P[:, jx], geom.P[:, jy], color="0.6", lw=3, label="demo path")
-        ax.plot(S[:, jx], S[:, jy], color="tab:blue", lw=1.2, label="executed path")
-        for t in anchors:
-            ax.plot(chunks[t][:, jx], chunks[t][:, jy], color=colors[t], lw=1.0, alpha=0.9)
-            ax.plot([S[t, jx]], [S[t, jy]], marker="o", color=colors[t], ms=4, mfc="none")
-        ax.set_xlabel(f"joint_{jx + 1}")
-        ax.set_ylabel(f"joint_{jy + 1}")
-        ax.set_title(f"phase plane j{jx + 1}/j{jy + 1}: chunks rejoin corridor")
-        if k == 0:
-            ax.legend(fontsize=8)
+    # overview phase plane j1/j2.
+    jx, jy = 0, 1
+    ax = axes[1][0]
+    ax.plot(geom.P[:, jx], geom.P[:, jy], color="0.75", lw=6, label="demo path (thick grey)")
+    ax.plot(S[:, jx], S[:, jy], color="tab:blue", lw=1.2, label="executed path")
+    for t in anchors:
+        ax.plot(chunks[t][:, jx], chunks[t][:, jy], color=colors[t], lw=1.4, alpha=0.95)
+        ax.plot([S[t, jx]], [S[t, jy]], marker="o", color=colors[t], ms=6, mec="k", mew=0.6)
+        _arrows_along(ax, chunks[t], jx, jy, colors[t], ks=(0, 6, 14))
+    ax.set_xlabel(f"joint_{jx + 1}")
+    ax.set_ylabel(f"joint_{jy + 1}")
+    ax.set_title("phase plane j1/j2 — chunks leave ● and merge onto the grey demo")
+    ax.legend(fontsize=8)
+
+    # zoom on the worst anchor — the rejoin geometry at deviation scale.
+    d0s = {t: float(np.linalg.norm(S[t, :n] - _interp_rows(geom.P, float(idxs[t])))) for t in anchors}
+    t_star = max(d0s, key=d0s.get)
+    C = chunks[t_star]
+    proj0 = _interp_rows(geom.P, float(idxs[t_star]))
+    ax = axes[1][1]
+    ax.plot(geom.P[:, jx], geom.P[:, jy], color="0.75", lw=10, label="demo path")
+    ax.plot(S[:, jx], S[:, jy], color="tab:blue", lw=1.2, label="executed path")
+    ax.plot(C[:, jx], C[:, jy], color=colors[t_star], lw=2.2, label="label chunk")
+    _arrows_along(ax, C, jx, jy, colors[t_star], ks=(0, 1, 2, 3, 5, 8, 12), lw=1.8)
+    ax.plot([S[t_star, jx]], [S[t_star, jy]], marker="o", color=colors[t_star], ms=9, mec="k", mew=1.0)
+    ax.plot([proj0[jx]], [proj0[jy]], marker="x", color="k", ms=9, mew=2, label="corridor projection")
+    ax.annotate(
+        "",
+        xy=C[0, [jx, jy]],
+        xytext=S[t_star, [jx, jy]],
+        arrowprops={"arrowstyle": "-|>", "color": "k", "lw": 2.2, "shrinkA": 0, "shrinkB": 0},
+    )
+    pts = np.vstack([C[:14, [jx, jy]], S[t_star, [jx, jy]][None], proj0[[jx, jy]][None]])
+    span = max(np.ptp(pts[:, 0]), np.ptp(pts[:, 1]), 4 * geom.med_step)
+    cx, cy = pts[:, 0].mean(), pts[:, 1].mean()
+    ax.set_xlim(cx - 0.75 * span, cx + 0.75 * span)
+    ax.set_ylim(cy - 0.75 * span, cy + 0.75 * span)
+    ax.set_xlabel(f"joint_{jx + 1}")
+    ax.set_ylabel(f"joint_{jy + 1}")
+    ax.set_title(
+        f"ZOOM: worst anchor t={t_star} (dev {d0s[t_star]:.3f} rad)\n"
+        "black arrow = first commanded step (state → label_0)"
+    )
+    ax.legend(fontsize=8, loc="best")
 
     # chunk corridor deviation vs position k — the within-chunk convergence.
-    ax = axes[1][n_planes]
+    ax = axes[1][2]
     for t in anchors:
         d = np.linalg.norm(chunks[t][:, None, :n] - geom.P[None, :, :], axis=2).min(axis=1)
         ax.plot(np.arange(horizon), d, color=colors[t], lw=1.0, alpha=0.9)
@@ -126,7 +172,7 @@ def _plot(
     ax.set_title("label_k deviation from demo corridor\n(linear decay to 0 = converges IN-chunk)")
 
     # step-speed profile: state->label_0 at k=0, then label deltas; cruise band.
-    ax = axes[1][n_planes + 1]
+    ax = axes[1][3]
     sp_demo = np.linalg.norm(np.diff(geom.P, axis=0), axis=1) * FPS
     ax.axhspan(
         np.percentile(sp_demo, 5), np.percentile(sp_demo, 95), color="0.85", label="demo cruise p5-p95"
@@ -142,7 +188,7 @@ def _plot(
     ax.set_ylabel("rad/s")
     ax.set_title("commanded step speed along chunk")
     ax.legend(fontsize=8)
-    for col in range(n_planes + 2, ncols):
+    for col in range(4, ncols):
         axes[1][col].axis("off")
 
     fig.tight_layout()

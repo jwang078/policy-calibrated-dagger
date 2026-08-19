@@ -235,11 +235,14 @@ class AugmentationConfig:
     # speed limits baked in), so no per-environment tuning: each label
     # closes at most rate*demo_step of the state's deviation per tick (full
     # close when nearer than that), guaranteeing the commanded first step
-    # <= (1+rate)x the env's own motion convention in ANY env. 0.5 = rejoin
-    # at half cruise speed. (Replaces the earlier deviation-proportional
-    # gain, whose jerk depended on env scale: a fixed fraction of a large
-    # deviation can exceed the env's step convention.)
-    relabel_correction_rate: float = 0.5
+    # <= (1+rate)x the env's own motion convention in ANY env. 1.0 = rejoin
+    # at the demo's own cruise speed — how the expert itself would rejoin.
+    # (<=0.5 leaves the inward correction weaker than the ~1-step tangential
+    # demo lead, so labels barely angle toward the corridor. Replaces the
+    # earlier deviation-proportional gain, whose jerk depended on env scale:
+    # a fixed fraction of a large deviation can exceed the env's step
+    # convention.)
+    relabel_correction_rate: float = 1.0
     # Seed a fresh torch.Generator for EVERY blend-path model call: the x_tsw
     # guidance-noising draw, the denoiser's per-step scheduler variance
     # (diffusion), the flow prior + anchor noise (PI0.5), and the anchor-chunk
@@ -731,7 +734,7 @@ def _relabel_frames_with_guidance(
     index_window: int,
     rate_cap_steps: float = 3.0,
     clamp_scale: float = 1.5,
-    correction_rate: float = 0.5,
+    correction_rate: float = 1.0,
 ) -> None:
     """Overwrite each frame's ``action`` with the DART expert label, in place.
 

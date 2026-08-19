@@ -204,10 +204,15 @@ class AugmentationConfig:
     # Horizon headroom for blend rollouts: total_steps = source length x this.
     # On-path-but-slow blends (pace < 1) were truncated at the source length
     # and scored as "diverged" purely from running out of steps (2026-08-18:
-    # pace 0.76 x 155 steps -> ends 0.5 rad short on the demo path). Strict-
+    # pace 0.76 x 155 steps -> ends 0.5 rad short on the demo path). 2.0 =
+    # let a lagging-but-faithful rollout run to the goal: at 1.3, ep27 r0.5
+    # reached demo cursor 180/192 on-path and was ratio-backed-off purely
+    # for pace (needed ~1.4x); slow on-path rollouts are exactly the good
+    # DART data and the labels are lag-proof (demo-clock resume). Strict-
     # success truncation still ends converged episodes at their natural
-    # length, so the headroom only pays when it is needed.
-    total_steps_multiplier: float = 1.3
+    # length, so the headroom only costs time on attempts the gate rejects
+    # anyway.
+    total_steps_multiplier: float = 2.0
     # Convergence gate: accept a blend rollout only if it hit strict success
     # OR its final commanded state lands within this many rad (arm-joint L2)
     # of the demo's final action. Divergent mid-ratio rollouts are a noise-
@@ -1377,6 +1382,34 @@ def run_augmentation(
                         if cfg.max_blend_end_gap_steps <= 0 or rollout.dropped_short or not rollout.frames:
                             _accepted = True
                             break
+                        if not rollout.success:
+                            # Trim the post-approach wander tail: past the
+                            # closest approach to the demo endpoint the
+                            # guidance is exhausted (cursor pinned at the
+                            # end) and the policy component just wanders —
+                            # measured 2026-08-19: doubling the budget made
+                            # ep27 r0.5's FINAL gap worse (0.195 -> 0.390)
+                            # while its closest approach was unchanged. Gate
+                            # on the closest approach; overtime drift never
+                            # rescues a rollout and only poisons the tail.
+                            _states = np.stack(
+                                [
+                                    np.asarray(f["observation.state"][:_n_arm], dtype=np.float64)
+                                    for f in rollout.frames
+                                ]
+                            )
+                            _t_star = int(np.argmin(np.linalg.norm(_states - _demo_end[None], axis=1)))
+                            if cfg.min_episode_length <= _t_star + 1 < len(rollout.frames):
+                                logger.info(
+                                    "source_ep=%d ratio=%.3f: trimmed %d post-approach wander "
+                                    "tick(s) (closest approach at t=%d/%d).",
+                                    source_ep,
+                                    ratio_eff,
+                                    len(rollout.frames) - _t_star - 1,
+                                    _t_star,
+                                    len(rollout.frames),
+                                )
+                                del rollout.frames[_t_star + 1 :]
                         _last = np.asarray(rollout.frames[-1]["observation.state"][:_n_arm], dtype=np.float64)
                         _end_gap = float(np.linalg.norm(_last - _demo_end))
                         if rollout.success or _end_gap <= _gap_gate:

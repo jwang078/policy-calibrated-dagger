@@ -250,6 +250,7 @@ class DartChunkDataset:
                 f"source_dataset_repo_id — re-record the blend or pass source_repo_id explicitly."
             )
         self.source_repo_id = source_repo_id
+        self._fingerprinted = False
         self.geoms = load_source_geometries(source_repo_id, n_arm=self.n_arm, root=root)
 
     @staticmethod
@@ -292,6 +293,43 @@ class DartChunkDataset:
 
         item = self.dataset[idx]
         action = item["action"]
+        if not self._fingerprinted:
+            # One-time (per process) positive evidence that relabeling is
+            # LIVE: the synthesized chunk must differ from the stored
+            # executed actions on real blend data. Grep training logs for
+            # "dart labels ACTIVE".
+            self._fingerprinted = True
+            import numpy as _np
+
+            _stored = action.detach().cpu().numpy()
+            _q = (
+                (
+                    item["observation.state"][-1]
+                    if item["observation.state"].dim() == 2
+                    else item["observation.state"]
+                )
+                .cpu()
+                .numpy()
+            )
+            _di = item["relabel_demo_index"]
+            _di = (
+                float(_di.reshape(-1)[-1])
+                if isinstance(_di, torch.Tensor)
+                else float(_np.reshape(_di, -1)[-1])
+            )
+            _geom = self.geoms[self.ep_to_source[int(item["episode_index"])]]
+            _lab = chunk_labels(
+                _q, _di, _geom, horizon=_stored.shape[0], rate=self.rate, ease_out=self.ease_out
+            )
+            _diff = float(_np.abs(_lab[:, : _stored.shape[1]] - _stored).mean())
+            import logging as _logging
+
+            _logging.info(
+                "dart labels ACTIVE for %s: first sampled chunk |label - stored_action| mean %.4f rad "
+                "(0.0000 would mean relabeling is inert — investigate)",
+                self.dataset.repo_id,
+                _diff,
+            )
         state = item["observation.state"]
         q = state[-1] if state.dim() == 2 else state  # last obs step conditions the chunk
         di = item["relabel_demo_index"]

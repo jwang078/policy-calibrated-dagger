@@ -153,11 +153,11 @@ def main() -> None:
         # align the demo-state polyline to the guidance grid by length.
         off = max(0, len(S_src_full) - len(g_act))
         S_src = S_src_full[off : off + len(g_act)]
-        from augment_dataset_with_blending import _relabel_frames_with_guidance
+        from dart_labels import demo_geometry, per_frame_labels
 
-        frames = [{"observation.state": track[t], "action": None} for t in range(len(track))]
-        _relabel_frames_with_guidance(frames, S_src, g_act, n_arm=n, index_window=45)
-        A_lb = np.stack([f["action"] for f in frames]).astype(np.float64)
+        geom = demo_geometry(S_src, g_act, n_arm=n)
+        _idxs, A_lb = per_frame_labels(track, geom, index_window=45)
+        A_lb = A_lb.astype(np.float64)
         out = args.out or f"relabel_view_npz_{key}.png"
         _plot_relabel_view(
             track[:, :n],

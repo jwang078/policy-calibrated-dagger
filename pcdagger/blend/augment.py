@@ -218,31 +218,19 @@ class AugmentationConfig:
     max_blend_end_gap: float = 0.15
     blend_end_gap_retries: int = 2
     # DART-style relabeling: "executed" (default) stores the rollout's
-    # executed mixture action; "guidance" stores the EXPERT action for the
-    # robot's position — computed by CONTINUOUS ARC-LENGTH PROJECTION of
-    # each visited state onto the source demo's state polyline (monotone,
-    # windowed, advance-rate-capped — jumps are structurally impossible),
-    # then interpolating the demo's actions at that arc and rate-limiting
-    # the label stream in action space. Observations stay the executed
-    # rollout's, so training sees perturbed states with corrective expert
-    # labels (delta = expert_target - perturbed_state under rel actions).
-    # NOTE: with "guidance", the action column no longer reproduces the
-    # executed path (inherent to DART) — filter_blend_collisions would
-    # validate the label path, not the executed one.
+    # executed mixture action. "guidance" ALSO stores the executed action —
+    # the dataset stays an honest record of what ran — but adds a per-frame
+    # ``relabel_demo_index`` scalar: the continuous demo index of the state's
+    # projection onto the source demo's state polyline (monotone, windowed,
+    # advance-rate-capped cursor — jumps structurally impossible). Expert
+    # label CHUNKS are then synthesized where they are consumed (the
+    # DartChunkDataset train-time wrapper / visualize_dart_chunks) from the
+    # frame's own state + this index — see dart_labels.py. Per-frame stored
+    # labels were abandoned: training chunks overlap, so a single action
+    # column cannot encode a chunk that converges to the demo from its
+    # conditioning frame's offset. The correction-rate knob (scale-free, in
+    # demo med_step units) lives in dart_labels, not here.
     relabel_actions: str = "executed"  # "executed" | "guidance"
-    # Correction rate for relabeled actions, in units of the SOURCE DEMO'S
-    # median per-tick step (its natural speed scale — fps, joint count and
-    # speed limits baked in), so no per-environment tuning: each label
-    # closes at most rate*demo_step of the state's deviation per tick (full
-    # close when nearer than that), guaranteeing the commanded first step
-    # <= (1+rate)x the env's own motion convention in ANY env. 1.0 = rejoin
-    # at the demo's own cruise speed — how the expert itself would rejoin.
-    # (<=0.5 leaves the inward correction weaker than the ~1-step tangential
-    # demo lead, so labels barely angle toward the corridor. Replaces the
-    # earlier deviation-proportional gain, whose jerk depended on env scale:
-    # a fixed fraction of a large deviation can exceed the env's step
-    # convention.)
-    relabel_correction_rate: float = 1.0
     # Seed a fresh torch.Generator for EVERY blend-path model call: the x_tsw
     # guidance-noising draw, the denoiser's per-step scheduler variance
     # (diffusion), the flow prior + anchor noise (PI0.5), and the anchor-chunk
@@ -726,77 +714,34 @@ def _episode_length(parquet_files: list[Path], episode_idx: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _relabel_frames_with_guidance(
+def _annotate_frames_with_demo_index(
     frames: list[dict[str, Any]],
     demo_states_raw: np.ndarray,
     demo_actions_raw: np.ndarray,
     n_arm: int,
     index_window: int,
-    rate_cap_steps: float = 3.0,
-    clamp_scale: float = 1.5,
-    correction_rate: float = 1.0,
+    index_offset: int = 0,
 ) -> None:
-    """Overwrite each frame's ``action`` with the DART expert label, in place.
+    """Attach ``relabel_demo_index`` to each frame, in place.
 
-    Continuous arc-length projection: each visited state is projected onto
-    the demo's state polyline (monotone, windowed, per-tick arc advance
-    capped at ``rate_cap_steps`` demo steps), and the label is the demo's
-    action linearly interpolated at that arc position (action[i] governs the
-    segment state[i]->state[i+1], so the one-step corrective lead is built
-    in). A final action-space rate clamp (``clamp_scale`` x the demo's
-    median per-step delta) guarantees the label stream — and therefore
-    every dataloader-assembled action chunk — is jerk-free even where the
-    projection legitimately catches up after a shortcut.
+    The continuous demo index of each visited state's projection onto the
+    source demo's state polyline (dart_labels.project_states — the same
+    monotone/windowed/rate-capped cursor as the progress guidance). Actions
+    are left untouched; expert label chunks are synthesized at train/viz
+    time from (state, index) — see dart_labels.chunk_labels.
+
+    ``index_offset`` shifts the stored index onto the FULL source episode's
+    frame grid (the demo arrays here are the episode's tail from
+    ``n_obs_steps``), so every consumer can build geometry from the source
+    episode as-loaded, with no tail-offset bookkeeping.
     """
-    P = np.asarray(demo_states_raw[:, :n_arm], dtype=np.float64)
-    A = np.asarray(demo_actions_raw, dtype=np.float64)
-    seg = np.diff(P, axis=0)
-    seg_len = np.linalg.norm(seg, axis=1)
-    cum = np.concatenate([[0.0], np.cumsum(seg_len)])
-    live = seg_len[seg_len > 1e-9]
-    med_step = float(np.median(live)) if len(live) else 1e-3
-    arc_window = max(1, int(index_window)) * med_step
-    s_prev = 0.0
-    labels: list[np.ndarray] = []
-    for fr in frames:
-        q = np.asarray(fr["observation.state"], dtype=np.float64)[:n_arm]
-        lo = max(int(np.searchsorted(cum, s_prev)) - 1, 0)
-        hi = min(int(np.searchsorted(cum, s_prev + arc_window)) + 1, len(seg_len))
-        best_s, best_d = s_prev, np.inf
-        for i in range(lo, hi):
-            if seg_len[i] < 1e-9:
-                continue
-            t = float(np.clip(np.dot(q - P[i], seg[i]) / (seg_len[i] ** 2), 0.0, 1.0))
-            proj = P[i] + t * seg[i]
-            d = float(np.linalg.norm(q - proj))
-            s_cand = max(float(cum[i] + t * seg_len[i]), s_prev)  # monotone
-            if d < best_d:
-                best_d, best_s = d, s_cand
-        s_prev = min(best_s, s_prev + rate_cap_steps * med_step)  # capped advance
-        idx = int(np.clip(np.searchsorted(cum, s_prev) - 1, 0, len(seg_len) - 1))
-        f = float(np.clip((s_prev - cum[idx]) / max(seg_len[idx], 1e-9), 0.0, 1.0))
-        a = (1.0 - f) * A[idx] + f * A[min(idx + 1, len(A) - 1)]
-        # Rate-limited correction (scale-free): close at most
-        # correction_rate * med_step of the state's corridor deviation per
-        # tick — the label track rejoins the demo at a bounded fraction of
-        # the demo's own cruise speed, fully closing when nearer than one
-        # increment. See relabel_correction_rate.
-        proj_state = P[idx] + f * (P[min(idx + 1, len(P) - 1)] - P[idx])
-        offset = q - proj_state
-        mag = float(np.linalg.norm(offset))
-        close = min(mag, max(0.0, float(correction_rate)) * med_step)
-        if mag > 1e-9 and mag - close > 0.0:
-            a = a.copy()
-            a[:n_arm] = a[:n_arm] + offset * ((mag - close) / mag)
-        labels.append(a)
-    cap = clamp_scale * med_step
-    for k in range(1, len(labels)):
-        d = labels[k] - labels[k - 1]
-        n = float(np.linalg.norm(d[:n_arm]))
-        if n > cap:
-            labels[k] = labels[k - 1] + d * (cap / n)
-    for fr, a in zip(frames, labels, strict=False):
-        fr["action"] = np.asarray(a, dtype=np.float32)
+    from dart_labels import demo_geometry, project_states
+
+    geom = demo_geometry(demo_states_raw, demo_actions_raw, n_arm=n_arm)
+    states = np.stack([np.asarray(fr["observation.state"], dtype=np.float64) for fr in frames])
+    idxs = project_states(states, geom, index_window=index_window) + float(index_offset)
+    for fr, di in zip(frames, idxs, strict=True):
+        fr["relabel_demo_index"] = np.array([di], dtype=np.float32)
 
 
 @dataclass
@@ -1102,6 +1047,14 @@ def run_augmentation(
         state_dim=source_state_dim,
         env_state_dim=source_env_state_dim,
     )
+    # Guidance relabeling adds the per-frame projection index used by the
+    # train-time DART chunk synthesis (see dart_labels.py). Declaring it in
+    # expected_features makes the resume-schema check refuse pre-relabel
+    # targets instead of failing mid-write.
+    extra_features: dict[str, dict] = {}
+    if cfg.relabel_actions == "guidance":
+        extra_features["relabel_demo_index"] = {"dtype": "float32", "shape": (1,), "names": None}
+        expected_features = {**expected_features, **extra_features}
     existing = load_lerobot_dataset(cfg.target_dataset_repo_id)
     if existing is not None:
         _existing_feats = existing.meta.features
@@ -1141,6 +1094,7 @@ def run_augmentation(
             num_dofs=cfg.num_dofs,
             state_dim=source_state_dim,
             env_state_dim=source_env_state_dim,
+            extra_features=extra_features or None,
         )
 
     # Idempotent-resume skip set (empty for a freshly created target).
@@ -1438,13 +1392,13 @@ def run_augmentation(
                             "--relabel_actions=guidance requires the source dataset to "
                             "carry observation.state (the demo polyline)."
                         )
-                    _relabel_frames_with_guidance(
+                    _annotate_frames_with_demo_index(
                         rollout.frames,
                         demo_states_raw,
                         guidance_actions_raw,
                         n_arm=_n_arm,
                         index_window=cfg.progress_guidance_window,
-                        correction_rate=cfg.relabel_correction_rate,
+                        index_offset=n_obs_steps,
                     )
 
                 # Commit one episode per (source_ep, ratio) pair.

@@ -215,8 +215,20 @@ class AugmentationConfig:
     # frames are anti-corrective label noise — retry with a fresh draw up to
     # blend_end_gap_retries times, then DROP the pair (unlike intervention
     # chunks, failed blends are not expert data). <= 0 disables the gate.
-    max_blend_end_gap: float = 0.15
+    # Gate threshold in units of the SOURCE DEMO'S median per-tick step
+    # (scale-free — same value works across episodes and environments; 8
+    # steps ~ 0.15 rad on the planar demos it was calibrated on).
+    max_blend_end_gap_steps: float = 8.0
     blend_end_gap_retries: int = 2
+    # After exhausting fresh-draw retries at a ratio, HALVE the ratio (down
+    # to two backoff levels, floor >0.1) and retry instead of dropping the
+    # pair: on hard DAgger scenarios the pure policy diverges, so mid/high
+    # ratios fail the gate systematically and coverage would otherwise skew
+    # toward easy episodes (measured 2026-08-19: eps 9/27 fail even ratio
+    # 0.1's gate at the requested ratio). The requested ratio stays the
+    # provenance key (blend_ratio); the achieved one is recorded as
+    # blend_ratio_effective episode metadata.
+    blend_ratio_backoff: bool = True
     # DART-style relabeling: "executed" (default) stores the rollout's
     # executed mixture action. "guidance" ALSO stores the executed action —
     # the dataset stays an honest record of what ran — but adds a per-frame
@@ -545,6 +557,7 @@ def rollout_closed_loop_for_augmentation(
     base_noise: torch.Tensor | None = None,
     pad_after_success: bool = True,
     min_episode_length: int = 60,
+    expected_env_state: np.ndarray | None = None,
 ) -> RolloutResult:
     """Run one closed-loop rollout and capture (raw_obs, action) per step.
 
@@ -613,6 +626,7 @@ def rollout_closed_loop_for_augmentation(
         progress_guidance_window=progress_guidance_window,
         demo_states_raw=demo_states_raw,
         pad_after_success=pad_after_success,
+        expected_env_state=expected_env_state,
         on_step=_on_step,
         on_success=_on_success,
         log=lambda msg: logger.info(msg),
@@ -1227,6 +1241,11 @@ def run_augmentation(
                 _s_lo = np.asarray(frames_df.iloc[n_obs_steps - 1]["observation.state"], dtype=np.float32)
                 _s_hi = np.asarray(frames_df.iloc[n_obs_steps + 2]["observation.state"], dtype=np.float32)
                 seed_joint_velocity = (_s_hi - _s_lo) / 3.0 * float(cfg.env_fps)
+            _expected_env_state = None
+            if "observation.environment_state" in frames_df.columns:
+                _expected_env_state = np.asarray(
+                    frames_df.iloc[n_obs_steps]["observation.environment_state"], dtype=np.float64
+                )
             guidance_actions_raw = np.stack(
                 [
                     np.asarray(row["action"], dtype=np.float32)
@@ -1300,61 +1319,90 @@ def run_augmentation(
                 _demo_end = np.asarray(guidance_actions_raw[-1, :_n_arm], dtype=np.float64)
                 rollout = None
                 _end_gap = float("nan")
-                for _attempt in range(1 + max(0, cfg.blend_end_gap_retries)):
-                    if _attempt > 0:
-                        # Fresh draw for the retry: re-salt the seeded stream
-                        # and (when pinned) redraw the base noise. The
-                        # lottery is decided by the draw — same draw, same
-                        # outcome.
-                        if cfg.sample_seed >= 0:
-                            wrapper.sample_seed = cfg.sample_seed + int(source_ep) + 100_000 * _attempt
-                        if cfg.fixed_base_noise and _base_noise is not None:
-                            _base_noise = torch.randn_like(_base_noise)
-                    rollout = rollout_closed_loop_for_augmentation(
-                        wrapper=wrapper,
-                        obs_preprocessor=obs_preprocessor,
-                        vec_env=vec_env,
-                        env_preprocessor=env_pre,
-                        env_postprocessor=env_post,
-                        seed_joint_state=seed_joint_state,
-                        seed_joint_velocity=seed_joint_velocity,
-                        guidance_actions_raw=guidance_actions_raw,
-                        ratio=float(ratio),
-                        blend_mode=blend_mode_enum,
-                        blend_interval_frac=cfg.blend_interval_frac,
-                        total_steps=total_steps,
-                        progress_guidance=cfg.progress_guidance,
-                        progress_guidance_window=cfg.progress_guidance_window,
-                        demo_states_raw=demo_states_raw,
-                        rename_map=rename_map,
-                        image_keys=image_keys,
-                        task_description=task_description,
-                        device=cfg.device,
-                        playlist_pos=_playlist_pos,
-                        env_state_dim=source_env_state_dim,
-                        base_noise=_base_noise,
-                        pad_after_success=cfg.pad_after_success,
-                        min_episode_length=cfg.min_episode_length,
-                    )
-                    if cfg.max_blend_end_gap <= 0 or rollout.dropped_short or not rollout.frames:
+                # Scale-free gate: threshold in demo med_step units.
+                _g_steps = np.linalg.norm(
+                    np.diff(guidance_actions_raw[:, :_n_arm].astype(np.float64), axis=0), axis=1
+                )
+                _med_step = float(np.median(_g_steps[_g_steps > 1e-9])) if (_g_steps > 1e-9).any() else 1e-3
+                _gap_gate = cfg.max_blend_end_gap_steps * _med_step
+                # Ratio ladder: requested ratio first, then halvings (backoff).
+                _ratio_ladder = [float(ratio)]
+                if cfg.blend_ratio_backoff:
+                    _r = float(ratio)
+                    while _r > 0.2 and len(_ratio_ladder) < 3:
+                        _r = round(_r / 2.0, 3)
+                        _ratio_ladder.append(_r)
+                ratio_eff = float(ratio)
+                _accepted = False
+                _attempt_no = 0
+                for ratio_eff in _ratio_ladder:
+                    for _attempt in range(1 + max(0, cfg.blend_end_gap_retries)):
+                        _attempt_no += 1
+                        if _attempt_no > 1:
+                            # Fresh draw for the retry: re-salt the seeded
+                            # stream and (when pinned) redraw the base noise.
+                            # The lottery is decided by the draw — same draw,
+                            # same outcome.
+                            if cfg.sample_seed >= 0:
+                                wrapper.sample_seed = cfg.sample_seed + int(source_ep) + 100_000 * _attempt_no
+                            if cfg.fixed_base_noise and _base_noise is not None:
+                                _base_noise = torch.randn_like(_base_noise)
+                        rollout = rollout_closed_loop_for_augmentation(
+                            wrapper=wrapper,
+                            obs_preprocessor=obs_preprocessor,
+                            vec_env=vec_env,
+                            env_preprocessor=env_pre,
+                            env_postprocessor=env_post,
+                            seed_joint_state=seed_joint_state,
+                            seed_joint_velocity=seed_joint_velocity,
+                            guidance_actions_raw=guidance_actions_raw,
+                            ratio=ratio_eff,
+                            blend_mode=blend_mode_enum,
+                            blend_interval_frac=cfg.blend_interval_frac,
+                            total_steps=total_steps,
+                            progress_guidance=cfg.progress_guidance,
+                            progress_guidance_window=cfg.progress_guidance_window,
+                            demo_states_raw=demo_states_raw,
+                            rename_map=rename_map,
+                            image_keys=image_keys,
+                            task_description=task_description,
+                            device=cfg.device,
+                            playlist_pos=_playlist_pos,
+                            env_state_dim=source_env_state_dim,
+                            base_noise=_base_noise,
+                            pad_after_success=cfg.pad_after_success,
+                            min_episode_length=cfg.min_episode_length,
+                            expected_env_state=_expected_env_state,
+                        )
+                        if cfg.max_blend_end_gap_steps <= 0 or rollout.dropped_short or not rollout.frames:
+                            _accepted = True
+                            break
+                        _last = np.asarray(rollout.frames[-1]["observation.state"][:_n_arm], dtype=np.float64)
+                        _end_gap = float(np.linalg.norm(_last - _demo_end))
+                        if rollout.success or _end_gap <= _gap_gate:
+                            _accepted = True
+                            break
+                        logger.warning(
+                            "source_ep=%d ratio=%.2f (eff %.3f) attempt %d: rollout did not "
+                            "converge (success=False, end_gap=%.3f > %.3f = %.1f x med_step) — %s.",
+                            source_ep,
+                            ratio,
+                            ratio_eff,
+                            _attempt_no,
+                            _end_gap,
+                            _gap_gate,
+                            cfg.max_blend_end_gap_steps,
+                            "retrying with a fresh draw"
+                            if _attempt < cfg.blend_end_gap_retries
+                            else (
+                                "backing off the ratio"
+                                if ratio_eff != _ratio_ladder[-1]
+                                else "dropping the pair"
+                            ),
+                        )
+                    if _accepted:
                         break
-                    _last = np.asarray(rollout.frames[-1]["observation.state"][:_n_arm], dtype=np.float64)
-                    _end_gap = float(np.linalg.norm(_last - _demo_end))
-                    if rollout.success or _end_gap <= cfg.max_blend_end_gap:
-                        break
-                    logger.warning(
-                        "source_ep=%d ratio=%.2f attempt %d: rollout did not converge "
-                        "(success=False, end_gap=%.3f > %.3f) — %s.",
-                        source_ep,
-                        ratio,
-                        _attempt + 1,
-                        _end_gap,
-                        cfg.max_blend_end_gap,
-                        "retrying with a fresh draw"
-                        if _attempt < cfg.blend_end_gap_retries
-                        else "dropping the pair",
-                    )
-                else:
+                if not _accepted:
                     n_dropped += 1
                     rollout = None
                     gc.collect()
@@ -1362,6 +1410,13 @@ def run_augmentation(
                     if cfg.sample_seed >= 0:
                         wrapper.sample_seed = cfg.sample_seed + int(source_ep)
                     continue
+                if ratio_eff != float(ratio):
+                    logger.info(
+                        "source_ep=%d: accepted at backed-off ratio %.3f (requested %.2f).",
+                        source_ep,
+                        ratio_eff,
+                        ratio,
+                    )
                 if cfg.sample_seed >= 0:
                     wrapper.sample_seed = cfg.sample_seed + int(source_ep)
                 _playlist_pos += 1
@@ -1413,6 +1468,7 @@ def run_augmentation(
                 episode_metadata: dict[str, Any] = {
                     "source_episode_idx": int(source_ep),
                     "blend_ratio": float(ratio),
+                    "blend_ratio_effective": float(ratio_eff),
                 }
                 if source_scenario_idx is not None:
                     episode_metadata["source_scenario_idx"] = int(source_scenario_idx)

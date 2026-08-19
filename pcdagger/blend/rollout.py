@@ -324,6 +324,8 @@ def run_blended_rollout(
     fps: float = 30.0,
     demo_states_raw: np.ndarray | None = None,
     pad_after_success: bool = True,
+    expected_env_state: np.ndarray | None = None,
+    env_state_match_tol: float = 0.02,
     on_step: Callable[[int, dict[str, Any], np.ndarray, bool], None] | None = None,
     on_success: Callable[[dict[str, Any]], None] | None = None,
     log: Callable[[str], None] = print,
@@ -371,6 +373,31 @@ def run_blended_rollout(
         seed=seed,
         benchmark_start_index=benchmark_start_index,
     )
+
+    # World-match guard: the seeded env's environment_state must reproduce the
+    # source episode's (obstacles + object). A mismatch means the scenario
+    # mapping is broken — e.g. the sim server was launched with a benchmark
+    # subset that does not contain (or reorders) the requested scenario, so
+    # ``benchmark_start_index`` lands on the WRONG WORLD: replays collide with
+    # obstacles the demo never saw and recorded images are poisoned (found
+    # 2026-08-19: a server pinned to subset=[0] silently ran every episode in
+    # scenario 0's world). Fails loudly instead. ``env_state_match_tol`` <= 0
+    # or no expected state disables (e.g. envs without environment_state).
+    if expected_env_state is not None and env_state_match_tol > 0 and "environment_state" in env_obs:
+        _got = np.asarray(env_obs["environment_state"][0], dtype=np.float64).reshape(-1)
+        _want = np.asarray(expected_env_state, dtype=np.float64).reshape(-1)
+        if _got.shape == _want.shape:
+            _err = float(np.max(np.abs(_got - _want)))
+            if _err > env_state_match_tol:
+                raise RuntimeError(
+                    f"WORLD MISMATCH after scenario seeding: environment_state differs from the "
+                    f"source episode's by max|delta|={_err:.3f} (> {env_state_match_tol}). The sim "
+                    f"server is not honoring benchmark_start_index={benchmark_start_index} — check "
+                    f"that it runs in EVAL_BENCHMARK mode with a benchmark subset containing this "
+                    f"scenario (identity subset recommended). Rollouts in a wrong world produce "
+                    f"colliding replays and poisoned training images.\n"
+                    f"  server  : {np.round(_got, 3)}\n  expected: {np.round(_want, 3)}"
+                )
 
     _run_filler_phase(
         wrapper,

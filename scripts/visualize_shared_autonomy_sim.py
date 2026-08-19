@@ -338,6 +338,7 @@ def get_sim_action_chunk_for_ratio(
     progress_guidance_window: int = 45,
     demo_states_raw: np.ndarray | None = None,
     frame_sink: dict[str, list[np.ndarray]] | None = None,
+    expected_env_state: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """Thin adapter over :func:`lib_sa_rollout.run_blended_rollout`.
 
@@ -390,6 +391,7 @@ def get_sim_action_chunk_for_ratio(
         progress_guidance=progress_guidance,
         progress_guidance_window=progress_guidance_window,
         demo_states_raw=demo_states_raw,
+        expected_env_state=expected_env_state,
         on_step=on_step,
     )
     return result.raw_actions, result.decoded_guidance_full
@@ -418,6 +420,7 @@ def get_sim_action_chunks_for_ratios(
     progress_guidance_window: int = 45,
     demo_states_raw: np.ndarray | None = None,
     record_videos: bool = False,
+    expected_env_state: np.ndarray | None = None,
 ) -> tuple[dict[float, np.ndarray], dict[float, np.ndarray], dict[float, dict[str, list[np.ndarray]]]]:
     """Run :func:`get_sim_action_chunk_for_ratio` for each ratio.
 
@@ -486,6 +489,7 @@ def get_sim_action_chunks_for_ratios(
             progress_guidance_window=progress_guidance_window,
             demo_states_raw=demo_states_raw,
             frame_sink=frames_by_ratio.setdefault(ratio, {}) if record_videos else None,
+            expected_env_state=expected_env_state,
         )
         results[ratio] = actions
         if decoded is not None:
@@ -1227,6 +1231,11 @@ def main():
             progress_guidance_window=args.progress_guidance_window,
             demo_states_raw=demo_states_raw,
             record_videos=args.record_videos,
+            expected_env_state=(
+                np.asarray(frames_df.iloc[n_obs_steps]["observation.environment_state"], dtype=np.float64)
+                if "observation.environment_state" in frames_df.columns
+                else None
+            ),
         )
         print("Done computing rollouts.")
     finally:
@@ -1339,6 +1348,40 @@ def main():
         output_path=ee_traj_path,
         no_show=args.no_show,
     )
+
+    # Ratio 1.0 (pure-policy bypass) often dwarfs the blended trajectories'
+    # spread — when it's present alongside other ratios, emit a second set of
+    # plots without it so the blend comparison stays readable.
+    action_chunks_no100 = {r: c for r, c in action_chunks.items() if r < 1.0}
+    if 0 < len(action_chunks_no100) < len(action_chunks):
+        ee_trajectories_no100 = {r: t for r, t in ee_trajectories.items() if r < 1.0}
+        # color_ratios pins each ratio's hue to its color in the full-set plots.
+        all_ratios = sorted(action_chunks.keys())
+        print("Plotting joint angles (without ratio 1.0) …")
+        plot_joint_angles(
+            action_chunks_by_ratio=action_chunks_no100,
+            joint_names=joint_names,
+            episode_index=episode_index,
+            frame_index=frame_index,
+            obs_states_raw=obs_states_raw,
+            guidance_actions_raw=guidance_actions_raw_for_plot,
+            decoded_guidance_raw=decoded_guidance,
+            output_path=output_dir / "joint_angles_no100.png",
+            no_show=args.no_show,
+            color_ratios=all_ratios,
+        )
+        print("Plotting EE trajectories (without ratio 1.0) …")
+        plot_ee_trajectories_3d(
+            ee_trajectories_by_ratio=ee_trajectories_no100,
+            episode_index=episode_index,
+            frame_index=frame_index,
+            obs_ee_positions=obs_ee_positions,
+            guidance_ee_positions=guidance_ee_positions,
+            decoded_guidance_ee_positions=decoded_guidance_ee_positions,
+            output_path=output_dir / "ee_trajectory_no100.html",
+            no_show=args.no_show,
+            color_ratios=all_ratios,
+        )
 
     print("Done.")
 

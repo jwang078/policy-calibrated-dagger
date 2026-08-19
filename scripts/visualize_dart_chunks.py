@@ -41,8 +41,6 @@ import numpy as np
 import pandas as pd
 from dart_labels import DemoGeometry, _interp_rows, chunk_labels, demo_geometry, project_states
 
-FPS = 30.0
-
 
 def _load_episode(repo_id: str, ep: int, cols=("observation.state", "action")) -> dict[str, np.ndarray]:
     root = os.path.expanduser(f"~/.cache/huggingface/lerobot/{repo_id}")
@@ -71,6 +69,7 @@ def _plot(
     horizon: int,
     rate: float,
     ease_out: float,
+    fps: float,
     anchor_every: int,
     title: str,
     out: str,
@@ -177,14 +176,14 @@ def _plot(
 
     # step-speed profile: state->label_0 at k=0, then label deltas; cruise band.
     ax = axes[1][3]
-    sp_demo = np.linalg.norm(np.diff(geom.P, axis=0), axis=1) * FPS
+    sp_demo = np.linalg.norm(np.diff(geom.P, axis=0), axis=1) * fps
     ax.axhspan(
         np.percentile(sp_demo, 5), np.percentile(sp_demo, 95), color="0.85", label="demo cruise p5-p95"
     )
     first_sps, max_sps = [], []
     for t in anchors:
         seq = np.vstack([S[t][None, :n], chunks[t][:, :n]])
-        sp = np.linalg.norm(np.diff(seq, axis=0), axis=1) * FPS
+        sp = np.linalg.norm(np.diff(seq, axis=0), axis=1) * fps
         ax.plot(np.arange(horizon), sp, color=colors[t], lw=1.0, alpha=0.9)
         first_sps.append(sp[0])
         max_sps.append(sp.max())
@@ -232,6 +231,7 @@ def main() -> None:
     ap.add_argument("--anchor_every", type=int, default=15)
     ap.add_argument("--index_window", type=int, default=45, help="npz mode: projection window (demo steps)")
     ap.add_argument("--num_arm_joints", type=int, default=3)
+    ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     n = args.num_arm_joints
@@ -250,7 +250,17 @@ def main() -> None:
         title = f"DART chunks (on-the-fly) — {key} of {os.path.basename(os.path.dirname(args.npz))} (source ep {src_ep})"
         out = args.out or f"dart_chunks_npz_{key}.png"
         _plot(
-            track[:, :n], idxs, geom, n, args.horizon, args.rate, args.ease_out, args.anchor_every, title, out
+            track[:, :n],
+            idxs,
+            geom,
+            n,
+            args.horizon,
+            args.rate,
+            args.ease_out,
+            args.fps,
+            args.anchor_every,
+            title,
+            out,
         )
         return
 

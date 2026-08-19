@@ -310,6 +310,7 @@ def main() -> None:
         args.horizon,
         args.rate,
         args.ease_out,
+        args.fps,
         args.anchor_every,
         title,
         out,

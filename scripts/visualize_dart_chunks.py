@@ -6,9 +6,13 @@ the full H-step expert label chunk the training dataloader would serve —
 demo clock advancing one index per tick, corridor offset decaying at
 ``rate x med_step`` per tick — and plots:
 
-  * per-joint time series: demo, executed track, and each anchor's chunk
-    overlaid at its wall ticks (chunks should peel off the executed track
-    and land on the demo);
+  * per-joint traces on the DEMO-INDEX axis (projection-aligned): demo,
+    executed track (each state at its projected demo index), and each
+    anchor's chunk at its own demo clock i0+k — correct labels land ON the
+    grey demo curve. (On a wall-tick axis a lagging rollout's chunks
+    converge to a lag-shifted copy of the demo — a parallel offset line —
+    which reads as an error but is just the robot being behind schedule;)
+  * a wall-clock vs demo-clock panel making that lag explicit;
   * joint-space phase planes: chunk curves fanning from anchor states into
     the demo corridor — the geometry the policy actually learns;
   * chunk corridor-deviation vs position k (linear decay to ZERO — the
@@ -97,7 +101,7 @@ def _plot(
                 arrowprops={"arrowstyle": "-|>", "color": color, "lw": lw, "shrinkA": 0, "shrinkB": 0},
             )
 
-    ncols = max(n, 4)
+    ncols = max(n + 1, 4)
     fig, axes = plt.subplots(2, ncols, figsize=(5.2 * ncols, 9))
     fig.suptitle(
         f"{title}\nTHICK grey=demo  blue=executed  colored curves=synthesized H={horizon} label chunks "
@@ -105,19 +109,34 @@ def _plot(
         f"(rate={rate} x med_step={geom.med_step:.4f}, ease_out={ease_out})"
     )
 
-    t_ax = np.arange(len(S))
     for j in range(n):
         ax = axes[0][j]
         ax.plot(np.arange(len(geom.P)), geom.P[:, j], color="0.75", lw=6, label="demo (source states)")
-        ax.plot(t_ax, S[:, j], color="tab:blue", lw=1.2, label="executed state")
+        # Projection-aligned: each executed state at ITS demo index, each
+        # chunk at its own demo clock i0+k — correct labels land ON the grey
+        # curve even when the rollout lags the demo clock (see lag panel).
+        ax.plot(idxs, S[:, j], color="tab:blue", lw=1.2, label="executed state (at its projected index)")
         for t in anchors:
-            ax.plot(np.arange(t, t + horizon), chunks[t][:, j], color=colors[t], lw=1.1, alpha=0.9)
-            ax.plot([t], [S[t, j]], marker="o", color=colors[t], ms=6, mec="k", mew=0.6)
+            ax.plot(idxs[t] + np.arange(horizon), chunks[t][:, j], color=colors[t], lw=1.1, alpha=0.9)
+            ax.plot([idxs[t]], [S[t, j]], marker="o", color=colors[t], ms=6, mec="k", mew=0.6)
         ax.set_title(f"joint_{j + 1}")
-        ax.set_xlabel("tick")
+        ax.set_xlabel("demo index (projection-aligned)")
         if j == 0:
             ax.legend(fontsize=8)
-    for col in range(n, ncols):
+    # wall clock vs demo clock — the lag the labels resume from.
+    ax = axes[0][n]
+    ax.plot([0, len(S)], [0, len(S)], color="0.6", ls="--", label="demo pace (y = x)")
+    ax.plot(np.arange(len(S)), idxs, color="tab:blue", lw=1.4, label="projected demo index")
+    for t in anchors:
+        ax.plot([t], [idxs[t]], marker="o", color=colors[t], ms=6, mec="k", mew=0.6)
+    ax.set_xlabel("wall tick")
+    ax.set_ylabel("demo index")
+    lag = np.arange(len(S)) - idxs
+    ax.set_title(
+        f"demo clock vs wall clock\n(final lag {lag[-1]:.0f} ticks; labels resume from the\nprojected index — they cannot teleport time)"
+    )
+    ax.legend(fontsize=8)
+    for col in range(n + 1, ncols):
         axes[0][col].axis("off")
 
     # overview phase plane j1/j2.

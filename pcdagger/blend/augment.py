@@ -217,6 +217,19 @@ class AugmentationConfig:
     # chunks, failed blends are not expert data). <= 0 disables the gate.
     max_blend_end_gap: float = 0.15
     blend_end_gap_retries: int = 2
+    # DART-style relabeling: "executed" (default) stores the rollout's
+    # executed mixture action; "guidance" stores the EXPERT action for the
+    # robot's position — computed by CONTINUOUS ARC-LENGTH PROJECTION of
+    # each visited state onto the source demo's state polyline (monotone,
+    # windowed, advance-rate-capped — jumps are structurally impossible),
+    # then interpolating the demo's actions at that arc and rate-limiting
+    # the label stream in action space. Observations stay the executed
+    # rollout's, so training sees perturbed states with corrective expert
+    # labels (delta = expert_target - perturbed_state under rel actions).
+    # NOTE: with "guidance", the action column no longer reproduces the
+    # executed path (inherent to DART) — filter_blend_collisions would
+    # validate the label path, not the executed one.
+    relabel_actions: str = "executed"  # "executed" | "guidance"
     # Seed a fresh torch.Generator for EVERY blend-path model call: the x_tsw
     # guidance-noising draw, the denoiser's per-step scheduler variance
     # (diffusion), the flow prior + anchor noise (PI0.5), and the anchor-chunk
@@ -238,6 +251,9 @@ class AugmentationConfig:
     rtc_max_guidance_weight: float = 10.0
     rtc_execution_horizon: int | None = None
     rtc_inference_delay: int = 0
+    # Canon blend knobs (see hybrid-path-scoring notes, 2026-08-18):
+    resample_noise_per_reblend: bool = False
+    rtc_hard_prefix_xfade: int = 0
     rtc_prefix_attention_schedule: str = "linear"  # linear | exp | zeros | ones
     # DEBUG: override the checkpoint's DDPM/DDIM `clip_sample` (None = keep the
     # trained value). clip_sample=True clamps the predicted clean action to
@@ -697,6 +713,66 @@ def _episode_length(parquet_files: list[Path], episode_idx: int) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _relabel_frames_with_guidance(
+    frames: list[dict[str, Any]],
+    demo_states_raw: np.ndarray,
+    demo_actions_raw: np.ndarray,
+    n_arm: int,
+    index_window: int,
+    rate_cap_steps: float = 3.0,
+    clamp_scale: float = 1.5,
+) -> None:
+    """Overwrite each frame's ``action`` with the DART expert label, in place.
+
+    Continuous arc-length projection: each visited state is projected onto
+    the demo's state polyline (monotone, windowed, per-tick arc advance
+    capped at ``rate_cap_steps`` demo steps), and the label is the demo's
+    action linearly interpolated at that arc position (action[i] governs the
+    segment state[i]->state[i+1], so the one-step corrective lead is built
+    in). A final action-space rate clamp (``clamp_scale`` x the demo's
+    median per-step delta) guarantees the label stream — and therefore
+    every dataloader-assembled action chunk — is jerk-free even where the
+    projection legitimately catches up after a shortcut.
+    """
+    P = np.asarray(demo_states_raw[:, :n_arm], dtype=np.float64)
+    A = np.asarray(demo_actions_raw, dtype=np.float64)
+    seg = np.diff(P, axis=0)
+    seg_len = np.linalg.norm(seg, axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg_len)])
+    live = seg_len[seg_len > 1e-9]
+    med_step = float(np.median(live)) if len(live) else 1e-3
+    arc_window = max(1, int(index_window)) * med_step
+    s_prev = 0.0
+    labels: list[np.ndarray] = []
+    for fr in frames:
+        q = np.asarray(fr["observation.state"], dtype=np.float64)[:n_arm]
+        lo = max(int(np.searchsorted(cum, s_prev)) - 1, 0)
+        hi = min(int(np.searchsorted(cum, s_prev + arc_window)) + 1, len(seg_len))
+        best_s, best_d = s_prev, np.inf
+        for i in range(lo, hi):
+            if seg_len[i] < 1e-9:
+                continue
+            t = float(np.clip(np.dot(q - P[i], seg[i]) / (seg_len[i] ** 2), 0.0, 1.0))
+            proj = P[i] + t * seg[i]
+            d = float(np.linalg.norm(q - proj))
+            s_cand = max(float(cum[i] + t * seg_len[i]), s_prev)  # monotone
+            if d < best_d:
+                best_d, best_s = d, s_cand
+        s_prev = min(best_s, s_prev + rate_cap_steps * med_step)  # capped advance
+        idx = int(np.clip(np.searchsorted(cum, s_prev) - 1, 0, len(seg_len) - 1))
+        f = float(np.clip((s_prev - cum[idx]) / max(seg_len[idx], 1e-9), 0.0, 1.0))
+        a = (1.0 - f) * A[idx] + f * A[min(idx + 1, len(A) - 1)]
+        labels.append(a)
+    cap = clamp_scale * med_step
+    for k in range(1, len(labels)):
+        d = labels[k] - labels[k - 1]
+        n = float(np.linalg.norm(d[:n_arm]))
+        if n > cap:
+            labels[k] = labels[k - 1] + d * (cap / n)
+    for fr, a in zip(frames, labels, strict=False):
+        fr["action"] = np.asarray(a, dtype=np.float32)
+
+
 @dataclass
 class AugmentedEpisodeResult:
     """Provenance row for one written (source episode, ratio) output episode."""
@@ -915,6 +991,8 @@ def run_augmentation(
     wrapper.rtc_max_guidance_weight = cfg.rtc_max_guidance_weight
     wrapper.rtc_execution_horizon = cfg.rtc_execution_horizon
     wrapper.rtc_inference_delay = cfg.rtc_inference_delay
+    wrapper.resample_noise_per_reblend = cfg.resample_noise_per_reblend
+    wrapper.rtc_hard_prefix_xfade = cfg.rtc_hard_prefix_xfade
     wrapper.rtc_prefix_attention_schedule = cfg.rtc_prefix_attention_schedule
     if cfg.rtc_prev_chunk:
         # Set post-init, so re-run the wrapper's init-time policy-type check.
@@ -948,6 +1026,8 @@ def run_augmentation(
             "uses identical noise, so every_step re-blends stay temporally coherent.",
             cfg.sample_seed,
         )
+    if cfg.relabel_actions not in ("executed", "guidance"):
+        raise ValueError(f"--relabel_actions must be 'executed' or 'guidance', got {cfg.relabel_actions!r}")
     if blend_mode_enum == BlendMode.EVERY_STEP and not cfg.fixed_base_noise and cfg.sample_seed < 0:
         logger.warning(
             "blend_mode=every_step WITHOUT --fixed_base_noise and WITH --sample_seed=-1: the "
@@ -1325,6 +1405,20 @@ def run_augmentation(
                     del rollout
                     gc.collect()
                     continue
+
+                if cfg.relabel_actions == "guidance" and rollout.frames:
+                    if demo_states_raw is None:
+                        raise ValueError(
+                            "--relabel_actions=guidance requires the source dataset to "
+                            "carry observation.state (the demo polyline)."
+                        )
+                    _relabel_frames_with_guidance(
+                        rollout.frames,
+                        demo_states_raw,
+                        guidance_actions_raw,
+                        n_arm=_n_arm,
+                        index_window=cfg.progress_guidance_window,
+                    )
 
                 # Commit one episode per (source_ep, ratio) pair.
                 # Pass a copy of each frame — dataset_writer.add_frame does

@@ -40,6 +40,12 @@ The output dataset preserves each kept episode's metadata
 (`source_episode_idx`, `blend_ratio`, `source_scenario_idx`) plus three new
 fields recording the filtering outcome (`pre_filter_n_frames`,
 `first_collision_frame`, `trimmed_to_n_frames`).
+
+CAVEAT (relabeled blends): datasets recorded with
+augment_dataset_with_blending --relabel_actions=guidance store DART expert
+labels in `action` — replaying the action column reproduces the LABEL path
+(≈ the source demo), not the executed path the observations recorded. The
+collision verdict then applies to the labels, not the visited states.
 """
 
 # NOTE: no `from __future__ import annotations` — draccus reads annotations

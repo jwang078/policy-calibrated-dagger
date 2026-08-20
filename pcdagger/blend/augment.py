@@ -223,7 +223,18 @@ class AugmentationConfig:
     # Gate threshold in units of the SOURCE DEMO'S median per-tick step
     # (scale-free — same value works across episodes and environments; 8
     # steps ~ 0.15 rad on the planar demos it was calibrated on).
-    max_blend_end_gap_steps: float = 8.0
+    # Loosened to a SANITY bound (was 8.0, the primary gate): with the goal
+    # taper active, endpoint distance conflates basin-following with the
+    # terminal contact creep that even pure guidance cannot push through —
+    # faithful follows (final cursor 121/124) were dropped over 0.19 rad
+    # last-mm gaps. The primary gate is now max_blend_end_lag_indices.
+    max_blend_end_gap_steps: float = 24.0
+    # PRIMARY convergence gate: the rollout's final projected demo index must
+    # be within this many indices of the demo end (after trims). Measures
+    # exactly what the gate exists for — did the rollout traverse the
+    # demonstration's basin to its end — independent of the goal taper and
+    # of terminal contact creep. Scale-free (demo-index units).
+    max_blend_end_lag_indices: int = 8
     blend_end_gap_retries: int = 2
     # After exhausting fresh-draw retries at a ratio, HALVE the ratio (down
     # to two backoff levels, floor >0.1) and retry instead of dropping the
@@ -1450,21 +1461,31 @@ def run_augmentation(
                                     len(rollout.frames),
                                 )
                                 del rollout.frames[_t_star + 1 :]
+                        if rollout.success:
+                            _accepted = True
+                            break
                         _last = np.asarray(rollout.frames[-1]["observation.state"][:_n_arm], dtype=np.float64)
                         _end_gap = float(np.linalg.norm(_last - _demo_end))
-                        if rollout.success or _end_gap <= _gap_gate:
+                        # _idxs was computed by the stall-cut block above
+                        # (always reached on the non-success path).
+                        _final_lag = float(len(guidance_actions_raw) - 1) - float(
+                            _idxs[len(rollout.frames) - 1]
+                        )
+                        if _final_lag <= cfg.max_blend_end_lag_indices and _end_gap <= _gap_gate:
                             _accepted = True
                             break
                         logger.warning(
                             "source_ep=%d ratio=%.2f (eff %.3f) attempt %d: rollout did not "
-                            "converge (success=False, end_gap=%.3f > %.3f = %.1f x med_step) — %s.",
+                            "converge (success=False, final progress lag %.1f idx vs gate %d; "
+                            "end_gap=%.3f vs sanity %.3f) — %s.",
                             source_ep,
                             ratio,
                             ratio_eff,
                             _attempt_no,
+                            _final_lag,
+                            cfg.max_blend_end_lag_indices,
                             _end_gap,
                             _gap_gate,
-                            cfg.max_blend_end_gap_steps,
                             "retrying with a fresh draw"
                             if _attempt < cfg.blend_end_gap_retries
                             else (

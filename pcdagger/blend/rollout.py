@@ -408,6 +408,11 @@ def run_blended_rollout(
                     f"  server  : {np.round(_got, 3)}\n  expected: {np.round(_want, 3)}"
                 )
 
+    # Filler chunks are DISCARDED (cancel() below) — searching the tube for
+    # them wastes ~n_action_steps x 4 denoiser calls per episode before the
+    # env ever steps (the pre-motion re-blend log burst, 2026-08-20).
+    _tube_saved = float(getattr(wrapper, "blend_tube_steps", 0.0) or 0.0)
+    wrapper.blend_tube_steps = 0.0
     _run_filler_phase(
         wrapper,
         obs_preprocessor,
@@ -421,6 +426,7 @@ def run_blended_rollout(
         seed_joint_velocity=seed_joint_velocity,
         fps=fps,
     )
+    wrapper.blend_tube_steps = _tube_saved
 
     raw_actions: list[np.ndarray] = []
     decoded_guidance_full: np.ndarray | None = None

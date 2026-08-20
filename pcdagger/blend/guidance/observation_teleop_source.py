@@ -107,6 +107,7 @@ class ObservationTeleopGuidanceSource:
         # policy term is conditioned on the live observation; per chunk
         # otherwise.
         self._rebuild_count = 0
+        self._tube_r_warm: float | None = None
         self._anchor_chunk_orig: Tensor | None = None
         self.has_guidance: bool = False
 
@@ -165,6 +166,7 @@ class ObservationTeleopGuidanceSource:
     def reset(self) -> None:
         """Episode-boundary reset."""
         self._rebuild_count = 0
+        self._tube_r_warm = None
         self._guided_chunk = None
         self._guided_chunk_abs = None
         self._anchor_chunk_orig = None
@@ -616,45 +618,59 @@ class ObservationTeleopGuidanceSource:
                 return wrapper.inner_policy.predict_action_chunk(ctx.batch, **denoise_kwargs)
             raise NotImplementedError(f"Unsupported guidance_blend_strategy: {strategy}")
 
-        blended = _blend_at(ratio, x_tsw)
-
         # TUBE RE-BLEND (wrapper.blend_tube_steps > 0): if the blended
         # chunk's max offset from the guidance fill exceeds N of the guidance
-        # chunk's own median steps, RE-RUN the blend at a reduced ratio
-        # (offset scales ~linearly with ratio, so one proportional correction
-        # usually lands; up to 3 tries, same seeds = same noise realization
-        # at a smaller ratio). Predictive — nothing outside the tube is ever
-        # emitted — and distribution-preserving: unlike action-space
-        # clipping, the accepted chunk is exactly what the policy blend
-        # produces at the effective ratio. (State-feedback ratio regulation
-        # failed live: the excursion executed first, then guidance yanked
-        # the robot back — teleport-shaking + a limit cycle pinned at the
-        # tube boundary, 2026-08-20.)
+        # chunk's own median steps, RE-RUN the blend at a reduced ratio (up
+        # to 3 corrections; same seeds = same noise realization at a smaller
+        # ratio). Predictive — nothing outside the tube is ever emitted —
+        # and distribution-preserving: the accepted chunk is exactly what
+        # the policy blend produces at the effective ratio. NOTE: offset(r)
+        # SATURATES for DENOISE (mode attraction: ~15 steps at r=0.5, still
+        # ~13 at r=0.15, compliant only near r~0.1 on hard scenarios), so
+        # each search warm-starts from the last ACCEPTED ratio x 1.5
+        # (recovering toward the requested max within ~3 compliant rebuilds)
+        # instead of re-descending from r_max with 4 denoiser calls every
+        # rebuild.
         _tube = float(getattr(wrapper, "blend_tube_steps", 0.0) or 0.0)
         if _tube > 0 and 0.0 < ratio < 1.0:
             _g = guidance_chunk[:, :, :action_dim]
             _gsteps = torch.linalg.norm(torch.diff(_g, dim=1), dim=-1)
             _live = _gsteps[_gsteps > 1e-9]
+            _r_try = float(ratio)
+            if self._tube_r_warm is not None:
+                _r_try = min(float(ratio), max(0.05, self._tube_r_warm * 1.5))
+            blended = _blend_at(_r_try, _make_x_tsw(_r_try) if _r_try != ratio else x_tsw)
             if _live.numel() > 0:
                 _med = torch.median(_live)
                 _budget = _tube * _med
-                _r_try = float(ratio)
+                _r_start = _r_try
+                _off0 = None
+                _tries = 0
                 for _ in range(3):
                     _off = torch.linalg.norm(blended[:, :, :action_dim] - _g, dim=-1).max()
+                    if _off0 is None:
+                        _off0 = _off
                     if _off <= _budget or _r_try <= 0.02:
                         break
-                    _r_new = max(0.02, _r_try * min(0.9, float(_budget / _off)))
-                    logging.info(
-                        "[blend] tube re-blend at rebuild %d: commanded offset %.1f guidance-steps "
-                        "> budget %.1f at r=%.3f -> re-blending at r=%.3f",
-                        self._rebuild_count,
-                        float(_off / _med),
-                        _tube,
-                        _r_try,
-                        _r_new,
-                    )
-                    _r_try = _r_new
+                    _r_try = max(0.02, _r_try * min(0.9, float(_budget / _off)))
+                    _tries += 1
                     blended = _blend_at(_r_try, _make_x_tsw(_r_try))
+                self._tube_r_warm = _r_try
+                if _tries > 0:
+                    _off_final = torch.linalg.norm(blended[:, :, :action_dim] - _g, dim=-1).max()
+                    logging.info(
+                        "[blend] tube re-blend at rebuild %d: offset %.1f -> %.1f guidance-steps "
+                        "(budget %.1f), r %.3f -> %.3f (%d re-blend(s))",
+                        self._rebuild_count,
+                        float(_off0 / _med),
+                        float(_off_final / _med),
+                        _tube,
+                        _r_start,
+                        _r_try,
+                        _tries,
+                    )
+        else:
+            blended = _blend_at(ratio, x_tsw)
 
         # Hard prefix crossfade (see wrapper.rtc_hard_prefix_xfade): force
         # seam continuity against the previous plan's leftover — position 0

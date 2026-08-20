@@ -448,6 +448,8 @@ def run_blended_rollout(
     _pg_med_step = float(np.median(_pg_seg[_pg_seg > 1e-9])) if (_pg_seg > 1e-9).any() else 1e-3
     _r_eff_sum, _r_eff_n = 0.0, 0
     _dev_hist: list[float] = []
+    _tube_engaged_since: int | None = None
+    _tube_ticks_total = 0
 
     for t in range(total_steps):
         # ── Hold mode: episode succeeded, don't step env again ────────────────
@@ -532,9 +534,25 @@ def run_blended_rollout(
                     )
                     _dev_hist.append(_dev)
                     _span = max(1e-6, float(blend_dev_zero_above) - float(blend_dev_full_below))
-                    _scale = min(
-                        _scale, float(np.clip((float(blend_dev_zero_above) - _dev) / _span, 0.0, 1.0))
-                    )
+                    _scale_tube = float(np.clip((float(blend_dev_zero_above) - _dev) / _span, 0.0, 1.0))
+                    _scale = min(_scale, _scale_tube)
+                    # Pull-back event logging: engage/release transitions (not
+                    # per-tick — regulation can stay engaged for long spans).
+                    if _scale_tube < 1.0:
+                        _tube_ticks_total += 1
+                        if _tube_engaged_since is None:
+                            _tube_engaged_since = t
+                            log(
+                                f"[ratio={ratio}] tube pull-back ENGAGED at t={t}: dev "
+                                f"{_dev:.1f} med_steps > {blend_dev_full_below:.1f}, "
+                                f"r_eff {ratio * _scale:.3f}"
+                            )
+                    elif _tube_engaged_since is not None:
+                        log(
+                            f"[ratio={ratio}] tube pull-back released at t={t} after "
+                            f"{t - _tube_engaged_since} tick(s): dev back to {_dev:.1f} med_steps"
+                        )
+                        _tube_engaged_since = None
                 wrapper.forward_flow_ratio = ratio * _scale
                 _r_eff_sum += ratio * _scale
                 _r_eff_n += 1
@@ -642,6 +660,13 @@ def run_blended_rollout(
             f"[ratio={ratio}] progress-guidance final demo cursor {_j_progress}/{_demo_arm.shape[0]} "
             f"(wall-clock ticks {n_ticks}; lag {n_ticks - _j_progress})"
         )
+        if blend_dev_regulation and _dev_hist:
+            log(
+                f"[ratio={ratio}] tube regulation: pulled back {_tube_ticks_total}/{len(_dev_hist)} "
+                f"tick(s); dev med_steps p50 {float(np.percentile(_dev_hist, 50)):.1f} "
+                f"p95 {float(np.percentile(_dev_hist, 95)):.1f} max {max(_dev_hist):.1f}; "
+                f"mean r_eff {(_r_eff_sum / _r_eff_n if _r_eff_n else 0.0):.3f}"
+            )
 
     return BlendRolloutResult(
         raw_actions=np.stack(raw_actions),

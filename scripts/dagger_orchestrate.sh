@@ -1094,7 +1094,30 @@ if dag_sum <= 0:
 natural = dag_sum / total
 f_eff   = f if frac_mode == 'exact' else min(f, natural)
 
-weights = [1.0 - f_eff] + [f_eff * (c / dag_sum) for c in dag_counts]
+# SLOT-EXACT species split: the raw-intervention species gets
+# raw_multiplier/(raw_multiplier + n_blends) of f_eff — with the sweep
+# default TIV = K+1 that is exactly 1/(1+K) — and the blend species shares
+# the rest equally by frame within itself; a no-blend lineage gives the
+# interventions 100% of f_eff. Frame counts only distribute weight WITHIN a
+# species (across rounds), so trims/taper changing blend episode lengths can
+# no longer shift the intervention-vs-blend composition (previously the
+# split was frame-proportional across everything: round-1 int landed at
+# 0.414 of F instead of 0.5 purely because blends recorded longer episodes).
+dag_raw = raw_counts[1:]
+int_idx   = [j for j in range(len(dag_counts)) if j % group_size == 0]
+blend_idx = [j for j in range(len(dag_counts)) if j % group_size != 0]
+int_frames   = sum(dag_raw[j] for j in int_idx)
+blend_frames = sum(dag_raw[j] for j in blend_idx)
+if n_blends == 0 or blend_frames <= 0:
+    share_int = 1.0
+else:
+    share_int = raw_multiplier / float(raw_multiplier + n_blends)
+dag_w = [0.0] * len(dag_counts)
+for j in int_idx:
+    dag_w[j] = f_eff * share_int * (dag_raw[j] / int_frames)
+for j in blend_idx:
+    dag_w[j] = f_eff * (1.0 - share_int) * (dag_raw[j] / blend_frames)
+weights = [1.0 - f_eff] + dag_w
 
 # Force exact sum=1 by absorbing FP error into the last non-zero weight
 # (avoid pinning the fix onto a 0-frame sub-dataset — the validator would
@@ -1112,7 +1135,7 @@ if frac_mode == 'exact':
     mode = 'EXACT@F'
 else:
     mode = 'CAP@F' if natural > f else 'NATURAL<F'
-mult_note = f'  tiv={tiv}  raw_mult={raw_multiplier}x' if raw_multiplier != 1 else ''
+mult_note = f'  split=int {share_int:.3f} / blends {1.0 - share_int:.3f} of F (slot-exact, tiv={tiv})'
 # In exact mode below the natural share, each DAgger frame is drawn
 # `oversample` times more often than proportional sampling would draw it.
 # Surface it (and warn when extreme) because heavy repetition of a small

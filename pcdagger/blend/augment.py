@@ -329,6 +329,17 @@ class AugmentationConfig:
     # src22 138 -> 129; combined with the progress-stall cut, src47
     # 185 -> 124. Default 16 demo indices (scale-free).
     blend_ratio_goal_taper: int = 16
+    # TUBE-REGULATED noise (see lib_sa_rollout): the requested ratio becomes
+    # a MAXIMUM — per tick the effective ratio anneals from full (state
+    # within blend_dev_full_below med_steps of the demo corridor) to 0 (at
+    # blend_dev_zero_above), so the CONTROLLED quantity is the coverage-tube
+    # radius and 'ratio r' means 'at most r, inside the declared tube'.
+    # Basin escapes get pulled back instead of retried/backed off; realized
+    # per-episode stats land in episode metadata (blend_ratio_effective_mean,
+    # blend_dev_steps_p50/p95). Scale-free knobs (med_step units).
+    blend_dev_regulation: bool = True
+    blend_dev_full_below: float = 3.0
+    blend_dev_zero_above: float = 8.0
     # Post-success handling. The strict-tolerance sim can still terminate a
     # blend rollout BEFORE the guidance runs out (the blended trajectory
     # reaches the goal early). Historically the rollout then froze into hold
@@ -559,6 +570,9 @@ class RolloutResult:
     # rollout came in under min_episode_length: frames is emptied and the
     # caller must skip saving this episode.
     dropped_short: bool = False
+    mean_effective_ratio: float | None = None  # tick-mean of taper/tube-scaled ratio
+    dev_steps_p50: float | None = None  # realized corridor deviation, med_step units
+    dev_steps_p95: float | None = None
 
 
 @torch.no_grad()
@@ -581,6 +595,9 @@ def rollout_closed_loop_for_augmentation(
     progress_guidance_soft_hold: float = 0.0,
     progress_guidance_hard_lag: int = 8,
     blend_ratio_goal_taper: int = 0,
+    blend_dev_regulation: bool = False,
+    blend_dev_full_below: float = 3.0,
+    blend_dev_zero_above: float = 8.0,
     demo_states_raw: np.ndarray | None = None,
     rename_map: dict[str, str],
     image_keys: list[str],
@@ -661,6 +678,9 @@ def rollout_closed_loop_for_augmentation(
         progress_guidance_soft_hold=progress_guidance_soft_hold,
         progress_guidance_hard_lag=progress_guidance_hard_lag,
         blend_ratio_goal_taper=blend_ratio_goal_taper,
+        blend_dev_regulation=blend_dev_regulation,
+        blend_dev_full_below=blend_dev_full_below,
+        blend_dev_zero_above=blend_dev_zero_above,
         demo_states_raw=demo_states_raw,
         pad_after_success=pad_after_success,
         expected_env_state=expected_env_state,
@@ -685,7 +705,13 @@ def rollout_closed_loop_for_augmentation(
                 dropped_short=True,
             )
         return RolloutResult(
-            frames=frames, n_steps=n_real, success=result.success, success_t=result.success_t
+            frames=frames,
+            n_steps=n_real,
+            success=result.success,
+            success_t=result.success_t,
+            mean_effective_ratio=result.mean_effective_ratio,
+            dev_steps_p50=result.dev_steps_p50,
+            dev_steps_p95=result.dev_steps_p95,
         )
 
     # Legacy pad path: pad to min_episode_length if the rollout was shorter
@@ -700,7 +726,13 @@ def rollout_closed_loop_for_augmentation(
             frames.append(dict(last_frame))
 
     return RolloutResult(
-        frames=frames, n_steps=len(frames), success=result.success, success_t=result.success_t
+        frames=frames,
+        n_steps=len(frames),
+        success=result.success,
+        success_t=result.success_t,
+        mean_effective_ratio=result.mean_effective_ratio,
+        dev_steps_p50=result.dev_steps_p50,
+        dev_steps_p95=result.dev_steps_p95,
     )
 
 
@@ -1402,6 +1434,9 @@ def run_augmentation(
                             progress_guidance_soft_hold=cfg.progress_guidance_soft_hold,
                             progress_guidance_hard_lag=cfg.progress_guidance_hard_lag,
                             blend_ratio_goal_taper=cfg.blend_ratio_goal_taper,
+                            blend_dev_regulation=cfg.blend_dev_regulation,
+                            blend_dev_full_below=cfg.blend_dev_full_below,
+                            blend_dev_zero_above=cfg.blend_dev_zero_above,
                             demo_states_raw=demo_states_raw,
                             rename_map=rename_map,
                             image_keys=image_keys,
@@ -1602,6 +1637,8 @@ def run_augmentation(
                 n_frames = len(rollout.frames)
                 for frame in rollout.frames:
                     target_ds.add_frame(dict(frame))
+                _mean_r_eff = rollout.mean_effective_ratio
+                _dev_p50, _dev_p95 = rollout.dev_steps_p50, rollout.dev_steps_p95
                 del rollout  # free image buffers before video encoding in save_episode
                 gc.collect()
                 episode_metadata: dict[str, Any] = {
@@ -1610,6 +1647,12 @@ def run_augmentation(
                     "blend_ratio": float(ratio),
                     "blend_ratio_effective": float(ratio_eff),
                 }
+                if _mean_r_eff is not None:
+                    episode_metadata["blend_ratio_effective_mean"] = float(_mean_r_eff)
+                if _dev_p50 is not None:
+                    episode_metadata["blend_dev_steps_p50"] = float(_dev_p50)
+                if _dev_p95 is not None:
+                    episode_metadata["blend_dev_steps_p95"] = float(_dev_p95)
                 if source_scenario_idx is not None:
                     episode_metadata["source_scenario_idx"] = int(source_scenario_idx)
                 target_ds.save_episode(episode_metadata=episode_metadata)

@@ -339,6 +339,9 @@ def get_sim_action_chunk_for_ratio(
     progress_guidance_soft_hold: float = 0.0,
     progress_guidance_hard_lag: int = 8,
     blend_ratio_goal_taper: int = 0,
+    blend_dev_regulation: bool = True,
+    blend_dev_full_below: float = 3.0,
+    blend_dev_zero_above: float = 8.0,
     demo_states_raw: np.ndarray | None = None,
     frame_sink: dict[str, list[np.ndarray]] | None = None,
     expected_env_state: np.ndarray | None = None,
@@ -396,6 +399,9 @@ def get_sim_action_chunk_for_ratio(
         progress_guidance_soft_hold=progress_guidance_soft_hold,
         progress_guidance_hard_lag=progress_guidance_hard_lag,
         blend_ratio_goal_taper=blend_ratio_goal_taper,
+        blend_dev_regulation=blend_dev_regulation,
+        blend_dev_full_below=blend_dev_full_below,
+        blend_dev_zero_above=blend_dev_zero_above,
         demo_states_raw=demo_states_raw,
         expected_env_state=expected_env_state,
         on_step=on_step,
@@ -427,6 +433,9 @@ def get_sim_action_chunks_for_ratios(
     progress_guidance_soft_hold: float = 0.0,
     progress_guidance_hard_lag: int = 8,
     blend_ratio_goal_taper: int = 0,
+    blend_dev_regulation: bool = True,
+    blend_dev_full_below: float = 3.0,
+    blend_dev_zero_above: float = 8.0,
     demo_states_raw: np.ndarray | None = None,
     record_videos: bool = False,
     expected_env_state: np.ndarray | None = None,
@@ -499,6 +508,9 @@ def get_sim_action_chunks_for_ratios(
             progress_guidance_soft_hold=progress_guidance_soft_hold,
             progress_guidance_hard_lag=progress_guidance_hard_lag,
             blend_ratio_goal_taper=blend_ratio_goal_taper,
+            blend_dev_regulation=blend_dev_regulation,
+            blend_dev_full_below=blend_dev_full_below,
+            blend_dev_zero_above=blend_dev_zero_above,
             demo_states_raw=demo_states_raw,
             frame_sink=frames_by_ratio.setdefault(ratio, {}) if record_videos else None,
             expected_env_state=expected_env_state,
@@ -741,6 +753,24 @@ def parse_args():
             "observation.state in the dataset for state-grid matching (falls back to the "
             "action matrix with a +1 shift)."
         ),
+    )
+    parser.add_argument(
+        "--blend_dev_regulation",
+        type=lambda x: x.lower() in ("1", "true", "yes"),
+        default=True,
+        help="tube-regulate the ratio by corridor deviation (requested ratio = maximum)",
+    )
+    parser.add_argument(
+        "--blend_dev_full_below",
+        type=float,
+        default=3.0,
+        help="full ratio while deviation <= this many med_steps",
+    )
+    parser.add_argument(
+        "--blend_dev_zero_above",
+        type=float,
+        default=8.0,
+        help="ratio annealed to 0 at this deviation (med_steps)",
     )
     parser.add_argument(
         "--blend_ratio_goal_taper",
@@ -1262,6 +1292,9 @@ def main():
             progress_guidance_soft_hold=args.progress_guidance_soft_hold,
             progress_guidance_hard_lag=args.progress_guidance_hard_lag,
             blend_ratio_goal_taper=args.blend_ratio_goal_taper,
+            blend_dev_regulation=args.blend_dev_regulation,
+            blend_dev_full_below=args.blend_dev_full_below,
+            blend_dev_zero_above=args.blend_dev_zero_above,
             demo_states_raw=demo_states_raw,
             record_videos=args.record_videos,
             expected_env_state=(

@@ -295,6 +295,9 @@ class BlendRolloutResult:
     success: bool
     success_t: int | None  # tick at which the episode terminated (None if never)
     final_progress_cursor: int | None  # progress-guidance demo cursor (None when off)
+    mean_effective_ratio: float | None = None  # tick-mean of the (taper/tube-scaled) ratio
+    dev_steps_p50: float | None = None  # median per-tick corridor deviation, med_step units
+    dev_steps_p95: float | None = None
 
 
 @torch.no_grad()
@@ -323,6 +326,9 @@ def run_blended_rollout(
     progress_guidance_soft_hold: float = 0.0,
     progress_guidance_hard_lag: int = 8,
     blend_ratio_goal_taper: int = 0,
+    blend_dev_regulation: bool = False,
+    blend_dev_full_below: float = 3.0,
+    blend_dev_zero_above: float = 8.0,
     seed_joint_velocity: np.ndarray | None = None,
     fps: float = 30.0,
     demo_states_raw: np.ndarray | None = None,
@@ -438,6 +444,10 @@ def run_blended_rollout(
         _match_shift = 1
     _j_progress = 0
     _j_clock = 0.0  # demo-pace playback cursor (float; see the progress block below)
+    _pg_seg = np.linalg.norm(np.diff(_demo_arm.astype(np.float64), axis=0), axis=1)
+    _pg_med_step = float(np.median(_pg_seg[_pg_seg > 1e-9])) if (_pg_seg > 1e-9).any() else 1e-3
+    _r_eff_sum, _r_eff_n = 0.0, 0
+    _dev_hist: list[float] = []
 
     for t in range(total_steps):
         # ── Hold mode: episode succeeded, don't step env again ────────────────
@@ -495,20 +505,39 @@ def run_blended_rollout(
             else:
                 _rate = 0.0
             _j_clock = min(_j_clock + _rate, float(guidance_actions_raw.shape[0] - 1))
-            # GOAL TAPER (blend_ratio_goal_taper > 0): anneal the blend ratio
-            # to 0 over the last N demo indices. DART's own validity
-            # condition is that the noisy supervisor still completes the
-            # task; a constant ratio violates it at the goal — the blend's
-            # fixed point sits r*(policy - expert) short of the endpoint, so
-            # strict success never fires and the rollout hovers (measured:
-            # r=0.1 with the round-0 policy, ep47 still approaching at 2x
-            # budget, episodes 1.4-1.9x source length of slow near-goal
-            # data). Tapering hands the landing to the guidance.
-            if blend_ratio_goal_taper > 0 and ratio not in (0.0, 1.0):
-                _remaining = float(guidance_actions_raw.shape[0] - 1) - _j_clock
-                wrapper.forward_flow_ratio = ratio * min(
-                    1.0, max(0.0, _remaining) / float(blend_ratio_goal_taper)
-                )
+            # Ratio scaling: the requested ratio is a MAXIMUM; two per-tick
+            # scale-free regulators anneal it down (combined by min):
+            #   * GOAL TAPER (blend_ratio_goal_taper > 0): -> 0 over the last
+            #     N demo indices — DART's validity condition (the noisy
+            #     supervisor must still complete the task) applied at the
+            #     goal, where a constant ratio leaves a r*(policy-expert)
+            #     equilibrium offset that blocks strict success.
+            #   * TUBE REGULATION (blend_dev_regulation): full ratio while
+            #     the state is within blend_dev_full_below med_steps of the
+            #     demo corridor, annealing linearly to 0 at
+            #     blend_dev_zero_above — deviation-feedback noise: the
+            #     CONTROLLED quantity is the coverage-tube radius, not the
+            #     mixing weight, so basin escapes are pulled back instead of
+            #     retried/backed off, and 'ratio r' honestly means 'at most
+            #     r, inside the declared tube'.
+            if ratio not in (0.0, 1.0):
+                _scale = 1.0
+                if blend_ratio_goal_taper > 0:
+                    _remaining = float(guidance_actions_raw.shape[0] - 1) - _j_clock
+                    _scale = min(_scale, max(0.0, min(1.0, _remaining / float(blend_ratio_goal_taper))))
+                if blend_dev_regulation:
+                    _dev = (
+                        float(np.linalg.norm(_q_now.astype(np.float64) - _demo_arm[_j_progress]))
+                        / _pg_med_step
+                    )
+                    _dev_hist.append(_dev)
+                    _span = max(1e-6, float(blend_dev_zero_above) - float(blend_dev_full_below))
+                    _scale = min(
+                        _scale, float(np.clip((float(blend_dev_zero_above) - _dev) / _span, 0.0, 1.0))
+                    )
+                wrapper.forward_flow_ratio = ratio * _scale
+                _r_eff_sum += ratio * _scale
+                _r_eff_n += 1
             guidance_chunk = None if suppress_guidance else guidance_actions_raw[_j_exec:]
         else:
             guidance_chunk = None if suppress_guidance else guidance_actions_raw[t:]
@@ -620,4 +649,7 @@ def run_blended_rollout(
         success=success,
         success_t=success_t,
         final_progress_cursor=_j_progress if progress_guidance else None,
+        mean_effective_ratio=(_r_eff_sum / _r_eff_n) if _r_eff_n else None,
+        dev_steps_p50=float(np.percentile(_dev_hist, 50)) if _dev_hist else None,
+        dev_steps_p95=float(np.percentile(_dev_hist, 95)) if _dev_hist else None,
     )

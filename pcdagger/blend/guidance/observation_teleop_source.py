@@ -546,12 +546,18 @@ class ObservationTeleopGuidanceSource:
         # which is what makes like-for-like A/B debugging valid.
         # salt=1: decorrelate the x_tsw noise from the model calls' prior draw
         # (same seed + same shape would make them identical tensors).
-        x_tsw = self._build_guidance_noise_from_chunk(
-            guidance_chunk,
-            ratio,
-            base_noise=base_noise,
-            generator=wrapper.build_sample_generator(salt=_nsalt + 1),
-        )
+        def _make_x_tsw(r_try: float) -> Tensor:
+            # Same salt every call -> the same seeded draw, scaled for the
+            # candidate ratio: a tube re-blend is the SAME noise realization
+            # at a smaller ratio, not a different lottery ticket.
+            return self._build_guidance_noise_from_chunk(
+                guidance_chunk,
+                r_try,
+                base_noise=base_noise,
+                generator=wrapper.build_sample_generator(salt=_nsalt + 1),
+            )
+
+        x_tsw = _make_x_tsw(ratio)
 
         # ── n_anchor_steps slice (shared computation) ──────────────────────
         anchor_slice: Tensor | None = None
@@ -560,54 +566,96 @@ class ObservationTeleopGuidanceSource:
             anchor_slice = guidance_chunk[:, self._chunk_step : self._chunk_step + n_a, :action_dim]
 
         # ── THE strategy branch — the only place the two paths differ ──────
-        if strategy == GuidanceBlendStrategy.INTERPOLATE:
-            # Glass-box stand-in for the denoiser: exact constant-ratio mix
-            # of the SAME two inputs the denoiser sees (pure-policy base,
-            # guidance fill).
-            blended = base_chunk.clone()
-            g = guidance_chunk[:, :, :action_dim]
-            blended[:, :, :action_dim] = ratio * base_chunk[:, :, :action_dim] + (1.0 - ratio) * g
-            if rtc_prev_leftover is not None:
-                # Glass-box analog of the RTC prev-chunk guidance: a prefix-
-                # weighted CONVEX pull toward the previous chunk's leftover.
-                # (The denoiser applies an annealed gradient correction per
-                # step; a linear mix with the same prefix weights is the
-                # closest non-iterative stand-in — approximate, but keeps the
-                # strategies' inputs and cadence identical for A/B debugging.)
-                n_l = min(rtc_prev_leftover.shape[1], blended.shape[1])
-                w = wrapper.rtc_prefix_weights(n_l).to(blended.dtype).to(blended.device).view(1, n_l, 1)
-                blended[:, :n_l, :action_dim] = (1.0 - w) * blended[:, :n_l, :action_dim] + w * (
-                    rtc_prev_leftover[:, :n_l, :action_dim]
-                )
-            if anchor_slice is not None:
-                # Post-hoc snap = the non-iterative analogue of DENOISE's
-                # in-loop inpainting (no sampler exists to re-anchor inside).
-                blended[:, self._chunk_step : self._chunk_step + anchor_slice.shape[1], :action_dim] = (
-                    anchor_slice
-                )
-        elif strategy == GuidanceBlendStrategy.DENOISE:
-            denoise_kwargs: dict = {"noise": x_tsw, "sa_noise_ratio": ratio}
-            denoise_generator = wrapper.build_sample_generator(salt=_nsalt)
-            if denoise_generator is not None:
-                denoise_kwargs["generator"] = denoise_generator
-            if anchor_slice is not None:
-                # In-loop inpainting: the sampler re-anchors these positions
-                # at EVERY denoising step so neighbouring steps stay coherent
-                # — cannot be replicated by post-assignment, hence the only
-                # mechanism difference beyond the mix itself.
-                denoise_kwargs["anchor_action"] = anchor_slice
-            if rtc_prev_leftover is not None:
-                # RTC-style consistency: the denoiser applies an annealed
-                # gradient correction toward the previous chunk's leftover at
-                # every denoising step (see DiffusionModel.conditional_sample).
-                # Additive to the x_tsw blend — ratio semantics unchanged.
-                n_l = rtc_prev_leftover.shape[1]
-                denoise_kwargs["rtc_prev_chunk"] = rtc_prev_leftover[:, :, :action_dim]
-                denoise_kwargs["rtc_prefix_weights"] = wrapper.rtc_prefix_weights(n_l)
-                denoise_kwargs["rtc_max_guidance_weight"] = wrapper.rtc_max_guidance_weight
-            blended = wrapper.inner_policy.predict_action_chunk(ctx.batch, **denoise_kwargs)
-        else:
+        # Wrapped as a function of the candidate ratio so the tube check
+        # below can RE-BLEND at a reduced ratio. The chunk is NEVER edited in
+        # action space: every emitted chunk is a genuine blend product of the
+        # policy at some effective ratio <= the requested one, so the action
+        # distribution comes entirely from the policy blending.
+        def _blend_at(r_try: float, x_tsw_try: Tensor) -> Tensor:
+            if strategy == GuidanceBlendStrategy.INTERPOLATE:
+                # Glass-box stand-in for the denoiser: exact constant-ratio
+                # mix of the SAME two inputs the denoiser sees (pure-policy
+                # base, guidance fill).
+                blended = base_chunk.clone()
+                g = guidance_chunk[:, :, :action_dim]
+                blended[:, :, :action_dim] = r_try * base_chunk[:, :, :action_dim] + (1.0 - r_try) * g
+                if rtc_prev_leftover is not None:
+                    # Glass-box analog of the RTC prev-chunk guidance: a
+                    # prefix-weighted CONVEX pull toward the previous chunk's
+                    # leftover (see the DENOISE branch for the real thing).
+                    n_l = min(rtc_prev_leftover.shape[1], blended.shape[1])
+                    w = wrapper.rtc_prefix_weights(n_l).to(blended.dtype).to(blended.device).view(1, n_l, 1)
+                    blended[:, :n_l, :action_dim] = (1.0 - w) * blended[:, :n_l, :action_dim] + w * (
+                        rtc_prev_leftover[:, :n_l, :action_dim]
+                    )
+                if anchor_slice is not None:
+                    # Post-hoc snap = the non-iterative analogue of DENOISE's
+                    # in-loop inpainting.
+                    blended[:, self._chunk_step : self._chunk_step + anchor_slice.shape[1], :action_dim] = (
+                        anchor_slice
+                    )
+                return blended
+            if strategy == GuidanceBlendStrategy.DENOISE:
+                denoise_kwargs: dict = {"noise": x_tsw_try, "sa_noise_ratio": r_try}
+                denoise_generator = wrapper.build_sample_generator(salt=_nsalt)
+                if denoise_generator is not None:
+                    denoise_kwargs["generator"] = denoise_generator
+                if anchor_slice is not None:
+                    # In-loop inpainting: the sampler re-anchors these
+                    # positions at EVERY denoising step so neighbouring steps
+                    # stay coherent.
+                    denoise_kwargs["anchor_action"] = anchor_slice
+                if rtc_prev_leftover is not None:
+                    # RTC-style consistency: annealed gradient correction
+                    # toward the previous chunk's leftover at every denoising
+                    # step (see DiffusionModel.conditional_sample).
+                    n_l = rtc_prev_leftover.shape[1]
+                    denoise_kwargs["rtc_prev_chunk"] = rtc_prev_leftover[:, :, :action_dim]
+                    denoise_kwargs["rtc_prefix_weights"] = wrapper.rtc_prefix_weights(n_l)
+                    denoise_kwargs["rtc_max_guidance_weight"] = wrapper.rtc_max_guidance_weight
+                return wrapper.inner_policy.predict_action_chunk(ctx.batch, **denoise_kwargs)
             raise NotImplementedError(f"Unsupported guidance_blend_strategy: {strategy}")
+
+        blended = _blend_at(ratio, x_tsw)
+
+        # TUBE RE-BLEND (wrapper.blend_tube_steps > 0): if the blended
+        # chunk's max offset from the guidance fill exceeds N of the guidance
+        # chunk's own median steps, RE-RUN the blend at a reduced ratio
+        # (offset scales ~linearly with ratio, so one proportional correction
+        # usually lands; up to 3 tries, same seeds = same noise realization
+        # at a smaller ratio). Predictive — nothing outside the tube is ever
+        # emitted — and distribution-preserving: unlike action-space
+        # clipping, the accepted chunk is exactly what the policy blend
+        # produces at the effective ratio. (State-feedback ratio regulation
+        # failed live: the excursion executed first, then guidance yanked
+        # the robot back — teleport-shaking + a limit cycle pinned at the
+        # tube boundary, 2026-08-20.)
+        _tube = float(getattr(wrapper, "blend_tube_steps", 0.0) or 0.0)
+        if _tube > 0 and 0.0 < ratio < 1.0:
+            _g = guidance_chunk[:, :, :action_dim]
+            _gsteps = torch.linalg.norm(torch.diff(_g, dim=1), dim=-1)
+            _live = _gsteps[_gsteps > 1e-9]
+            if _live.numel() > 0:
+                _med = torch.median(_live)
+                _budget = _tube * _med
+                _r_try = float(ratio)
+                for _ in range(3):
+                    _off = torch.linalg.norm(blended[:, :, :action_dim] - _g, dim=-1).max()
+                    if _off <= _budget or _r_try <= 0.02:
+                        break
+                    _r_new = max(0.02, _r_try * min(0.9, float(_budget / _off)))
+                    logging.info(
+                        "[blend] tube re-blend at rebuild %d: commanded offset %.1f guidance-steps "
+                        "> budget %.1f at r=%.3f -> re-blending at r=%.3f",
+                        self._rebuild_count,
+                        float(_off / _med),
+                        _tube,
+                        _r_try,
+                        _r_new,
+                    )
+                    _r_try = _r_new
+                    blended = _blend_at(_r_try, _make_x_tsw(_r_try))
+
         # Hard prefix crossfade (see wrapper.rtc_hard_prefix_xfade): force
         # seam continuity against the previous plan's leftover — position 0
         # is mostly the old plan, ramping to fully-new over N positions.
@@ -621,38 +669,7 @@ class ObservationTeleopGuidanceSource:
                 blended[:, :n_x, :action_dim] = w * blended[:, :n_x, :action_dim] + (
                     1.0 - w
                 ) * rtc_prev_leftover[:, :n_x, :action_dim].to(blended.dtype)
-        # COMMAND-SPACE NOISE CLIP (wrapper.blend_noise_clip_steps > 0): the
-        # blended chunk's offset from the guidance fill IS the injected noise
-        # r*(policy - guidance). Uniformly scale it so no commanded position
-        # departs the guidance path by more than N of the guidance chunk's
-        # own median steps — the coverage tube is enforced BEFORE the action
-        # is ever sent. (State-feedback ratio regulation executes the
-        # excursion first and yanks the robot back after: measured limit
-        # cycle pinned at the tube boundary with visible shaking, 2026-08-20.)
-        # Uniform scaling preserves the noise's temporal shape; skipped at
-        # ratio 0/1 (exact replay / pure policy).
-        _clip_steps = float(getattr(wrapper, "blend_noise_clip_steps", 0.0) or 0.0)
-        if _clip_steps > 0 and 0.0 < ratio < 1.0:
-            _g = guidance_chunk[:, :, :action_dim]
-            _delta = blended[:, :, :action_dim] - _g
-            _gsteps = torch.linalg.norm(torch.diff(_g, dim=1), dim=-1)
-            _live = _gsteps[_gsteps > 1e-9]
-            if _live.numel() > 0:
-                _med = torch.median(_live)
-                _budget = _clip_steps * _med
-                _max_off = torch.linalg.norm(_delta, dim=-1).max()
-                if _max_off > _budget:
-                    _sc = (_budget / _max_off).item()
-                    blended = blended.clone()
-                    blended[:, :, :action_dim] = _g + _sc * _delta
-                    logging.info(
-                        "[blend] noise clip ENGAGED at rebuild %d: commanded offset %.1f guidance-steps "
-                        "> budget %.1f — noise scaled x%.2f before execution",
-                        self._rebuild_count,
-                        (_max_off / _med).item(),
-                        _clip_steps,
-                        _sc,
-                    )
+
         self._guided_chunk = blended
         # Store the ABSOLUTE decode alongside (RTC's ActionQueue keeps the
         # processed actions for the same reason): the anchor was refreshed at

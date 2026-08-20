@@ -340,13 +340,14 @@ class AugmentationConfig:
     blend_dev_regulation: bool = False
     blend_dev_full_below: float = 3.0
     blend_dev_zero_above: float = 8.0
-    # Command-space noise clip (predictive tube): max commanded offset from
-    # the guidance chunk in guidance-median-steps, applied at blend time
-    # BEFORE execution (see observation_teleop_source). Replaces the
-    # state-feedback tube regulation (now default-off), which executed the
-    # excursion and yanked the robot back — measured limit cycle at the tube
-    # boundary with visible shaking. 0 disables.
-    blend_noise_clip_steps: float = 8.0
+    # Tube re-blend budget (predictive): if the blended chunk's max offset
+    # from the guidance fill exceeds this many guidance-median-steps, the
+    # blend is RE-RUN at a reduced ratio before anything executes (same
+    # seeds, smaller ratio) — the emitted chunk is always a genuine
+    # policy-blend product; the action distribution comes entirely from the
+    # policy blending. Replaces both action-space clipping and the failed
+    # state-feedback regulation. 0 disables.
+    blend_tube_steps: float = 8.0
     # Post-success handling. The strict-tolerance sim can still terminate a
     # blend rollout BEFORE the guidance runs out (the blended trajectory
     # reaches the goal early). Historically the rollout then froze into hold
@@ -1054,7 +1055,7 @@ def run_augmentation(
     wrapper.rtc_inference_delay = cfg.rtc_inference_delay
     wrapper.resample_noise_per_reblend = cfg.resample_noise_per_reblend
     wrapper.rtc_hard_prefix_xfade = cfg.rtc_hard_prefix_xfade
-    wrapper.blend_noise_clip_steps = cfg.blend_noise_clip_steps
+    wrapper.blend_tube_steps = cfg.blend_tube_steps
     wrapper.rtc_prefix_attention_schedule = cfg.rtc_prefix_attention_schedule
     if cfg.rtc_prev_chunk:
         # Set post-init, so re-run the wrapper's init-time policy-type check.

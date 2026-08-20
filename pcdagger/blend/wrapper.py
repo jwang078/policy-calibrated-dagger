@@ -442,6 +442,11 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # plans come from independent draws and the boundary accel measured
         # ~2x mid-interval (7.5 vs 4, spikes to 24 rad/s^2). 0 disables.
         self.rtc_hard_prefix_xfade: int = 0
+        # Command-space noise clip (see observation_teleop_source blend
+        # finalize): max commanded offset from the guidance chunk, in units
+        # of the guidance chunk's own median step. 0 disables. Predictive
+        # tube enforcement — the noise is scaled BEFORE execution.
+        self.blend_noise_clip_steps: float = 8.0
         # RTC-style previous-chunk guidance (see SharedAutonomyConfig.rtc_*).
         # Plain mutable attributes so debug scripts can flip them post-init,
         # mirroring how guidance_blend_strategy / sample_seed are handled.

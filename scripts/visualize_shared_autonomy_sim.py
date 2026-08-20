@@ -339,7 +339,7 @@ def get_sim_action_chunk_for_ratio(
     progress_guidance_soft_hold: float = 0.0,
     progress_guidance_hard_lag: int = 8,
     blend_ratio_goal_taper: int = 0,
-    blend_dev_regulation: bool = True,
+    blend_dev_regulation: bool = False,
     blend_dev_full_below: float = 3.0,
     blend_dev_zero_above: float = 8.0,
     demo_states_raw: np.ndarray | None = None,
@@ -433,7 +433,7 @@ def get_sim_action_chunks_for_ratios(
     progress_guidance_soft_hold: float = 0.0,
     progress_guidance_hard_lag: int = 8,
     blend_ratio_goal_taper: int = 0,
-    blend_dev_regulation: bool = True,
+    blend_dev_regulation: bool = False,
     blend_dev_full_below: float = 3.0,
     blend_dev_zero_above: float = 8.0,
     demo_states_raw: np.ndarray | None = None,
@@ -757,7 +757,7 @@ def parse_args():
     parser.add_argument(
         "--blend_dev_regulation",
         type=lambda x: x.lower() in ("1", "true", "yes"),
-        default=True,
+        default=False,
         help="tube-regulate the ratio by corridor deviation (requested ratio = maximum)",
     )
     parser.add_argument(

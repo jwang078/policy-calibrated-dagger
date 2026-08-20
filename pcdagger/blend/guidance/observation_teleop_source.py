@@ -621,6 +621,38 @@ class ObservationTeleopGuidanceSource:
                 blended[:, :n_x, :action_dim] = w * blended[:, :n_x, :action_dim] + (
                     1.0 - w
                 ) * rtc_prev_leftover[:, :n_x, :action_dim].to(blended.dtype)
+        # COMMAND-SPACE NOISE CLIP (wrapper.blend_noise_clip_steps > 0): the
+        # blended chunk's offset from the guidance fill IS the injected noise
+        # r*(policy - guidance). Uniformly scale it so no commanded position
+        # departs the guidance path by more than N of the guidance chunk's
+        # own median steps — the coverage tube is enforced BEFORE the action
+        # is ever sent. (State-feedback ratio regulation executes the
+        # excursion first and yanks the robot back after: measured limit
+        # cycle pinned at the tube boundary with visible shaking, 2026-08-20.)
+        # Uniform scaling preserves the noise's temporal shape; skipped at
+        # ratio 0/1 (exact replay / pure policy).
+        _clip_steps = float(getattr(wrapper, "blend_noise_clip_steps", 0.0) or 0.0)
+        if _clip_steps > 0 and 0.0 < ratio < 1.0:
+            _g = guidance_chunk[:, :, :action_dim]
+            _delta = blended[:, :, :action_dim] - _g
+            _gsteps = torch.linalg.norm(torch.diff(_g, dim=1), dim=-1)
+            _live = _gsteps[_gsteps > 1e-9]
+            if _live.numel() > 0:
+                _med = torch.median(_live)
+                _budget = _clip_steps * _med
+                _max_off = torch.linalg.norm(_delta, dim=-1).max()
+                if _max_off > _budget:
+                    _sc = (_budget / _max_off).item()
+                    blended = blended.clone()
+                    blended[:, :, :action_dim] = _g + _sc * _delta
+                    logging.info(
+                        "[blend] noise clip ENGAGED at rebuild %d: commanded offset %.1f guidance-steps "
+                        "> budget %.1f — noise scaled x%.2f before execution",
+                        self._rebuild_count,
+                        (_max_off / _med).item(),
+                        _clip_steps,
+                        _sc,
+                    )
         self._guided_chunk = blended
         # Store the ABSOLUTE decode alongside (RTC's ActionQueue keeps the
         # processed actions for the same reason): the anchor was refreshed at

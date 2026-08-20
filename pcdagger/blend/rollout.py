@@ -527,12 +527,14 @@ def run_blended_rollout(
                 if blend_ratio_goal_taper > 0:
                     _remaining = float(guidance_actions_raw.shape[0] - 1) - _j_clock
                     _scale = min(_scale, max(0.0, min(1.0, _remaining / float(blend_ratio_goal_taper))))
+                # Deviation telemetry (always on under progress guidance —
+                # feeds the realized-tube episode metadata even when the
+                # state-feedback regulation below is disabled).
+                _dev = (
+                    float(np.linalg.norm(_q_now.astype(np.float64) - _demo_arm[_j_progress])) / _pg_med_step
+                )
+                _dev_hist.append(_dev)
                 if blend_dev_regulation:
-                    _dev = (
-                        float(np.linalg.norm(_q_now.astype(np.float64) - _demo_arm[_j_progress]))
-                        / _pg_med_step
-                    )
-                    _dev_hist.append(_dev)
                     _span = max(1e-6, float(blend_dev_zero_above) - float(blend_dev_full_below))
                     _scale_tube = float(np.clip((float(blend_dev_zero_above) - _dev) / _span, 0.0, 1.0))
                     _scale = min(_scale, _scale_tube)

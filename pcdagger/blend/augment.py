@@ -1514,6 +1514,51 @@ def run_augmentation(
                     gc.collect()
                     continue
 
+                if rollout.frames:
+                    # Terminal-dwell trim (ALL accepted rollouts, success
+                    # included — success bypasses the gate trims, so a
+                    # rollout that reaches the goal and then sits parked
+                    # waiting for strict success records 20-50 frozen ticks;
+                    # measured on blend010 eps 0-2: 11-27% frozen frames,
+                    # all in the last quarter, with re-blend-boundary
+                    # micro-twitches). Two combined scale-free criteria, cut
+                    # at whichever fires earlier:
+                    #   * net motion: last tick whose 5-tick net displacement
+                    #     exceeds 1 med_step (filters oscillating twitches);
+                    #   * progress plateau: first tick within 2 demo indices
+                    #     of the final projected index (+10 settle ticks).
+                    # Offline validation: frozen fraction 11/27/15% -> 5/7/6%.
+                    from dart_labels import demo_geometry as _dgeom, project_states as _pstates
+
+                    _sd = np.stack(
+                        [
+                            np.asarray(f["observation.state"][:_n_arm], dtype=np.float64)
+                            for f in rollout.frames
+                        ]
+                    )
+                    _idxs2 = _pstates(
+                        _sd,
+                        _dgeom(demo_states_raw, guidance_actions_raw, n_arm=_n_arm),
+                        index_window=cfg.progress_guidance_window,
+                    )
+                    _W = 5
+                    _disp = np.linalg.norm(_sd[_W:] - _sd[:-_W], axis=1)
+                    _moving = np.where(_disp > _med_step)[0]
+                    _keep_motion = (int(_moving.max()) + _W + 3) if len(_moving) else len(_sd)
+                    _keep_idx = int(np.argmax(_idxs2 >= _idxs2[-1] - 2.0)) + 10
+                    _keep = max(int(cfg.min_episode_length), min(_keep_motion, _keep_idx))
+                    if _keep < len(rollout.frames):
+                        logger.info(
+                            "source_ep=%d ratio=%.3f: trimmed %d terminal-dwell tick(s) "
+                            "(motion cut %d, progress-plateau cut %d).",
+                            source_ep,
+                            ratio_eff,
+                            len(rollout.frames) - _keep,
+                            _keep_motion,
+                            _keep_idx,
+                        )
+                        del rollout.frames[_keep:]
+
                 if cfg.relabel_actions == "guidance" and rollout.frames:
                     if demo_states_raw is None:
                         raise ValueError(

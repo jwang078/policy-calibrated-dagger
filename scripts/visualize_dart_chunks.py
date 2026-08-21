@@ -246,7 +246,7 @@ def _plot(
     ax.set_aspect(
         "equal", adjustable="datalim"
     )  # both axes are radians — unequal aspect steepens every angle
-    ax.legend(fontsize=9)
+    # no per-axis legend: the shared legend above the left 2x2 covers it.
 
     # zoom on the worst anchor — the rejoin geometry at deviation scale.
     d0s = {t: float(np.linalg.norm(S[t, :n] - _interp_rows(geom.P, float(idxs[t])))) for t in anchors}

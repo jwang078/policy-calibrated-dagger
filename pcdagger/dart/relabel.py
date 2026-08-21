@@ -17,9 +17,10 @@ synthesized where it is consumed (dataloader / visualizer) from two things:
 
 Synthesis (all quantities in the demo's own units — no per-env tuning):
 
-    i_k      = min(i0 + k, end)                        # demo clock: 1 index/tick
-    d_k+1    = d_k - min(rate*med_step, ease_out*d_k)  # cruise-speed closure,
-    label_k  = demo_action(i_k) + d_k * u              #   C1 ease-out merge
+    c_k      = min(rate*med_step, ease_out*d_k)        # correction (C1 ease-out)
+    t_k      = min(med_step, sqrt((B*med_step)^2-c_k^2))  # leftover -> progress
+    i_k+1    = i_k + t_k/med_step                       # clock slows while correcting
+    label_k  = demo_action(i_k) + d_k * u               # B = speed_budget (1.2)
 
 ``med_step`` is the demo's median per-tick joint step (fps/DOF/speed baked
 in), so ``rate=1.0`` means the label track rejoins at the demo's own cruise
@@ -121,6 +122,7 @@ def chunk_labels(
     horizon: int,
     rate: float = 1.0,
     ease_out: float = 0.3,
+    speed_budget: float = 1.2,
 ) -> np.ndarray:
     """Synthesize the expert's ``horizon``-step response from one state.
 
@@ -147,13 +149,29 @@ def chunk_labels(
     labels = np.empty((horizon, geom.A.shape[1]), dtype=np.float64)
     end = float(len(geom.A) - 1)
     d_k = d0
+    # SPEED-BUDGETED rejoin: each label step spends at most
+    # speed_budget * med_step of total motion, correction FIRST, and the
+    # demo clock advances at whatever rate the leftover affords
+    # (sqrt(budget^2 - c^2), capped at demo pace). While correcting hard the
+    # clock runs slow (~0.66x at budget 1.2, correction 1.0), so the
+    # rendezvous lands further in time at a demo point the robot can
+    # feasibly reach — additive progress+correction demanded sustained
+    # 1.4-1.6x-cruise labels the model's action prior never contains, which
+    # a trained policy systematically undershoots (worst at wide tubes,
+    # where rejoins last up to tube_steps ticks).
+    b = max(1.0, float(speed_budget)) * geom.med_step
+    idx = float(demo_index)
     for k in range(horizon):
-        labels[k] = _interp_rows(geom.A, min(demo_index + k, end))
-        d_k = max(0.0, d_k - min(close, ease * d_k) if ease > 0.0 else d_k - close)
+        labels[k] = _interp_rows(geom.A, min(idx, end))
+        c_k = min(close, ease * d_k) if ease > 0.0 else close
+        c_k = min(c_k, d_k)
+        d_k = d_k - c_k
         if d_k < 0.05 * geom.med_step:
             d_k = 0.0
         if d_k > 0.0:
             labels[k, : geom.n_arm] += d_k * u
+        t_k = min(geom.med_step, float(np.sqrt(max(0.0, b * b - c_k * c_k))))
+        idx = min(idx + t_k / geom.med_step, end)
     return labels
 
 

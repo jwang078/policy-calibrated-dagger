@@ -631,6 +631,7 @@ def rollout_closed_loop_for_augmentation(
     pad_after_success: bool = True,
     min_episode_length: int = 60,
     expected_env_state: np.ndarray | None = None,
+    env_state_static_mask: np.ndarray | None = None,
     abort_dev_steps: float = 0.0,
 ) -> RolloutResult:
     """Run one closed-loop rollout and capture (raw_obs, action) per step.
@@ -707,6 +708,7 @@ def rollout_closed_loop_for_augmentation(
         demo_states_raw=demo_states_raw,
         pad_after_success=pad_after_success,
         expected_env_state=expected_env_state,
+        env_state_static_mask=env_state_static_mask,
         abort_dev_steps=abort_dev_steps,
         on_step=_on_step,
         on_success=_on_success,
@@ -1352,10 +1354,28 @@ def run_augmentation(
                 _s_hi = np.asarray(frames_df.iloc[n_obs_steps + 2]["observation.state"], dtype=np.float32)
                 seed_joint_velocity = (_s_hi - _s_lo) / 3.0 * float(cfg.env_fps)
             _expected_env_state = None
+            _env_state_static_mask = None
             if "observation.environment_state" in frames_df.columns:
                 _expected_env_state = np.asarray(
                     frames_df.iloc[n_obs_steps]["observation.environment_state"], dtype=np.float64
                 )
+                # Which env_state dims are SCENARIO dims (block/obstacles —
+                # static over the episode's opening frames) vs robot-derived
+                # dims (the planar oracle state ends with the EE, which moves
+                # whenever the handoff was mid-motion)? The world-match guard
+                # holds static dims to the strict tolerance but only a loose
+                # one on moving dims — comparing the seeded EE (from the
+                # commanded action at n_obs-1) against the achieved state at
+                # n_obs measures the source robot's own tracking error, which
+                # false-positived as a "world mismatch" at fast handoffs
+                # (2026-08-21: 4.1 cm EE lag, world byte-identical).
+                _es_head = np.stack(
+                    [
+                        np.asarray(r["observation.environment_state"], dtype=np.float64)
+                        for _, r in frames_df.iloc[: n_obs_steps + 6].iterrows()
+                    ]
+                )
+                _env_state_static_mask = np.ptp(_es_head, axis=0) < 0.005
             guidance_actions_raw = np.stack(
                 [
                     np.asarray(row["action"], dtype=np.float32)
@@ -1491,6 +1511,7 @@ def run_augmentation(
                                 pad_after_success=cfg.pad_after_success,
                                 min_episode_length=cfg.min_episode_length,
                                 expected_env_state=_expected_env_state,
+                                env_state_static_mask=_env_state_static_mask,
                                 abort_dev_steps=(
                                     cfg.max_tube_breach_ratio * cfg.blend_tube_steps
                                     if cfg.max_tube_breach_ratio > 0 and cfg.blend_tube_steps > 0

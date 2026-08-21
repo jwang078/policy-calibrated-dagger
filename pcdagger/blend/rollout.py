@@ -345,6 +345,7 @@ def run_blended_rollout(
     demo_states_raw: np.ndarray | None = None,
     pad_after_success: bool = True,
     expected_env_state: np.ndarray | None = None,
+    env_state_static_mask: np.ndarray | None = None,
     env_state_match_tol: float = 0.02,
     abort_dev_steps: float = 0.0,
     on_step: Callable[[int, dict[str, Any], np.ndarray, bool], None] | None = None,
@@ -408,8 +409,19 @@ def run_blended_rollout(
         _got = np.asarray(env_obs["environment_state"][0], dtype=np.float64).reshape(-1)
         _want = np.asarray(expected_env_state, dtype=np.float64).reshape(-1)
         if _got.shape == _want.shape:
-            _err = float(np.max(np.abs(_got - _want)))
-            if _err > env_state_match_tol:
+            _delta = np.abs(_got - _want)
+            # SCENARIO dims (static over the source episode's opening frames:
+            # block/obstacles) must match strictly; robot-derived dims (e.g.
+            # the planar oracle EE, which moves whenever the handoff was
+            # mid-motion) get 10x slack — their "mismatch" is the source
+            # robot's own tracking error, not a wrong world.
+            if env_state_static_mask is not None and env_state_static_mask.shape == _delta.shape:
+                _bound = np.where(env_state_static_mask, env_state_match_tol, 10.0 * env_state_match_tol)
+            else:
+                _bound = np.full_like(_delta, env_state_match_tol)
+            _err = float(np.max(_delta - _bound))
+            if _err > 0:
+                _err = float(np.max(_delta))
                 raise WorldMismatchError(
                     f"WORLD MISMATCH after scenario seeding: environment_state differs from the "
                     f"source episode's by max|delta|={_err:.3f} (> {env_state_match_tol}) at "

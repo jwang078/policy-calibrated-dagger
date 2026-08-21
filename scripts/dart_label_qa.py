@@ -125,7 +125,10 @@ def main() -> None:
             amax = float(np.linalg.norm(np.diff(L, n=2, axis=0), axis=1).max())
             if amax > a_lim + 1e-9:
                 viols.append(f"t={t} accel {amax * FPS * FPS:.2f} rad/s^2")
-            if float(np.linalg.norm(L[0] - S[t])) > 1.5 * b:
+            # junction: label_0 continues the robot's TRUE motion, which may
+            # legitimately exceed the per-demo budget (v0 is honored up to
+            # 2.5b) — bound by the larger of the budget and the launch speed.
+            if float(np.linalg.norm(L[0] - S[t])) > max(1.5 * b, 1.1 * sp0):
                 viols.append(f"t={t} junction jump {float(np.linalg.norm(L[0] - S[t])):.3f} rad")
             for k in range(1, len(v) - 1):
                 n0, n1 = np.linalg.norm(v[k]), np.linalg.norm(v[k + 1])

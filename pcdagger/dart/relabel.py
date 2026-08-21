@@ -394,7 +394,14 @@ def chunk_labels(
                 mean_sp *= 0.75
                 changed = True
             if not acc_ok and t_merge < horizon - 1:
-                t_merge = min(horizon - 1, int(np.ceil(t_merge * 1.3)))
+                _t_new = min(horizon - 1, int(np.ceil(t_merge * 1.3)))
+                # Stretching T buys GENTLENESS, not distance: hold the chord
+                # still by scaling mean speed down with the bump — otherwise
+                # di grows with T and the bump loop drags mid-episode anchors
+                # into the demo-end clamp (arrive-and-hold chunks far from
+                # the end; observed at demo index 105/156 -> i_r clamped).
+                mean_sp *= t_merge / _t_new
+                t_merge = _t_new
                 changed = True
             if not changed:
                 break
@@ -646,6 +653,7 @@ class DartChunkDataset:
         if vel is not None:
             vel = vel.cpu().numpy() if isinstance(vel, torch.Tensor) else np.asarray(vel)
             vel = vel[-1] if vel.ndim == 2 else vel  # last row when delta-stacked
+        info: dict = {}
         labels = chunk_labels(
             q.cpu().numpy(),
             di,
@@ -655,11 +663,60 @@ class DartChunkDataset:
             ease_out=self.ease_out,
             prev_state=prev,
             velocity=vel,
+            info=info,
         )
+        # NO ARRIVE-AND-HOLD SAMPLES: an anchor close to the demo's end gets
+        # a chunk whose tail lands on the end and HOLDS (land-at-rest, or the
+        # fill clamping at the last index). With the diffusion horizon at 64
+        # and do_mask_loss_for_padding=False those hold frames TRAIN the
+        # policy to brake early and sit near the goal (observed as eval
+        # dawdling: failures that creep close and time out). Instead of
+        # padding/holding, redirect the sample to an earlier anchor in the
+        # SAME episode until the whole chunk is genuine motion; the endgame
+        # stays supervised by the base/intervention data.
+        tries = 0
+        while self._chunk_holds(labels, info) and idx > 0 and tries < 10:
+            # Step back far enough to matter; crossing an episode boundary is
+            # fine (short episodes hold EVERYWHERE — substitute a neighbor's
+            # interior anchor) — the geometry is re-fetched per item.
+            shift = min(idx, max(8, action.shape[0] // 4))
+            idx -= shift
+            tries += 1
+            item = self.dataset[idx]
+            action = item["action"]
+            state = item["observation.state"]
+            q = state[-1] if state.dim() == 2 else state
+            di = item["relabel_demo_index"]
+            di = float(di.reshape(-1)[-1]) if isinstance(di, torch.Tensor) else float(np.reshape(di, -1)[-1])
+            geom = self.geoms[self.ep_to_source[int(item["episode_index"])]]
+            prev = state[0].cpu().numpy() if (state.dim() == 2 and state.shape[0] >= 2) else None
+            vel = item.get("relabel_velocity")
+            if vel is not None:
+                vel = vel.cpu().numpy() if isinstance(vel, torch.Tensor) else np.asarray(vel)
+                vel = vel[-1] if vel.ndim == 2 else vel
+            info = {}
+            labels = chunk_labels(
+                q.cpu().numpy(),
+                di,
+                geom,
+                horizon=action.shape[0],
+                rate=self.rate,
+                ease_out=self.ease_out,
+                prev_state=prev,
+                velocity=vel,
+                info=info,
+            )
         item["action"] = torch.as_tensor(
             labels[:, : action.shape[1]], dtype=action.dtype, device=action.device
         )
         return item
+
+    @staticmethod
+    def _chunk_holds(labels: np.ndarray, info: dict) -> bool:
+        """True when the chunk's tail stops moving (arrive-and-hold at the demo end)."""
+        if info.get("end_clamped"):
+            return True
+        return bool(np.linalg.norm(labels[-1] - labels[-2]) < 1e-9)
 
 
 def maybe_wrap_dart(dataset, root: str | None = None, rate: float = 1.0, ease_out: float = 0.3):

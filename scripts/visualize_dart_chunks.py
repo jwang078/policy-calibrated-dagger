@@ -43,7 +43,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from dart_labels import DemoGeometry, _interp_rows, chunk_labels, demo_geometry, project_states
+from dart_labels import DemoGeometry, _interp_rows, chunk_labels, chunk_ok, demo_geometry, project_states
 
 # ── figure text (EDIT ME — mirrors paper_plots/dart_chunks_src47/plot.py) ──
 TEXT = {
@@ -124,6 +124,29 @@ def _plot(
             info=inf,
         )
         infos[t] = inf
+    # Which anchors does TRAINING actually sample? (dart_relabel.chunk_ok —
+    # hold-zone / accel-spike anchors are excluded from the sampling window.)
+    # Evaluated at the TRAINING horizon (64), which reaches further than the
+    # plotted chunks — an anchor can look fine at H=32 yet hold at H=64.
+    TRAIN_H = 64
+    oks = {}
+    for t in anchors:
+        inf64: dict = {}
+        lab64 = chunk_labels(
+            S[t],
+            float(idxs[t]),
+            geom,
+            horizon=TRAIN_H,
+            rate=rate,
+            ease_out=ease_out,
+            prev_state=S[t - 1] if t > 0 else None,
+            velocity=_smooth_vel(t),
+            info=inf64,
+        )
+        oks[t] = chunk_ok(lab64, inf64, geom)[0]
+
+    def _style(t: int) -> dict:
+        return {"alpha": 0.95, "ls": "-"} if oks.get(t, True) else {"alpha": 0.35, "ls": ":"}
 
     def _chunk_clock(t: int) -> np.ndarray:
         """X-coords for anchor t's chunk: each label at its OWN demo clock.
@@ -205,7 +228,7 @@ def _plot(
         )
         for t in anchors:
             cx = _chunk_clock(t)
-            ax.plot(cx, chunks[t][:, j], color=colors[t], lw=1.2, alpha=0.95, zorder=3)
+            ax.plot(cx, chunks[t][:, j], color=colors[t], lw=1.2, zorder=3, **_style(t))
             ax.plot([idxs[t]], [S[t, j]], marker="o", color=colors[t], ms=6, mec="k", mew=0.6, zorder=4)
             _arrows_along(ax, np.column_stack([cx, chunks[t][:, j]]), 0, 1, colors[t], ks=(8, 20), lw=1.1)
         ax.set_title(TEXT["joint_titles"][j] if j < len(TEXT["joint_titles"]) else f"Joint {j + 1}")
@@ -237,7 +260,7 @@ def _plot(
         label=TEXT["legend_state_path"],
     )
     for t in anchors:
-        ax.plot(chunks[t][:, jx], chunks[t][:, jy], color=colors[t], lw=1.4, alpha=0.95, zorder=3)
+        ax.plot(chunks[t][:, jx], chunks[t][:, jy], color=colors[t], lw=1.4, zorder=3, **_style(t))
         ax.plot([S[t, jx]], [S[t, jy]], marker="o", color=colors[t], ms=6, mec="k", mew=0.6, zorder=4)
         _arrows_along(ax, chunks[t], jx, jy, colors[t], ks=(0, 6, 14))
     ax.set_xlabel(TEXT["ylabel_joint"].format(j=jx + 1))
@@ -250,7 +273,8 @@ def _plot(
 
     # zoom on the worst anchor — the rejoin geometry at deviation scale.
     d0s = {t: float(np.linalg.norm(S[t, :n] - _interp_rows(geom.P, float(idxs[t])))) for t in anchors}
-    t_star = max(d0s, key=d0s.get)
+    _served = [t for t in anchors if oks.get(t, True)]
+    t_star = max(_served or anchors, key=lambda t: d0s[t])  # worst SERVED anchor
     C = chunks[t_star]
     proj0 = _interp_rows(geom.P, float(idxs[t_star]))
     ax = ax_zoom
@@ -281,7 +305,7 @@ def _plot(
     ax = ax_dev
     for t in anchors:
         d = np.linalg.norm(chunks[t][:, None, :n] - geom.P[None, :, :], axis=2).min(axis=1)
-        ax.plot(np.arange(horizon), d, color=colors[t], lw=1.0, alpha=0.9)
+        ax.plot(np.arange(horizon), d, color=colors[t], lw=1.0, **_style(t))
     ax.set_xlabel("Chunk position k")
     ax.set_ylabel("Deviation (rad)")
     ax.set_title(TEXT["dev_title"])
@@ -296,7 +320,7 @@ def _plot(
     for t in anchors:
         seq = np.vstack([S[t][None, :n], chunks[t][:, :n]])
         sp = np.linalg.norm(np.diff(seq, axis=0), axis=1) * fps
-        ax.plot(np.arange(horizon), sp, color=colors[t], lw=1.0, alpha=0.9)
+        ax.plot(np.arange(horizon), sp, color=colors[t], lw=1.0, **_style(t))
         first_sps.append(sp[0])
         max_sps.append(sp.max())
     ax.set_xlabel("Chunk position k")

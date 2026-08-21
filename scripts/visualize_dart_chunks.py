@@ -80,7 +80,15 @@ def _plot(
 ) -> None:
     anchors = list(range(0, len(S) - 1, max(1, anchor_every)))
     chunks = {
-        t: chunk_labels(S[t], float(idxs[t]), geom, horizon=horizon, rate=rate, ease_out=ease_out)
+        t: chunk_labels(
+            S[t],
+            float(idxs[t]),
+            geom,
+            horizon=horizon,
+            rate=rate,
+            ease_out=ease_out,
+            prev_state=S[t - 1] if t > 0 else None,
+        )
         for t in anchors
     }
     cmap = plt.get_cmap("plasma")

@@ -124,6 +124,7 @@ def chunk_labels(
     ease_out: float = 0.3,
     speed_budget: float = 1.2,
     ease_in: float = 0.35,
+    prev_state: np.ndarray | None = None,
 ) -> np.ndarray:
     """Synthesize the expert's ``horizon``-step response from one state.
 
@@ -161,6 +162,70 @@ def chunk_labels(
     # a trained policy systematically undershoots (worst at wide tubes,
     # where rejoins last up to tube_steps ticks).
     b = max(1.0, float(speed_budget)) * geom.med_step
+    end_i = float(len(geom.A) - 1)
+    # HERMITE MERGE (heading-continuous at BOTH ends): when the state's own
+    # velocity is known and the offset is non-trivial, the rejoin is a cubic
+    # Hermite from (q, v0) to (demo action at a budget-chosen rendezvous
+    # index, demo velocity there). The launch direction IS the robot's
+    # current motion — no perpendicular departure from the blended path —
+    # and the landing is tangent to the demo. Rendezvous time T comes from
+    # the speed budget (chord/T <= B), the rendezvous index from the
+    # tangential distance the budget affords: di = sqrt((T*B)^2 - d0^2).
+    if prev_state is not None and d0 > 0.5 * geom.med_step:
+        v0 = (
+            np.asarray(state, dtype=np.float64)[: geom.n_arm]
+            - np.asarray(prev_state, dtype=np.float64)[: geom.n_arm]
+        )
+        sp0 = float(np.linalg.norm(v0))
+        if sp0 < 0.2 * geom.med_step:
+            # stationary robot: launch along the corridor tangent instead.
+            v0 = _interp_rows(geom.P, min(demo_index + 1.0, end_i)) - proj0
+            sp0 = float(np.linalg.norm(v0)) or 1e-9
+        v0 = v0 * (min(sp0, b) / sp0)
+        labels = np.empty((horizon, geom.A.shape[1]), dtype=np.float64)
+        t_merge = max(2, int(np.ceil(d0 / (0.8 * b))))
+        for _ in range(3):  # speed-check bumps
+            di = float(np.sqrt(max(0.0, (t_merge * b) ** 2 - d0 * d0))) / geom.med_step
+            i_r = min(end_i, float(demo_index) + di)
+            a_r = _interp_rows(geom.A, i_r)
+            tan_r = (
+                _interp_rows(geom.A, min(i_r + 1.0, end_i)) - _interp_rows(geom.A, max(i_r - 1.0, 0.0))
+            ) / 2.0
+            pts = []
+            ok = True
+            prev_pt = np.asarray(state, dtype=np.float64)[: geom.A.shape[1]].copy()
+            for k in range(min(t_merge, horizon)):
+                t01 = (k + 1) / t_merge
+                h00 = 2 * t01**3 - 3 * t01**2 + 1
+                h10 = t01**3 - 2 * t01**2 + t01
+                h01 = -2 * t01**3 + 3 * t01**2
+                h11 = t01**3 - t01**2
+                pt = a_r.copy()
+                pt[: geom.n_arm] = (
+                    h00 * q
+                    + h10 * (v0 * t_merge)
+                    + h01 * a_r[: geom.n_arm]
+                    + h11 * (tan_r[: geom.n_arm] * t_merge)
+                )
+                # non-arm dims (gripper): linear from the current demo action.
+                if geom.A.shape[1] > geom.n_arm:
+                    a0_row = _interp_rows(geom.A, min(float(demo_index), end_i))
+                    pt[geom.n_arm :] = (1 - t01) * a0_row[geom.n_arm :] + t01 * a_r[geom.n_arm :]
+                if np.linalg.norm(pt[: geom.n_arm] - prev_pt[: geom.n_arm]) > 1.4 * b:
+                    ok = False
+                    break
+                pts.append(pt)
+                prev_pt = pt
+            if ok or horizon - 1 <= t_merge:
+                break
+            t_merge = min(horizon - 1, int(np.ceil(t_merge * 1.5)))
+        for k in range(horizon):
+            if k < len(pts):
+                labels[k] = pts[k]
+            else:
+                labels[k] = _interp_rows(geom.A, min(i_r + (k - len(pts) + 1), end_i))
+        return labels
+
     idx = float(demo_index)
     for k in range(horizon):
         labels[k] = _interp_rows(geom.A, min(idx, end))
@@ -198,7 +263,17 @@ def per_frame_labels(
     """
     idxs = project_states(states, geom, index_window, rate_cap_steps=rate_cap_steps)
     labels = np.stack(
-        [chunk_labels(s, i, geom, horizon=1, rate=rate)[0] for s, i in zip(states, idxs, strict=True)]
+        [
+            chunk_labels(
+                states[i],
+                idxs[i],
+                geom,
+                horizon=1,
+                rate=rate,
+                prev_state=states[i - 1] if i > 0 else None,
+            )[0]
+            for i in range(len(states))
+        ]
     )
     return idxs, labels
 
@@ -362,8 +437,15 @@ class DartChunkDataset:
         di = item["relabel_demo_index"]
         di = float(di.reshape(-1)[-1]) if isinstance(di, torch.Tensor) else float(np.reshape(di, -1)[-1])
         geom = self.geoms[self.ep_to_source[int(item["episode_index"])]]
+        prev = state[0].cpu().numpy() if (state.dim() == 2 and state.shape[0] >= 2) else None
         labels = chunk_labels(
-            q.cpu().numpy(), di, geom, horizon=action.shape[0], rate=self.rate, ease_out=self.ease_out
+            q.cpu().numpy(),
+            di,
+            geom,
+            horizon=action.shape[0],
+            rate=self.rate,
+            ease_out=self.ease_out,
+            prev_state=prev,
         )
         item["action"] = torch.as_tensor(
             labels[:, : action.shape[1]], dtype=action.dtype, device=action.device

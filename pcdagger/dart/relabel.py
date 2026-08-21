@@ -17,7 +17,7 @@ synthesized where it is consumed (dataloader / visualizer) from two things:
 
 Synthesis (all quantities in the demo's own units — no per-env tuning):
 
-    c_k      = min(rate*med_step, ease_out*d_k)        # correction (C1 ease-out)
+    c_k      = min(rate*med_step, ease_out*d_k, ease_in*(k+1)*med_step)  # S-curve
     t_k      = min(med_step, sqrt((B*med_step)^2-c_k^2))  # leftover -> progress
     i_k+1    = i_k + t_k/med_step                       # clock slows while correcting
     label_k  = demo_action(i_k) + d_k * u               # B = speed_budget (1.2)
@@ -123,6 +123,7 @@ def chunk_labels(
     rate: float = 1.0,
     ease_out: float = 0.3,
     speed_budget: float = 1.2,
+    ease_in: float = 0.35,
 ) -> np.ndarray:
     """Synthesize the expert's ``horizon``-step response from one state.
 
@@ -164,6 +165,14 @@ def chunk_labels(
     for k in range(horizon):
         labels[k] = _interp_rows(geom.A, min(idx, end))
         c_k = min(close, ease * d_k) if ease > 0.0 else close
+        # EASE-IN (mirror of the ease-out): lateral correction ramps up over
+        # the first ~1/ease_in ticks instead of starting at full rate — a
+        # correction-first start launched ~56 deg off the direction of
+        # travel ('explicitly switching directions'); with the ramp the
+        # rejoin is an on-ramp S-curve that initially moves like the policy
+        # and bends into the corridor progressively.
+        if ease_in > 0.0:
+            c_k = min(c_k, float(ease_in) * (k + 1) * geom.med_step)
         c_k = min(c_k, d_k)
         d_k = d_k - c_k
         if d_k < 0.05 * geom.med_step:

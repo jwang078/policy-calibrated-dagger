@@ -286,6 +286,16 @@ def progress_guidance_index(demo_arm: np.ndarray, q_now: np.ndarray, j_prev: int
 # ── the rollout ───────────────────────────────────────────────────────────────
 
 
+class WorldMismatchError(RuntimeError):
+    """Scenario seeding cannot reproduce the source episode's world.
+
+    Raised by the world-match guard in :func:`run_blended_rollout`. Callers
+    that iterate many source episodes should catch this, drop the offending
+    episode loudly, and continue — retrying is pointless (deterministic) and
+    aborting the whole run wastes every remaining episode.
+    """
+
+
 @dataclass
 class BlendRolloutResult:
     """Arrays captured from one blended rollout (actions, overlays, success info)."""
@@ -400,13 +410,16 @@ def run_blended_rollout(
         if _got.shape == _want.shape:
             _err = float(np.max(np.abs(_got - _want)))
             if _err > env_state_match_tol:
-                raise RuntimeError(
+                raise WorldMismatchError(
                     f"WORLD MISMATCH after scenario seeding: environment_state differs from the "
-                    f"source episode's by max|delta|={_err:.3f} (> {env_state_match_tol}). The sim "
-                    f"server is not honoring benchmark_start_index={benchmark_start_index} — check "
-                    f"that it runs in EVAL_BENCHMARK mode with a benchmark subset containing this "
-                    f"scenario (identity subset recommended). Rollouts in a wrong world produce "
-                    f"colliding replays and poisoned training images.\n"
+                    f"source episode's by max|delta|={_err:.3f} (> {env_state_match_tol}) at "
+                    f"benchmark_start_index={benchmark_start_index}. Two known causes: (a) the sim "
+                    f"serves the WRONG scenario (bad benchmark subset/ordering — most dims differ), "
+                    f"or (b) the SOURCE EPISODE itself did not start from the pristine scenario "
+                    f"(the pre-intervention policy roll displaced an object before the takeover — "
+                    f"only that object's dims differ). Either way this world cannot be reproduced "
+                    f"by scenario seeding, and rollouts in a wrong world produce colliding replays "
+                    f"and poisoned training data.\n"
                     f"  server  : {np.round(_got, 3)}\n  expected: {np.round(_want, 3)}"
                 )
 

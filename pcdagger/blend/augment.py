@@ -99,6 +99,7 @@ from lib_sa_policy_loading import (  # type: ignore[import-not-found]  # noqa: E
     load_wrapped_policy,
 )
 from lib_sa_rollout import (  # type: ignore[import-not-found]  # noqa: E402,F401
+    WorldMismatchError,
     check_sim_strict_goal_tolerances,
     progress_guidance_index,  # re-export kept for external importers
     run_blended_rollout,
@@ -1443,6 +1444,7 @@ def run_augmentation(
                         _ratio_ladder.append(_r)
                 ratio_eff = float(ratio)
                 _accepted = False
+                _world_mismatch = False
                 _attempt_no = 0
                 for ratio_eff in _ratio_ladder:
                     for _attempt in range(1 + max(0, cfg.blend_end_gap_retries)):
@@ -1456,44 +1458,60 @@ def run_augmentation(
                                 wrapper.sample_seed = cfg.sample_seed + int(source_ep) + 100_000 * _attempt_no
                             if cfg.fixed_base_noise and _base_noise is not None:
                                 _base_noise = torch.randn_like(_base_noise)
-                        rollout = rollout_closed_loop_for_augmentation(
-                            wrapper=wrapper,
-                            obs_preprocessor=obs_preprocessor,
-                            vec_env=vec_env,
-                            env_preprocessor=env_pre,
-                            env_postprocessor=env_post,
-                            seed_joint_state=seed_joint_state,
-                            seed_joint_velocity=seed_joint_velocity,
-                            guidance_actions_raw=guidance_actions_raw,
-                            ratio=ratio_eff,
-                            blend_mode=blend_mode_enum,
-                            blend_interval_frac=cfg.blend_interval_frac,
-                            total_steps=total_steps,
-                            progress_guidance=cfg.progress_guidance,
-                            progress_guidance_window=cfg.progress_guidance_window,
-                            progress_guidance_soft_hold=cfg.progress_guidance_soft_hold,
-                            progress_guidance_hard_lag=cfg.progress_guidance_hard_lag,
-                            blend_ratio_goal_taper=cfg.blend_ratio_goal_taper,
-                            blend_dev_regulation=cfg.blend_dev_regulation,
-                            blend_dev_full_below=cfg.blend_dev_full_below,
-                            blend_dev_zero_above=cfg.blend_dev_zero_above,
-                            demo_states_raw=demo_states_raw,
-                            rename_map=rename_map,
-                            image_keys=image_keys,
-                            task_description=task_description,
-                            device=cfg.device,
-                            playlist_pos=_playlist_pos,
-                            env_state_dim=source_env_state_dim,
-                            base_noise=_base_noise,
-                            pad_after_success=cfg.pad_after_success,
-                            min_episode_length=cfg.min_episode_length,
-                            expected_env_state=_expected_env_state,
-                            abort_dev_steps=(
-                                cfg.max_tube_breach_ratio * cfg.blend_tube_steps
-                                if cfg.max_tube_breach_ratio > 0 and cfg.blend_tube_steps > 0
-                                else 0.0
-                            ),
-                        )
+                        try:
+                            rollout = rollout_closed_loop_for_augmentation(
+                                wrapper=wrapper,
+                                obs_preprocessor=obs_preprocessor,
+                                vec_env=vec_env,
+                                env_preprocessor=env_pre,
+                                env_postprocessor=env_post,
+                                seed_joint_state=seed_joint_state,
+                                seed_joint_velocity=seed_joint_velocity,
+                                guidance_actions_raw=guidance_actions_raw,
+                                ratio=ratio_eff,
+                                blend_mode=blend_mode_enum,
+                                blend_interval_frac=cfg.blend_interval_frac,
+                                total_steps=total_steps,
+                                progress_guidance=cfg.progress_guidance,
+                                progress_guidance_window=cfg.progress_guidance_window,
+                                progress_guidance_soft_hold=cfg.progress_guidance_soft_hold,
+                                progress_guidance_hard_lag=cfg.progress_guidance_hard_lag,
+                                blend_ratio_goal_taper=cfg.blend_ratio_goal_taper,
+                                blend_dev_regulation=cfg.blend_dev_regulation,
+                                blend_dev_full_below=cfg.blend_dev_full_below,
+                                blend_dev_zero_above=cfg.blend_dev_zero_above,
+                                demo_states_raw=demo_states_raw,
+                                rename_map=rename_map,
+                                image_keys=image_keys,
+                                task_description=task_description,
+                                device=cfg.device,
+                                playlist_pos=_playlist_pos,
+                                env_state_dim=source_env_state_dim,
+                                base_noise=_base_noise,
+                                pad_after_success=cfg.pad_after_success,
+                                min_episode_length=cfg.min_episode_length,
+                                expected_env_state=_expected_env_state,
+                                abort_dev_steps=(
+                                    cfg.max_tube_breach_ratio * cfg.blend_tube_steps
+                                    if cfg.max_tube_breach_ratio > 0 and cfg.blend_tube_steps > 0
+                                    else 0.0
+                                ),
+                            )
+                        except WorldMismatchError as _wme:
+                            # This source episode's world is unreproducible
+                            # (usually: the pre-intervention policy roll
+                            # displaced an object before the takeover, so the
+                            # episode never started from the pristine
+                            # scenario). Deterministic — retries cannot help.
+                            # Crash THIS episode loudly and keep the run.
+                            logger.warning(
+                                "source_ep=%d ratio=%.2f: DROPPING source episode — %s",
+                                source_ep,
+                                ratio,
+                                _wme,
+                            )
+                            _world_mismatch = True
+                            break
                         if (
                             cfg.max_tube_breach_ratio > 0
                             and cfg.blend_tube_steps > 0
@@ -1610,7 +1628,7 @@ def run_augmentation(
                                 else "dropping the pair"
                             ),
                         )
-                    if _accepted:
+                    if _accepted or _world_mismatch:
                         break
                 if not _accepted:
                     n_dropped += 1

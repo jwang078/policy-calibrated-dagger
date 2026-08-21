@@ -340,15 +340,18 @@ class AugmentationConfig:
     blend_dev_regulation: bool = False
     blend_dev_full_below: float = 3.0
     blend_dev_zero_above: float = 8.0
-    # TUBE-BREACH accept gate: reject any rollout (success included) whose
-    # REALIZED corridor-deviation p95 exceeds this multiple of
-    # blend_tube_steps. The tube re-blend constrains the PLANNED chunk only;
+    # TUBE-BREACH accept gate: "how far past the declared tube may a rollout
+    # actually stray before we throw it away?" — 1.5 means reject any
+    # rollout (success included) whose realized corridor deviation (p95 over
+    # its ticks) exceeds 1.5x blend_tube_steps. Also arms the matching
+    # early abort inside the rollout loop (lib_sa_rollout abort_dev_steps).
+    # The tube re-blend constrains the PLANNED chunk only;
     # execution compounding can still run past it (2026-08-21, ep 9 of the
     # dag1 b050 set: dev p95 36 med-steps against a 16-step tube -> 0.75 rad
     # offsets whose DART rejoins are physically impossible within a chunk).
     # Rejected rollouts retry with a fresh draw and then drop, like the
     # convergence gate. <= 0 (or blend_tube_steps == 0) disables.
-    max_blend_dev_p95_mult: float = 1.5
+    max_tube_breach_ratio: float = 1.5
     # Tube re-blend budget (predictive): if the blended chunk's max offset
     # from the guidance fill exceeds this many guidance-median-steps, the
     # blend is RE-RUN at a reduced ratio before anything executes (same
@@ -1486,13 +1489,13 @@ def run_augmentation(
                             min_episode_length=cfg.min_episode_length,
                             expected_env_state=_expected_env_state,
                             abort_dev_steps=(
-                                cfg.max_blend_dev_p95_mult * cfg.blend_tube_steps
-                                if cfg.max_blend_dev_p95_mult > 0 and cfg.blend_tube_steps > 0
+                                cfg.max_tube_breach_ratio * cfg.blend_tube_steps
+                                if cfg.max_tube_breach_ratio > 0 and cfg.blend_tube_steps > 0
                                 else 0.0
                             ),
                         )
                         if (
-                            cfg.max_blend_dev_p95_mult > 0
+                            cfg.max_tube_breach_ratio > 0
                             and cfg.blend_tube_steps > 0
                             and (
                                 rollout.tube_breach  # early abort — retry even if short/empty
@@ -1501,7 +1504,7 @@ def run_augmentation(
                                     and not rollout.dropped_short
                                     and rollout.dev_steps_p95 is not None
                                     and rollout.dev_steps_p95
-                                    > cfg.max_blend_dev_p95_mult * cfg.blend_tube_steps
+                                    > cfg.max_tube_breach_ratio * cfg.blend_tube_steps
                                 )
                             )
                         ):
@@ -1515,8 +1518,8 @@ def run_augmentation(
                                 _attempt_no,
                                 " (aborted early)" if rollout.tube_breach else "",
                                 rollout.dev_steps_p95 if rollout.dev_steps_p95 is not None else float("nan"),
-                                cfg.max_blend_dev_p95_mult * cfg.blend_tube_steps,
-                                cfg.max_blend_dev_p95_mult,
+                                cfg.max_tube_breach_ratio * cfg.blend_tube_steps,
+                                cfg.max_tube_breach_ratio,
                                 cfg.blend_tube_steps,
                                 "retrying with a fresh draw"
                                 if _attempt < cfg.blend_end_gap_retries

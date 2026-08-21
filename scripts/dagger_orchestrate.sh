@@ -390,6 +390,43 @@ set -euo pipefail
 #                                 (--intervention_n_episodes/_sample_from_first/
 #                                 _sample_seed/_extra_args) are IGNORED in rerun
 #                                 mode (a warning is emitted if set).
+#   --separate_blend_lineage[=true|false]
+#                                 (default false) Give the blend lineage its OWN
+#                                 DAgger loop instead of piggy-backing on the
+#                                 source's interventions/policies. When true,
+#                                 rerun-mode data reuse is TURNED OFF even
+#                                 though --rerun_blends_from is present:
+#                                   * step 1 RECORDS this lineage's own
+#                                     interventions every round, from THIS
+#                                     lineage's previous-round (blend-finetuned)
+#                                     policy — i.e. the errors being corrected
+#                                     are the blended policy's own errors;
+#                                   * step 2 blends against that same policy;
+#                                   * step 6 finetunes from THIS lineage's
+#                                     _ft_dag(r-1), not source's.
+#                                 --rerun_blends_from then only records
+#                                 provenance (which baseline lineage this
+#                                 experiment is meant to be compared against);
+#                                 it is written to the dagger sidecar under
+#                                 `separate_blend_lineage.baseline_*` and used
+#                                 by dagger_plot.py for the overlay comparison.
+#                                 NAMING: because nothing is shared with the
+#                                 source, EVERY artifact (intervention, blend,
+#                                 _nocoll, merged, training dir) is named from
+#                                 THIS lineage's own BASE_DATASET_SHORT /
+#                                 BASE_POLICY_NAME — so the blends_tag (b050,
+#                                 b090_080, ...) appears in the intervention +
+#                                 blend dataset names too, which is what keeps
+#                                 them from colliding with the source's. That
+#                                 also makes those names ~5-10 chars longer than
+#                                 in rerun mode; the pre-flight length check
+#                                 covers the `_nocoll` worst case.
+#                                 The sweep wrapper skips its `_rr` run_tag
+#                                 auto-suffix in this mode (the blends_tag
+#                                 already disambiguates the lineage), so the
+#                                 policy dirs read `..._<run_tag>_b050_ft_dagN`.
+#                                 --num_rounds is REQUIRED here (there is no
+#                                 source lineage to auto-detect it from).
 #   --reuse_intervention_from=PFX Advanced override: source intervention dataset
 #                                 short prefix (everything before _<a|r>_dag<N>).
 #                                 Use when --rerun_blends_from's auto-derivation
@@ -820,6 +857,11 @@ RERUN_BLENDS_FROM=""
 # auto-derivation from --rerun_blends_from.
 REUSE_INTERVENTION_FROM=""
 REUSE_POLICY_FROM=""
+# --separate_blend_lineage: turn OFF rerun-mode data reuse while keeping the
+# source pointer as provenance. See the header doc. The blend lineage then
+# records its own interventions from its own finetuned policy each round —
+# a self-contained DAgger loop whose artifacts all carry the blends_tag.
+SEPARATE_BLEND_LINEAGE=false
 # Intervention method selector. "rrt" uses the SA wrapper's RRT-to-goal
 # planner (existing behavior); "oracle_goal" uses a straight-line joint-space
 # interpolation from q_start to the oracle's q_goal_bias. Recorded frames are
@@ -1267,6 +1309,8 @@ for arg in "$@"; do
         --rerun_blends_from=*)               RERUN_BLENDS_FROM="${arg#*=}" ;;
         --reuse_intervention_from=*)         REUSE_INTERVENTION_FROM="${arg#*=}" ;;
         --reuse_policy_from=*)               REUSE_POLICY_FROM="${arg#*=}" ;;
+        --separate_blend_lineage)            SEPARATE_BLEND_LINEAGE=true ;;
+        --separate_blend_lineage=*)          SEPARATE_BLEND_LINEAGE="${arg#*=}" ;;
         --intervention_method=*)             INTERVENTION_METHOD="${arg#*=}" ;;
         --intervention_oracle_goal_chunk_steps=*) INTERVENTION_ORACLE_GOAL_CHUNK_STEPS="${arg#*=}" ;;
         --model=*)                    MODEL="${arg#*=}" ;;
@@ -1381,7 +1425,9 @@ fi
 # --retrain_round0 is a source-lineage operation: rerun lineages never train
 # round 0 (they branch off the SOURCE's policies), so honoring it here would
 # at best be a no-op and at worst rm -rf a base dir the source depends on.
-if [[ "$RETRAIN_ROUND0" == true && -n "$RERUN_BLENDS_FROM" ]]; then
+# (--separate_blend_lineage is exempt: such a lineage does not branch off the
+# source, so its round 0 is the ordinary shared base training.)
+if [[ "$RETRAIN_ROUND0" == true && -n "$RERUN_BLENDS_FROM" && "$SEPARATE_BLEND_LINEAGE" != "true" ]]; then
     echo "ERROR: --retrain_round0 is incompatible with --rerun_blends_from (rerun lineages never train round 0)." >&2
     echo "  Retrain the base in the SOURCE lineage instead: either invoke dagger_orchestrate.sh" >&2
     echo "  directly with the source's --run_tag + --retrain_round0, or pass --retrain_round0" >&2
@@ -1506,6 +1552,52 @@ fi
 RERUN_MODE_ENABLED=false
 if [[ -n "$RERUN_BLENDS_FROM" || -n "$REUSE_INTERVENTION_FROM" || -n "$REUSE_POLICY_FROM" ]]; then
     RERUN_MODE_ENABLED=true
+fi
+
+# --separate_blend_lineage: the blend lineage runs its OWN DAgger loop.
+#
+# Implementation is deliberately a single switch: we turn RERUN_MODE_ENABLED
+# back OFF and stash the source pointers in SEPARATE_BLEND_LINEAGE_BASELINE_*
+# for provenance only. Everything downstream that keys off RERUN_MODE_ENABLED
+# then does the right thing without a second code path:
+#   * naming        → SOURCE_INT_SHORT_PREFIX = BASE_DATASET_SHORT, so the
+#                     intervention / blend / _nocoll datasets carry THIS
+#                     lineage's blends_tag (no collision with the source);
+#   * step 1        → records interventions instead of reusing source's;
+#   * round loop    → CURRENT_POLICY carries forward from this lineage's own
+#                     _ft_dag(r-1) instead of being overridden with source's;
+#   * --force_restart → deletes this lineage's own blends (it owns them now);
+#   * pre-flight    → no source-on-disk checks, no "ignored in rerun mode"
+#                     warnings for the intervention-recording flags (they are
+#                     very much used here).
+case "$SEPARATE_BLEND_LINEAGE" in
+    true|false) ;;
+    *) echo "ERROR: --separate_blend_lineage must be true or false (got '$SEPARATE_BLEND_LINEAGE')." >&2; exit 1 ;;
+esac
+SEPARATE_BLEND_LINEAGE_BASELINE_RUN_TAG=""
+SEPARATE_BLEND_LINEAGE_BASELINE_BLENDS_TAG=""
+if [[ "$SEPARATE_BLEND_LINEAGE" == "true" ]]; then
+    if [[ -n "$REUSE_INTERVENTION_FROM" || -n "$REUSE_POLICY_FROM" ]]; then
+        echo "ERROR: --separate_blend_lineage is incompatible with --reuse_intervention_from /" >&2
+        echo "  --reuse_policy_from: those flags exist to POINT AT another lineage's artifacts," >&2
+        echo "  which is exactly what a separate blend lineage does not do." >&2
+        exit 1
+    fi
+    SEPARATE_BLEND_LINEAGE_BASELINE_RUN_TAG="$SOURCE_RUN_TAG"
+    SEPARATE_BLEND_LINEAGE_BASELINE_BLENDS_TAG="$SOURCE_BLENDS_TAG"
+    if [[ "$RERUN_MODE_ENABLED" == "true" ]]; then
+        echo "[separate_blend_lineage] --rerun_blends_from='$RERUN_BLENDS_FROM' kept as PROVENANCE ONLY."
+        echo "[separate_blend_lineage]   This lineage records its own interventions each round from its"
+        echo "[separate_blend_lineage]   own previous-round policy, blends against that policy, and"
+        echo "[separate_blend_lineage]   finetunes from its own _ft_dag(r-1)."
+        if [[ -z "$NUM_ROUNDS" ]]; then
+            echo "ERROR: --num_rounds=N is required with --separate_blend_lineage" >&2
+            echo "  (auto-detection reads the SOURCE lineage's rounds off disk, which this mode" >&2
+            echo "   does not consume — state the round count explicitly)." >&2
+            exit 1
+        fi
+    fi
+    RERUN_MODE_ENABLED=false
 fi
 
 # In rerun mode --num_rounds is optional (auto-detected from source lineage on
@@ -2197,6 +2289,33 @@ else
     SOURCE_POLICY_BASENAME="$BASE_POLICY_NAME"
 fi
 
+# --separate_blend_lineage provenance names. Not used to resolve ANY artifact
+# (this lineage owns all of its own) — recorded in the sidecar so dagger_plot
+# can overlay this lineage against the baseline it was meant to be compared
+# with, exactly like it does for real reruns.
+SEPARATE_BLEND_LINEAGE_BASELINE_INT_SHORT_PREFIX=""
+SEPARATE_BLEND_LINEAGE_BASELINE_POLICY_BASENAME=""
+if [[ "$SEPARATE_BLEND_LINEAGE" == "true" && -n "$SEPARATE_BLEND_LINEAGE_BASELINE_RUN_TAG" ]]; then
+    SEPARATE_BLEND_LINEAGE_BASELINE_INT_SHORT_PREFIX="$(_derive_base_dataset_short_for_tags \
+        "$SEPARATE_BLEND_LINEAGE_BASELINE_RUN_TAG" "$SEPARATE_BLEND_LINEAGE_BASELINE_BLENDS_TAG")"
+    SEPARATE_BLEND_LINEAGE_BASELINE_POLICY_BASENAME="$(_derive_base_policy_name_for_tags \
+        "$SEPARATE_BLEND_LINEAGE_BASELINE_RUN_TAG" "$SEPARATE_BLEND_LINEAGE_BASELINE_BLENDS_TAG")"
+    echo "[separate_blend_lineage] Baseline (comparison-only) lineage: $SEPARATE_BLEND_LINEAGE_BASELINE_POLICY_BASENAME"
+    echo "[separate_blend_lineage] This lineage's own artifacts:      ${BASE_DATASET_SHORT}_${ACTION_INFIX}_dag{N} / ${BASE_POLICY_NAME}_ft_dag{N}"
+    # Hard collision guard: without a distinguishing tag (blends_tag or a
+    # different run_tag) this lineage would RECORD INTO the baseline's own
+    # intervention datasets and train over its checkpoints.
+    if [[ "$BASE_DATASET_SHORT" == "$SEPARATE_BLEND_LINEAGE_BASELINE_INT_SHORT_PREFIX" \
+       || "$BASE_POLICY_NAME"   == "$SEPARATE_BLEND_LINEAGE_BASELINE_POLICY_BASENAME" ]]; then
+        echo "ERROR: --separate_blend_lineage would write into the baseline lineage's own artifacts." >&2
+        echo "  This lineage:  dataset prefix '$BASE_DATASET_SHORT', policy '$BASE_POLICY_NAME'" >&2
+        echo "  Baseline:      dataset prefix '$SEPARATE_BLEND_LINEAGE_BASELINE_INT_SHORT_PREFIX', policy '$SEPARATE_BLEND_LINEAGE_BASELINE_POLICY_BASENAME'" >&2
+        echo "  Give this run a non-empty --blends (its b<NNN> tag disambiguates), or a --run_tag" >&2
+        echo "  that differs from --rerun_blends_from's." >&2
+        exit 1
+    fi
+fi
+
 # Rerun-blends mode: auto-detect NUM_ROUNDS from source lineage on disk if
 # omitted. Scans the local HF cache for source intervention datasets named
 # `<SOURCE_INT_SHORT_PREFIX>_<ACTION_INFIX>_dag<N>` and uses the highest
@@ -2404,6 +2523,11 @@ write_dagger_config_sidecar() {
     DAG_CFG_MODEL_TAG="$MODEL_TAG" \
     DAG_CFG_METHOD_TAG="$METHOD_TAG" \
     DAG_CFG_RERUN_MODE_ENABLED="$RERUN_MODE_ENABLED" \
+    DAG_CFG_SEPARATE_BLEND_LINEAGE="$SEPARATE_BLEND_LINEAGE" \
+    DAG_CFG_SEP_BASELINE_RUN_TAG="${SEPARATE_BLEND_LINEAGE_BASELINE_RUN_TAG:-}" \
+    DAG_CFG_SEP_BASELINE_BLENDS_TAG="${SEPARATE_BLEND_LINEAGE_BASELINE_BLENDS_TAG:-}" \
+    DAG_CFG_SEP_BASELINE_INT_SHORT_PREFIX="${SEPARATE_BLEND_LINEAGE_BASELINE_INT_SHORT_PREFIX:-}" \
+    DAG_CFG_SEP_BASELINE_POLICY_BASENAME="${SEPARATE_BLEND_LINEAGE_BASELINE_POLICY_BASENAME:-}" \
     DAG_CFG_SOURCE_RUN_TAG="$SOURCE_RUN_TAG" \
     DAG_CFG_SOURCE_BLENDS_TAG="$SOURCE_BLENDS_TAG" \
     DAG_CFG_SOURCE_INT_SHORT_PREFIX="$SOURCE_INT_SHORT_PREFIX" \
@@ -2447,6 +2571,19 @@ if os.environ["DAG_CFG_RERUN_MODE_ENABLED"] == "true":
         "source_policy_basename":  os.environ["DAG_CFG_SOURCE_POLICY_BASENAME"],
         "branching_policy_path":   os.environ["DAG_CFG_BRANCHING_POLICY"],
     }
+# --separate_blend_lineage: NOT a rerun (rerun_mode stays None so every
+# artifact-resolving consumer reads `naming.base_dataset_short`), but we keep
+# the baseline pointer so dagger_plot can still overlay the two lineages.
+separate_blend_lineage = None
+if os.environ.get("DAG_CFG_SEPARATE_BLEND_LINEAGE") == "true":
+    separate_blend_lineage = {
+        "enabled": True,
+        "baseline_run_tag":          os.environ.get("DAG_CFG_SEP_BASELINE_RUN_TAG", ""),
+        "baseline_blends_tag":       os.environ.get("DAG_CFG_SEP_BASELINE_BLENDS_TAG", ""),
+        "baseline_int_short_prefix": os.environ.get("DAG_CFG_SEP_BASELINE_INT_SHORT_PREFIX", ""),
+        "baseline_policy_basename":  os.environ.get("DAG_CFG_SEP_BASELINE_POLICY_BASENAME", ""),
+        "branching_policy_path":     os.environ["DAG_CFG_BRANCHING_POLICY"],
+    }
 blends_str = os.environ["DAG_CFG_BLENDS_STR"].strip()
 blends = [float(x) for x in blends_str.split()] if blends_str else []
 config = {
@@ -2457,6 +2594,7 @@ config = {
     "host": socket.gethostname(),
     "training_output_dir": os.environ["DAG_CFG_TRAIN_OUTPUT_DIR"],
     "rerun_mode": rerun_mode,
+    "separate_blend_lineage": separate_blend_lineage,
     "naming": {
         "base_dataset_short": os.environ["DAG_CFG_BASE_DATASET_SHORT"],
         "base_policy_name":   os.environ["DAG_CFG_BASE_POLICY_NAME"],
@@ -3410,6 +3548,30 @@ if [[ "$ANY_NAME_TOO_LONG" == true ]]; then
         echo "  length ${#BASE_DATASET_SHORT}; was derived from BASE_REPO=$BASE_REPO) and retry." >&2
     fi
     exit 1
+fi
+# Blend / `_nocoll` dataset names. These are NOT fatal: nothing in the blend
+# path pushes to the Hub, so an over-long name only costs readability (and a
+# too-long wandb artifact name if these repo_ids are ever logged). Warn so the
+# user can shorten --dag_short_override / --run_tag before a long lineage runs.
+# Length is ratio-independent (blend tags are always 3 digits) and grows with
+# the round number, so probing the last round with the first ratio is enough.
+# This matters most under --separate_blend_lineage, where the blend datasets
+# inherit THIS lineage's blends_tag (+5-10 chars vs rerun mode's source prefix).
+if (( ${#BLENDS[@]} > 0 )); then
+    _probe_blend_repo="$(blend_repo_for_round "$NUM_ROUNDS" "${BLENDS[0]}")"
+    _probe_names=( "$_probe_blend_repo" )
+    if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
+        _probe_names+=( "$(nocoll_repo_for_round "$NUM_ROUNDS" "${BLENDS[0]}")" )
+    fi
+    for _pn in "${_probe_names[@]}"; do
+        if (( ${#_pn} > 56 )); then
+            echo "  WARN: blend dataset name exceeds the 56-char convention (${#_pn}): '$_pn'" >&2
+            if [[ "$SEPARATE_BLEND_LINEAGE" == "true" ]]; then
+                echo "        (--separate_blend_lineage puts this lineage's blends_tag '$BLENDS_TAG' into the" >&2
+                echo "         blend dataset prefix; shorten --dag_short_override or --run_tag to fit.)" >&2
+            fi
+        fi
+    done
 fi
 echo "  ✓ all derived names valid (alias step: $([ "$SKIP_ALIAS_STEP" == true ] && echo SKIPPED || echo enabled))."
 fi  # end of `if [[ "$CLEANUP_ONLY" == true ]]; then ... else ...`
@@ -5268,6 +5430,40 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
                 if [[ "$ACTION_FORMAT" == "rel" ]]; then
                     run_or_echo bash "$SCRIPT_DIR/compute_relative_stats.sh" --dataset_repo="$BLEND_REPO"
                 fi
+            fi
+            # Step 2a-viz — DART label check plots. After every blend round,
+            # render the chunk-label figure (visualize_dart_chunks.py) for a
+            # few episodes (first / middle / last of the blend dataset) into
+            # the round's training dir, next to the other dagger sidecars,
+            # with a .cmd.txt beside each PNG holding the exact command to
+            # regenerate it. Dart-labeled runs only; idempotent (skips PNGs
+            # already on disk).
+            if [[ "$BLEND_LABELS" == "dart" ]] && dataset_exists "$BLEND_REPO"; then
+                DART_VIZ_DIR="$TRAIN_OUTPUT_DIR/dagger/dart_check"
+                run_or_echo mkdir -p "$DART_VIZ_DIR"
+                _dart_eps="$(python3 - "$LEROBOT_CACHE/$BLEND_REPO" <<'PYEOF'
+import sys
+
+import pandas as pd
+
+m = pd.read_parquet(sys.argv[1] + "/meta/episodes/chunk-000/file-000.parquet")
+n = len(m)
+print(" ".join(str(p) for p in sorted({0, n // 2, n - 1})))
+PYEOF
+)"
+                _blend_base="${BLEND_REPO##*/}"
+                for _ep in $_dart_eps; do
+                    _dart_png="$DART_VIZ_DIR/dart_chunks_${_blend_base}_ep${_ep}.png"
+                    if [[ -f "$_dart_png" ]]; then
+                        echo "  ratio=$R → $_dart_png already on disk; skipping dart-check plot."
+                        continue
+                    fi
+                    _dart_cmd="python $SCRIPT_DIR/visualize_dart_chunks.py --blend_repo_id=$BLEND_REPO --source_repo_id=$INT_REPO --episode_index=$_ep --out=$_dart_png"
+                    echo "  ratio=$R → dart-check plot: $_dart_png"
+                    # Non-fatal: a viz failure must never kill the round.
+                    run_or_echo $_dart_cmd || echo "  WARNING: dart-check plot failed for ep $_ep (non-fatal)."
+                    run_or_echo bash -c "echo '$_dart_cmd' > '${_dart_png%.png}.cmd.txt'"
+                done
             fi
             # Step 2b — collision filter (optional). Replays the blend dataset
             # through a headless splatsim and drops episodes that hit obstacles

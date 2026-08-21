@@ -340,6 +340,15 @@ class AugmentationConfig:
     blend_dev_regulation: bool = False
     blend_dev_full_below: float = 3.0
     blend_dev_zero_above: float = 8.0
+    # TUBE-BREACH accept gate: reject any rollout (success included) whose
+    # REALIZED corridor-deviation p95 exceeds this multiple of
+    # blend_tube_steps. The tube re-blend constrains the PLANNED chunk only;
+    # execution compounding can still run past it (2026-08-21, ep 9 of the
+    # dag1 b050 set: dev p95 36 med-steps against a 16-step tube -> 0.75 rad
+    # offsets whose DART rejoins are physically impossible within a chunk).
+    # Rejected rollouts retry with a fresh draw and then drop, like the
+    # convergence gate. <= 0 (or blend_tube_steps == 0) disables.
+    max_blend_dev_p95_mult: float = 1.5
     # Tube re-blend budget (predictive): if the blended chunk's max offset
     # from the guidance fill exceeds this many guidance-median-steps, the
     # blend is RE-RUN at a reduced ratio before anything executes (same
@@ -581,6 +590,7 @@ class RolloutResult:
     mean_effective_ratio: float | None = None  # tick-mean of taper/tube-scaled ratio
     dev_steps_p50: float | None = None  # realized corridor deviation, med_step units
     dev_steps_p95: float | None = None
+    tube_breach: bool = False  # rollout aborted early: realized dev crossed the gate
 
 
 @torch.no_grad()
@@ -617,6 +627,7 @@ def rollout_closed_loop_for_augmentation(
     pad_after_success: bool = True,
     min_episode_length: int = 60,
     expected_env_state: np.ndarray | None = None,
+    abort_dev_steps: float = 0.0,
 ) -> RolloutResult:
     """Run one closed-loop rollout and capture (raw_obs, action) per step.
 
@@ -692,6 +703,7 @@ def rollout_closed_loop_for_augmentation(
         demo_states_raw=demo_states_raw,
         pad_after_success=pad_after_success,
         expected_env_state=expected_env_state,
+        abort_dev_steps=abort_dev_steps,
         on_step=_on_step,
         on_success=_on_success,
         log=lambda msg: logger.info(msg),
@@ -711,6 +723,7 @@ def rollout_closed_loop_for_augmentation(
                 success=result.success,
                 success_t=result.success_t,
                 dropped_short=True,
+                tube_breach=result.tube_breach,
             )
         return RolloutResult(
             frames=frames,
@@ -720,6 +733,7 @@ def rollout_closed_loop_for_augmentation(
             mean_effective_ratio=result.mean_effective_ratio,
             dev_steps_p50=result.dev_steps_p50,
             dev_steps_p95=result.dev_steps_p95,
+            tube_breach=result.tube_breach,
         )
 
     # Legacy pad path: pad to min_episode_length if the rollout was shorter
@@ -741,6 +755,7 @@ def rollout_closed_loop_for_augmentation(
         mean_effective_ratio=result.mean_effective_ratio,
         dev_steps_p50=result.dev_steps_p50,
         dev_steps_p95=result.dev_steps_p95,
+        tube_breach=result.tube_breach,
     )
 
 
@@ -1470,7 +1485,48 @@ def run_augmentation(
                             pad_after_success=cfg.pad_after_success,
                             min_episode_length=cfg.min_episode_length,
                             expected_env_state=_expected_env_state,
+                            abort_dev_steps=(
+                                cfg.max_blend_dev_p95_mult * cfg.blend_tube_steps
+                                if cfg.max_blend_dev_p95_mult > 0 and cfg.blend_tube_steps > 0
+                                else 0.0
+                            ),
                         )
+                        if (
+                            cfg.max_blend_dev_p95_mult > 0
+                            and cfg.blend_tube_steps > 0
+                            and (
+                                rollout.tube_breach  # early abort — retry even if short/empty
+                                or (
+                                    rollout.frames
+                                    and not rollout.dropped_short
+                                    and rollout.dev_steps_p95 is not None
+                                    and rollout.dev_steps_p95
+                                    > cfg.max_blend_dev_p95_mult * cfg.blend_tube_steps
+                                )
+                            )
+                        ):
+                            logger.warning(
+                                "source_ep=%d ratio=%.2f (eff %.3f) attempt %d: TUBE BREACH%s — "
+                                "realized dev p95 %.1f med-steps, gate %.1f (%.2gx tube %g); "
+                                "execution compounding outran the planned-chunk re-blend — %s.",
+                                source_ep,
+                                ratio,
+                                ratio_eff,
+                                _attempt_no,
+                                " (aborted early)" if rollout.tube_breach else "",
+                                rollout.dev_steps_p95 if rollout.dev_steps_p95 is not None else float("nan"),
+                                cfg.max_blend_dev_p95_mult * cfg.blend_tube_steps,
+                                cfg.max_blend_dev_p95_mult,
+                                cfg.blend_tube_steps,
+                                "retrying with a fresh draw"
+                                if _attempt < cfg.blend_end_gap_retries
+                                else (
+                                    "backing off the ratio"
+                                    if ratio_eff != _ratio_ladder[-1]
+                                    else "dropping the pair"
+                                ),
+                            )
+                            continue
                         if cfg.max_blend_end_gap_steps <= 0 or rollout.dropped_short or not rollout.frames:
                             _accepted = True
                             break

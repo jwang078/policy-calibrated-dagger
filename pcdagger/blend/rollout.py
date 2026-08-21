@@ -298,6 +298,7 @@ class BlendRolloutResult:
     mean_effective_ratio: float | None = None  # tick-mean of the (taper/tube-scaled) ratio
     dev_steps_p50: float | None = None  # median per-tick corridor deviation, med_step units
     dev_steps_p95: float | None = None
+    tube_breach: bool = False  # aborted early: realized dev crossed abort_dev_steps
 
 
 @torch.no_grad()
@@ -335,6 +336,7 @@ def run_blended_rollout(
     pad_after_success: bool = True,
     expected_env_state: np.ndarray | None = None,
     env_state_match_tol: float = 0.02,
+    abort_dev_steps: float = 0.0,
     on_step: Callable[[int, dict[str, Any], np.ndarray, bool], None] | None = None,
     on_success: Callable[[dict[str, Any]], None] | None = None,
     log: Callable[[str], None] = print,
@@ -456,6 +458,15 @@ def run_blended_rollout(
     _dev_hist: list[float] = []
     _tube_engaged_since: int | None = None
     _tube_ticks_total = 0
+    # EARLY BREACH ABORT (abort_dev_steps > 0): the planned-chunk tube
+    # re-blend saturates under DENOISE mode attraction on hard basins, so
+    # the executed state can still leave the tube (ep 9, 2026-08-21) — the
+    # accept gate would reject the episode post hoc anyway; abort the
+    # moment the realized deviation crosses the gate instead of burning the
+    # rest of the episode. 3 consecutive ticks so a one-tick projection
+    # glitch cannot kill a healthy rollout.
+    _breach_run = 0
+    _tube_breach = False
 
     for t in range(total_steps):
         # ── Hold mode: episode succeeded, don't step env again ────────────────
@@ -540,6 +551,19 @@ def run_blended_rollout(
                     float(np.linalg.norm(_q_now.astype(np.float64) - _demo_arm[_j_progress])) / _pg_med_step
                 )
                 _dev_hist.append(_dev)
+                if abort_dev_steps > 0.0 and _dev > abort_dev_steps:
+                    _breach_run += 1
+                    if _breach_run >= 3:
+                        _tube_breach = True
+                        log(
+                            f"[ratio={ratio}] TUBE BREACH ABORT at t={t}: realized dev "
+                            f"{_dev:.1f} med_steps > gate {abort_dev_steps:.1f} for "
+                            f"{_breach_run} consecutive tick(s) — ending the rollout now "
+                            f"(the accept gate would reject it post hoc anyway)"
+                        )
+                        break
+                else:
+                    _breach_run = 0
                 if blend_dev_regulation:
                     _span = max(1e-6, float(blend_dev_zero_above) - float(blend_dev_full_below))
                     _scale_tube = float(np.clip((float(blend_dev_zero_above) - _dev) / _span, 0.0, 1.0))
@@ -685,4 +709,5 @@ def run_blended_rollout(
         mean_effective_ratio=(_r_eff_sum / _r_eff_n) if _r_eff_n else None,
         dev_steps_p50=float(np.percentile(_dev_hist, 50)) if _dev_hist else None,
         dev_steps_p95=float(np.percentile(_dev_hist, 95)) if _dev_hist else None,
+        tube_breach=_tube_breach,
     )

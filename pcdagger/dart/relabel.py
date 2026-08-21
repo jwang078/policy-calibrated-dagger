@@ -50,6 +50,8 @@ class DemoGeometry:
     seg_len: np.ndarray  # (T-1,) segment lengths
     cum: np.ndarray  # (T,) cumulative arc length
     med_step: float  # median non-degenerate segment length
+    acc_p95: float = 0.0  # p95 per-tick^2 accel of the demo path (rad/tick^2)
+    acc_mean: float = 0.0  # mean per-tick^2 accel of the demo path (rad/tick^2)
 
     @property
     def n_arm(self) -> int:
@@ -66,7 +68,19 @@ def demo_geometry(demo_states_raw: np.ndarray, demo_actions_raw: np.ndarray, n_a
     cum = np.concatenate([[0.0], np.cumsum(seg_len)])
     live = seg_len[seg_len > 1e-9]
     med_step = float(np.median(live)) if len(live) else 1e-3
-    return DemoGeometry(P=pts, A=acts, seg=seg, seg_len=seg_len, cum=cum, med_step=med_step)
+    acc = np.linalg.norm(np.diff(pts, n=2, axis=0), axis=1) if len(pts) > 2 else np.zeros(1)
+    acc_p95 = float(np.percentile(acc, 95)) if len(acc) else 0.0
+    acc_mean = float(np.mean(acc)) if len(acc) else 0.0
+    return DemoGeometry(
+        P=pts,
+        A=acts,
+        seg=seg,
+        seg_len=seg_len,
+        cum=cum,
+        med_step=med_step,
+        acc_p95=acc_p95,
+        acc_mean=acc_mean,
+    )
 
 
 def project_states(
@@ -127,6 +141,8 @@ def chunk_labels(
     prev_state: np.ndarray | None = None,
     glide_ratio: float = 2.0,
     velocity: np.ndarray | None = None,
+    accel_budget: float = 1.0,
+    info: dict | None = None,
 ) -> np.ndarray:
     """Synthesize the expert's ``horizon``-step response from one state.
 
@@ -165,15 +181,21 @@ def chunk_labels(
     # where rejoins last up to tube_steps ticks).
     b = max(1.0, float(speed_budget)) * geom.med_step
     end_i = float(len(geom.A) - 1)
-    # HERMITE MERGE (heading-continuous at BOTH ends): when the state's own
-    # velocity is known and the offset is non-trivial, the rejoin is a cubic
-    # Hermite from (q, v0) to (demo action at a budget-chosen rendezvous
-    # index, demo velocity there). The launch direction IS the robot's
-    # current motion — no perpendicular departure from the blended path —
-    # and the landing is tangent to the demo. Rendezvous time T comes from
-    # the speed budget (chord/T <= B), the rendezvous index from the
-    # tangential distance the budget affords: di = sqrt((T*B)^2 - d0^2).
-    if (velocity is not None or prev_state is not None) and d0 > 0.5 * geom.med_step:
+    # QUINTIC MERGE (position+velocity continuous at both ends, accel ZERO
+    # at both ends): when the state's own velocity is known and the offset
+    # is non-trivial, the rejoin is a min-jerk quintic from (q, v0) to (demo
+    # action at a budget-chosen rendezvous index, demo velocity there).
+    # Launch direction AND curvature match the robot's current motion, so
+    # the track initially continues like the policy and bends mid-flight.
+    # Rendezvous time T is the larger of the speed budget (chord/T <= B) and
+    # the accel budget (peak ~5.77*d0/T^2 <= accel_budget x demo MEAN accel);
+    # the rendezvous index is the tangential distance the speed budget
+    # affords: di = sqrt((T*B)^2 - d0^2).
+    # No offset floor: even ON the corridor the quintic matters — an anchor
+    # whose speed differs from demo pace (episode start: robot at rest, demo
+    # cruising) needs the same smooth velocity ramp, and with d0 ~ 0 the
+    # merge degenerates gracefully to demo-following.
+    if velocity is not None or prev_state is not None:
         # Launch tangent: prefer an externally SMOOTHED velocity (the
         # recorded relabel_velocity annotation, or a windowed estimate from
         # a full track) — a single-tick finite difference on a noisy blend
@@ -187,58 +209,223 @@ def chunk_labels(
                 - np.asarray(prev_state, dtype=np.float64)[: geom.n_arm]
             )
         sp0 = float(np.linalg.norm(v0))
-        if sp0 < 0.2 * geom.med_step:
-            # stationary robot: launch along the corridor tangent instead.
-            v0 = _interp_rows(geom.P, min(demo_index + 1.0, end_i)) - proj0
-            sp0 = float(np.linalg.norm(v0)) or 1e-9
-        v0 = v0 * (min(sp0, b) / sp0)
+        if sp0 > 2.5 * b:
+            v0 = v0 * (2.5 * b / sp0)  # sanity cap only — outlier estimates
+        # NOTE: v0 is otherwise NOT modified — the launch boundary condition
+        # must be the robot's TRUE velocity, however small (zeroing a
+        # creeping robot's v0, like clamping a faster-than-budget robot down
+        # to b, injects its own instantaneous velocity step at the
+        # junction); the budgets shape the curve via T, not the boundary
+        # conditions. A tiny noisy v0 is harmless: m0 = v0*T stays tiny.
         labels = np.empty((horizon, geom.A.shape[1]), dtype=np.float64)
-        # Rendezvous time from the GLIDE RATIO (tangential:normal >= glide:1,
-        # chord angle <= atan(1/glide) ~ 27 deg at 2.0): chord = d0*sqrt(1+g^2),
-        # T = chord/B. The earlier correction-dominated choice (T = d0/0.8B)
-        # made 53-deg chords that rendered as perpendicular spokes.
+        # Merge time from BOTH budgets. Speed: chord = d0*sqrt(1+g^2) covered
+        # at <= B (glide ratio keeps the chord angle <= atan(1/g) ~ 27 deg at
+        # 2.0). Accel: the quintic's peak lateral accel is ~5.77*d0/T^2, kept
+        # under accel_budget x the demo's own mean accel — a cubic-Hermite
+        # merge at the speed-only T hit 9-15 rad/s^2 (10-16x the demo's max,
+        # which never exceeds ~1 rad/s^2), all of it applied AT the junction
+        # (cubic accel peaks at the endpoints), which is why chunks read as
+        # 'explicitly switching direction' despite shallow chords.
         g = max(0.5, float(glide_ratio))
-        t_merge = max(2, int(np.ceil(d0 * float(np.sqrt(1.0 + g * g)) / b)))
-        for _ in range(3):  # speed-check bumps
-            di = float(np.sqrt(max(0.0, (t_merge * b) ** 2 - d0 * d0))) / geom.med_step
+        # Budget anchored to the demo's MEAN accel (~0.2 rad/s^2 planar; the
+        # p95 anchor at 3x read as 'accelerating too hard' — labels should
+        # move like the demo's typical motion, not its hardest turn). Large
+        # offsets then want T beyond the horizon; the horizon-1 cap keeps
+        # them ~0.5-0.7 rad/s^2, still under the demo's p95.
+        a_max = float(accel_budget) * max(geom.acc_mean, 0.01 * geom.med_step)
+        tan0 = (
+            _interp_rows(geom.P, min(float(demo_index) + 1.0, end_i))
+            - _interp_rows(geom.P, max(float(demo_index) - 1.0, 0.0))
+        ) / 2.0
+        # BRAKE PHASE (wrong-way launch): when v0 points against the nominal
+        # glide direction (g:1 forward:inward), a single quintic must carry
+        # the full m0 = v0*T tangent — at a horizon-scale T this sweeps a
+        # backward lobe of ~0.2 rad (the 'going backwards' curls on tube
+        # breaches). A real expert brakes first — a min-jerk stop along v0,
+        # exactly what TOPP-RA produces at a reversal cusp — then glides.
+        # Both the brake and the post-brake glide run at the RECOVERY accel
+        # a_rec: the demo's own p95, which (demos here being planner-made
+        # intervention recordings) IS the intervention pipeline's realized
+        # max_joint_acc envelope — labels stay in-distribution relative to
+        # interventions by construction, and the anchor tracks any future
+        # change to the planner limits automatically.
+        a_rec = max(geom.acc_p95, 1.5 * a_max)
+        brake_pts: list[np.ndarray] = []
+        a0_row = _interp_rows(geom.A, min(float(demo_index), end_i))
+        u_off = offset / d0 if d0 > 1e-9 else np.zeros_like(offset)
+        t_hat = tan0 / (float(np.linalg.norm(tan0)) + 1e-12)
+        glide_dir = g * t_hat - u_off
+        gd_norm = float(np.linalg.norm(glide_dir))
+        align = float(np.dot(v0, glide_dir)) / (sp0 * gd_norm) if sp0 > 1e-12 and gd_norm > 1e-9 else 1.0
+        if align < -0.1 and sp0 > 0.5 * geom.med_step:
+            a_brake = a_rec
+            t_b = max(2, int(np.ceil(1.875 * sp0 / a_brake)))
+            for k in range(min(t_b, horizon)):
+                t01 = (k + 1) / t_b
+                s3 = t01 * t01 * t01
+                s4, s5 = s3 * t01, s3 * t01 * t01
+                h0 = 1 - 10 * s3 + 15 * s4 - 6 * s5
+                h1 = t01 - 6 * s3 + 8 * s4 - 3 * s5
+                h3 = 10 * s3 - 15 * s4 + 6 * s5
+                pt = a0_row.copy()
+                pt[: geom.n_arm] = h0 * q + h1 * (v0 * t_b) + h3 * (q + 0.5 * v0 * t_b)
+                brake_pts.append(pt)
+            # glide launches from the stop point, at rest.
+            q = brake_pts[-1][: geom.n_arm].copy()
+            v0 = np.zeros_like(v0)
+            sp0 = 0.0
+            offset = q - proj0
+            d0 = float(np.linalg.norm(offset))
+        # Post-brake glides use the recovery envelope (a merge from a brake
+        # cusp at demo-MEAN accel would creep for seconds); ordinary merges
+        # keep the gentler cruise budget.
+        a_glide = a_rec if brake_pts else a_max
+        # Mean merge speed: trapezoid between launch and demo cruise, capped
+        # by the speed budget. Demanding chord = T*b regardless of sp0 made
+        # slow launches bulge above the budget mid-flight. After a brake
+        # cusp the ramp runs at a_rec, so refine the trapezoid once with the
+        # actual ramp time instead of averaging against a standing start.
+        mean_sp = min(b, 0.5 * (sp0 + geom.med_step))
+        # T seed: lateral glide, lateral accel, AND the tangential velocity
+        # ramp (an on-corridor anchor at the wrong speed — episode start —
+        # has d0 ~ 0 but still needs 1.875*|dv|/a_glide ticks to retime).
+        t_speed = d0 * float(np.sqrt(1.0 + g * g)) / mean_sp
+        t_accel = float(np.sqrt(5.77 * d0 / a_glide))
+        # Tangential retiming always runs at the RECOVERY envelope: at demo-
+        # MEAN accel a modest speed mismatch wanted 100+ ticks, and a T far
+        # beyond chord/speed makes the quintic loiter (tangent magnitudes
+        # scale with T) — mid-merge speed bulged to ~1.9x the mean.
+        t_vel = 1.875 * float(np.linalg.norm(v0 - tan0)) / a_rec
+        if brake_pts:
+            t0 = max(2.0, max(t_speed, t_accel, t_vel))
+            t_ramp = b / a_glide
+            mean_sp = min(b, b * (1.0 - t_ramp / (2.0 * t0)) if t0 > t_ramp else a_glide * t0 / 2.0)
+            mean_sp = max(mean_sp, 0.25 * b)
+            t_speed = d0 * float(np.sqrt(1.0 + g * g)) / mean_sp
+        t_ideal = max(2, int(np.ceil(max(t_speed, t_accel, t_vel))))
+        t_merge = min(horizon - 1, t_ideal)
+        if t_merge * mean_sp < d0 * float(np.sqrt(2.0)):
+            # RENDEZVOUS COLLAPSE guard: when horizon-1 ticks of budgeted
+            # motion cannot even cross the offset at a 45-deg chord, the
+            # sqrt below floors at di ~ 0 — a pure perpendicular dive with
+            # zero forward progress. Rejoining within the chunk is already
+            # physically impossible here, so keep the GEOMETRY honest
+            # instead: use the uncapped ideal T (the label chunk is then
+            # the first `horizon` ticks of a longer gentle merge, and
+            # in-chunk convergence is sacrificed exactly where it never
+            # existed).
+            t_merge = t_ideal
+        for _ in range(5):  # numeric speed/accel-check adjustments
+            # t_built: the T the pts below are actually sampled with. The
+            # loop may bump t_merge AFTER the final build (exhausted tries),
+            # so t_merge can end stale — diagnostics must report t_built or
+            # the viz maps the chunk's on-demo tail to the wrong indices.
+            t_built = t_merge
+            di = float(np.sqrt(max(0.0, (t_merge * mean_sp) ** 2 - d0 * d0))) / geom.med_step
             i_r = min(end_i, float(demo_index) + di)
             a_r = _interp_rows(geom.A, i_r)
             tan_r = (
                 _interp_rows(geom.A, min(i_r + 1.0, end_i)) - _interp_rows(geom.A, max(i_r - 1.0, 0.0))
             ) / 2.0
+            land_rest = i_r >= end_i - 1.0
+            if land_rest:
+                # Rendezvous at (or within one index of) the demo's END: the
+                # demo is over, so land AT REST — landing with the end
+                # tangent and then holding was a ~6 rad/s^2 one-tick stop,
+                # and a rendezvous 0.x indices from the end has only that
+                # 0.x of fill left (same stop, one tick later).
+                tan_r[:] = 0.0
+            # QUINTIC (min-jerk) merge: position+velocity matched at both
+            # ends, acceleration ZERO at both ends — the label track leaves
+            # exactly as the robot was already moving (no accel step at the
+            # junction) and bends into the corridor mid-flight.
+            # Build the FULL merge, then check — never truncate: a partial
+            # merge spliced onto the demo fill is itself a discontinuity far
+            # worse than any budget overshoot it would be avoiding.
             pts = []
-            ok = True
-            prev_pt = np.asarray(state, dtype=np.float64)[: geom.A.shape[1]].copy()
-            for k in range(min(t_merge, horizon)):
+            if brake_pts:
+                prev_pt = brake_pts[-1].copy()
+                prev_v = (
+                    brake_pts[-1][: geom.n_arm] - brake_pts[-2][: geom.n_arm]
+                    if len(brake_pts) >= 2
+                    else v0.copy()
+                )
+            else:
+                prev_pt = np.asarray(state, dtype=np.float64)[: geom.A.shape[1]].copy()
+                prev_v = v0.copy()
+            worst_speed = worst_acc = 0.0
+            for k in range(min(t_merge, max(0, horizon - len(brake_pts)))):
                 t01 = (k + 1) / t_merge
-                h00 = 2 * t01**3 - 3 * t01**2 + 1
-                h10 = t01**3 - 2 * t01**2 + t01
-                h01 = -2 * t01**3 + 3 * t01**2
-                h11 = t01**3 - t01**2
+                s3 = t01 * t01 * t01
+                s4, s5 = s3 * t01, s3 * t01 * t01
+                h0 = 1 - 10 * s3 + 15 * s4 - 6 * s5
+                h1 = t01 - 6 * s3 + 8 * s4 - 3 * s5
+                h3 = 10 * s3 - 15 * s4 + 6 * s5
+                h4 = -4 * s3 + 7 * s4 - 3 * s5
                 pt = a_r.copy()
                 pt[: geom.n_arm] = (
-                    h00 * q
-                    + h10 * (v0 * t_merge)
-                    + h01 * a_r[: geom.n_arm]
-                    + h11 * (tan_r[: geom.n_arm] * t_merge)
+                    h0 * q
+                    + h1 * (v0 * t_merge)
+                    + h3 * a_r[: geom.n_arm]
+                    + h4 * (tan_r[: geom.n_arm] * t_merge)
                 )
                 # non-arm dims (gripper): linear from the current demo action.
                 if geom.A.shape[1] > geom.n_arm:
                     a0_row = _interp_rows(geom.A, min(float(demo_index), end_i))
                     pt[geom.n_arm :] = (1 - t01) * a0_row[geom.n_arm :] + t01 * a_r[geom.n_arm :]
-                if np.linalg.norm(pt[: geom.n_arm] - prev_pt[: geom.n_arm]) > 1.4 * b:
-                    ok = False
-                    break
+                step_v = pt[: geom.n_arm] - prev_pt[: geom.n_arm]
+                worst_speed = max(worst_speed, float(np.linalg.norm(step_v)))
+                worst_acc = max(worst_acc, float(np.linalg.norm(step_v - prev_v)))
                 pts.append(pt)
-                prev_pt = pt
-            if ok or horizon - 1 <= t_merge:
+                prev_pt, prev_v = pt, step_v
+            # A launch faster than the budget is the robot's real speed, not
+            # a curve defect — the speed ceiling never sits below it.
+            speed_ok = worst_speed <= max(1.4 * b, 1.05 * sp0)
+            acc_ok = worst_acc <= 1.3 * a_glide
+            if speed_ok and acc_ok:
                 break
-            t_merge = min(horizon - 1, int(np.ceil(t_merge * 1.5)))
+            changed = False
+            if not speed_ok and mean_sp > 0.35 * geom.med_step:
+                # Speed bulge: the quintic swerves through a longer path than
+                # the chord (boundary-direction mismatch), so mid-merge speed
+                # overshoots the mean. Lengthening T does NOT help — the
+                # bulge ratio is scale-invariant in T (chord and tangents
+                # both scale with it). Shrink the rendezvous DISTANCE.
+                mean_sp *= 0.75
+                changed = True
+            if not acc_ok and t_merge < horizon - 1:
+                t_merge = min(horizon - 1, int(np.ceil(t_merge * 1.3)))
+                changed = True
+            if not changed:
+                break
+        all_pts = brake_pts + pts
         for k in range(horizon):
-            if k < len(pts):
-                labels[k] = pts[k]
+            if k < len(all_pts):
+                labels[k] = all_pts[k]
+            elif land_rest:
+                # landed AT REST at the demo's end — hold there (advancing
+                # the last fractional index would be a rest -> cruise jump).
+                labels[k] = a_r
             else:
-                labels[k] = _interp_rows(geom.A, min(i_r + (k - len(pts) + 1), end_i))
+                labels[k] = _interp_rows(geom.A, min(i_r + (k - len(all_pts) + 1), end_i))
+        if info is not None:
+            # Diagnostics for the label-QA sweep: which structural paths this
+            # anchor exercised (edge-case coverage) and the budgets used.
+            info.update(
+                branch="quintic",
+                braked=bool(brake_pts),
+                t_brake=len(brake_pts),
+                t_merge=int(t_built),
+                uncapped=bool(t_built > horizon - 1),
+                d0=float(d0),
+                sp0=float(sp0),
+                align=float(align),
+                di=float(di),
+                end_clamped=bool(land_rest),
+                a_budget=float(a_glide),
+                worst_speed=float(worst_speed),
+                worst_acc=float(worst_acc),
+            )
         return labels
 
     idx = float(demo_index)
@@ -261,6 +448,8 @@ def chunk_labels(
             labels[k, : geom.n_arm] += d_k * u
         t_k = min(geom.med_step, float(np.sqrt(max(0.0, b * b - c_k * c_k))))
         idx = min(idx + t_k / geom.med_step, end)
+    if info is not None:
+        info.update(branch="pursuit", braked=False, d0=float(d0))
     return labels
 
 

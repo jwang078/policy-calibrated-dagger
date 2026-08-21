@@ -12,6 +12,7 @@ from lerobot.datasets.dart_relabel import (  # noqa: F401
     DemoGeometry,
     _interp_rows,
     chunk_labels,
+    chunk_ok,
     demo_geometry,
     load_source_geometries,
     maybe_wrap_dart,

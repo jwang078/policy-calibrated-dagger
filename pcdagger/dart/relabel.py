@@ -381,7 +381,15 @@ def chunk_labels(
             # A launch faster than the budget is the robot's real speed, not
             # a curve defect — the speed ceiling never sits below it.
             speed_ok = worst_speed <= max(1.4 * b, 1.05 * sp0)
-            acc_ok = worst_acc <= 1.3 * a_glide
+            # Reject only what exceeds the demo's ENVELOPE (a_rec ~ p95).
+            # Bounding by the MEAN budget here failed chronically — a label
+            # merely tracking an ordinary demo turn exceeds the mean — and
+            # with the chord held, every bump stretched T against ~cruise
+            # boundary speeds, forcing the quintic to loiter/detour to burn
+            # the surplus time (near-corridor chunks visibly left the demo
+            # and came back). The mean-accel preference lives in the T SEED
+            # (t_accel), not in this reject bound.
+            acc_ok = worst_acc <= 1.3 * a_rec
             if speed_ok and acc_ok:
                 break
             changed = False
@@ -619,7 +627,7 @@ class DartChunkDataset:
                     velocity=vels_ep[t] if vels_ep is not None else None,
                     info=info,
                 )
-                return self._chunk_holds(labels, info)
+                return not chunk_ok(labels, info, geom)[0]
 
             # exact per-frame sweep: hold-ness is only NEAR-monotone in the
             # frame index (velocity variation), so evaluate every anchor —
@@ -760,6 +768,29 @@ class DartChunkDataset:
         if info.get("end_clamped"):
             return True
         return bool(np.linalg.norm(labels[-1] - labels[-2]) < 1e-9)
+
+
+def chunk_ok(labels: np.ndarray, info: dict, geom: DemoGeometry) -> tuple[bool, str]:
+    """Single validity predicate for a synthesized chunk — shared by the
+    train-time sampling window and the QA certificate, so training serves
+    exactly what QA certifies.
+
+    Rejects (reason string names the cause):
+      * ``hold``  — the tail stops moving (demo-end hold zone); with an
+        unmasked pad loss these frames teach brake-early-and-sit;
+      * ``accel`` — a label-internal accel spike above the demo envelope
+        (2*sqrt(n)*acc_p95, floored at 0.2*med_step ~ the env's junction
+        noise scale) — boundary-geometry artifacts (partial fill steps at a
+        clamped end, fast-anchor-on-slow-demo splices).
+    """
+    if info.get("end_clamped") or bool(np.linalg.norm(labels[-1] - labels[-2]) < 1e-9):
+        return False, "hold"
+    n = geom.n_arm
+    a_lim = max(2.0 * float(np.sqrt(n)) * geom.acc_p95, 0.2 * geom.med_step)
+    amax = float(np.linalg.norm(np.diff(labels[:, :n], n=2, axis=0), axis=1).max())
+    if amax > a_lim + 1e-9:
+        return False, "accel"
+    return True, "ok"
 
 
 def maybe_wrap_dart(dataset, root: str | None = None, rate: float = 1.0, ease_out: float = 0.3):

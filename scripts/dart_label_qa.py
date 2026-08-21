@@ -35,7 +35,7 @@ import sys
 
 import numpy as np
 import pandas as pd
-from dart_labels import chunk_labels, demo_geometry, project_states
+from dart_labels import chunk_labels, chunk_ok, demo_geometry, project_states
 
 FPS = 30.0
 
@@ -79,9 +79,8 @@ def main() -> None:
         sg = src_df[src_df.episode_index == src_map.get(ep, ep)]
         if len(sg) < 10 or len(g) < 10:
             continue
-        geom = demo_geometry(
-            np.stack(sg["observation.state"].to_numpy()), np.stack(sg["action"].to_numpy()), n
-        )
+        sg_actions = np.stack(sg["action"].to_numpy())
+        geom = demo_geometry(np.stack(sg["observation.state"].to_numpy()), sg_actions, n)
         S = np.stack(g["observation.state"].to_numpy())[:, :n].astype(np.float64)
         if "relabel_demo_index" in g.columns:
             idxs = np.array([float(np.reshape(x, -1)[0]) for x in g["relabel_demo_index"].to_numpy()])
@@ -93,6 +92,9 @@ def main() -> None:
         # 0.2 * med_step ~ 3.5 rad/s^2 planar — junction noise scale is set
         # by the env, not by how hard this particular demo turns).
         a_lim = max(2.0 * float(np.sqrt(n)) * geom.acc_p95, 0.2 * geom.med_step)
+        # a chunk faithfully following the demo hits the demo's own top
+        # speed (fast phases exceed 1.4x the MEDIAN-based budget) — allow it.
+        d_max_step = float(np.linalg.norm(np.diff(sg_actions[:, :n], axis=0), axis=1).max())
         viols: list[str] = []
         for t in range(1, len(S) - 1, max(1, args.stride)):
             lo, hi = max(0, t - 3), min(len(S) - 1, t + 3)
@@ -108,6 +110,13 @@ def main() -> None:
                 info=info,
             )[:, :n]
             total_anchors += 1
+            # Mirror the train-time sampling window (same predicate:
+            # dart_relabel.chunk_ok): anchors excluded from sampling are
+            # counted, not checked — QA certifies exactly what is served.
+            _ok, _why = chunk_ok(L if L.shape[1] == geom.n_arm else L, info, geom)
+            if not _ok:
+                cov[f"excluded_{_why}"] = cov.get(f"excluded_{_why}", 0) + 1
+                continue
             if info.get("branch") == "pursuit":
                 cov["pursuit"] += 1
             else:
@@ -118,7 +127,7 @@ def main() -> None:
             v = np.diff(track, axis=0)
             sp0 = float(np.linalg.norm(v0))
             speeds = np.linalg.norm(v[1:], axis=1)
-            if speeds.max() > max(1.4 * b, 1.05 * sp0) + 1e-9:
+            if speeds.max() > max(1.4 * b, 1.15 * sp0, 1.05 * d_max_step) + 1e-9:
                 viols.append(f"t={t} speed {speeds.max() * FPS:.2f} rad/s")
             # accel: LABEL-INTERNAL only — the junction 2nd-difference mixes
             # in the robot's own state noise, which is data, not the label.

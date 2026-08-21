@@ -565,6 +565,76 @@ class DartChunkDataset:
         self.source_repo_id = source_repo_id
         self._fingerprinted = False
         self.geoms = load_source_geometries(source_repo_id, n_arm=self.n_arm, root=root)
+        self._valid = self._build_valid_window()
+
+    def _build_valid_window(self) -> np.ndarray:
+        """Flat indices whose label chunk is genuine motion end to end.
+
+        Anchors near the demo's end synthesize chunks whose tail lands on
+        the end and HOLDS; with an unmasked action-pad loss those frames
+        train brake-early-and-sit (eval dawdling). Sampling is restricted to
+        the exact set of anchors whose full-horizon chunk keeps moving,
+        found by synthesizing every anchor once at init (~1 ms each).
+        """
+        import pandas as pd
+
+        dts = getattr(self.dataset, "delta_timestamps", None) or {}
+        horizon = len(dts.get("action", [])) or 64
+        files = sorted(glob.glob(os.path.join(str(self.dataset.root), "data/**/*.parquet"), recursive=True))
+        cols = ["index", "episode_index", "frame_index", "observation.state", "relabel_demo_index"]
+        has_vel = "relabel_velocity" in self.dataset.meta.features
+        if has_vel:
+            cols.append("relabel_velocity")
+        df = pd.concat([pd.read_parquet(f, columns=cols) for f in files])
+        valid: list[np.ndarray] = []
+        for ep, g in df.groupby("episode_index"):
+            src = self.ep_to_source.get(int(ep))
+            if src is None or src not in self.geoms:
+                continue
+            geom = self.geoms[src]
+            g = g.sort_values("frame_index")
+            states_ep = np.stack(g["observation.state"].to_numpy()).astype(np.float64)[:, : self.n_arm]
+            dis_ep = np.array([float(np.reshape(v, -1)[-1]) for v in g["relabel_demo_index"].to_numpy()])
+            vels_ep = (
+                np.stack(
+                    [
+                        np.reshape(np.asarray(v, dtype=np.float64), -1)[: self.n_arm]
+                        for v in g["relabel_velocity"].to_numpy()
+                    ]
+                )
+                if has_vel
+                else None
+            )
+
+            def _holds_at(t, states_ep=states_ep, dis_ep=dis_ep, vels_ep=vels_ep, geom=geom) -> bool:
+                info: dict = {}
+                labels = chunk_labels(
+                    states_ep[t],
+                    dis_ep[t],
+                    geom,
+                    horizon=horizon,
+                    rate=self.rate,
+                    ease_out=self.ease_out,
+                    prev_state=states_ep[t - 1] if t > 0 else None,
+                    velocity=vels_ep[t] if vels_ep is not None else None,
+                    info=info,
+                )
+                return self._chunk_holds(labels, info)
+
+            # exact per-frame sweep: hold-ness is only NEAR-monotone in the
+            # frame index (velocity variation), so evaluate every anchor —
+            # ~1 ms each, a one-time init cost of seconds per dataset.
+            keep = np.array([not _holds_at(t) for t in range(len(states_ep))])
+            valid.append(g["index"].to_numpy()[keep].astype(np.int64))
+        if not valid:
+            import logging
+
+            logging.warning(
+                "dart_relabel %s: no hold-free anchors found — sampling the full range.",
+                self.dataset.repo_id,
+            )
+            return np.arange(len(self.dataset), dtype=np.int64)
+        return np.concatenate(valid)
 
     @staticmethod
     def _episode_pairing(dataset) -> tuple[dict[int, int], str | None]:
@@ -604,6 +674,11 @@ class DartChunkDataset:
         """Return the wrapped item with its action chunk replaced by DART labels."""
         import torch
 
+        # Sample only from the precomputed hold-free window: indices map
+        # uniformly onto valid anchors (len() is unchanged so multi-dataset
+        # cumulative sizes stay correct).
+        if len(self._valid) and len(self._valid) < len(self.dataset):
+            idx = int(self._valid[idx % len(self._valid)])
         item = self.dataset[idx]
         action = item["action"]
         if not self._fingerprinted:
@@ -674,38 +749,6 @@ class DartChunkDataset:
         # padding/holding, redirect the sample to an earlier anchor in the
         # SAME episode until the whole chunk is genuine motion; the endgame
         # stays supervised by the base/intervention data.
-        tries = 0
-        while self._chunk_holds(labels, info) and idx > 0 and tries < 10:
-            # Step back far enough to matter; crossing an episode boundary is
-            # fine (short episodes hold EVERYWHERE — substitute a neighbor's
-            # interior anchor) — the geometry is re-fetched per item.
-            shift = min(idx, max(8, action.shape[0] // 4))
-            idx -= shift
-            tries += 1
-            item = self.dataset[idx]
-            action = item["action"]
-            state = item["observation.state"]
-            q = state[-1] if state.dim() == 2 else state
-            di = item["relabel_demo_index"]
-            di = float(di.reshape(-1)[-1]) if isinstance(di, torch.Tensor) else float(np.reshape(di, -1)[-1])
-            geom = self.geoms[self.ep_to_source[int(item["episode_index"])]]
-            prev = state[0].cpu().numpy() if (state.dim() == 2 and state.shape[0] >= 2) else None
-            vel = item.get("relabel_velocity")
-            if vel is not None:
-                vel = vel.cpu().numpy() if isinstance(vel, torch.Tensor) else np.asarray(vel)
-                vel = vel[-1] if vel.ndim == 2 else vel
-            info = {}
-            labels = chunk_labels(
-                q.cpu().numpy(),
-                di,
-                geom,
-                horizon=action.shape[0],
-                rate=self.rate,
-                ease_out=self.ease_out,
-                prev_state=prev,
-                velocity=vel,
-                info=info,
-            )
         item["action"] = torch.as_tensor(
             labels[:, : action.shape[1]], dtype=action.dtype, device=action.device
         )

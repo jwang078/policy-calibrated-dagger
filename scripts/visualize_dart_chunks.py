@@ -125,7 +125,10 @@ def _plot(
         # curve even when the rollout lags the demo clock (see lag panel).
         ax.plot(idxs, S[:, j], color="tab:blue", lw=1.2, label="executed state (at its projected index)")
         for t in anchors:
-            ax.plot(idxs[t] + np.arange(horizon), chunks[t][:, j], color=colors[t], lw=1.1, alpha=0.9)
+            # place each label at ITS nearest demo index — the Hermite merge
+            # does not advance one index per tick, so i0+k lies.
+            cx = np.linalg.norm(chunks[t][:, None, :n] - geom.P[None, :, :], axis=2).argmin(axis=1)
+            ax.plot(cx, chunks[t][:, j], color=colors[t], lw=1.1, alpha=0.9)
             ax.plot([idxs[t]], [S[t, j]], marker="o", color=colors[t], ms=6, mec="k", mew=0.6)
         ax.set_title(f"joint_{j + 1}")
         ax.set_xlabel("demo index (projection-aligned)")

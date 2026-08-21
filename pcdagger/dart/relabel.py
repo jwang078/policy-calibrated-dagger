@@ -125,6 +125,7 @@ def chunk_labels(
     speed_budget: float = 1.2,
     ease_in: float = 0.35,
     prev_state: np.ndarray | None = None,
+    glide_ratio: float = 2.0,
 ) -> np.ndarray:
     """Synthesize the expert's ``horizon``-step response from one state.
 
@@ -183,7 +184,12 @@ def chunk_labels(
             sp0 = float(np.linalg.norm(v0)) or 1e-9
         v0 = v0 * (min(sp0, b) / sp0)
         labels = np.empty((horizon, geom.A.shape[1]), dtype=np.float64)
-        t_merge = max(2, int(np.ceil(d0 / (0.8 * b))))
+        # Rendezvous time from the GLIDE RATIO (tangential:normal >= glide:1,
+        # chord angle <= atan(1/glide) ~ 27 deg at 2.0): chord = d0*sqrt(1+g^2),
+        # T = chord/B. The earlier correction-dominated choice (T = d0/0.8B)
+        # made 53-deg chords that rendered as perpendicular spokes.
+        g = max(0.5, float(glide_ratio))
+        t_merge = max(2, int(np.ceil(d0 * float(np.sqrt(1.0 + g * g)) / b)))
         for _ in range(3):  # speed-check bumps
             di = float(np.sqrt(max(0.0, (t_merge * b) ** 2 - d0 * d0))) / geom.med_step
             i_r = min(end_i, float(demo_index) + di)

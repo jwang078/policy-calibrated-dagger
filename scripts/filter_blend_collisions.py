@@ -673,6 +673,12 @@ def _run(
         # filtering or train-time relabeling silently degrades to executed
         # labels on the `_nocoll` sibling.
         expected_features["relabel_demo_index"] = {"dtype": "float32", "shape": (1,), "names": None}
+    if "relabel_velocity" in _source_feats:
+        expected_features["relabel_velocity"] = {
+            "dtype": "float32",
+            "shape": tuple(_source_feats["relabel_velocity"]["shape"]),
+            "names": None,
+        }
     existing = load_lerobot_dataset(cfg.target_repo_id)
     if existing is not None:
         _existing_feats = existing.meta.features
@@ -710,9 +716,12 @@ def _run(
             state_dim=source_state_dim,
             env_state_dim=source_env_state_dim,
             extra_features=(
-                {"relabel_demo_index": expected_features["relabel_demo_index"]}
-                if "relabel_demo_index" in expected_features
-                else None
+                {
+                    k: expected_features[k]
+                    for k in ("relabel_demo_index", "relabel_velocity")
+                    if k in expected_features
+                }
+                or None
             ),
         )
 

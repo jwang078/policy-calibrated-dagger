@@ -126,6 +126,7 @@ def chunk_labels(
     ease_in: float = 0.35,
     prev_state: np.ndarray | None = None,
     glide_ratio: float = 2.0,
+    velocity: np.ndarray | None = None,
 ) -> np.ndarray:
     """Synthesize the expert's ``horizon``-step response from one state.
 
@@ -172,11 +173,19 @@ def chunk_labels(
     # and the landing is tangent to the demo. Rendezvous time T comes from
     # the speed budget (chord/T <= B), the rendezvous index from the
     # tangential distance the budget affords: di = sqrt((T*B)^2 - d0^2).
-    if prev_state is not None and d0 > 0.5 * geom.med_step:
-        v0 = (
-            np.asarray(state, dtype=np.float64)[: geom.n_arm]
-            - np.asarray(prev_state, dtype=np.float64)[: geom.n_arm]
-        )
+    if (velocity is not None or prev_state is not None) and d0 > 0.5 * geom.med_step:
+        # Launch tangent: prefer an externally SMOOTHED velocity (the
+        # recorded relabel_velocity annotation, or a windowed estimate from
+        # a full track) — a single-tick finite difference on a noisy blend
+        # path can point anywhere, and a Hermite launched along that noise
+        # looks perpendicular again (user diagnosis, 2026-08-21).
+        if velocity is not None:
+            v0 = np.asarray(velocity, dtype=np.float64)[: geom.n_arm].copy()
+        else:
+            v0 = (
+                np.asarray(state, dtype=np.float64)[: geom.n_arm]
+                - np.asarray(prev_state, dtype=np.float64)[: geom.n_arm]
+            )
         sp0 = float(np.linalg.norm(v0))
         if sp0 < 0.2 * geom.med_step:
             # stationary robot: launch along the corridor tangent instead.
@@ -444,6 +453,10 @@ class DartChunkDataset:
         di = float(di.reshape(-1)[-1]) if isinstance(di, torch.Tensor) else float(np.reshape(di, -1)[-1])
         geom = self.geoms[self.ep_to_source[int(item["episode_index"])]]
         prev = state[0].cpu().numpy() if (state.dim() == 2 and state.shape[0] >= 2) else None
+        vel = item.get("relabel_velocity")
+        if vel is not None:
+            vel = vel.cpu().numpy() if isinstance(vel, torch.Tensor) else np.asarray(vel)
+            vel = vel[-1] if vel.ndim == 2 else vel  # last row when delta-stacked
         labels = chunk_labels(
             q.cpu().numpy(),
             di,
@@ -452,6 +465,7 @@ class DartChunkDataset:
             rate=self.rate,
             ease_out=self.ease_out,
             prev_state=prev,
+            velocity=vel,
         )
         item["action"] = torch.as_tensor(
             labels[:, : action.shape[1]], dtype=action.dtype, device=action.device

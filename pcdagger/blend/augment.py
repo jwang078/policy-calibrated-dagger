@@ -831,8 +831,16 @@ def _annotate_frames_with_demo_index(
     geom = demo_geometry(demo_states_raw, demo_actions_raw, n_arm=n_arm)
     states = np.stack([np.asarray(fr["observation.state"], dtype=np.float64) for fr in frames])
     idxs = project_states(states, geom, index_window=index_window) + float(index_offset)
-    for fr, di in zip(frames, idxs, strict=True):
+    for t, (fr, di) in enumerate(zip(frames, idxs, strict=True)):
         fr["relabel_demo_index"] = np.array([di], dtype=np.float32)
+        # Smoothed per-frame velocity (+-3 tick window): the Hermite label
+        # launch tangent. A 1-tick finite difference on a noisy blend path
+        # points anywhere; train time only loads 2 obs frames, so the
+        # smoothed estimate must be recorded.
+        lo, hi = max(0, t - 3), min(len(states) - 1, t + 3)
+        fr["relabel_velocity"] = ((states[hi, :n_arm] - states[lo, :n_arm]) / max(1, hi - lo)).astype(
+            np.float32
+        )
 
 
 @dataclass
@@ -1146,6 +1154,11 @@ def run_augmentation(
     extra_features: dict[str, dict] = {}
     if cfg.relabel_actions == "guidance":
         extra_features["relabel_demo_index"] = {"dtype": "float32", "shape": (1,), "names": None}
+        extra_features["relabel_velocity"] = {
+            "dtype": "float32",
+            "shape": (cfg.num_dofs,),
+            "names": None,
+        }
         expected_features = {**expected_features, **extra_features}
     existing = load_lerobot_dataset(cfg.target_dataset_repo_id)
     if existing is not None:

@@ -79,6 +79,12 @@ def _plot(
     out: str,
 ) -> None:
     anchors = list(range(0, len(S) - 1, max(1, anchor_every)))
+
+    def _smooth_vel(t: int, w: int = 3) -> np.ndarray:
+        """Windowed velocity — a 1-tick FD on a noisy blend path points anywhere."""
+        lo, hi = max(0, t - w), min(len(S) - 1, t + w)
+        return (S[hi] - S[lo]) / max(1, hi - lo)
+
     chunks = {
         t: chunk_labels(
             S[t],
@@ -88,6 +94,7 @@ def _plot(
             rate=rate,
             ease_out=ease_out,
             prev_state=S[t - 1] if t > 0 else None,
+            velocity=_smooth_vel(t),
         )
         for t in anchors
     }
@@ -162,6 +169,9 @@ def _plot(
     ax.set_xlabel(f"joint_{jx + 1}")
     ax.set_ylabel(f"joint_{jy + 1}")
     ax.set_title("phase plane j1/j2 — chunks leave ● and merge onto the grey demo")
+    ax.set_aspect(
+        "equal", adjustable="datalim"
+    )  # both axes are radians — unequal aspect steepens every angle
     ax.legend(fontsize=8)
 
     # zoom on the worst anchor — the rejoin geometry at deviation scale.
@@ -189,6 +199,7 @@ def _plot(
     ax.set_ylim(cy - 0.75 * span, cy + 0.75 * span)
     ax.set_xlabel(f"joint_{jx + 1}")
     ax.set_ylabel(f"joint_{jy + 1}")
+    ax.set_aspect("equal", adjustable="datalim")
     ax.set_title(
         f"ZOOM: worst anchor t={t_star} (dev {d0s[t_star]:.3f} rad)\n"
         "black arrow = first commanded step (state → label_0)"

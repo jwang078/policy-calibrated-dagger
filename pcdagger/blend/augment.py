@@ -714,6 +714,12 @@ def rollout_closed_loop_for_augmentation(
         on_success=_on_success,
         log=lambda msg: logger.info(msg),
     )
+    # Per-frame collision flags from the live rollout (aligned 1:1 with the
+    # frames _on_step captured; later trims cut from the END so alignment of
+    # the surviving prefix is preserved).
+    if result.in_collision is not None:
+        for _fr, _c in zip(frames, result.in_collision):
+            _fr["frame_in_collision"] = np.array([float(_c)], dtype=np.float32)
 
     if not pad_after_success:
         # No padding of any kind: the rollout was truncated at the success tick
@@ -1180,6 +1186,10 @@ def run_augmentation(
             "shape": (cfg.num_dofs,),
             "names": None,
         }
+        # Per-frame collision flag from the LIVE blend rollout — lets
+        # collision filtering happen at train time (loader-side window)
+        # instead of a destructive replay filter producing _nc/_tfc copies.
+        extra_features["frame_in_collision"] = {"dtype": "float32", "shape": (1,), "names": None}
         expected_features = {**expected_features, **extra_features}
     existing = load_lerobot_dataset(cfg.target_dataset_repo_id)
     if existing is not None:

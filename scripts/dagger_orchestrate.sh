@@ -3771,12 +3771,34 @@ raw_blends_complete_for_round() {
     return 0
 }
 
+# NEW-STYLE collision filtering: blend datasets recorded with a per-frame
+# ``frame_in_collision`` column need NO replay filter and NO `_nc`/`_tfc`
+# sibling datasets — the sibling policy trains on the RAW blends with the
+# loader-side --dataset.blend_collision_filter flag instead (non-destructive;
+# switching modes is a flag change, not a dataset rebuild).
+blend_has_collision_column() {
+    grep -q '"frame_in_collision"' "$LEROBOT_CACHE/$1/meta/info.json" 2>/dev/null
+}
+new_style_collision_filtering_for_round() {
+    local _p _R
+    (( ${#BLENDS[@]} == 0 )) && return 1
+    for _p in $(seq 1 "$1"); do
+        for _R in "${BLENDS[@]}"; do
+            blend_has_collision_column "$(blend_repo_for_round "$_p" "$_R")" || return 1
+        done
+    done
+    return 0
+}
+
 # Per-round `_nocoll`-sibling completion check. Required for step 6b (the
 # collision-filtered sibling policy). Only meaningful when
 # --filter_blend_collisions is on; empty $BLENDS → vacuously true.
 nocoll_blends_complete_for_round() {
     local r="$1"
     (( ${#BLENDS[@]} == 0 )) && return 0
+    # New-style datasets carry frame_in_collision: filtering happens at train
+    # time; no sibling datasets exist or are needed.
+    new_style_collision_filtering_for_round "$r" && return 0
     local R nocoll_repo nocoll_short
     for R in "${BLENDS[@]}"; do
         nocoll_repo="$(nocoll_repo_for_round "$r" "$R")"
@@ -5520,7 +5542,9 @@ PYEOF
             # then uses the resulting `_nocoll` sibling instead of the raw blend.
             # Idempotent: short-circuits if `_nocoll` (and its stats sidecar
             # in rel mode) is already on disk.
-            if [[ "$FILTER_BLEND_COLLISIONS" != "false" ]]; then
+            if [[ "$FILTER_BLEND_COLLISIONS" != "false" ]] && blend_has_collision_column "$BLEND_REPO"; then
+                echo "  ratio=$R → $BLEND_REPO carries frame_in_collision; skipping replay filter (train-time loader filtering)."
+            elif [[ "$FILTER_BLEND_COLLISIONS" != "false" ]]; then
                 NOCOLL_SHORT="$(nocoll_short_for_round "$r" "$R")"
                 NOCOLL_REPO="$(nocoll_repo_for_round "$r" "$R")"
                 _nocoll_complete=false
@@ -6317,7 +6341,7 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
         #                                   would need train_sweep.sh
         #                                   plumbing that isn't needed yet)
         #   * non-PURE_POLICY_MODE         (no DAgger data in pure mode)
-        if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]] && \
+        if [[ "$FILTER_BLEND_COLLISIONS" != "false" ]] && \
            [[ "$USE_WEIGHTED_SAMPLING" == "true" ]] && \
            [[ "$MODE" == "finetune" ]] && \
            [[ "$PURE_POLICY_MODE" != "true" ]] && \
@@ -6333,14 +6357,27 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                 # their `_nocoll` siblings.
                 NC_REPO_IDS=( "$BASE_REPO" )
                 NC_STATS_PATHS=( "$STATS_BASE/$BASE_REPO_DATASET_SHORT/stats_rel${FT_CHUNK}.json" )
+                NC_FILTER_FLAG_ARGS=()
+                if new_style_collision_filtering_for_round "$r"; then
+                    # New-style: same RAW blend datasets as step 6; filtering
+                    # happens in the dataloader via the recorded per-frame
+                    # collision column.
+                    NC_FILTER_FLAG_ARGS=( "--dataset.blend_collision_filter=$FILTER_BLEND_COLLISIONS" )
+                    echo "  [step 6b] new-style collision filtering: raw blends + --dataset.blend_collision_filter=$FILTER_BLEND_COLLISIONS"
+                fi
                 for _p in $(seq 1 "$r"); do
                     _p_int_repo="$(int_repo_for_round "$_p")"
                     _p_int_short="$(int_short_for_round "$_p")"
                     NC_REPO_IDS+=( "$_p_int_repo" )
                     NC_STATS_PATHS+=( "$STATS_BASE/$_p_int_short/stats_rel${FT_CHUNK}.json" )
                     for _R in "${BLENDS[@]}"; do
-                        _nc_repo="$(nocoll_repo_for_round "$_p" "$_R")"
-                        _nc_short="$(nocoll_short_for_round "$_p" "$_R")"
+                        if (( ${#NC_FILTER_FLAG_ARGS[@]} > 0 )); then
+                            _nc_repo="$(blend_repo_for_round "$_p" "$_R")"
+                            _nc_short="$(blend_short_for_round "$_p" "$_R")"
+                        else
+                            _nc_repo="$(nocoll_repo_for_round "$_p" "$_R")"
+                            _nc_short="$(nocoll_short_for_round "$_p" "$_R")"
+                        fi
                         NC_REPO_IDS+=( "$_nc_repo" )
                         NC_STATS_PATHS+=( "$STATS_BASE/$_nc_short/stats_rel${FT_CHUNK}.json" )
                     done
@@ -6362,6 +6399,7 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
                     --dataset.norm_mode="$NORM_MODE" \
                     --dataset.stats_path= \
                     --dataset.use_weighted_sampling=true \
+                    "${NC_FILTER_FLAG_ARGS[@]}" \
                     --policy.repo_id="$NOCOLL_RUN_NAME" \
                     --output_dir="$NOCOLL_TRAIN_OUTPUT_DIR" \
                     --job_name="$NOCOLL_RUN_NAME" \

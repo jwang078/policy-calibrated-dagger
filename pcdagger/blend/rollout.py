@@ -35,6 +35,37 @@ from lerobot.policies.shared_autonomy_wrapper import BlendMode
 from lerobot.utils.constants import ACTION
 from lerobot.utils.sim_seeding import seed_splatsim_env_to_state
 
+# ── collision flag extraction ─────────────────────────────────────────────────
+
+
+def extract_in_collision_flag(info: dict) -> bool:
+    """Pull ``in_collision`` from a Gymnasium vec-env info dict.
+
+    Vec-env wraps a single-env's info as either ``info["in_collision"]``
+    (sync-vec passthrough), ``info["info_metrics"]["in_collision"]``
+    (splatsim folding), or ``info["final_info"][0][...]`` (terminated step).
+    Robust against all three; missing -> False.
+    """
+    if not info:
+        return False
+    if "in_collision" in info:
+        return bool(np.asarray(info["in_collision"]).any())
+    metrics = info.get("info_metrics")
+    if isinstance(metrics, dict) and "in_collision" in metrics:
+        return bool(np.asarray(metrics["in_collision"]).any())
+    final = info.get("final_info")
+    if final is not None:
+        for sub in final:
+            if not sub:
+                continue
+            if "in_collision" in sub:
+                return bool(np.asarray(sub["in_collision"]).any())
+            sm = sub.get("info_metrics")
+            if isinstance(sm, dict) and "in_collision" in sm:
+                return bool(np.asarray(sm["in_collision"]).any())
+    return False
+
+
 # ── sim physics-mode check ────────────────────────────────────────────────────
 
 
@@ -309,6 +340,7 @@ class BlendRolloutResult:
     dev_steps_p50: float | None = None  # median per-tick corridor deviation, med_step units
     dev_steps_p95: float | None = None
     tube_breach: bool = False  # aborted early: realized dev crossed abort_dev_steps
+    in_collision: np.ndarray | None = None  # per-captured-frame collision flag (aligned with on_step calls)
 
 
 @torch.no_grad()
@@ -492,6 +524,13 @@ def run_blended_rollout(
     # glitch cannot kill a healthy rollout.
     _breach_run = 0
     _tube_breach = False
+    # Per-captured-frame collision flags: the flag for the state each
+    # on_step/raw_actions entry observes (from the info of the step that
+    # PRODUCED that state). Recorded into the blend dataset as
+    # ``frame_in_collision`` so collision filtering can happen at TRAIN time
+    # (loader-side) instead of via a destructive replay filter.
+    _coll_hist: list[bool] = []
+    _last_info: dict = {}
 
     for t in range(total_steps):
         # ── Hold mode: episode succeeded, don't step env again ────────────────
@@ -501,6 +540,7 @@ def run_blended_rollout(
             assert hold_action is not None and terminal_env_obs is not None
             if on_step is not None:
                 on_step(t, terminal_env_obs, hold_action, True)
+            _coll_hist.append(extract_in_collision_flag(_last_info))
             raw_actions.append(hold_action)
             continue
 
@@ -648,9 +688,11 @@ def run_blended_rollout(
         # to be sent (the blend script builds its dataset frame here).
         if on_step is not None:
             on_step(t, env_obs, action_1d, False)
+        _coll_hist.append(extract_in_collision_flag(_last_info))
         raw_actions.append(action_1d)
 
         env_obs, _reward, _term, _trunc, _info = vec_env.step(action_numpy)
+        _last_info = _info
 
         # Decoded-guidance overlay: what the guidance source actually fed the
         # blend, decoded back to raw joints (plot diagnostic).
@@ -735,4 +777,5 @@ def run_blended_rollout(
         dev_steps_p50=float(np.percentile(_dev_hist, 50)) if _dev_hist else None,
         dev_steps_p95=float(np.percentile(_dev_hist, 95)) if _dev_hist else None,
         tube_breach=_tube_breach,
+        in_collision=np.asarray(_coll_hist, dtype=bool),
     )

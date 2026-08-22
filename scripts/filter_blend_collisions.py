@@ -691,6 +691,8 @@ def _run(
             "shape": tuple(_source_feats["relabel_velocity"]["shape"]),
             "names": None,
         }
+    if "frame_in_collision" in _source_feats:
+        expected_features["frame_in_collision"] = {"dtype": "float32", "shape": (1,), "names": None}
     existing = load_lerobot_dataset(cfg.target_repo_id)
     if existing is not None:
         _existing_feats = existing.meta.features
@@ -730,7 +732,7 @@ def _run(
             extra_features=(
                 {
                     k: expected_features[k]
-                    for k in ("relabel_demo_index", "relabel_velocity")
+                    for k in ("relabel_demo_index", "relabel_velocity", "frame_in_collision")
                     if k in expected_features
                 }
                 or None

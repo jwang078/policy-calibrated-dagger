@@ -406,6 +406,8 @@ class DartChunkDataset:
         rate: float = 1.0,
         ease_out: float = 0.3,
         root: str | None = None,
+        collision_filter: str = "none",
+        collision_margin: int = 10,
     ):
         """Wrap ``dataset``, pairing its episodes to its source demos.
 
@@ -417,6 +419,16 @@ class DartChunkDataset:
         self.dataset = dataset
         self.rate = float(rate)
         self.ease_out = float(ease_out)
+        if collision_filter not in ("none", "drop", "trim_first_collision"):
+            raise ValueError(
+                f"collision_filter must be none|drop|trim_first_collision, got {collision_filter!r}"
+            )
+        self.collision_filter = collision_filter
+        self.collision_margin = int(collision_margin)
+        # label cache: flat index -> synthesized float32 chunk (filled by the
+        # window sweep; __getitem__ becomes a lookup — the dataloader-side
+        # synthesis cost drops to ~zero).
+        self._labels: dict[int, np.ndarray] = {}
         if n_arm is None:
             n_arm = max(1, int(dataset.meta.features["action"]["shape"][0]) - 1)
         self.n_arm = int(n_arm)
@@ -450,6 +462,18 @@ class DartChunkDataset:
         has_vel = "relabel_velocity" in self.dataset.meta.features
         if has_vel:
             cols.append("relabel_velocity")
+        has_coll = "frame_in_collision" in self.dataset.meta.features
+        if has_coll:
+            cols.append("frame_in_collision")
+        elif self.collision_filter != "none":
+            import logging
+
+            logging.warning(
+                "dart_relabel %s: collision_filter=%s requested but the dataset has no "
+                "frame_in_collision column (recorded pre-feature) — no collision filtering applied.",
+                self.dataset.repo_id,
+                self.collision_filter,
+            )
         df = pd.concat([pd.read_parquet(f, columns=cols) for f in files])
         valid: list[np.ndarray] = []
         for ep, g in df.groupby("episode_index"):
@@ -471,7 +495,35 @@ class DartChunkDataset:
                 else None
             )
 
-            def _holds_at(t, states_ep=states_ep, dis_ep=dis_ep, vels_ep=vels_ep, geom=geom) -> bool:
+            # Loader-side collision filtering (mirrors the legacy replay
+            # filter's semantics, non-destructively): "drop" excludes the
+            # whole episode when any frame collided; "trim_first_collision"
+            # excludes frames from (first collision - margin) onward.
+            n_ep = len(states_ep)
+            allowed = np.ones(n_ep, dtype=bool)
+            if has_coll and self.collision_filter != "none":
+                coll = np.array(
+                    [
+                        float(np.reshape(np.asarray(v), -1)[0]) > 0.5
+                        for v in g["frame_in_collision"].to_numpy()
+                    ]
+                )
+                if coll.any():
+                    if self.collision_filter == "drop":
+                        allowed[:] = False
+                    else:
+                        first = int(np.argmax(coll))
+                        allowed[max(0, first - self.collision_margin) :] = False
+            # exact per-frame sweep: hold-ness is only NEAR-monotone in the
+            # frame index (velocity variation), so evaluate every anchor —
+            # ~1 ms each, a one-time init cost of seconds per dataset. The
+            # synthesized chunks are KEPT (self._labels) so training-time
+            # __getitem__ is a lookup, not a synthesis.
+            flat = g["index"].to_numpy().astype(np.int64)
+            keep = np.zeros(n_ep, dtype=bool)
+            for t in range(n_ep):
+                if not allowed[t]:
+                    continue
                 info: dict = {}
                 labels = chunk_labels(
                     states_ep[t],
@@ -484,13 +536,10 @@ class DartChunkDataset:
                     velocity=vels_ep[t] if vels_ep is not None else None,
                     info=info,
                 )
-                return not chunk_ok(labels, info, geom)[0]
-
-            # exact per-frame sweep: hold-ness is only NEAR-monotone in the
-            # frame index (velocity variation), so evaluate every anchor —
-            # ~1 ms each, a one-time init cost of seconds per dataset.
-            keep = np.array([not _holds_at(t) for t in range(len(states_ep))])
-            valid.append(g["index"].to_numpy()[keep].astype(np.int64))
+                if chunk_ok(labels, info, geom)[0]:
+                    keep[t] = True
+                    self._labels[int(flat[t])] = labels.astype(np.float32)
+            valid.append(flat[keep])
         if not valid:
             import logging
 
@@ -546,6 +595,12 @@ class DartChunkDataset:
             idx = int(self._valid[idx % len(self._valid)])
         item = self.dataset[idx]
         action = item["action"]
+        cached = self._labels.get(int(idx))
+        if cached is not None and cached.shape[0] == action.shape[0] and self._fingerprinted:
+            item["action"] = torch.as_tensor(
+                cached[:, : action.shape[1]], dtype=action.dtype, device=action.device
+            )
+            return item
         if not self._fingerprinted:
             # One-time (per process) positive evidence that relabeling is
             # LIVE: the synthesized chunk must differ from the stored
@@ -650,7 +705,14 @@ def chunk_ok(labels: np.ndarray, info: dict, geom: DemoGeometry) -> tuple[bool, 
     return True, "ok"
 
 
-def maybe_wrap_dart(dataset, root: str | None = None, rate: float = 1.0, ease_out: float = 0.3):
+def maybe_wrap_dart(
+    dataset,
+    root: str | None = None,
+    rate: float = 1.0,
+    ease_out: float = 0.3,
+    collision_filter: str = "none",
+    collision_margin: int = 10,
+):
     """Wrap ``dataset`` in DartChunkDataset iff it carries ``relabel_demo_index``.
 
     The factory-side entry point for ``--dataset.dart_relabel=true``: relabeled
@@ -663,13 +725,23 @@ def maybe_wrap_dart(dataset, root: str | None = None, rate: float = 1.0, ease_ou
 
     if "relabel_demo_index" not in getattr(dataset.meta, "features", {}):
         return dataset
-    wrapped = DartChunkDataset(dataset, root=root, rate=rate, ease_out=ease_out)
+    wrapped = DartChunkDataset(
+        dataset,
+        root=root,
+        rate=rate,
+        ease_out=ease_out,
+        collision_filter=collision_filter,
+        collision_margin=collision_margin,
+    )
     logging.info(
-        "dart_relabel: wrapping %s with DART chunk labels (source %s, n_arm=%d, rate=%.2f, ease_out=%.2f)",
+        "dart_relabel: wrapping %s with DART chunk labels (source %s, n_arm=%d, "
+        "collision_filter=%s, sampling window %d/%d anchors, label cache %d chunks)",
         dataset.repo_id,
         wrapped.source_repo_id,
         wrapped.n_arm,
-        rate,
-        ease_out,
+        collision_filter,
+        len(wrapped._valid),
+        len(dataset),
+        len(wrapped._labels),
     )
     return wrapped

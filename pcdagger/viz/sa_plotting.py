@@ -1,5 +1,7 @@
-"""Shared autonomy plotting helpers — joint-angle grids and 3D EE trajectories
-overlaid by ``forward_flow_ratio``. Used by the SA visualization scripts.
+"""Shared autonomy plotting helpers.
+
+Joint-angle grids and 3D EE trajectories overlaid by ``forward_flow_ratio``.
+Used by the SA visualization scripts.
 
 Extracted from ``visualize_shared_autonomy_DEPRECATED`` so downstream callers
 don't have to depend on a deprecated module.
@@ -31,6 +33,7 @@ def plot_joint_angles(
     decoded_guidance_raw: np.ndarray | None = None,
     output_path: Path | None = None,
     no_show: bool = False,
+    color_ratios: list[float] | None = None,
 ):
     """Grid of joint angle subplots, one colored line per forward_flow_ratio.
 
@@ -40,9 +43,13 @@ def plot_joint_angles(
     ``guidance_actions_raw``: optional ``[n_action_steps, action_dim]`` GT
                               actions shown in green at timesteps
                               ``[0, …, n_action_steps-1]`` for reference.
+    ``color_ratios``: optional superset of ratios to build the colormap over,
+                      so a filtered plot keeps each ratio's hue from the full one.
     """
     ratios = sorted(action_chunks_by_ratio.keys())
-    colors = _ratio_colors(ratios)
+    palette_ratios = sorted(color_ratios) if color_ratios else ratios
+    palette = _ratio_colors(palette_ratios)
+    colors = [palette[palette_ratios.index(r)] for r in ratios]
     n_dims = len(joint_names)
     n_cols = 3
     n_rows = ceil(n_dims / n_cols)
@@ -186,6 +193,7 @@ def plot_ee_trajectories_3d(
     decoded_guidance_ee_positions: np.ndarray | None = None,
     output_path: Path | None = None,
     no_show: bool = False,
+    color_ratios: list[float] | None = None,
 ):
     """Interactive 3D plotly figure with one EE trajectory per forward_flow_ratio.
 
@@ -193,9 +201,12 @@ def plot_ee_trajectories_3d(
                           gray before ``t=0``.
     ``guidance_ee_positions``: optional ``[n_action_steps, 3]`` GT EE positions
                                shown in green.
+    ``color_ratios``: optional superset of ratios to build the colormap over,
+                      so a filtered plot keeps each ratio's hue from the full one.
     """
     ratios = sorted(ee_trajectories_by_ratio.keys())
-    cmap = plt.colormaps["plasma"].resampled(max(len(ratios), 2))
+    palette_ratios = sorted(color_ratios) if color_ratios else ratios
+    palette = _ratio_colors(palette_ratios)
 
     def to_hex(c):
         r, g, b, _ = c
@@ -278,9 +289,9 @@ def plot_ee_trajectories_3d(
             )
         )
 
-    for i, ratio in enumerate(ratios):
+    for ratio in ratios:
         traj = ee_trajectories_by_ratio[ratio]  # [n_action_steps+1, 3]
-        color = to_hex(cmap(i / max(len(ratios) - 1, 1)))
+        color = to_hex(palette[palette_ratios.index(ratio)])
         n = traj.shape[0]
         sizes = [12] + [5] * (n - 2) + [8]
         # ['circle', 'circle-open', 'cross', 'diamond',

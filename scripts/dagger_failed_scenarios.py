@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Compute the list of FAILED scenario indices from a prior DAgger round's
-training-time eval, so the next round's intervention recording can target
-only those scenarios instead of re-running all 30.
+"""Compute the FAILED scenario indices from a prior DAgger round's eval.
 
-Mapping logic (verified against
-`splatsim/robots/sim_robot_pybullet_base.py:2280-2310`):
+Used so the next round's intervention recording can target only the failed
+scenarios instead of re-running the full subset.
+
+Mapping logic (verified against SplatSim's `_handle_reset` — scenario
+selection is POSITIONAL; the reset seed does NOT pick scenarios):
 
     * SplatSim's EVAL_BENCHMARK mode advances through `eval_benchmark_subset`
-      in scan order. With seed=K, the next reset jumps to
-      `subset[(K % len(subset))]` (formula in `_handle_reset`).
-    * lerobot-eval uses contiguous `seed = start_seed + episode_idx`. With
-      `start_seed=0`, episode `i` runs scenario `subset[i % len(subset)]`,
-      which for `n_episodes == len(subset)` collapses to `subset[i]`.
+      in scan order, and lerobot-eval pins each rollout deterministically by
+      passing `options={"benchmark_start_index": i}` with `i` = the absolute
+      0-based episode index — so episode `i` runs scenario
+      `subset[i % len(subset)]`, which for `n_episodes == len(subset)`
+      collapses to `subset[i]`. (Historically this mapping rode on
+      `seed = start_seed + i` with start_seed=0; the seed-pinned reset was
+      replaced by benchmark_start_index, same positional result.)
     * eval_info.json's `per_task[0].metrics.successes` is a list of length
       `n_episodes`. Position `i` ↔ scenario `subset[i]`.
 
@@ -45,10 +48,11 @@ from pathlib import Path
 
 
 def _newest_train_config(train_dir: Path) -> Path | None:
-    """Walk the train dir's checkpoints/ subdirs and return the train_config.json
-    from the highest-step checkpoint. We need this to discover what
-    `eval_benchmark_subset` the eval ran against — the eval_info.json itself
-    only records per-task success lists, not the subset.
+    """Return the train_config.json from the highest-step checkpoint.
+
+    We need this to discover what `eval_benchmark_subset` the eval ran
+    against — the eval_info.json itself only records per-task success
+    lists, not the subset.
     """
     candidates = sorted(
         train_dir.glob("checkpoints/*/pretrained_model/train_config.json"),
@@ -58,6 +62,7 @@ def _newest_train_config(train_dir: Path) -> Path | None:
 
 
 def main() -> int:
+    """CLI entry point."""
     p = argparse.ArgumentParser(prog="dagger_failed_scenarios")
     p.add_argument(
         "--prev_train_dir",

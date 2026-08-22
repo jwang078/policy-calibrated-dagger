@@ -42,8 +42,9 @@ from typing import Literal
 
 
 def blend_tag_for_ratio(ratio: float) -> str:
-    """Convert a forward-flow ratio (float in [0, 1]) → 3-digit zero-padded
-    percent string. e.g. 0.9 → "090", 0.1 → "010", 0.95 → "095".
+    """Convert a forward-flow ratio in [0, 1] to a 3-digit percent tag.
+
+    e.g. 0.9 → "090", 0.1 → "010", 0.95 → "095".
 
     Mirrors `_blend_tag_for_ratio` in dagger_orchestrate.sh:1165.
     """
@@ -62,6 +63,7 @@ def ratio_for_blend_tag(tag: str | int) -> float:
 
 def int_short(prefix: str, infix: str, round: int) -> str:
     """Intervention dataset short name for a given round.
+
     Mirrors `int_short_for_round` in dagger_orchestrate.sh:1148.
     """
     return f"{prefix}_{infix}_dag{round}"
@@ -69,6 +71,7 @@ def int_short(prefix: str, infix: str, round: int) -> str:
 
 def int_repo(hf_user: str, prefix: str, infix: str, round: int) -> str:
     """Full intervention dataset repo id (`<hf_user>/<int_short>`).
+
     Mirrors `int_repo_for_round` in dagger_orchestrate.sh:1149.
     """
     return f"{hf_user}/{int_short(prefix, infix, round)}"
@@ -76,6 +79,7 @@ def int_repo(hf_user: str, prefix: str, infix: str, round: int) -> str:
 
 def blend_short(prefix: str, infix: str, round: int, ratio: float) -> str:
     """Blend dataset short name: `<int_short>_blend<NNN>`.
+
     Mirrors `blend_short_for_round` in dagger_orchestrate.sh:1166.
     """
     return f"{int_short(prefix, infix, round)}_blend{blend_tag_for_ratio(ratio)}"
@@ -83,13 +87,33 @@ def blend_short(prefix: str, infix: str, round: int, ratio: float) -> str:
 
 def blend_repo(hf_user: str, prefix: str, infix: str, round: int, ratio: float) -> str:
     """Full blend dataset repo id.
+
     Mirrors `blend_repo_for_round` in dagger_orchestrate.sh:1167.
     """
     return f"{hf_user}/{blend_short(prefix, infix, round, ratio)}"
 
 
-def nocoll_short(prefix: str, infix: str, round: int, ratio: float) -> str:
-    """Collision-filtered blend dataset short name: `<blend_short>_nocoll`.
+# Collision-filtered blend suffix. `_nc` since 2026-08-21 (matches the `_nc`
+# suffix already used for the step-6b sibling POLICY dir, and buys back 4 chars
+# against the 56-char repo-id limit — the `_nocoll` spelling was the binding
+# constraint for --separate_blend_lineage names, which carry the blends_tag).
+# `_nocoll` datasets created before the rename are still on disk, so it stays a
+# recognized suffix everywhere names are PARSED, and the orchestrator falls back
+# to it when a legacy dataset exists (write new, read old).
+NOCOLL_SUFFIX = "_nc"
+LEGACY_NOCOLL_SUFFIX = "_nocoll"
+# Mode-specific collision-filter suffixes (2026-08-22): the filter's behavior
+# is part of the dataset's identity, so the name carries the mode —
+#   * mode="drop"                 -> `_nc`  (pure no-collision episodes)
+#   * mode="trim_first_collision" -> `_tfc` (clean prefixes kept up to the
+#     first collision minus margin — the historical `_nc`/`_nocoll` behavior,
+#     so trim-mode lookups fall back to those legacy spellings)
+TRIM_SUFFIX = "_tfc"
+FILTER_SUFFIXES = {"drop": NOCOLL_SUFFIX, "trim_first_collision": TRIM_SUFFIX}
+
+
+def nocoll_short(prefix: str, infix: str, round: int, ratio: float, mode: str = "drop") -> str:
+    """Collision-filtered blend dataset short name: `<blend_short>_nc`.
 
     Produced by `filter_blend_collisions.py` when
     `--filter_blend_collisions` is set on the orchestrator. Replays the
@@ -97,17 +121,35 @@ def nocoll_short(prefix: str, infix: str, round: int, ratio: float) -> str:
     touch obstacles; the surviving (and possibly-trimmed) episodes are
     written under this name and used as the merge source instead of the
     raw `_blend<NNN>` dataset.
+
+    See `legacy_nocoll_short` for the pre-rename `_nocoll` spelling.
     """
-    return f"{blend_short(prefix, infix, round, ratio)}_nocoll"
+    return f"{blend_short(prefix, infix, round, ratio)}{FILTER_SUFFIXES[mode]}"
 
 
-def nocoll_repo(hf_user: str, prefix: str, infix: str, round: int, ratio: float) -> str:
+def nocoll_repo(hf_user: str, prefix: str, infix: str, round: int, ratio: float, mode: str = "drop") -> str:
     """Full collision-filtered blend dataset repo id."""
-    return f"{hf_user}/{nocoll_short(prefix, infix, round, ratio)}"
+    return f"{hf_user}/{nocoll_short(prefix, infix, round, ratio, mode=mode)}"
+
+
+def legacy_nocoll_short(prefix: str, infix: str, round: int, ratio: float) -> str:
+    """Pre-rename collision-filtered blend short name: `<blend_short>_nocoll`.
+
+    Only for LOOKING UP datasets produced before the `_nc` rename — never for
+    naming new ones. Callers that consume a `_nocoll` dataset should prefer
+    `nocoll_short` and fall back to this when only the legacy dir is on disk.
+    """
+    return f"{blend_short(prefix, infix, round, ratio)}{LEGACY_NOCOLL_SUFFIX}"
+
+
+def legacy_nocoll_repo(hf_user: str, prefix: str, infix: str, round: int, ratio: float) -> str:
+    """Full pre-rename collision-filtered blend repo id."""
+    return f"{hf_user}/{legacy_nocoll_short(prefix, infix, round, ratio)}"
 
 
 def merged_short(base_dataset_short: str, infix: str, round: int) -> str:
     """Merged training-dataset short: `<base_dataset_short>_<infix>_dag<N>_m`.
+
     Mirrors `merged_short_for_round` in dagger_orchestrate.sh:1156.
 
     Note: this uses BASE_DATASET_SHORT (the NEW lineage's prefix), not
@@ -124,6 +166,7 @@ def merged_repo(hf_user: str, base_dataset_short: str, infix: str, round: int) -
 
 def alias_short(prefix: str, infix: str, round: int, model: str, action_format: str) -> str:
     """Alias dataset short: `<int_short>_<model><action_format>00`.
+
     Mirrors `alias_short_for_round` in dagger_orchestrate.sh:1150.
     """
     return f"{int_short(prefix, infix, round)}_{model}{action_format}00"
@@ -195,8 +238,9 @@ def base_lineage_of(lineage: str) -> str | None:
 
 
 def camera_name_tag(cameras: str, include_env_state: bool, exclude_gripper: bool) -> str:
-    """Combine feature-source flags → the `_<tag>` suffix that goes into every
-    training-dir basename (train_sweep.sh sets this as `CAMERA_NAME_TAG`).
+    """Combine feature-source flags into the training-dir `_<tag>` suffix.
+
+    Goes into every training-dir basename (train_sweep.sh sets this as `CAMERA_NAME_TAG`).
 
     Rules (must match train_sweep.sh's inline derivation exactly, since the
     orchestrator's base-policy name check compares against the training dir
@@ -232,7 +276,8 @@ def camera_name_tag(cameras: str, include_env_state: bool, exclude_gripper: bool
 
 
 def parse_camera_name_tag(tag: str) -> dict:
-    """Inverse of camera_name_tag(): parse a `_<tag>` suffix back into its
+    """Inverse of camera_name_tag(): parse a `_<tag>` suffix back into its.
+
     (cameras, include_env_state, exclude_gripper) components.
 
     Peels the optional trailing tokens in reverse-emit order:
@@ -333,12 +378,27 @@ def derive_base_policy_name(stem: str, run_tag: str, model_tag: str, method_tag:
 #   lever_grip0_d5jvm_diff_r_dag7_blend010     → blend (pct=10)
 #   lever_grip0_d5jvm_diff_r_dag7_m            → merged
 #   lever_grip0_rerun_v1_diff_b070_010_r_dag3  → intervention (rerun naming)
+#   pl12_03dag_diff_b050_r_dag3_blend050       → blend (separate-blend-lineage
+#                                                naming: the blends_tag lives
+#                                                inside <prefix>)
 # Anything not matching is treated as kind="base".
-# Suffix grammar: `_blend<NNN>` may itself be followed by `_nocoll` (collision-
-# filtered variant); merged datasets end in `_m`. Anything else is intervention.
+#
+# TWO PREFIX SCHEMAS produce these names, and both parse identically because
+# the blends_tag is just part of <prefix>:
+#   * rerun-blends mode (--rerun_blends_from): intervention/blend/_nocoll names
+#     use the SOURCE lineage's prefix, which carries source's blends_tag (often
+#     empty) — that is what makes blend datasets cross-rerun cacheable.
+#   * fresh recording, including --separate_blend_lineage: the lineage owns its
+#     data, so the prefix is its OWN base_dataset_short and therefore carries
+#     ITS blends_tag (`..._b050_r_dag3`). Consumers that need to know which
+#     schema a lineage used read the sidecar: `rerun_mode.source_int_short_prefix`
+#     when present, else `naming.base_dataset_short`.
+# Suffix grammar: `_blend<NNN>` may itself be followed by `_nc` (collision-
+# filtered variant) or its pre-2026-08-21 spelling `_nocoll`; merged datasets
+# end in `_m`. Anything else is intervention.
 _DATASET_SHORT_RE = re.compile(
     r"^(?P<prefix>.+?)_(?P<infix>[ra])_dag(?P<round>\d+)"
-    r"(?:_(?P<suffix>blend\d{3}(?:_nocoll)?|m))?$"
+    r"(?:_(?P<suffix>blend\d{3}(?:_nc|_tfc|_nocoll)?|m))?$"
 )
 
 DatasetKind = Literal["base", "intervention", "blend", "merged"]
@@ -346,8 +406,10 @@ DatasetKind = Literal["base", "intervention", "blend", "merged"]
 
 @dataclass(frozen=True)
 class ParsedDatasetName:
-    """Result of `parse_dataset_short`. Fields not relevant to a given `kind`
-    are None (e.g. blend_pct is None for kind != "blend")."""
+    """Result of `parse_dataset_short`. Fields not relevant to a given `kind`.
+
+    are None (e.g. blend_pct is None for kind != "blend").
+    """
 
     kind: DatasetKind
     name: str  # original input (for round-tripping / logging)
@@ -386,9 +448,19 @@ def parse_dataset_short(name: str) -> ParsedDatasetName:
         kind = "merged"
     elif suffix.startswith("blend"):
         kind = "blend"
-        if suffix.endswith("_nocoll"):
+        if (
+            suffix.endswith(NOCOLL_SUFFIX)
+            or suffix.endswith(TRIM_SUFFIX)
+            or suffix.endswith(LEGACY_NOCOLL_SUFFIX)
+        ):
             is_nocoll = True
-            blend_pct = int(suffix[len("blend") : -len("_nocoll")])
+            if suffix.endswith(LEGACY_NOCOLL_SUFFIX):
+                sfx = LEGACY_NOCOLL_SUFFIX
+            elif suffix.endswith(TRIM_SUFFIX):
+                sfx = TRIM_SUFFIX
+            else:
+                sfx = NOCOLL_SUFFIX
+            blend_pct = int(suffix[len("blend") : -len(sfx)])
         else:
             blend_pct = int(suffix[len("blend") :])
     else:  # pragma: no cover  (regex alternation excludes anything else)
@@ -414,8 +486,10 @@ ROUND_SUFFIX_RE = re.compile(r"(?:_ft)?_dag(\d+)(?:_([^/]+))?$")
 
 
 def _argv_get_flag(argv: list[str], name: str, default: str | None = None) -> str | None:
-    """Pull `--<name>=<value>` from an argv list (used to introspect a sidecar's
-    `orchestrator_invocation.argv`). Returns the value or `default` if absent."""
+    """Pull `--<name>=<value>` from an argv list (used to introspect a sidecar's.
+
+    `orchestrator_invocation.argv`). Returns the value or `default` if absent.
+    """
     pfx = f"--{name}="
     for a in argv:
         if a.startswith(pfx):
@@ -429,7 +503,8 @@ def load_sidecar(path: str | Path) -> dict:
 
 
 def find_sidecar_by_prefix(training_root: str | Path, prefix: str) -> Path | None:
-    """Scan `<training_root>/*/dagger/config.json` for the first sidecar whose
+    """Scan `<training_root>/*/dagger/config.json` for the first sidecar whose.
+
     `naming.base_dataset_short == prefix` OR `rerun_mode.source_int_short_prefix
     == prefix`. Returns the sidecar Path or None.
 
@@ -440,6 +515,11 @@ def find_sidecar_by_prefix(training_root: str | Path, prefix: str) -> Path | Non
     In rerun mode, two different reruns can share the same
     `source_int_short_prefix` — that's fine here, because their base_repo
     pointers (via `config.initial_policy_path`) are identical.
+
+    --separate_blend_lineage sidecars have `rerun_mode: null` and so match on
+    `naming.base_dataset_short` only — which is correct: that lineage's prefix
+    (blends_tag included) names artifacts nobody else owns, and the BASELINE
+    lineage's prefix must NOT resolve to it.
     """
     root = Path(training_root)
     if not root.is_dir():
@@ -459,7 +539,8 @@ def find_sidecar_by_prefix(training_root: str | Path, prefix: str) -> Path | Non
 
 
 def load_initial_policy_train_config(sidecar: dict) -> dict | None:
-    """Walk the sidecar's `config.initial_policy_path` to find a loaded
+    """Walk the sidecar's `config.initial_policy_path` to find a loaded.
+
     `train_config.json` dict (or None if not findable).
 
     Matches the orchestrator's `resolve_latest_checkpoint` candidate order:
@@ -516,7 +597,8 @@ def resolve_base_repo(
     explicit_override: str | None = None,
     hf_user: str = "JennyWWW",
 ) -> tuple[str | None, str]:
-    """Resolve the base dataset repo id (`<hf_user>/<short>`) for a DAgger
+    """Resolve the base dataset repo id (`<hf_user>/<short>`) for a DAgger.
+
     lineage. Returns `(resolved_repo_id, source_tag)`.
 
     Resolution order (HIGHEST priority first):
@@ -567,7 +649,8 @@ def enumerate_blend_paths_on_disk(
     infix: str,
     round: int,
 ) -> list[tuple[int, Path]]:
-    """Glob `<cache>/<hf_user>/<prefix>_<infix>_dag<round>_blend*` and parse
+    """Glob `<cache>/<hf_user>/<prefix>_<infix>_dag<round>_blend*` and parse.
+
     each percent value out of the trailing `_blend<NNN>` suffix.
 
     Returns `[(pct, path), ...]` sorted by pct ascending. Empty list if no
@@ -616,7 +699,8 @@ def enumerate_blend_paths_on_disk(
 
 
 def lineage_of(dir_name: str, model: str) -> str | None:
-    """Map a training-dir basename to its lineage key, or None if not a
+    """Map a training-dir basename to its lineage key, or None if not a.
+
     DAgger round dir.
 
     Migrated as-is from dagger_plot.py:146.
@@ -684,12 +768,27 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--ratio", required=True, type=float)
 
     sp = sub.add_parser("nocoll_short", help="collision-filtered blend dataset short")
+    sp.add_argument("--mode", default="drop", choices=["drop", "trim_first_collision"])
+    sp.add_argument("--prefix", required=True)
+    sp.add_argument("--infix", required=True)
+    sp.add_argument("--round", required=True, type=int)
+    sp.add_argument("--ratio", required=True, type=float)
+
+    sp = sub.add_parser("legacy_nocoll_short", help="pre-rename `_nocoll` blend dataset short")
+    sp.add_argument("--prefix", required=True)
+    sp.add_argument("--infix", required=True)
+    sp.add_argument("--round", required=True, type=int)
+    sp.add_argument("--ratio", required=True, type=float)
+
+    sp = sub.add_parser("legacy_nocoll_repo", help="pre-rename `_nocoll` blend dataset repo id")
+    sp.add_argument("--hf_user", required=True)
     sp.add_argument("--prefix", required=True)
     sp.add_argument("--infix", required=True)
     sp.add_argument("--round", required=True, type=int)
     sp.add_argument("--ratio", required=True, type=float)
 
     sp = sub.add_parser("nocoll_repo", help="collision-filtered blend dataset repo id")
+    sp.add_argument("--mode", default="drop", choices=["drop", "trim_first_collision"])
     sp.add_argument("--hf_user", required=True)
     sp.add_argument("--prefix", required=True)
     sp.add_argument("--infix", required=True)
@@ -786,9 +885,13 @@ def _cli_main(argv: list[str]) -> int:
     elif cmd == "blend_repo":
         print(blend_repo(args.hf_user, args.prefix, args.infix, args.round, args.ratio))
     elif cmd == "nocoll_short":
-        print(nocoll_short(args.prefix, args.infix, args.round, args.ratio))
+        print(nocoll_short(args.prefix, args.infix, args.round, args.ratio, mode=args.mode))
     elif cmd == "nocoll_repo":
-        print(nocoll_repo(args.hf_user, args.prefix, args.infix, args.round, args.ratio))
+        print(nocoll_repo(args.hf_user, args.prefix, args.infix, args.round, args.ratio, mode=args.mode))
+    elif cmd == "legacy_nocoll_short":
+        print(legacy_nocoll_short(args.prefix, args.infix, args.round, args.ratio))
+    elif cmd == "legacy_nocoll_repo":
+        print(legacy_nocoll_repo(args.hf_user, args.prefix, args.infix, args.round, args.ratio))
     elif cmd == "merged_short":
         print(merged_short(args.base_dataset_short, args.infix, args.round))
     elif cmd == "merged_repo":

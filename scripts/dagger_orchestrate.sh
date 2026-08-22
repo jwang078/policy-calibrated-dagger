@@ -2734,15 +2734,24 @@ blend_repo_for_round()   { _py_dagger_name blend_repo   --hf_user="$HF_USER" --p
 # does not. Every downstream use — resume detection, stats sidecar paths,
 # weighted repo_ids, deletion — flows through them, so one lineage consistently
 # sees one spelling.
-_nocoll_short_new()    { _py_dagger_name nocoll_short        --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1" --ratio="$2"; }
+_nocoll_short_new()    { _py_dagger_name nocoll_short        --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1" --ratio="$2" --mode="${FILTER_BLEND_COLLISIONS/false/drop}"; }
 _nocoll_short_legacy() { _py_dagger_name legacy_nocoll_short --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1" --ratio="$2"; }
 nocoll_short_for_round() {
-    local _new _legacy
+    local _new _legacy _nc_hist
     _new="$(_nocoll_short_new "$1" "$2")"
     if [[ ! -d "$LEROBOT_CACHE/$HF_USER/$_new" ]]; then
-        _legacy="$(_nocoll_short_legacy "$1" "$2")"
-        if [[ -d "$LEROBOT_CACHE/$HF_USER/$_legacy" ]]; then
-            echo "$_legacy"; return 0
+        # Historical `_nc` / `_nocoll` datasets were produced by the (then
+        # unnamed) trim-first-collision behavior — trim-mode lookups may read
+        # them; drop-mode must NOT (their content is trimmed, not dropped).
+        if [[ "$FILTER_BLEND_COLLISIONS" == "trim_first_collision" ]]; then
+            _nc_hist="${_new%_tfc}_nc"
+            if [[ -d "$LEROBOT_CACHE/$HF_USER/$_nc_hist" ]]; then
+                echo "$_nc_hist"; return 0
+            fi
+            _legacy="$(_nocoll_short_legacy "$1" "$2")"
+            if [[ -d "$LEROBOT_CACHE/$HF_USER/$_legacy" ]]; then
+                echo "$_legacy"; return 0
+            fi
         fi
     fi
     echo "$_new"
@@ -2811,7 +2820,9 @@ train_output_dir_for_round() {
 # untouched.
 nocoll_train_output_dir_for_round() {
     local round_n="$1"
-    echo "$(train_output_dir_for_round "$round_n")_nc"
+    local _sfx="_nc"
+    [[ "$FILTER_BLEND_COLLISIONS" == "trim_first_collision" ]] && _sfx="_tfc"
+    echo "$(train_output_dir_for_round "$round_n")${_sfx}"
 }
 # Filename of nocoll_train_output_dir = the canonical policy.repo_id we use
 # for the sibling policy (kept consistent with how step 6 derives FT_RUN_NAME
@@ -3556,7 +3567,7 @@ for r in $(seq 1 "$NUM_ROUNDS"); do
         _nc_name="$(nocoll_run_name_for_round "$r")"
         if (( ${#_nc_name} > 128 )); then
             echo "ERROR: nocoll sibling policy name exceeds 128 chars (${#_nc_name}): '$_nc_name'" >&2
-            echo "  Step 6b (--filter_blend_collisions) appends '_nc' to each round's training dir." >&2
+            echo "  Step 6b (--filter_blend_collisions) appends '_nc' (drop) / '_tfc' (trim) to each round's training dir." >&2
             echo "  Shorten the lineage somewhere upstream (e.g. --run_tag, --base_short, or --dag_short_override)." >&2
             ANY_NAME_TOO_LONG=true
         fi

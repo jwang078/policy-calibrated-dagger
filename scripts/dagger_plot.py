@@ -55,7 +55,8 @@ def parse_eval_dict(line: str) -> dict | None:
 
 
 def _parse_reeval_eval_info(json_path: Path) -> dict | None:
-    """Parse a dagger_reeval_lineage.sh-written eval_info.json into the
+    """Parse a dagger_reeval_lineage.sh-written eval_info.json into the.
+
     {succ, pos_err, ori_err, in_coll, trunc, ep_len} dict the plotter expects.
 
     Mirrors the same metric extraction `dagger_progress.sh:print_row` uses
@@ -318,8 +319,11 @@ def read_lineage_rerun_metadata(lineage: str, model: str) -> dict | None:
     """Read the rerun-source pointer for a lineage from its earliest round's dagger/config.json sidecar.
 
     Returns a dict with keys `source_lineage` and (optionally) `source_run_tag` /
-    `source_blends_tag` if this lineage was produced by --rerun_blends_from.
-    Returns None if the lineage isn't a rerun or has no sidecar.
+    `source_blends_tag` if this lineage was produced by --rerun_blends_from, or
+    by --separate_blend_lineage (which records the same pointer under
+    `separate_blend_lineage.baseline_*` — that lineage owns all of its own
+    artifacts, but is still meant to be plotted against its baseline).
+    Returns None if the lineage has neither pointer, or has no sidecar.
 
     Why earliest round: the orchestrator re-writes the sidecar on every
     invocation, but all rounds within a single lineage share the same
@@ -345,7 +349,22 @@ def read_lineage_rerun_metadata(lineage: str, model: str) -> dict | None:
             continue
         rerun_mode = cfg.get("rerun_mode")
         if not rerun_mode:
-            return None
+            # --separate_blend_lineage lineages own all of their artifacts (so
+            # `rerun_mode` is deliberately null), but still record the baseline
+            # lineage they were meant to be compared against. Pair them the
+            # same way so the overlay plots keep working.
+            sep = cfg.get("separate_blend_lineage")
+            if not sep:
+                return None
+            src_policy = sep.get("baseline_policy_basename", "")
+            prefix = f"{model}_"
+            if not src_policy.startswith(prefix):
+                return None
+            return {
+                "source_lineage": src_policy[len(prefix) :],
+                "source_run_tag": sep.get("baseline_run_tag", ""),
+                "source_blends_tag": sep.get("baseline_blends_tag", ""),
+            }
         # source_policy_basename is `<model_prefix>_<source_lineage>` — strip
         # the model prefix to recover the source's lineage key.
         src_policy = rerun_mode.get("source_policy_basename", "")
@@ -361,7 +380,8 @@ def read_lineage_rerun_metadata(lineage: str, model: str) -> dict | None:
 
 
 def group_reruns_by_source(lineages: list[str], model: str) -> dict[str, list[str]]:
-    """Return {source_lineage: [rerun_lineage, ...]} for every source lineage that has
+    """Return {source_lineage: [rerun_lineage, ...]} for every source lineage that has.
+
     at least one rerun on disk. Source lineages with no reruns are not in the dict.
     """
     grouped: dict[str, list[str]] = {}
@@ -442,7 +462,8 @@ COMPARISON_METRICS = [
 
 
 def _sort_lineages_for_display(rerun_lineages: list[str]) -> list[str]:
-    """Stable sort by (string-length, name). Groups single-blend reruns
+    """Stable sort by (string-length, name). Groups single-blend reruns.
+
     (`rerun_v1_b010`, length 13) BEFORE two-blend reruns (`rerun_v1_b090_050`,
     length 17), and within each length-group sorts alphanumerically (which,
     for the blend-tag naming convention, corresponds to ascending ratio).
@@ -455,7 +476,8 @@ def _sort_lineages_for_display(rerun_lineages: list[str]) -> list[str]:
 
 
 def _name_rainbow_colors(rerun_lineages: list[str]) -> dict[str, tuple[float, float, float, float]]:
-    """Assign each rerun a stable rainbow color based on its position in the
+    """Assign each rerun a stable rainbow color based on its position in the.
+
     sorted-for-display list (see _sort_lineages_for_display). The color
     identifies the LINEAGE, not its performance — so the same rerun has the
     same color across every metric plot.
@@ -476,7 +498,8 @@ def _per_rerun_avg_delta(
     direction: str,
     prefer_reeval: bool = True,
 ) -> tuple[dict[str, float | None], dict[str, float | None], dict[str, int]]:
-    """Per-rerun mean, std, and N of (rerun-beats-source) delta across canonical
+    """Per-rerun mean, std, and N of (rerun-beats-source) delta across canonical.
+
     ft rounds. Returns (mean_by_lineage, std_by_lineage, n_by_lineage).
 
     Computes BOTH the canonical ``_ft_dag${N}`` rounds AND, when present, the
@@ -532,7 +555,7 @@ def _per_rerun_avg_delta(
         return r.get("variant", "ft") == "ft"
 
     def _is_nc(r: dict) -> bool:
-        return r.get("variant") == "retrain" and r.get("retrain_suffix") == "nc"
+        return r.get("variant") == "retrain" and r.get("retrain_suffix") in ("nc", "tfc")
 
     for rerun in rerun_lineages:
         rows = collect_lineage_rows(rerun, model, prefer_reeval=prefer_reeval)
@@ -595,7 +618,7 @@ def plot_comparison_metric(
         # linestyle and a hollow-marker variant make raw-vs-filtered
         # visually distinct without burning a new color slot.
         nc_rows_present = any(
-            r.get("variant") == "retrain" and r.get("retrain_suffix") == "nc" for r in rerun_rows
+            r.get("variant") == "retrain" and r.get("retrain_suffix") in ("nc", "tfc") for r in rerun_rows
         )
         if nc_rows_present:
             series.append(
@@ -627,7 +650,7 @@ def plot_comparison_metric(
                 r
                 for r in rows
                 if r.get("variant") == "retrain"
-                and r.get("retrain_suffix") == "nc"
+                and r.get("retrain_suffix") in ("nc", "tfc")
                 and r.get(metric) is not None
             ]
             # Anchor the nc curve at the shared round-0 base point (same
@@ -772,7 +795,7 @@ def plot_comparison_metric_delta(
                     r
                     for r in rows
                     if r.get("variant") == "retrain"
-                    and r.get("retrain_suffix") == "nc"
+                    and r.get("retrain_suffix") in ("nc", "tfc")
                     and r.get(metric) is not None
                 ]
                 if not sel:
@@ -857,7 +880,8 @@ def plot_comparison_metric_avg_delta_bar(
     error_bar_type: str = "sem",
     prefer_reeval: bool = True,
 ) -> int:
-    """Bar chart: per-rerun "winning delta" averaged across canonical finetune
+    """Bar chart: per-rerun "winning delta" averaged across canonical finetune.
+
     DAgger rounds. Positive bars ALWAYS mean rerun beats source on average,
     regardless of metric direction:
       - For ↑-better metrics (succ):     delta = rerun − source
@@ -1198,6 +1222,7 @@ def plot_lineage(lineage: str, model: str, out_path: Path, prefer_reeval: bool =
 
 
 def main():
+    """CLI entry point."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument(
         "--base_short",

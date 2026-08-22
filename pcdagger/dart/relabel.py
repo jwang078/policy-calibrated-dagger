@@ -227,9 +227,16 @@ def chunk_labels(
             v0 = v0 * (2.5 * b / sp0)  # sanity cap only — outlier estimates
             sp0 = 2.5 * b
         end_i = float(len(geom.A) - 1)
-        kp = (4.7 / 45.0) ** 2  # critically damped, ~45-tick settle
-        kd = 2.0 * float(np.sqrt(kp))
         a_clamp = 0.9 * max(2.0 * float(np.sqrt(geom.n_arm)) * geom.acc_p95, 0.2 * geom.med_step)
+        # ADAPTIVE gain: correct as decisively as the envelope allows — the
+        # initial corrective accel Kp*d0 sits at the clamp, so settle time
+        # scales with sqrt(offset) (~18 ticks at 3 med-steps, ~37 at a tube
+        # edge) instead of a fixed timid constant; the floor keeps
+        # near-corridor anchors from amplifying mrad noise at envelope
+        # accel. Critical damping (Kd = 2*sqrt(Kp)) still guarantees the
+        # no-overshoot/no-detour property.
+        kp = a_clamp / max(d0, 4.0 * geom.med_step)
+        kd = 2.0 * float(np.sqrt(kp))
         a_slew = 0.5 * a_clamp  # bounded jerk: accel ramps over ~2 ticks
         v_cap = max(1.4 * b, 1.05 * sp0)
         x = q.copy()

@@ -56,7 +56,7 @@ def main() -> None:
     ap.add_argument("--horizon", type=int, default=32)
     ap.add_argument("--num_dofs", type=int, default=3)
     ap.add_argument("--stride", type=int, default=1, help="anchor stride (1 = every frame)")
-    ap.add_argument("--max_turn_deg", type=float, default=25.0)
+    ap.add_argument("--max_turn_deg", type=float, default=30.0)
     args = ap.parse_args()
 
     bl_df = _load_all(args.blend_repo_id)

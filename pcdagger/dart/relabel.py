@@ -444,6 +444,35 @@ class DartChunkDataset:
         self.geoms = load_source_geometries(source_repo_id, n_arm=self.n_arm, root=root)
         self._valid = self._build_valid_window()
 
+    def _cache_key(self, horizon: int) -> str:
+        """Fingerprint for the persistent window/label cache.
+
+        Any change to the label function source, the synthesis knobs, the
+        horizon, the collision-filter settings, or the dataset content
+        (frame count + newest data file mtime) produces a different key, so
+        a stale cache can never be served — this is the safe version of
+        "preprocess the dataset": disk-persisted, self-invalidating.
+        """
+        import hashlib
+        import inspect
+
+        files = sorted(glob.glob(os.path.join(str(self.dataset.root), "data/**/*.parquet"), recursive=True))
+        newest = max((os.path.getmtime(f) for f in files), default=0.0)
+        blob = "|".join(
+            [
+                inspect.getsource(chunk_labels),
+                inspect.getsource(chunk_ok),
+                f"h={horizon}",
+                f"rate={self.rate}",
+                f"ease={self.ease_out}",
+                f"cf={self.collision_filter}",
+                f"cm={self.collision_margin}",
+                f"n={len(self.dataset)}",
+                f"mtime={newest:.3f}",
+            ]
+        )
+        return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
     def _build_valid_window(self) -> np.ndarray:
         """Flat indices whose label chunk is genuine motion end to end.
 
@@ -451,12 +480,27 @@ class DartChunkDataset:
         the end and HOLDS; with an unmasked action-pad loss those frames
         train brake-early-and-sit (eval dawdling). Sampling is restricted to
         the exact set of anchors whose full-horizon chunk keeps moving,
-        found by synthesizing every anchor once at init (~1 ms each).
+        found by synthesizing every anchor once — and persisted to a
+        self-invalidating disk cache so repeat launches skip the sweep.
         """
         import pandas as pd
 
         dts = getattr(self.dataset, "delta_timestamps", None) or {}
         horizon = len(dts.get("action", [])) or 64
+        key = self._cache_key(horizon)
+        cache_path = os.path.join(str(self.dataset.root), f"dart_label_cache_{key}.npz")
+        if os.path.exists(cache_path):
+            try:
+                z = np.load(cache_path)
+                if str(z["key"]) == key:
+                    valid_cached = z["valid"].astype(np.int64)
+                    labels_arr = z["labels"]
+                    self._labels = {int(i): labels_arr[k] for k, i in enumerate(valid_cached)}
+                    return valid_cached
+            except Exception as e:  # unreadable/corrupt cache -> rebuild
+                import logging
+
+                logging.warning("dart_relabel: ignoring unreadable label cache %s (%s)", cache_path, e)
         files = sorted(glob.glob(os.path.join(str(self.dataset.root), "data/**/*.parquet"), recursive=True))
         cols = ["index", "episode_index", "frame_index", "observation.state", "relabel_demo_index"]
         has_vel = "relabel_velocity" in self.dataset.meta.features
@@ -548,7 +592,21 @@ class DartChunkDataset:
                 self.dataset.repo_id,
             )
             return np.arange(len(self.dataset), dtype=np.int64)
-        return np.concatenate(valid)
+        out = np.concatenate(valid)
+        try:
+            np.savez_compressed(
+                cache_path,
+                key=key,
+                valid=out,
+                labels=np.stack([self._labels[int(i)] for i in out]),
+            )
+        except Exception:
+            import logging
+
+            logging.warning(
+                "dart_relabel %s: could not write label cache %s", self.dataset.repo_id, cache_path
+            )
+        return out
 
     @staticmethod
     def _episode_pairing(dataset) -> tuple[dict[int, int], str | None]:

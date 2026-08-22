@@ -25,7 +25,11 @@ import numpy as np
 # ── figure text (EDIT ME) ─────────────────────────────────────────────────
 TEXT = {
     "suptitle": "",  # e.g. "Chunk-Level DART Relabeling of a Policy-Augmented Rollout"
-    "joint_titles": ["Joint 1 Trajectory", "Joint 2 Trajectory", "Joint 3 Trajectory"],
+    "joint_titles": [
+        "Joint 1 Corrections from Policy-Augmented Trajectory \n  to Expert Intervention",
+        "Joint 2 Trajectory",
+        "Joint 3 Trajectory",
+    ],
     "clock_title": "Task Progress vs. Time",
     "phase_title": "Joint-Space Paths with Recovery Chunks",
     "zoom_title": "Recovery Chunk (Detail)",
@@ -33,15 +37,15 @@ TEXT = {
     "speed_title": "Commanded Speed Along the Chunk",
     "xlabel_time": "Timestep",
     "ylabel_joint": "Joint{j} Position",
-    "legend_demo": "Demo",
-    "legend_state": "Policy-Augmented State",
-    "legend_demo_path": "Demo path",
+    "legend_demo": "Expert Intervention Trajectory",
+    "legend_state": "Policy-Augmented Trajectory",
+    "legend_demo_path": "Intervention path",
     "legend_state_path": "Policy-Augmented path",
     "legend_chunk": "Label chunk",
     "legend_projection": "Corridor projection",
-    "legend_pace": "Demo pace (y = x)",
-    "legend_progress": "Projected demo index",
-    "legend_cruise": "Demo cruise p5–p95",
+    "legend_pace": "Intervention pace (y = x)",
+    "legend_progress": "Projected intervention index",
+    "legend_cruise": "Intervention cruise p5–p95",
 }
 
 # ── plot parameters ───────────────────────────────────────────────────────

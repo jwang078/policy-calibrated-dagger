@@ -2830,6 +2830,21 @@ nocoll_train_output_dir_for_round() {
 nocoll_run_name_for_round() {
     basename "$(nocoll_train_output_dir_for_round "$1")"
 }
+# EVERY on-disk spelling of the step-6b sibling policy dir for a round —
+# `_nc` (drop), `_tfc` (trim), plus the pre-2026-08-21 `_nocoll`. Deletion
+# paths must use this instead of nocoll_train_output_dir_for_round, which
+# only names what the CURRENT --filter_blend_collisions mode would WRITE:
+# lineages built before the mode split carry `_nc` no matter which mode a
+# later --force_restart / --cleanup_only invocation runs under, so globbing
+# the active suffix alone silently left their `_ft_dag<N>_nc` dirs on disk.
+nocoll_train_output_dirs_all_for_round() {
+    local _base _sfx
+    _base="$(train_output_dir_for_round "$1")"
+    while IFS= read -r _sfx; do
+        [[ -z "$_sfx" ]] && continue
+        echo "${_base}${_sfx}"
+    done < <(_py_dagger_name filter_suffixes)
+}
 # Back-compat aliases. They both call through to the mode-aware function
 # so external scripts that referenced the old function names keep working.
 train_output_dir_scratch()  { train_output_dir_for_round "$1"; }
@@ -4128,7 +4143,13 @@ restart_from_scratch() {
         # idempotent on missing paths, so safe to include even for
         # lineages built without --filter_blend_collisions. Use the
         # _DIR_ variant (full path), not _RUN_NAME (basename only).
-        RESTART_PATHS+=( "$(nocoll_train_output_dir_for_round "$r")" )
+        # Every suffix spelling (`_nc` / `_tfc` / legacy `_nocoll`), not just
+        # the current mode's — see nocoll_train_output_dirs_all_for_round.
+        while IFS= read -r _NC_DIR; do
+            [[ -z "$_NC_DIR" ]] && continue
+            RESTART_PATHS+=( "$_NC_DIR" )
+            RESTART_PATHS+=( "$LEROBOT_ROOT/outputs/dagger/$(basename "$_NC_DIR")" )
+        done < <(nocoll_train_output_dirs_all_for_round "$r")
         # Blended-intervention datasets + their rel-action stats sidecars,
         # one per ratio in $BLENDS. No-op when $BLENDS is empty.
         # In rerun mode blends are cross-rerun-cacheable (see comment on
@@ -4141,14 +4162,19 @@ restart_from_scratch() {
                 # Collision-filtered siblings (always include in the cleanup
                 # list; the underlying rm is idempotent on missing paths, so
                 # this is safe whether the user ran with the flag or not).
-                # Both spellings: nocoll_short_for_round resolves to ONE of
-                # them, but a lineage can legitimately hold a legacy `_nocoll`
-                # for one round and a new `_nc` for another (rounds added after
-                # the rename), so clear both. rm is idempotent on missing paths.
-                for _NCS in "$(_nocoll_short_new "$r" "$R")" "$(_nocoll_short_legacy "$r" "$R")"; do
+                # ALL spellings (`_nc` / `_tfc` / legacy `_nocoll`):
+                # nocoll_short_for_round resolves to ONE of them, but a lineage
+                # can legitimately hold a legacy `_nocoll` for one round, a
+                # pre-mode-split `_nc` for another, and a `_tfc` for rounds
+                # added after 2026-08-22 — so clear every one. rm is idempotent
+                # on missing paths.
+                while IFS= read -r _NCS; do
+                    [[ -z "$_NCS" ]] && continue
                     RESTART_PATHS+=( "$LEROBOT_CACHE/$HF_USER/$_NCS" )
                     RESTART_PATHS+=( "$STATS_BASE/$_NCS" )
-                done
+                done < <(_py_dagger_name nocoll_shorts_all \
+                            --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" \
+                            --round="$r" --ratio="$R")
             done
         fi
         # Intervention output dir lives INSIDE the training dir
@@ -4334,11 +4360,14 @@ elif [[ "$FORCE_RESTART" == true ]]; then
                 # Collision-filtered siblings (always attempt; rm -rf is
                 # idempotent on missing paths so this is safe regardless of
                 # whether --filter_blend_collisions was used).
-                # Both spellings — see the RESTART_PATHS block above.
-                for _NCS in "$(_nocoll_short_new "$r" "$R")" "$(_nocoll_short_legacy "$r" "$R")"; do
+                # ALL spellings — see the RESTART_PATHS block above.
+                while IFS= read -r _NCS; do
+                    [[ -z "$_NCS" ]] && continue
                     run_or_echo rm -rf "$LEROBOT_CACHE/$HF_USER/$_NCS"
                     run_or_echo rm -rf "$STATS_BASE/$_NCS"
-                done
+                done < <(_py_dagger_name nocoll_shorts_all \
+                            --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" \
+                            --round="$r" --ratio="$R")
                 _blend_deleted_any=true
             done
             # Glob-based sweep of orphaned blends. The explicit BLENDS loop
@@ -4387,9 +4416,14 @@ elif [[ "$FORCE_RESTART" == true ]]; then
         # Without this, full cleanup leaves orphan _nc training dirs that
         # the user then has to clean up via a second --nc_only pass. Use
         # the _DIR_ variant (full path); _RUN_NAME returns basename only.
-        _NC_TRAIN_DIR="$(nocoll_train_output_dir_for_round "$r")"
-        run_or_echo rm -rf "$_NC_TRAIN_DIR"
-        run_or_echo rm -rf "$LEROBOT_ROOT/outputs/dagger/$(basename "$_NC_TRAIN_DIR")"
+        # Every suffix spelling (`_nc` / `_tfc` / legacy `_nocoll`), not just
+        # the one the CURRENT --filter_blend_collisions mode would write —
+        # see nocoll_train_output_dirs_all_for_round.
+        while IFS= read -r _NC_TRAIN_DIR; do
+            [[ -z "$_NC_TRAIN_DIR" ]] && continue
+            run_or_echo rm -rf "$_NC_TRAIN_DIR"
+            run_or_echo rm -rf "$LEROBOT_ROOT/outputs/dagger/$(basename "$_NC_TRAIN_DIR")"
+        done < <(nocoll_train_output_dirs_all_for_round "$r")
     done
     do_final_scratch && run_or_echo rm -rf "$(train_output_dir_final_scratch)"
     if [[ "$CLEANUP_ONLY" == true ]]; then

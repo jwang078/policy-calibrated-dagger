@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Plot + measure RECORDED blend datasets against their source DAgger lineage.
+r"""Plot + measure RECORDED blend datasets against their source DAgger lineage.
 
 Two outputs from one invocation:
 
@@ -84,6 +84,7 @@ from dagger_naming import (  # type: ignore[import-not-found]  # noqa: E402
     find_sidecar_by_prefix,
     int_cache_path,
     int_short,
+    legacy_nocoll_short,
     load_sidecar,
     nocoll_short,
     parse_dataset_short,
@@ -104,8 +105,9 @@ from lerobot.utils.lerobot_dataset_utils import resolve_dataset_dir  # noqa: E40
 
 
 def load_full_episode(data_dir: Path, episode_index: int) -> pd.DataFrame:
-    """All rows of one episode (actions + states only — no video decode),
-    sorted by frame_index. Thin variant of ``lib_dataset_episode_io.
+    """All rows of one episode (actions + states only — no video decode).
+
+    Sorted by frame_index. Thin variant of ``lib_dataset_episode_io.
     load_episode_frames`` without the fixed-window requirement.
     """
     dfs = [
@@ -119,12 +121,15 @@ def load_full_episode(data_dir: Path, episode_index: int) -> pd.DataFrame:
 
 
 def episode_actions(df: pd.DataFrame) -> np.ndarray:
+    """Stack the action column of an episode frame into a (T, adim) array."""
     return np.stack([np.asarray(a, dtype=np.float32) for a in df["action"]])
 
 
 def find_episode_for_source(meta: pd.DataFrame, source_episode_idx: int) -> int | None:
-    """Episode index in a blend dataset whose provenance row points at
-    ``source_episode_idx`` (written per-episode by the blend script).
+    """Episode index in a blend dataset for a given source episode.
+
+    Matches the provenance row pointing at ``source_episode_idx``
+    (written per-episode by the blend script).
     """
     if meta.empty or "source_episode_idx" not in meta.columns:
         return None
@@ -143,8 +148,10 @@ def mean_tick_delta(actions: np.ndarray, num_dofs: int) -> float:
 
 
 def trim_hold_tail(arr: np.ndarray) -> np.ndarray:
-    """Drop the trailing run of frames identical to the last one (success-hold
-    / min-length padding writes exact copies, so deltas there are exactly 0).
+    """Drop the trailing run of frames identical to the last one.
+
+    Success-hold / min-length padding writes exact copies, so deltas
+    there are exactly 0.
     """
     n = arr.shape[0]
     while n > 1 and np.array_equal(arr[n - 1], arr[n - 2]):
@@ -187,10 +194,10 @@ def measure_dataset(
     for ep, g in df.groupby("episode_index"):
         g = g.sort_values("frame_index")
         actions = trim_hold_tail(np.stack([np.asarray(a, dtype=np.float64) for a in g["action"]]))
-        nd = num_dofs if num_dofs is not None else actions.shape[1] - 1
+        n_arm = num_dofs if num_dofs is not None else actions.shape[1] - 1
         n_frames += actions.shape[0]
         if actions.shape[0] >= 2:
-            deltas.append(np.abs(np.diff(actions[:, :nd], axis=0)))
+            deltas.append(np.abs(np.diff(actions[:, :n_arm], axis=0)))
         if has_env:
             es = np.asarray(g["observation.environment_state"].iloc[-1], dtype=np.float64)
             if max(*ee_dims, *goal_dims) < es.shape[0]:
@@ -300,10 +307,26 @@ def print_speed_table(args: argparse.Namespace, parsed, hf_user: str, lerobot_ca
             if args.variant in ("raw", "both"):
                 _print_speed_row(f"{blend_path.name} [blend {pct / 100:.2f}]", measure_blend(blend_path))
             if args.variant in ("nocoll", "both"):
-                nc = blend_path.parent / nocoll_short(prefix, infix, r, pct / 100.0)
-                if (nc / "data").is_dir():
+                nc = _resolve_nocoll_path(blend_path.parent, prefix, infix, r, pct)
+                if nc is not None and (nc / "data").is_dir():
                     _print_speed_row(f"{nc.name} [nocoll {pct / 100:.2f}]", measure_blend(nc))
     print()
+
+
+def _resolve_nocoll_path(parent, prefix: str, infix: str, round_: int, pct: int):
+    """Return the on-disk collision-filtered sibling for a blend, or None.
+
+    The suffix is `_nc` since 2026-08-21; datasets filtered before that carry
+    the older `_nocoll` spelling. Prefer the current name, fall back to legacy.
+    """
+    for short in (
+        nocoll_short(prefix, infix, round_, pct / 100.0),
+        legacy_nocoll_short(prefix, infix, round_, pct / 100.0),
+    ):
+        cand = parent / short
+        if cand.is_dir():
+            return cand
+    return None
 
 
 # ── FK (optional, needs --policy_path) ────────────────────────────────────────
@@ -377,12 +400,14 @@ def run_episode_plots(args: argparse.Namespace, parsed, hf_user: str, given_data
     for pct, blend_path in blends:
         short = blend_path.name
         if args.variant == "nocoll":
-            nc_short = nocoll_short(parsed.prefix, parsed.infix, round_, pct / 100.0)
-            nc_path = blend_path.parent / nc_short
-            if not nc_path.is_dir():
-                print(f"  [skip] {nc_short}: no _nocoll sibling on disk")
+            nc_path = _resolve_nocoll_path(blend_path.parent, parsed.prefix, parsed.infix, round_, pct)
+            if nc_path is None:
+                print(
+                    f"  [skip] {nocoll_short(parsed.prefix, parsed.infix, round_, pct / 100.0)}: "
+                    "no collision-filtered sibling on disk (checked `_nc` and legacy `_nocoll`)"
+                )
                 continue
-            short, blend_path = nc_short, nc_path
+            short, blend_path = nc_path.name, nc_path
         data_dir = blend_path / "data" if (blend_path / "data").is_dir() else blend_path
         ep = find_episode_for_source(load_episodes_meta(data_dir), source_ep)
         if ep is None:
@@ -408,7 +433,7 @@ def run_episode_plots(args: argparse.Namespace, parsed, hf_user: str, given_data
 
     # ── output naming (mirrors the sim visualizer's style) ────────────────────
     if args.output_dir is None:
-        variant_tag = "_nocoll" if args.variant == "nocoll" else ""
+        variant_tag = "_nc" if args.variant == "nocoll" else ""
         output_dir = Path("outputs/viz") / f"blend_dataset_{intervention_short}_srcep{source_ep}{variant_tag}"
     else:
         output_dir = Path(args.output_dir)
@@ -465,6 +490,7 @@ def run_episode_plots(args: argparse.Namespace, parsed, hf_user: str, given_data
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -548,6 +574,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """CLI entry point."""
     args = parse_args()
     if args.speed_only and args.no_speed_table:
         raise SystemExit("--speed_only and --no_speed_table are mutually exclusive.")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Detect anomalies in LeRobot intervention datasets that hurt DAgger training.
+r"""Detect anomalies in LeRobot intervention datasets that hurt DAgger training.
 
 Ten anomaly classes, each with a distinct underlying bug. Eight are
 default-on; the two expensive/redundant ones are opt-in (see CLI flags).
@@ -217,12 +217,12 @@ _DEFAULT_HF_USER = os.environ.get("HF_USER", "JennyWWW")
 
 
 def _parsed_intervention(name: str):
-    """Parse a dataset basename and return its ParsedDatasetName when it
-    looks like a raw DAgger intervention dataset. Returns None for base /
-    merged / blend / unrecognized names.
+    r"""Parse a basename to a ParsedDatasetName when it is a raw intervention.
+
+    Returns None for base / merged / blend / unrecognized names.
 
     Tolerant fallback: dagger_naming's canonical regex restricts the suffix
-    grammar to `blend\\d{3}(_nocoll)?|m` (the orchestrator-managed artifact
+    grammar to `blend\\d{3}(_nc|_nocoll)?|m` (the orchestrator-managed artifact
     kinds), so ad-hoc backups like `_dag1_old` and `--retrain_suffix`
     variants like `_dag5_v2` parse as kind='base'. Those are real data we
     want to surface in the lineage scan, so when canonical parse falls back
@@ -258,10 +258,13 @@ def _parsed_intervention(name: str):
 
 
 def _suffix_of(name: str) -> str:
-    """Return the trailing `_<suffix>` after `_dag<N>` (e.g. `_old`, `_v2`),
+    """Return the trailing `_<suffix>` after `_dag<N>` (e.g.
+
+    `_old`, `_v2`),
     or empty string if there isn't one. parse_dataset_short only models
     intervention/merged/blend kinds; the dag-number-trailing freeform suffix
-    (used by manual backups and `--retrain_suffix`) isn't captured there."""
+    (used by manual backups and `--retrain_suffix`) isn't captured there.
+    """
     m = _DATASET_SUFFIX_RE.match(name)
     return (m.group("suffix") or "") if m else ""
 
@@ -395,10 +398,12 @@ DEFAULT_REL_HORIZON = 8
 
 
 def load_action_delta_stats(stats_path: Path) -> tuple[np.ndarray, np.ndarray] | None:
-    """Read action min/max (the relative-action delta range) from a
-    stats_rel8.json-style sidecar. Returns (min, max) float64 arrays over the
+    """Read action min/max (the rel-action delta range) from a stats sidecar.
+
+    stats_rel8.json-style file. Returns (min, max) float64 arrays over the
     full action dim (gripper included; scan_episode selects arm dims), or None
-    if the file is missing / malformed / lacks min+max."""
+    if the file is missing / malformed / lacks min+max.
+    """
     try:
         d = json.loads(Path(stats_path).read_text())
     except (OSError, json.JSONDecodeError):
@@ -414,9 +419,11 @@ def load_action_delta_stats(stats_path: Path) -> tuple[np.ndarray, np.ndarray] |
 
 
 def _default_rel_stats_path(dataset_root: Path) -> Path:
-    """Canonical on-disk location of a dataset's rel-action stats sidecar:
-    <repo>/outputs/dataset_stats/<dataset_name>/stats_rel8.json. Mirrors where
-    compute_relative_stats.sh writes them."""
+    """Canonical on-disk location of a dataset's rel-action stats sidecar.
+
+    <repo>/outputs/dataset_stats/<dataset_name>/stats_rel8.json — mirrors where
+    compute_relative_stats.sh writes them.
+    """
     repo_root = Path(__file__).resolve().parent.parent
     return repo_root / "outputs" / "dataset_stats" / dataset_root.name / "stats_rel8.json"
 
@@ -750,11 +757,13 @@ def scan_episode(
 
 
 def _image_mean_intensities(g_image_col) -> np.ndarray:
-    """Decode the dict-wrapped PNG bytes in a Series-like column to a (T,)
-    array of mean pixel intensities (0..255). Uses PIL for decode + numpy
+    """Decode dict-wrapped PNG bytes to a (T,) array of mean pixel intensities.
+
+    Intensities are 0..255. Uses PIL for decode + numpy
     for the mean. Expensive — called only when image-intensity detection
     is on. Returns a length-0 array on any decode failure so the caller
-    can silently skip the column."""
+    can silently skip the column.
+    """
     try:
         from PIL import Image  # type: ignore
     except ImportError:
@@ -1103,6 +1112,7 @@ def _format_episode_detail(class_key: str, ep_id: int, ep_len: int, info) -> lis
 
 
 def print_report(result: dict, verbose: bool, max_verbose_episodes: int = 10) -> None:
+    """Print the per-dataset anomaly report to stdout."""
     root = result["dataset_root"]
     n_total = result["n_episodes"]
     affected = _affected_episodes(result)
@@ -1232,8 +1242,9 @@ def _emit_resolved_cleanup(sidecar_path: Path, sidecar: dict, round_n: int) -> N
 
 
 def print_cleanup_command(result: dict, sidecar_path: Path | None = None) -> None:
-    """Print a copy-pasteable cleanup + resume command for re-running this
-    round (and all downstream rounds) of the lineage.
+    """Print a copy-pasteable cleanup + resume command for this round.
+
+    Covers the round and all downstream rounds of the lineage.
 
     Why not lerobot-edit-dataset? Deleting individual episodes via
     edit-dataset would leave the rel-action stats sidecar stale (computed
@@ -1336,9 +1347,11 @@ def discover_interventions_in_dir(
 def auto_discover_intervention_datasets(
     cache_root: Path, hf_user: str, lineage_filter: str | None
 ) -> list[Path]:
-    """No-positional-filter wrapper: scan the whole `<cache_root>/<hf_user>/`
-    user dir. Thin shim around discover_interventions_in_dir kept for callsite
-    readability."""
+    """Scan the whole `<cache_root>/<hf_user>/` user dir (no positional filter).
+
+    Thin shim around discover_interventions_in_dir kept for callsite
+    readability.
+    """
     return discover_interventions_in_dir(
         cache_root / hf_user,
         name_substring=lineage_filter,
@@ -1346,8 +1359,10 @@ def auto_discover_intervention_datasets(
 
 
 def _dataset_root_of(path: Path) -> Path:
-    """Normalize a user-supplied path to the DATASET ROOT dir (the one whose
-    basename is the DAgger dataset name and which contains data/ + meta/).
+    """Normalize a user-supplied path to the DATASET ROOT dir.
+
+    The root is the dir whose basename is the DAgger dataset name and which
+    contains data/ + meta/.
 
     Tab-completion routinely lands the user on a deeper path —
     `.../<dataset>/data/chunk-000` or `.../<dataset>/data` — but lineage
@@ -1367,8 +1382,10 @@ def _dataset_root_of(path: Path) -> Path:
 
 
 def expand_dataset_root_to_lineage(dataset_root: Path) -> list[Path]:
-    """Given a single intervention dataset path, return every sibling in the
-    same parent dir that shares its lineage stem + action infix. Mirrors how
+    """Expand one intervention dataset path to its whole on-disk lineage.
+
+    Returns every sibling in the same parent dir that shares the lineage
+    stem + action infix. Mirrors how
     `dagger_cleanup_lineage.sh --detect_siblings` expands a single training
     dir to a same-prefix-K family on disk; here we work in dataset-name space
     instead of training-dir-name space, but the same `parse_dataset_short`
@@ -1392,8 +1409,10 @@ def expand_dataset_root_to_lineage(dataset_root: Path) -> list[Path]:
 
 
 def lineage_stem_of(dataset_root: Path) -> str | None:
-    """Return the lineage stem (everything before `_<a|r>_dag<N>`) of a
-    dataset, or None if it doesn't parse as an intervention dataset."""
+    """Return the lineage stem (everything before `_<a|r>_dag<N>`) of a dataset.
+
+    None if it doesn't parse as an intervention dataset.
+    """
     parsed = _parsed_intervention(dataset_root.name)
     return parsed.prefix if parsed else None
 
@@ -1444,6 +1463,7 @@ def print_lineage_summary(results: list[dict]) -> None:
 
 
 def main() -> int:
+    """CLI entry point."""
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,

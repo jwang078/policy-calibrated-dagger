@@ -111,6 +111,26 @@ LEGACY_NOCOLL_SUFFIX = "_nocoll"
 TRIM_SUFFIX = "_tfc"
 FILTER_SUFFIXES = {"drop": NOCOLL_SUFFIX, "trim_first_collision": TRIM_SUFFIX}
 
+# EVERY collision-filter suffix that can appear on disk, current + historical.
+# Ordered new-first. Deletion / discovery paths must sweep ALL of these rather
+# than only the suffix the CURRENT --filter_blend_collisions mode would write:
+# a lineage recorded before the 2026-08-22 mode split carries `_nc` (or, before
+# 2026-08-21, `_nocoll`) regardless of which mode a later cleanup invocation
+# runs under, and a single lineage can hold a mix across rounds. Globbing only
+# the active mode's suffix is what silently left `_ft_dag<N>_nc` policy dirs
+# behind when cleanup ran in trim mode.
+ALL_FILTER_SUFFIXES = (NOCOLL_SUFFIX, TRIM_SUFFIX, LEGACY_NOCOLL_SUFFIX)
+
+
+def nocoll_shorts_all(prefix: str, infix: str, round: int, ratio: float) -> list[str]:
+    """Every on-disk spelling of the collision-filtered blend dataset short.
+
+    For deletion / discovery only — use `nocoll_short` (mode-aware) when
+    NAMING a dataset to write.
+    """
+    base = blend_short(prefix, infix, round, ratio)
+    return [f"{base}{sfx}" for sfx in ALL_FILTER_SUFFIXES]
+
 
 def nocoll_short(prefix: str, infix: str, round: int, ratio: float, mode: str = "drop") -> str:
     """Collision-filtered blend dataset short name: `<blend_short>_nc`.
@@ -774,6 +794,20 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--round", required=True, type=int)
     sp.add_argument("--ratio", required=True, type=float)
 
+    sp = sub.add_parser(
+        "nocoll_shorts_all",
+        help="every on-disk spelling of the collision-filtered blend short (one per line)",
+    )
+    sp.add_argument("--prefix", required=True)
+    sp.add_argument("--infix", required=True)
+    sp.add_argument("--round", required=True, type=int)
+    sp.add_argument("--ratio", required=True, type=float)
+
+    sub.add_parser(
+        "filter_suffixes",
+        help="every collision-filter suffix that can appear on disk (one per line)",
+    )
+
     sp = sub.add_parser("legacy_nocoll_short", help="pre-rename `_nocoll` blend dataset short")
     sp.add_argument("--prefix", required=True)
     sp.add_argument("--infix", required=True)
@@ -888,6 +922,12 @@ def _cli_main(argv: list[str]) -> int:
         print(nocoll_short(args.prefix, args.infix, args.round, args.ratio, mode=args.mode))
     elif cmd == "nocoll_repo":
         print(nocoll_repo(args.hf_user, args.prefix, args.infix, args.round, args.ratio, mode=args.mode))
+    elif cmd == "nocoll_shorts_all":
+        for _n in nocoll_shorts_all(args.prefix, args.infix, args.round, args.ratio):
+            print(_n)
+    elif cmd == "filter_suffixes":
+        for _s in ALL_FILTER_SUFFIXES:
+            print(_s)
     elif cmd == "legacy_nocoll_short":
         print(legacy_nocoll_short(args.prefix, args.infix, args.round, args.ratio))
     elif cmd == "legacy_nocoll_repo":

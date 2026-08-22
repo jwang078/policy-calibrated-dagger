@@ -412,7 +412,7 @@ set -euo pipefail
 #                                 by dagger_plot.py for the overlay comparison.
 #                                 NAMING: because nothing is shared with the
 #                                 source, EVERY artifact (intervention, blend,
-#                                 _nocoll, merged, training dir) is named from
+#                                 _nc, merged, training dir) is named from
 #                                 THIS lineage's own BASE_DATASET_SHORT /
 #                                 BASE_POLICY_NAME — so the blends_tag (b050,
 #                                 b090_080, ...) appears in the intervention +
@@ -420,7 +420,7 @@ set -euo pipefail
 #                                 them from colliding with the source's. That
 #                                 also makes those names ~5-10 chars longer than
 #                                 in rerun mode; the pre-flight length check
-#                                 covers the `_nocoll` worst case.
+#                                 covers the `_nc` worst case.
 #                                 The sweep wrapper skips its `_rr` run_tag
 #                                 auto-suffix in this mode (the blends_tag
 #                                 already disambiguates the lineage), so the
@@ -1292,7 +1292,15 @@ for arg in "$@"; do
         --blends=*)                          BLENDS_STR="${arg#*=}" ;;
         --blend_extra_args=*)                BLEND_EXTRA_ARGS="${arg#*=}" ;;
         --blend_labels=*)                    BLEND_LABELS="${arg#*=}" ;;
-        --filter_blend_collisions)           FILTER_BLEND_COLLISIONS=true ;;
+        --filter_blend_collisions)           FILTER_BLEND_COLLISIONS=trim_first_collision ;;
+        --filter_blend_collisions=*)
+            FILTER_BLEND_COLLISIONS="${arg#*=}"
+            case "$FILTER_BLEND_COLLISIONS" in
+                true)  FILTER_BLEND_COLLISIONS=trim_first_collision ;;
+                false|drop|trim_first_collision) ;;
+                *) echo "ERROR: --filter_blend_collisions must be false|drop|trim_first_collision (got '$FILTER_BLEND_COLLISIONS')" >&2; exit 1 ;;
+            esac
+            ;;
         --filter_collision_extra_args=*)     FILTER_COLLISION_EXTRA_ARGS="${arg#*=}" ;;
         --filter_collision_env_port=*)       FILTER_COLLISION_ENV_PORT="${arg#*=}" ;;
         --num_workers=*)                     NUM_WORKERS="${arg#*=}" ;;
@@ -2612,7 +2620,7 @@ config = {
         "finetune_steps":         int(os.environ["DAG_CFG_FINETUNE_STEPS"]),
         "blends":                 blends,
         "target_intervention_volume": int(os.environ["DAG_CFG_TARGET_INTERVENTION_VOLUME"]),
-        "filter_blend_collisions": os.environ["DAG_CFG_FILTER_BLEND_COLLISIONS"] == "true",
+        "filter_blend_collisions": os.environ["DAG_CFG_FILTER_BLEND_COLLISIONS"],
         "intervention_method":    os.environ["DAG_CFG_INTERVENTION_METHOD"],
         "initial_policy_path":    os.environ["DAG_CFG_INITIAL_POLICY_PATH"],
         "use_weighted_sampling":  os.environ["DAG_CFG_USE_WEIGHTED_SAMPLING"] == "true",
@@ -2716,9 +2724,30 @@ _blend_tag_for_ratio()   { _py_dagger_name blend_tag    --ratio="$1"; }
 blend_short_for_round()  { _py_dagger_name blend_short  --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1" --ratio="$2"; }
 blend_repo_for_round()   { _py_dagger_name blend_repo   --hf_user="$HF_USER" --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1" --ratio="$2"; }
 # Collision-filtered blend dataset (produced by filter_blend_collisions.py
-# when --filter_blend_collisions is on). Naming: `<blend_short>_nocoll`.
-nocoll_short_for_round() { _py_dagger_name nocoll_short --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1" --ratio="$2"; }
-nocoll_repo_for_round()  { _py_dagger_name nocoll_repo  --hf_user="$HF_USER" --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1" --ratio="$2"; }
+# when --filter_blend_collisions is on). Naming: `<blend_short>_nc`.
+#
+# WRITE NEW, READ OLD. The suffix was `_nocoll` before 2026-08-21; the rename
+# to `_nc` buys 4 chars against the 56-char repo-id limit (and matches the `_nc`
+# sibling POLICY dir). Datasets created under the old spelling are still on
+# disk and cost a full headless-sim replay to regenerate, so these two helpers
+# return the LEGACY name whenever the legacy dataset dir exists and the new one
+# does not. Every downstream use — resume detection, stats sidecar paths,
+# weighted repo_ids, deletion — flows through them, so one lineage consistently
+# sees one spelling.
+_nocoll_short_new()    { _py_dagger_name nocoll_short        --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1" --ratio="$2"; }
+_nocoll_short_legacy() { _py_dagger_name legacy_nocoll_short --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1" --ratio="$2"; }
+nocoll_short_for_round() {
+    local _new _legacy
+    _new="$(_nocoll_short_new "$1" "$2")"
+    if [[ ! -d "$LEROBOT_CACHE/$HF_USER/$_new" ]]; then
+        _legacy="$(_nocoll_short_legacy "$1" "$2")"
+        if [[ -d "$LEROBOT_CACHE/$HF_USER/$_legacy" ]]; then
+            echo "$_legacy"; return 0
+        fi
+    fi
+    echo "$_new"
+}
+nocoll_repo_for_round()  { echo "$HF_USER/$(nocoll_short_for_round "$1" "$2")"; }
 
 # Source training-dir lookup for rerun-blends mode. At round r, the rerun
 # branches off SOURCE's _ft_dag(r-1) for both blending (step 2) and finetune
@@ -3323,7 +3352,7 @@ stop_sim() {
 # Same lifecycle pattern as start_sim/stop_sim above, but pinned to
 # $FILTER_COLLISION_ENV_PORT_RESOLVED and launched with --headless.
 start_filter_sim() {
-    [[ "$FILTER_BLEND_COLLISIONS" == "true" ]] || return 0
+    [[ "$FILTER_BLEND_COLLISIONS" != "false" ]] || return 0
     [[ "$MANAGE_SPLATSIM" == true ]] || return 0
     # Resolve the aux port lazily: explicit flag wins; else main port + 100
     # so the two sims don't collide on the same TCP port.
@@ -3523,7 +3552,7 @@ for r in $(seq 1 "$NUM_ROUNDS"); do
     # repo-name limit is 96. We validate against 128 so non-push runs can
     # still use long lineage names — the user will hit HF's 96 separately
     # at push time if they enable that. Append `_nc` to the existing dir name.
-    if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
+    if [[ "$FILTER_BLEND_COLLISIONS" != "false" ]]; then
         _nc_name="$(nocoll_run_name_for_round "$r")"
         if (( ${#_nc_name} > 128 )); then
             echo "ERROR: nocoll sibling policy name exceeds 128 chars (${#_nc_name}): '$_nc_name'" >&2
@@ -3560,7 +3589,7 @@ fi
 if (( ${#BLENDS[@]} > 0 )); then
     _probe_blend_repo="$(blend_repo_for_round "$NUM_ROUNDS" "${BLENDS[0]}")"
     _probe_names=( "$_probe_blend_repo" )
-    if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
+    if [[ "$FILTER_BLEND_COLLISIONS" != "false" ]]; then
         _probe_names+=( "$(nocoll_repo_for_round "$NUM_ROUNDS" "${BLENDS[0]}")" )
     fi
     for _pn in "${_probe_names[@]}"; do
@@ -3755,7 +3784,7 @@ nocoll_blends_complete_for_round() {
 all_blends_complete_for_round() {
     local r="$1"
     raw_blends_complete_for_round "$r" || return 1
-    if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
+    if [[ "$FILTER_BLEND_COLLISIONS" != "false" ]]; then
         nocoll_blends_complete_for_round "$r" || return 1
     fi
     return 0
@@ -3786,7 +3815,7 @@ for r in $(seq 1 "$NUM_ROUNDS"); do
     # cleaned (step 7 only touches the merged dataset). When the flag is on,
     # step 6 still trains the un-filtered (raw blend) policy with its
     # existing name — the filter produces an ADDITIONAL sibling policy
-    # in a new step (6b) named with a _nocoll suffix. That step has its
+    # in a new step (6b) named with a _nc suffix. That step has its
     # own completeness check; it doesn't affect step 6's resume detection.
     #
     # The trained checkpoint is the round's TERMINAL artifact, so it — not the
@@ -3818,7 +3847,7 @@ for r in $(seq 1 "$NUM_ROUNDS"); do
         # round at step 6+. Step 6 will no-op (raw policy already at target
         # step, lerobot-train detects that), then step 6b will run and
         # produce the nocoll sibling.
-        if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]] && (( ${#BLENDS[@]} > 0 )); then
+        if [[ "$FILTER_BLEND_COLLISIONS" != "false" ]] && (( ${#BLENDS[@]} > 0 )); then
             if ! training_exists "$(nocoll_train_output_dir_for_round "$r")"; then
                 step=5
             fi
@@ -4079,8 +4108,14 @@ restart_from_scratch() {
                 # Collision-filtered siblings (always include in the cleanup
                 # list; the underlying rm is idempotent on missing paths, so
                 # this is safe whether the user ran with the flag or not).
-                RESTART_PATHS+=( "$LEROBOT_CACHE/$(nocoll_repo_for_round "$r" "$R")" )
-                RESTART_PATHS+=( "$STATS_BASE/$(nocoll_short_for_round "$r" "$R")" )
+                # Both spellings: nocoll_short_for_round resolves to ONE of
+                # them, but a lineage can legitimately hold a legacy `_nocoll`
+                # for one round and a new `_nc` for another (rounds added after
+                # the rename), so clear both. rm is idempotent on missing paths.
+                for _NCS in "$(_nocoll_short_new "$r" "$R")" "$(_nocoll_short_legacy "$r" "$R")"; do
+                    RESTART_PATHS+=( "$LEROBOT_CACHE/$HF_USER/$_NCS" )
+                    RESTART_PATHS+=( "$STATS_BASE/$_NCS" )
+                done
             done
         fi
         # Intervention output dir lives INSIDE the training dir
@@ -4266,8 +4301,11 @@ elif [[ "$FORCE_RESTART" == true ]]; then
                 # Collision-filtered siblings (always attempt; rm -rf is
                 # idempotent on missing paths so this is safe regardless of
                 # whether --filter_blend_collisions was used).
-                run_or_echo rm -rf "$LEROBOT_CACHE/$(nocoll_repo_for_round "$r" "$R")"
-                run_or_echo rm -rf "$STATS_BASE/$(nocoll_short_for_round "$r" "$R")"
+                # Both spellings — see the RESTART_PATHS block above.
+                for _NCS in "$(_nocoll_short_new "$r" "$R")" "$(_nocoll_short_legacy "$r" "$R")"; do
+                    run_or_echo rm -rf "$LEROBOT_CACHE/$HF_USER/$_NCS"
+                    run_or_echo rm -rf "$STATS_BASE/$_NCS"
+                done
                 _blend_deleted_any=true
             done
             # Glob-based sweep of orphaned blends. The explicit BLENDS loop
@@ -5471,7 +5509,7 @@ PYEOF
             # then uses the resulting `_nocoll` sibling instead of the raw blend.
             # Idempotent: short-circuits if `_nocoll` (and its stats sidecar
             # in rel mode) is already on disk.
-            if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
+            if [[ "$FILTER_BLEND_COLLISIONS" != "false" ]]; then
                 NOCOLL_SHORT="$(nocoll_short_for_round "$r" "$R")"
                 NOCOLL_REPO="$(nocoll_repo_for_round "$r" "$R")"
                 _nocoll_complete=false
@@ -5513,6 +5551,7 @@ PYEOF
                         --env_external_host="$ENV_EXTERNAL_HOST" \
                         --env_eval_benchmark_repo_id="$EVAL_BENCHMARK_REPO_ID" \
                         --output_dir="$FILTER_OUTPUT_DIR" \
+                        --mode="$FILTER_BLEND_COLLISIONS" \
                         $FILTER_COLLISION_EXTRA_ARGS
                     # Stats sidecar for the filtered dataset.
                     if [[ "$ACTION_FORMAT" == "rel" ]]; then
@@ -5657,7 +5696,7 @@ PYEOF
             # sibling produced in step 2b. The raw blend stays on disk
             # (cross-rerun cacheable) but isn't part of THIS lineage's merge.
             for R in "${BLENDS[@]}"; do
-                if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
+                if [[ "$FILTER_BLEND_COLLISIONS" != "false" ]]; then
                     SRC_BLEND="$(nocoll_repo_for_round "$prev" "$R")"
                 else
                     SRC_BLEND="$(blend_repo_for_round "$prev" "$R")"
@@ -6509,7 +6548,7 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
                 FS_W_REPO_IDS+=( "$_p_int_repo" )
                 FS_W_STATS_PATHS+=( "$STATS_BASE/$_p_int_short/stats_rel${FS_CHUNK}.json" )
                 for _R in "${BLENDS[@]}"; do
-                    if [[ "$FILTER_BLEND_COLLISIONS" == "true" ]]; then
+                    if [[ "$FILTER_BLEND_COLLISIONS" != "false" ]]; then
                         _b_repo="$(nocoll_repo_for_round "$_p" "$_R")"
                         _b_short="$(nocoll_short_for_round "$_p" "$_R")"
                     else

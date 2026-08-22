@@ -2,7 +2,7 @@
 
 Reads a blend dataset (output of `augment_dataset_with_blending.py`), replays
 each episode through a SplatSim env in headless physics-only mode, and writes
-out a sibling dataset (`<blend>_nocoll`) containing only the surviving frames:
+out a sibling dataset (`<blend>_nc`; `_nocoll` before 2026-08-21) containing only the surviving frames:
 
   * Episodes with NO collision get copied through full-length.
   * Episodes that collide get trimmed to `t_collide - pre_collision_margin`
@@ -30,7 +30,7 @@ Then:
 
     python my_scripts/filter_blend_collisions.py \
         --source_repo_id=JennyWWW/lever_grip0_d5jvm_diff_r_dag3_blend090 \
-        --target_repo_id=JennyWWW/lever_grip0_d5jvm_diff_r_dag3_blend090_nocoll \
+        --target_repo_id=JennyWWW/lever_grip0_d5jvm_diff_r_dag3_blend090_nc \
         --env_task=upright_small_engine_new \
         --env_robot_name=robot_iphone_w_engine_new \
         --env_external_port=6101 \
@@ -44,7 +44,7 @@ fields recording the filtering outcome (`pre_filter_n_frames`,
 Relabeled blends (--relabel_actions=guidance) store EXECUTED actions plus a
 per-frame `relabel_demo_index` (train-time DART labels are synthesized by the
 dataloader, see lerobot.datasets.dart_relabel) — so replaying the action
-column reproduces the true executed path, and the `_nocoll` sibling carries
+column reproduces the true executed path, and the `_nc` sibling carries
 `relabel_demo_index` and the `source_dataset_repo_id` metadata through so
 DART training keeps working on the filtered dataset.
 """
@@ -118,7 +118,8 @@ class FilterCollisionsConfig:
     # Source = the blend dataset to filter.
     source_repo_id: str = ""
     # Target = where the filtered (and possibly trimmed) episodes are written.
-    # Conventionally `<source_repo_id>_nocoll` (see dagger_naming.nocoll_*).
+    # Conventionally `<source_repo_id>_nc` (see dagger_naming.nocoll_*);
+    # datasets filtered before 2026-08-21 use the older `_nocoll` spelling.
     target_repo_id: str = ""
 
     # SplatSim connection (must be launched with --headless out-of-process —
@@ -141,6 +142,14 @@ class FilterCollisionsConfig:
     env_eval_benchmark_repo_id: str = "JennyWWW/eval_splatsim_approach_lever_benchmark_1000"
 
     # Filter knobs.
+    # What to do with an episode that collides during replay:
+    #   * "trim_first_collision" (default, the historical behavior): keep the
+    #     clean prefix up to `first_collision - pre_collision_margin`; drop
+    #     the episode only when that prefix is shorter than
+    #     `min_episode_length`.
+    #   * "drop": drop ANY episode containing a collision, full stop —
+    #     stricter selection, no partial episodes.
+    mode: str = "trim_first_collision"
     # Drop `pre_collision_margin` frames before the first colliding frame so
     # the policy isn't trained on "near-miss" approaches that ended in a
     # crash. Default 10 ≈ 1/3 sec at 30fps.
@@ -463,6 +472,7 @@ def decide_trim(
     first_collision_frame: int | None,
     pre_collision_margin: int,
     min_episode_length: int,
+    mode: str = "trim_first_collision",
 ) -> tuple[int, bool, str | None]:
     """Return `(trimmed_to, kept, drop_reason)` for one replayed episode.
 
@@ -472,6 +482,8 @@ def decide_trim(
     """
     if first_collision_frame is None:
         return n_frames, True, None
+    if mode == "drop":
+        return 0, False, f"collision at frame {first_collision_frame} (mode=drop)"
     new_len = max(0, first_collision_frame - pre_collision_margin)
     if new_len < min_episode_length:
         return 0, False, f"trimmed_len={new_len} < min={min_episode_length}"
@@ -848,7 +860,11 @@ def _run(
                     first_collision,
                 )
             trimmed_to, kept, drop_reason = decide_trim(
-                ep_length, first_collision, cfg.pre_collision_margin, cfg.min_episode_length
+                ep_length,
+                first_collision,
+                cfg.pre_collision_margin,
+                cfg.min_episode_length,
+                mode=cfg.mode,
             )
 
             if not kept:

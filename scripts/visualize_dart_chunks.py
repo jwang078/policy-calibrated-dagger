@@ -161,6 +161,8 @@ def _plot(
         inf = infos.get(t, {})
         i0, end = float(idxs[t]), float(len(geom.P) - 1)
         h = len(chunks[t])
+        if "clock" in inf:  # servo labels report their cursor exactly
+            return np.asarray(inf["clock"], dtype=float)[:h]
         if "t_merge" not in inf:  # pursuit fallback: demo pace from i0
             return np.minimum(i0 + np.arange(h), end)
         tb, tm = int(inf.get("t_brake", 0)), max(1, int(inf["t_merge"]))

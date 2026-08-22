@@ -25,6 +25,10 @@ npz mode (fast iteration — projection computed on the fly):
         --npz <run>/rollout_data.npz --ratio 0.5 \
         --source_repo_id JennyWWW/... --episode_index 0
 
+sim video (add to either mode — replays the same chunks on the planar arm in
+an offline PyBullet client, no launch_nodes server needed):
+    ... --sim_video [out.mp4] --sim_anchors 6
+
 dataset mode (validates the recorded ``relabel_demo_index`` end to end):
     python my_scripts/visualize_dart_chunks.py \
         --blend_repo_id JennyWWW/..._blend --source_repo_id JennyWWW/... \
@@ -103,7 +107,9 @@ def _plot(
     anchor_every: int,
     title: str,
     out: str,
-) -> None:
+    jacobian_fn=None,
+    cartesian_lambda: float = 4.0,
+) -> dict:
     anchors = list(range(0, len(S) - 1, max(1, anchor_every)))
 
     def _smooth_vel(t: int, w: int = 3) -> np.ndarray:
@@ -123,6 +129,8 @@ def _plot(
             ease_out=ease_out,
             prev_state=S[t - 1] if t > 0 else None,
             velocity=_smooth_vel(t),
+            jacobian_fn=jacobian_fn,
+            cartesian_lambda=cartesian_lambda,
             info=inf,
         )
         infos[t] = inf
@@ -143,6 +151,8 @@ def _plot(
             ease_out=ease_out,
             prev_state=S[t - 1] if t > 0 else None,
             velocity=_smooth_vel(t),
+            jacobian_fn=jacobian_fn,
+            cartesian_lambda=cartesian_lambda,
             info=inf64,
         )
         oks[t] = chunk_ok(lab64, inf64, geom)[0]
@@ -369,6 +379,66 @@ def _plot(
         f"|label0-state| max {dev0.max():.4f} | ticks-to-corridor p50 {int(np.median(rejoin))} "
         f"of H={len(chunks[anchors[0]])}"
     )
+    # Handed to the optional sim renderer (--sim_video) so it replays exactly
+    # the chunks this figure plots, in the same per-anchor colors.
+    return {"anchors": anchors, "chunks": chunks, "oks": oks, "colors": colors, "infos": infos}
+
+
+def _sim_video(args, S, idxs, geom, res, env, png_out: str, title: str) -> None:
+    """Replay a subset of the plotted chunks on the robot (see dart_sim_video).
+
+    Anchors are picked EVENLY over the ones training actually samples
+    (``chunk_ok``), plus the worst-deviation served anchor — the same one the
+    figure's zoom panel details — so the video and the plot tell one story.
+    """
+    from dart_sim_video import render_dart_sim_video
+
+    anchors, chunks, oks, colors = res["anchors"], res["chunks"], res["oks"], res["colors"]
+    served = [t for t in anchors if oks.get(t, True)] or anchors
+    k = max(1, min(args.sim_anchors, len(served)))
+    picks = {served[int(round(i))] for i in np.linspace(0, len(served) - 1, k)}
+    worst = max(served, key=lambda t: np.linalg.norm(S[t] - _interp_rows(geom.P, float(idxs[t]))))
+    picks.add(worst)
+    out = args.sim_video
+    if out == "auto":
+        out = os.path.splitext(png_out)[0] + ".mp4"
+    env_state = env.get("observation.environment_state")
+    kwargs = dict(
+        infos=res["infos"],
+        env_state=None if env_state is None or not len(env_state) else env_state[0],
+        fps=args.fps,
+        size=args.sim_size,
+        stride=args.sim_stride,
+        chunk_frame_repeat=args.sim_chunk_slowdown,
+        anchor_pause_frames=args.sim_anchor_pause,
+        end_hold_frames=args.sim_end_hold,
+        autofit=not args.sim_no_autofit,
+        title=title,
+    )
+    render_dart_sim_video(
+        S,
+        idxs,
+        geom,
+        chunks,
+        sorted(picks),
+        colors,
+        out,
+        **kwargs,
+    )
+    if not args.sim_no_chunk_only:
+        # Same anchors, same framing, no rollout/expert arms — the labels alone.
+        render_dart_sim_video(
+            S,
+            idxs,
+            geom,
+            chunks,
+            sorted(picks),
+            colors,
+            os.path.splitext(out)[0] + "_chunk_only.mp4",
+            chunks_only=True,
+            lead_in_frames=args.sim_lead_in,
+            **kwargs,
+        )
 
 
 def main() -> None:
@@ -393,8 +463,64 @@ def main() -> None:
     ap.add_argument("--num_arm_joints", type=int, default=3)
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--out", default=None)
+    ap.add_argument(
+        "--cartesian_gain",
+        action="store_true",
+        help="shape the servo's spring term by the arm's Jacobian metric "
+        "(W = (s_t^2+lam)(J^T J + lam I)^-1) so corrections along EE-loud "
+        "directions are damped — kills the end-effector cusps a pure "
+        "joint-space rejoin makes. Planar arm only (needs the URDF).",
+    )
+    ap.add_argument(
+        "--cartesian_lambda",
+        type=float,
+        default=4.0,
+        help="damping strength, in units of the demo direction's EE gain^2 "
+        "(higher = gentler shaping; 0 disables)",
+    )
+    # ── optional PyBullet replay of the same chunks on the robot ─────────────
+    ap.add_argument(
+        "--sim_video",
+        nargs="?",
+        const="auto",
+        default=None,
+        help="also render an mp4 of the corrections on the planar arm "
+        "(offline PyBullet, no launch_nodes server). Bare flag = <out>.mp4",
+    )
+    ap.add_argument("--sim_anchors", type=int, default=6, help="how many anchors to replay")
+    ap.add_argument("--sim_size", type=int, default=720, help="video resolution (square)")
+    ap.add_argument("--sim_stride", type=int, default=1, help="play every Nth rollout frame")
+    ap.add_argument("--sim_chunk_slowdown", type=int, default=2, help="video frames held per chunk label")
+    ap.add_argument(
+        "--sim_anchor_pause",
+        type=int,
+        default=0,
+        help="video frames to freeze on the anchor before the chunk starts (default 0: no stall)",
+    )
+    ap.add_argument("--sim_end_hold", type=int, default=16, help="video frames held on the completed rejoin")
+    ap.add_argument(
+        "--sim_lead_in",
+        type=int,
+        default=20,
+        help="chunk-only video: executed-rollout frames played into each anchor (0 = none)",
+    )
+    ap.add_argument(
+        "--sim_no_chunk_only",
+        action="store_true",
+        help="skip the companion <video>_chunk_only.mp4 (the label chunks with nothing overlaid)",
+    )
+    ap.add_argument(
+        "--sim_no_autofit",
+        action="store_true",
+        help="keep the env's exact 60° policy-camera framing instead of fitting this episode",
+    )
     args = ap.parse_args()
     n = args.num_arm_joints
+    jac_fn = None
+    if args.cartesian_gain:
+        from dart_sim_video import make_planar_jacobian
+
+        jac_fn = make_planar_jacobian()
 
     if args.npz:
         z = np.load(args.npz, allow_pickle=True)
@@ -409,7 +535,7 @@ def main() -> None:
         idxs = project_states(track, geom, index_window=args.index_window)
         title = f"DART chunks (on-the-fly) — {key} of {os.path.basename(os.path.dirname(args.npz))} (source ep {src_ep})"
         out = args.out or f"dart_chunks_npz_{key}.png"
-        _plot(
+        res = _plot(
             track[:, :n],
             idxs,
             geom,
@@ -421,7 +547,12 @@ def main() -> None:
             args.anchor_every,
             title,
             out,
+            jacobian_fn=jac_fn,
+            cartesian_lambda=args.cartesian_lambda,
         )
+        if args.sim_video:
+            env = _load_episode(args.source_repo_id, src_ep, cols=("observation.environment_state",))
+            _sim_video(args, track[:, :n], idxs, geom, res, env, out, title)
         return
 
     if not args.blend_repo_id:
@@ -439,11 +570,12 @@ def main() -> None:
             f"{args.blend_repo_id}: no relabel_demo_index column — record with --relabel_actions=guidance"
         )
     src = _load_episode(args.source_repo_id, src_ep)
+    env = _load_episode(args.blend_repo_id, args.episode_index, cols=("observation.environment_state",))
     geom = demo_geometry(src["observation.state"], src["action"], n_arm=n)
     idxs = np.asarray(bl["relabel_demo_index"], dtype=np.float64).reshape(-1)
     title = f"DART chunks — blend ep {args.episode_index} of {args.blend_repo_id} (source ep {src_ep})"
     out = args.out or f"dart_chunks_{args.blend_repo_id.split('/')[-1]}_ep{args.episode_index}.png"
-    _plot(
+    res = _plot(
         bl["observation.state"][:, :n],
         idxs,
         geom,
@@ -455,7 +587,11 @@ def main() -> None:
         args.anchor_every,
         title,
         out,
+        jacobian_fn=jac_fn,
+        cartesian_lambda=args.cartesian_lambda,
     )
+    if args.sim_video:
+        _sim_video(args, bl["observation.state"][:, :n], idxs, geom, res, env, out, title)
 
 
 if __name__ == "__main__":

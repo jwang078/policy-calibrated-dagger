@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import glob
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -129,6 +130,30 @@ def _interp_rows(mat: np.ndarray, i: float) -> np.ndarray:
     return (1.0 - f) * mat[idx] + f * mat[nxt]
 
 
+def _cartesian_shape(
+    e: np.ndarray, v_ref: np.ndarray, jac: np.ndarray, cartesian_lambda: float
+) -> np.ndarray:
+    """Damp the parts of the position error whose EE image is louder than the demo's.
+
+    ``W = (s_t^2 + lam) (J^T J + lam I)^-1``, ``lam = cartesian_lambda * s_t^2``,
+    ``s_t = |J u_t|`` the EE gain of the demo's direction of travel. Unit gain
+    along ``u_t`` by construction; a direction with EE gain ``s`` is scaled by
+    ``(s_t^2 + lam) / (s^2 + lam)``. A degenerate reference velocity (the demo
+    at rest) leaves the error untouched — there is no tangential direction to
+    normalize against, and damping everything would just stall the rejoin.
+    """
+    jac = np.asarray(jac, dtype=np.float64)
+    nv = float(np.linalg.norm(v_ref))
+    if nv < 1e-12:
+        return e
+    st2 = float(np.linalg.norm(jac @ (v_ref / nv)) ** 2)
+    lam = max(float(cartesian_lambda), 0.0) * st2
+    if st2 <= 0.0 or lam <= 0.0:
+        return e
+    n = jac.shape[1]
+    return (st2 + lam) * np.linalg.solve(jac.T @ jac + lam * np.eye(n), e)
+
+
 def chunk_labels(
     state: np.ndarray,
     demo_index: float,
@@ -142,6 +167,8 @@ def chunk_labels(
     glide_ratio: float = 2.0,
     velocity: np.ndarray | None = None,
     accel_budget: float = 1.0,
+    jacobian_fn: Callable[[np.ndarray], np.ndarray] | None = None,
+    cartesian_lambda: float = 4.0,
     info: dict | None = None,
 ) -> np.ndarray:
     """Synthesize the expert's ``horizon``-step response from one state.
@@ -273,7 +300,10 @@ def chunk_labels(
             else:
                 p_ref = a_row[: geom.n_arm]
                 v_ref = (_interp_rows(geom.A, min(i_f + 1.0, end_i)) - a_row)[: geom.n_arm]
-            a_cmd = kp * (p_ref - x) + kd * (v_ref - v)
+            e = p_ref - x
+            if jacobian_fn is not None:
+                e = _cartesian_shape(e, v_ref, jacobian_fn(x), cartesian_lambda)
+            a_cmd = kp * e + kd * (v_ref - v)
             na = float(np.linalg.norm(a_cmd))
             if na > a_clamp:
                 a_cmd *= a_clamp / na
@@ -293,6 +323,7 @@ def chunk_labels(
         if info is not None:
             info.update(
                 branch="servo",
+                cartesian=jacobian_fn is not None,
                 d0=float(d0),
                 sp0=float(sp0),
                 end_clamped=bool(hit_end),

@@ -63,6 +63,8 @@ TEXT = {
     "legend_demo_path": "Expert Intervention Trajectory",
     "legend_state_path": "Policy-Augmented Trajectory",
     "legend_chunk": "Label chunk",
+    "legend_chunk_served": "DART label chunks (sampled in training)",
+    "legend_chunk_excluded": "Excluded from sampling (end-of-intervention hold zone)",
     "legend_projection": "Corridor projection",
     "legend_pace": "Intervention pace (y = x)",
     "legend_progress": "Projected intervention index",
@@ -334,13 +336,23 @@ def _plot(
     cx_group = 0.5 * (0.045 + 0.475)
     fig.text(cx_group, 0.935, TEXT["joint_group_title"], ha="center", va="bottom", fontsize=14)
     handles, labels_ = ax_joints[0].get_legend_handles_labels()
+    from matplotlib.lines import Line2D
+
+    handles += [
+        Line2D([], [], color=cmap(0.55), lw=1.6, ls="-"),
+        Line2D([], [], color=cmap(0.55), lw=1.6, ls=":", alpha=0.5),
+    ]
+    labels_ += [
+        TEXT["legend_chunk_served"],
+        TEXT["legend_chunk_excluded"],
+    ]
     fig.legend(
         handles,
         labels_,
         loc="lower center",
-        bbox_to_anchor=(cx_group, 0.885),
+        bbox_to_anchor=(cx_group, 0.875),
         ncol=2,
-        fontsize=10,
+        fontsize=9,
         frameon=False,
     )
     fig.savefig(out, dpi=110)

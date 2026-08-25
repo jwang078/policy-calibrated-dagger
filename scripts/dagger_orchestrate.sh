@@ -7197,6 +7197,13 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
         fi
 
         TRAIN_OUTPUT_DIR="$FINAL_BFT_DIR"   # consumed by run_training_step
+        # END-ONLY checkpoint + eval: the bft policy is a terminal artifact —
+        # nothing consumes its intermediate evals (dagger_plot_repeats reads
+        # only the final eval_info), and each intermediate eval costs a full
+        # EVAL_N_EPISODES sim sweep. lerobot-train always saves+evals at
+        # step == cfg.steps, so freq=BFT_TARGET_STEPS fires exactly once, at
+        # the end. Tradeoff accepted 2026-08-25: an interrupted bft restarts
+        # from the round-0 base instead of a midpoint checkpoint.
         cleanup_pre_train_partial "$TRAIN_OUTPUT_DIR"
         stage_dagger_config_sidecar "$NUM_ROUNDS" "$FINAL_BFT_DIR"
         # shellcheck disable=SC2086  # FINETUNE_EXTRA_ARGS_EFF is word-split intentionally
@@ -7213,8 +7220,8 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
             --output_dir="$FINAL_BFT_DIR" \
             --job_name="$FINAL_BFT_RUN_NAME" \
             --steps="$BFT_TARGET_STEPS" \
-            --eval_freq="$FINETUNE_EVAL_FREQ" \
-            --save_freq="$FINETUNE_SAVE_FREQ" \
+            --eval_freq="$BFT_TARGET_STEPS" \
+            --save_freq="$BFT_TARGET_STEPS" \
             "${TRAIN_EXT_PORT_RESUME[@]}" \
             "${BFT_BATCH_SIZE_ARG[@]}" \
             "${BFT_DECAY_LR_ARG[@]}" \

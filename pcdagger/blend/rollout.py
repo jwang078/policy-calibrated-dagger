@@ -23,6 +23,7 @@ handling, decoded-guidance capture — is shared line-for-line.
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -98,7 +99,7 @@ def _fetch_sim_env_config(vec_env) -> dict | None:
         return None
 
 
-def warn_if_sim_physics_unsynced(vec_env, log=print) -> bool | None:
+def warn_if_sim_physics_unsynced(vec_env, log=print, *, required: bool = False) -> bool | None:
     """Report whether the connected sim runs --sync_physics_to_client.
 
     Queries the server's get_env_config (works over ZMQ and in-process) for
@@ -118,11 +119,19 @@ def warn_if_sim_physics_unsynced(vec_env, log=print) -> bool | None:
     if synced is True:
         log("[sim] sync_physics_to_client=ON — sim physics is gated on this client's commands.")
     elif synced is False:
-        log(
-            "[sim] WARNING: sync_physics_to_client=OFF — the sim integrates physics in "
-            "WALLCLOCK time while the policy thinks. Slow policies will look jumpy and "
-            "off-policy. Relaunch launch_nodes.py with --sync_physics_to_client."
+        msg = (
+            "[sim] sync_physics_to_client=OFF — the sim integrates physics in WALLCLOCK "
+            "time while the policy thinks: every slow tick (chunk-rebuild denoise) becomes "
+            "a physical LURCH in the achieved motion that is invisible in the commanded "
+            "actions (measured 2026-08-25: pixel-motion spikes ~20x the per-tick median at "
+            "every chunk boundary). Relaunch launch_nodes.py with --sync_physics_to_client."
         )
+        if required:
+            raise SystemExit(
+                msg + "\nRefusing to record against an unsynced sim "
+                "(pass --allow_unsynced_physics to override)."
+            )
+        log("WARNING: " + msg)
     else:
         log(
             "[sim] NOTE: could not determine the sim's sync_physics_to_client mode "
@@ -217,6 +226,18 @@ def _build_sim_batch(
     if task_description is not None:
         obs["task"] = [task_description]
     obs = obs_preprocessor(obs)
+    if os.environ.get("DAG_BATCH_DEBUG"):
+        import builtins
+
+        _n = getattr(builtins, "_dag_batch_dbg_count", 0)
+        if _n < int(os.environ.get("DAG_BATCH_DEBUG_TICKS", "2")):
+            builtins._dag_batch_dbg_count = _n + 1
+            for k, v in sorted(obs.items()):
+                if isinstance(v, torch.Tensor):
+                    print(
+                        f"[batch-dbg {_n}] {k}: shape {tuple(v.shape)} "
+                        f"vals {v.detach().cpu().numpy().reshape(-1)[:12].round(4).tolist()}"
+                    )
     if guidance_chunk is not None:
         chunk_t = torch.tensor(guidance_chunk, dtype=torch.float32, device=device).unsqueeze(0)
         obs["observation.policy_guidance_chunk"] = chunk_t
@@ -372,6 +393,25 @@ def run_blended_rollout(
     blend_dev_regulation: bool = False,
     blend_dev_full_below: float = 3.0,
     blend_dev_zero_above: float = 8.0,
+    # Build the guidance chunk from the DART label function (dart_labels.
+    # chunk_labels) evaluated at the CURRENT state and projection cursor,
+    # instead of the raw demo window at demo pace. The rollout's guidance
+    # then equals the train-time supervision targets by construction
+    # (same function, same clock): position k is where the DART servo says
+    # the robot SHOULD be at future tick k given its current deviation —
+    # the clock slows for correction, so chunk seams are continuous (no
+    # cursor-relock snap) and the suffix anchor's aim point needs no
+    # separate timestep correction. Requires progress_guidance=True (the
+    # projection cursor IS the DART demo_index).
+    guidance_from_dart_labels: bool = False,
+    # Monotone aim clock for DART-track guidance (indices/med-steps). On each
+    # rebuild the track's demo_index is the PREVIOUS track's clock at the
+    # switch position — so the aim NEVER steps backward at seams — clamped to
+    # at most this many indices ahead of the robot's projection, so it cannot
+    # run away from a stalled robot either (the pure state-relock retreats by
+    # the per-chunk shortfall; the pure clock-resume is unbounded). <=0
+    # disables the resume (pure state-relock, the original behavior).
+    dart_guidance_max_lead: float = 8.0,
     seed_joint_velocity: np.ndarray | None = None,
     fps: float = 30.0,
     demo_states_raw: np.ndarray | None = None,
@@ -531,6 +571,26 @@ def run_blended_rollout(
     # (loader-side) instead of via a destructive replay filter.
     _coll_hist: list[bool] = []
     _last_info: dict = {}
+    _dart_geom = None
+    _q_hist: list[np.ndarray] = []
+    _dart_prev_clock: list[float] | None = None
+    _dart_prev_build_t = 0
+    _dart_prev_proj: float | None = None
+    if guidance_from_dart_labels:
+        if not progress_guidance:
+            raise ValueError("guidance_from_dart_labels requires progress_guidance=True")
+        from dart_labels import (
+            _interp_rows as _dart_interp_rows,
+            chunk_labels as _dart_chunk_labels,
+            demo_geometry as _dart_demo_geometry,
+        )
+
+        _dart_states = demo_states_raw if demo_states_raw is not None else guidance_actions_raw
+        _dart_geom = _dart_demo_geometry(
+            np.asarray(_dart_states, dtype=np.float64),
+            np.asarray(guidance_actions_raw, dtype=np.float64),
+            _num_arm,
+        )
 
     for t in range(total_steps):
         # ── Hold mode: episode succeeded, don't step env again ────────────────
@@ -582,6 +642,24 @@ def run_blended_rollout(
             _j_clock = max(_j_clock, float(_j_progress))
             _j_exec = min(int(_j_clock) + _match_shift, guidance_actions_raw.shape[0] - 1)
             _lag = _j_clock - _j_progress
+            # DART-track aim clock (see guidance_from_dart_labels): computed
+            # HERE — before the ratio regulators — because the goal taper must
+            # key on the clock the guidance actually runs on. Keying it on the
+            # vestigial demo-pace _j_clock left the taper lagging the track:
+            # near the demo end the track already aims at the final pose while
+            # the taper still sees indices remaining, so the ratio stays up
+            # and the r*(policy-expert) equilibrium offset stalls the robot
+            # short of strict success until _j_clock catches up and the ratio
+            # collapses at once (stall-then-leap, measured ep35 t=173-176).
+            _dart_aim = float(_j_progress)
+            if guidance_from_dart_labels:
+                if dart_guidance_max_lead > 0 and _dart_prev_clock is not None:
+                    _switch_pos = min(max(0, t - _dart_prev_build_t), len(_dart_prev_clock) - 1)
+                    _dart_aim = min(
+                        max(_dart_aim, float(_dart_prev_clock[_switch_pos])),
+                        float(_j_progress) + float(dart_guidance_max_lead),
+                    )
+                _dart_aim = min(_dart_aim, float(guidance_actions_raw.shape[0] - 1))
             if _lag <= max(0, int(progress_guidance_lag_tol)):
                 _rate = 1.0
             elif _lag < max(int(progress_guidance_lag_tol) + 1, int(progress_guidance_hard_lag)):
@@ -607,7 +685,26 @@ def run_blended_rollout(
             if ratio not in (0.0, 1.0):
                 _scale = 1.0
                 if blend_ratio_goal_taper > 0:
-                    _remaining = float(guidance_actions_raw.shape[0] - 1) - _j_clock
+                    # The taper removes the r*(policy-expert) equilibrium
+                    # offset when the ROBOT nears the goal — so it must key on
+                    # the robot's projection. The vestigial _j_clock LAGS it
+                    # (ratio stays up too long -> stall short of strict
+                    # success, then a leap when the clock catches up); the
+                    # DART aim clock LEADS it (the track's clock saturates at
+                    # the demo end ~a chunk before the robot arrives -> ratio
+                    # collapses while the robot is still away -> the ratio-0
+                    # branch teleport-commands the end pose). Both measured on
+                    # ep35, 2026-08-25.
+                    _taper_clock = float(_j_progress) if guidance_from_dart_labels else _j_clock
+                    _remaining = float(guidance_actions_raw.shape[0] - 1) - _taper_clock
+                    # NOTE: do NOT shift this ramp to reach zero early — a
+                    # near-zero ratio while the robot still has lateral offset
+                    # couples badly with the lead-capped aim (commands park at
+                    # demo[aim] instead of gliding in; measured ep35: stall at
+                    # 3.5 med + 3.6-med leap with a remaining-2 shift). The
+                    # plain ramp gives a monotone approach with only <=0.5
+                    # med-step settling wiggles in the final ~3 ticks, which
+                    # the DART hold-free window excludes from serving anyway.
                     _scale = min(_scale, max(0.0, min(1.0, _remaining / float(blend_ratio_goal_taper))))
                 # Deviation telemetry (always on under progress guidance —
                 # feeds the realized-tube episode metadata even when the
@@ -616,6 +713,15 @@ def run_blended_rollout(
                     float(np.linalg.norm(_q_now.astype(np.float64) - _demo_arm[_j_progress])) / _pg_med_step
                 )
                 _dev_hist.append(_dev)
+                # Timestep correction for the suffix anchor (see
+                # wrapper.anchor_clock_lag / anchor_suffix_steps): a robot
+                # _dev med-steps off-corridor needs ~_dev ticks of the chunk
+                # to correct before it can track demo pace (the DART servo's
+                # clock slowdown), so the chunk-end aim point is the demo at
+                # (cursor + T - _dev). Published every tick; the obs-teleop
+                # source consumes it as an index shift at anchor-build time.
+                if int(getattr(wrapper, "anchor_suffix_steps", 0) or 0) > 0:
+                    wrapper.anchor_clock_lag = max(0, int(round(_dev)))
                 if abort_dev_steps > 0.0 and _dev > abort_dev_steps:
                     _breach_run += 1
                     if _breach_run >= 3:
@@ -653,7 +759,98 @@ def run_blended_rollout(
                 wrapper.forward_flow_ratio = ratio * _scale
                 _r_eff_sum += ratio * _scale
                 _r_eff_n += 1
-            guidance_chunk = None if suppress_guidance else guidance_actions_raw[_j_exec:]
+            if guidance_from_dart_labels:
+                # DART-track guidance: same label function as training.
+                _q_hist.append(_q_now.astype(np.float64).copy())
+                if len(_q_hist) > 8:
+                    _q_hist.pop(0)
+                if suppress_guidance:
+                    guidance_chunk = None
+                else:
+                    # PLAN-CONTINUOUS LAUNCH: the track launches from the demo
+                    # corridor at the (monotone, pace-matched) aim clock — NOT
+                    # from the robot's state. State-launched tracks restart at
+                    # the robot every rebuild, which puts a backward value-step
+                    # into the guidance whenever the robot lags its plan (the
+                    # rejoin transient re-encoded each refresh). Labels must
+                    # launch from the visited state (train-time semantics);
+                    # guidance must not (rollout-time reference). The blend
+                    # ratio and the suffix anchor are what pull the robot
+                    # toward this reference; the max-lead clamp on the aim is
+                    # what keeps the reference from running away from a robot
+                    # that cannot follow.
+                    # PACE-MATCHED speed budget ("account for the ticks that
+                    # lead up to the anchor"): the servo's default budget
+                    # (1.2x demo median) is the pace of a robot that FOLLOWS
+                    # the track — but the executor is a ratio-blend of policy
+                    # and track, which realizes less arc per tick. A track
+                    # paced faster than the blend can move puts every future
+                    # waypoint (and the suffix anchor) out of reach, so each
+                    # rebuild reveals a shortfall: the guidance snaps back
+                    # (state-relock) or ratchets ahead (clock-resume). Budget
+                    # the track at the REALIZED arc pace of the previous
+                    # inter-refresh window (slight optimism, floored so a
+                    # stall can recover) and the plan aims where the blend
+                    # will actually be — seams close at the source.
+                    _speed_budget = 1.2
+                    if _dart_prev_proj is not None and t > _dart_prev_build_t:
+                        _i0 = int(np.clip(_dart_prev_proj, 0, len(_dart_geom.cum) - 1))
+                        _i1 = int(np.clip(_j_progress, 0, len(_dart_geom.cum) - 1))
+                        _arc = float(_dart_geom.cum[_i1] - _dart_geom.cum[_i0])
+                        _rate = _arc / ((t - _dart_prev_build_t) * _dart_geom.med_step)
+                        _speed_budget = float(min(1.2, max(0.3, 1.05 * _rate)))
+                    # Monotone aim clock — computed above (before the ratio
+                    # regulators, which the goal taper keys on it).
+                    _aim = _dart_aim
+                    _launch = _dart_interp_rows(_dart_geom.P, _aim)
+                    _launch_prev = _dart_interp_rows(_dart_geom.P, max(0.0, _aim - _speed_budget))
+                    _v0 = _launch - _launch_prev
+                    _dart_info: dict = {}
+                    _track = _dart_chunk_labels(
+                        _launch,
+                        _aim,
+                        _dart_geom,
+                        horizon=64,
+                        speed_budget=_speed_budget,
+                        prev_state=_launch_prev,
+                        velocity=_v0,
+                        info=_dart_info,
+                    )
+                    if os.environ.get("DAG_DART_AIM_DEBUG"):
+                        _pc = None
+                        if _dart_prev_clock is not None:
+                            _sp = min(max(0, t - _dart_prev_build_t), len(_dart_prev_clock) - 1)
+                            _pc = round(float(_dart_prev_clock[_sp]), 1)
+                        print(
+                            f"[dart-aim] t={t} chunk_offset={t % n_action_steps} "
+                            f"dt_prev_build={t - _dart_prev_build_t} proj={_j_progress} "
+                            f"prev_clock@switch={_pc} aim={_aim:.1f} sb={_speed_budget:.2f} "
+                            f"track_clock0={float((_dart_info.get('clock') or [0])[0]):.1f} "
+                            f"track_clock16={float((_dart_info.get('clock') or [0] * 17)[min(16, len(_dart_info.get('clock') or [0]) - 1)]):.1f}"
+                        )
+                    _dart_prev_clock = list(_dart_info.get("clock") or []) or None
+                    _dart_prev_build_t = t
+                    _dart_prev_proj = float(_j_progress)
+                    _track = np.asarray(_track, dtype=np.float32)
+                    if _track.shape[1] < guidance_actions_raw.shape[1]:
+                        # Defensive: pad non-arm columns (gripper) from the demo
+                        # at the track's own clock indices.
+                        _clock = _dart_info.get("clock") or [float(_j_progress)] * len(_track)
+                        _pad_rows = np.stack(
+                            [
+                                guidance_actions_raw[min(int(round(c)), guidance_actions_raw.shape[0] - 1)]
+                                for c in _clock
+                            ]
+                        ).astype(np.float32)
+                        _full = _pad_rows.copy()
+                        _full[:, : _track.shape[1]] = _track
+                        _track = _full
+                    guidance_chunk = _track
+                    # The track already embeds the servo's slowed clock — the
+                    # suffix anchor must NOT apply a second timestep shift.
+                    wrapper.anchor_clock_lag = 0
+            else:
+                guidance_chunk = None if suppress_guidance else guidance_actions_raw[_j_exec:]
         else:
             guidance_chunk = None if suppress_guidance else guidance_actions_raw[t:]
 
@@ -669,6 +866,30 @@ def run_blended_rollout(
 
         action_norm = wrapper.select_action(batch, base_noise=base_noise)
         raw_action = wrapper.postprocessor(action_norm)
+        if os.environ.get("DAG_DECODE_DEBUG") and t < int(os.environ.get("DAG_DECODE_DEBUG_TICKS", "4")):
+            _steps_info = []
+            for _s in wrapper.postprocessor.steps:
+                _en = getattr(_s, "enabled", "n/a")
+                _steps_info.append(f"{type(_s).__name__}(enabled={_en})")
+            _rs = None
+            for _s in wrapper.postprocessor.steps:
+                _rs = getattr(_s, "relative_step", None) or _rs
+            _anchor = None
+            if _rs is not None and getattr(_rs, "_last_state", None) is not None:
+                _anchor = _rs._last_state.detach().cpu().numpy().reshape(-1)[:3].round(3).tolist()
+            print(f"[decode-dbg] t={t} steps={_steps_info}")
+            print(
+                f"[decode-dbg]   action_norm={action_norm.detach().cpu().numpy().reshape(-1)[:3].round(3).tolist()}"
+            )
+            print(
+                f"[decode-dbg]   raw_action ={raw_action.detach().cpu().numpy().reshape(-1)[:3].round(3).tolist()}"
+            )
+            print(
+                f"[decode-dbg]   q_now      ={np.asarray(env_obs['agent_pos']).reshape(-1)[:3].round(3).tolist()}"
+            )
+            print(
+                f"[decode-dbg]   rel_anchor ={_anchor} rel_enabled={getattr(_rs, 'enabled', None) if _rs is not None else None}"
+            )
 
         if env_postprocessor is not None:
             _post_out = env_postprocessor({ACTION: raw_action})
@@ -689,6 +910,8 @@ def run_blended_rollout(
         if on_step is not None:
             on_step(t, env_obs, action_1d, False)
         _coll_hist.append(extract_in_collision_flag(_last_info))
+        if os.environ.get("DAG_COLL_DEBUG") and _coll_hist[-1]:
+            print(f"[coll-dbg] t={t} IN COLLISION")
         raw_actions.append(action_1d)
 
         env_obs, _reward, _term, _trunc, _info = vec_env.step(action_numpy)
@@ -758,6 +981,18 @@ def run_blended_rollout(
         log(
             f"[ratio={ratio}] progress-guidance final demo cursor {_j_progress}/{_demo_arm.shape[0]} "
             f"(wall-clock ticks {n_ticks}; lag {n_ticks - _j_progress})"
+        )
+    # Collision visibility: eval TERMINATES on collision (terminate_on_collision
+    # in the training env config), but this rollout keeps stepping — a collided
+    # robot stays pinned against the obstacle for the rest of the episode,
+    # which reads as a policy "limit cycle" in videos/metrics unless flagged
+    # (scenario 0 ratio-1.0 debugging, 2026-08-24: 102/155 ticks in collision
+    # were mistaken for a wrapper chunking bug).
+    if any(_coll_hist):
+        _first_coll = _coll_hist.index(True)
+        log(
+            f"[ratio={ratio}] COLLISION: {sum(_coll_hist)}/{len(_coll_hist)} ticks in collision "
+            f"(first at t={_first_coll}); true eval would have TERMINATED there."
         )
         if blend_dev_regulation and _dev_hist:
             log(

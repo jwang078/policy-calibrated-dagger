@@ -97,7 +97,7 @@ def main() -> None:
         d_max_step = float(np.linalg.norm(np.diff(sg_actions[:, :n], axis=0), axis=1).max())
         viols: list[str] = []
         for t in range(1, len(S) - 1, max(1, args.stride)):
-            lo, hi = max(0, t - 3), min(len(S) - 1, t + 3)
+            lo, hi = max(0, t - 5), min(len(S) - 1, t + 5)
             v0 = (S[hi] - S[lo]) / max(1, hi - lo)
             info: dict = {}
             L = chunk_labels(

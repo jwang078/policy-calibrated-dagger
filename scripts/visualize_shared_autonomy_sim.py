@@ -16,7 +16,17 @@ crash). Launch the simulator once:
             --robot_port 6001 \\
             --robot_name robot_iphone_w_engine_curtain \\
             --eval_benchmark_repo_id <benchmark_dataset_repo_id> \\
+            --sync_physics_to_client \\
             --strict_goal_tolerances
+
+``--sync_physics_to_client`` is NOT optional for rollout work: without it,
+physics integrates in WALL-CLOCK time, so every slow tick (a chunk-rebuild
+denoise takes ~0.3 s) lets the PD controller keep integrating toward the last
+target — the robot visibly LURCHES at every chunk boundary, in the video and
+in the achieved states, while the commanded actions look perfectly smooth
+(measured 2026-08-25: pixel-motion spikes ~20x the per-tick median, all at
+the chunk-boundary phase; synced rerun of the same config had zero). The
+orchestrator's managed sims pass it by default; manual launches must too.
 
 Then point this script at it:
 
@@ -39,6 +49,7 @@ cd ~/code/SplatSim && python scripts/launch_nodes.py \
     --robot_port 6001 \
     --robot_name robot_iphone_w_engine_curtain \
     --eval_benchmark_repo_id JennyWWW/eval_splatsim_approach_lever_benchmark_1000 \
+    --sync_physics_to_client \
     --strict_goal_tolerances
 
 # 2. Run visualize (in another terminal)
@@ -89,6 +100,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -339,6 +351,7 @@ def get_sim_action_chunk_for_ratio(
     progress_guidance_soft_hold: float = 0.0,
     progress_guidance_hard_lag: int = 8,
     blend_ratio_goal_taper: int = 0,
+    guidance_from_dart_labels: bool = False,
     blend_dev_regulation: bool = False,
     blend_dev_full_below: float = 3.0,
     blend_dev_zero_above: float = 8.0,
@@ -399,6 +412,7 @@ def get_sim_action_chunk_for_ratio(
         progress_guidance_soft_hold=progress_guidance_soft_hold,
         progress_guidance_hard_lag=progress_guidance_hard_lag,
         blend_ratio_goal_taper=blend_ratio_goal_taper,
+        guidance_from_dart_labels=guidance_from_dart_labels,
         blend_dev_regulation=blend_dev_regulation,
         blend_dev_full_below=blend_dev_full_below,
         blend_dev_zero_above=blend_dev_zero_above,
@@ -433,11 +447,12 @@ def get_sim_action_chunks_for_ratios(
     progress_guidance_soft_hold: float = 0.0,
     progress_guidance_hard_lag: int = 8,
     blend_ratio_goal_taper: int = 0,
+    guidance_from_dart_labels: bool = False,
     blend_dev_regulation: bool = False,
     blend_dev_full_below: float = 3.0,
     blend_dev_zero_above: float = 8.0,
     demo_states_raw: np.ndarray | None = None,
-    record_videos: bool = False,
+    record_videos: bool = True,
     expected_env_state: np.ndarray | None = None,
 ) -> tuple[dict[float, np.ndarray], dict[float, np.ndarray], dict[float, dict[str, list[np.ndarray]]]]:
     """Run :func:`get_sim_action_chunk_for_ratio` for each ratio.
@@ -452,9 +467,14 @@ def get_sim_action_chunks_for_ratios(
     (every non-``_stretch`` key in the env's pixels dict) and returns them as
     the third element: ``{ratio: {image_key: [frame, ...]}}``.
     """
-    torch.manual_seed(42)
+    # DAG_GLOBAL_SEED overrides the global torch seed (default 42): the DDPM
+    # sampler draws its per-step variance noise from the GLOBAL stream, so at
+    # ratio 1.0 passthrough (inner select_action takes no generator) this is
+    # the ONLY seed that varies the rollout — --sample_seed does nothing there.
+    _gseed = int(os.environ.get("DAG_GLOBAL_SEED", "42"))
+    torch.manual_seed(_gseed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
+        torch.cuda.manual_seed_all(_gseed)
     base_noise: torch.Tensor | None = None
     if fixed_base_noise:
         if getattr(wrapper.config, "max_action_dim", None) is not None:
@@ -483,9 +503,9 @@ def get_sim_action_chunks_for_ratios(
         # ratio continues the stream where the previous rollout left it and
         # blends against a DIFFERENT policy sample — breaking cross-ratio
         # comparability (blends land outside the [guidance, policy] envelope).
-        torch.manual_seed(42)
+        torch.manual_seed(_gseed)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(42)
+            torch.cuda.manual_seed_all(_gseed)
         actions, decoded = get_sim_action_chunk_for_ratio(
             wrapper,
             obs_preprocessor,
@@ -508,6 +528,7 @@ def get_sim_action_chunks_for_ratios(
             progress_guidance_soft_hold=progress_guidance_soft_hold,
             progress_guidance_hard_lag=progress_guidance_hard_lag,
             blend_ratio_goal_taper=blend_ratio_goal_taper,
+            guidance_from_dart_labels=guidance_from_dart_labels,
             blend_dev_regulation=blend_dev_regulation,
             blend_dev_full_below=blend_dev_full_below,
             blend_dev_zero_above=blend_dev_zero_above,
@@ -731,7 +752,21 @@ def parse_args():
     )
     parser.add_argument("--blend_strategy", default="denoise", choices=["denoise", "interpolate"])
     parser.add_argument("--guidance_repr", default="absolute_pos", choices=["absolute_pos", "delta"])
-    parser.add_argument("--n_anchor_steps", type=int, default=0)
+    # Tube re-blend, matching the blend pipeline (wrapper default is 8.0; the
+    # orchestrate lineages run 16.0). 0 disables. The viz never ABORTS on
+    # breach (visualize everything); only the predictive ratio-cut re-blend
+    # is mirrored here.
+    parser.add_argument(
+        "--blend_tube_steps",
+        type=float,
+        default=None,
+        help="Tube radius in demo med-steps for the predictive re-blend "
+        "(None = keep wrapper default 8.0; pipeline uses 16.0; 0 disables)",
+    )
+    parser.add_argument("--guidance_from_dart_labels", type=lambda s: s.lower() != "false", default=False)
+    parser.add_argument("--anchor_prefix_steps", type=int, default=0)
+    parser.add_argument("--anchor_suffix_steps", type=int, default=0)
+    parser.add_argument("--anchor_every_denoise_step", type=lambda s: s.lower() != "false", default=True)
     parser.add_argument(
         "--total_steps",
         type=int,
@@ -1070,7 +1105,11 @@ def main():
         wrapper.sample_seed = args.sample_seed
         print(f"Per-call sample generator enabled (seed={args.sample_seed}).")
     wrapper.policy_guidance_representation = PolicyGuidanceRepresentation(args.guidance_repr)
-    wrapper.n_anchor_steps = args.n_anchor_steps
+    if args.blend_tube_steps is not None:
+        wrapper.blend_tube_steps = float(args.blend_tube_steps)
+    wrapper.anchor_prefix_steps = args.anchor_prefix_steps
+    wrapper.anchor_suffix_steps = args.anchor_suffix_steps
+    wrapper.anchor_every_denoise_step = args.anchor_every_denoise_step
     wrapper.rtc_prev_chunk_guidance = args.rtc_prev_chunk
     wrapper.rtc_max_guidance_weight = args.rtc_max_guidance_weight
     wrapper.rtc_execution_horizon = args.rtc_execution_horizon
@@ -1292,6 +1331,7 @@ def main():
             progress_guidance_soft_hold=args.progress_guidance_soft_hold,
             progress_guidance_hard_lag=args.progress_guidance_hard_lag,
             blend_ratio_goal_taper=args.blend_ratio_goal_taper,
+            guidance_from_dart_labels=args.guidance_from_dart_labels,
             blend_dev_regulation=args.blend_dev_regulation,
             blend_dev_full_below=args.blend_dev_full_below,
             blend_dev_zero_above=args.blend_dev_zero_above,
@@ -1339,7 +1379,11 @@ def main():
             blend_interval_tag = "everystep"
         else:
             blend_interval_tag = f"blendint{int(round(args.blend_interval_frac * 100)):03d}"
-        anchor_tag = f"anchor{args.n_anchor_steps}" if args.n_anchor_steps > 0 else "noanchor"
+        anchor_tag = (
+            f"anchor{args.anchor_prefix_steps}p{args.anchor_suffix_steps}s"
+            if (args.anchor_prefix_steps > 0 or args.anchor_suffix_steps > 0)
+            else "noanchor"
+        )
         nas_tag = f"nas{n_action_steps}"
         noise_tag = "" if args.fixed_base_noise else "_freshnoise"
         pg_tag = "_pg" if args.progress_guidance else ""

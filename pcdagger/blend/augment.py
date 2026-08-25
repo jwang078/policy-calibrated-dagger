@@ -170,7 +170,26 @@ class AugmentationConfig:
     blend_mode: str = "once_per_chunk"  # "once_per_chunk" | "every_step"
     blend_strategy: str = "denoise"  # "denoise" | "interpolate"
     guidance_repr: str = "absolute_pos"  # "absolute_pos" | "delta"
-    n_anchor_steps: int = 0
+    # Chunk anchoring (in-loop inpainting; see lerobot/policies/common/chunk_anchor.py):
+    # anchor_prefix_steps pins the first k positions of each built chunk to
+    # guidance (seam continuity); anchor_suffix_steps pins the LAST M positions
+    # (rejoin-by-construction: every chunk plans a return to the demo corridor,
+    # bounding blend deviations per chunk instead of letting them compound).
+    # anchor_every_denoise_step=True (default) re-pins at every denoise step and
+    # clamps clean at the end (hard guarantee); False = one soft injection.
+    anchor_prefix_steps: int = 0
+    anchor_suffix_steps: int = 0
+    anchor_every_denoise_step: bool = True
+    # Guidance chunk = DART label track (dart_labels.chunk_labels at the
+    # current state/projection) instead of the raw demo window — rollout
+    # guidance then EQUALS the train-time supervision targets (same
+    # function, same clock): seam-continuous, timestep-corrected, and the
+    # blend distribution matches the label distribution by construction.
+    guidance_from_dart_labels: bool = False
+    # Recording against an unsynced sim (no --sync_physics_to_client) corrupts
+    # the achieved-motion data with chunk-boundary lurches; the blend script
+    # therefore REFUSES unless this override is set.
+    allow_unsynced_physics: bool = False
     n_action_steps: int | None = None  # None ⇒ keep policy's default
     # Interval between guidance re-blends, as a fraction of the executed chunk
     # (n_action_steps), in [0, 1]: 1.0 = blend at chunk boundaries only
@@ -860,11 +879,15 @@ def _annotate_frames_with_demo_index(
     idxs = project_states(states, geom, index_window=index_window) + float(index_offset)
     for t, (fr, di) in enumerate(zip(frames, idxs, strict=True)):
         fr["relabel_demo_index"] = np.array([di], dtype=np.float32)
-        # Smoothed per-frame velocity (+-3 tick window): the Hermite label
-        # launch tangent. A 1-tick finite difference on a noisy blend path
-        # points anywhere; train time only loads 2 obs frames, so the
-        # smoothed estimate must be recorded.
-        lo, hi = max(0, t - 3), min(len(states) - 1, t + 3)
+        # Smoothed per-frame velocity (+-5 tick window): the label launch
+        # tangent. A 1-tick finite difference on a noisy blend path points
+        # anywhere; train time only loads 2 obs frames, so the smoothed
+        # estimate must be recorded. Window widened +-3 -> +-5 (2026-08-25):
+        # on anchored-blend rollouts (per-tick velocity noise/signal ~0.5)
+        # the +-3 estimate still carried 10-19% error vs the smoothed true
+        # velocity; +-5 halves it to 5-10% with negligible smearing (accel
+        # time constants are ~10+ ticks).
+        lo, hi = max(0, t - 5), min(len(states) - 1, t + 5)
         fr["relabel_velocity"] = ((states[hi, :n_arm] - states[lo, :n_arm]) / max(1, hi - lo)).astype(
             np.float32
         )
@@ -1043,7 +1066,7 @@ def run_augmentation(
     )
     env_dict = make_env(env_cfg_obj, n_envs=1, use_async_envs=False)
     vec_env = env_dict["splatsim"][0]
-    warn_if_sim_physics_unsynced(vec_env, log=logger.info)
+    warn_if_sim_physics_unsynced(vec_env, log=logger.info, required=not cfg.allow_unsynced_physics)
     check_sim_strict_goal_tolerances(vec_env, required=not cfg.allow_loose_goal_tolerances, log=logger.info)
 
     # ── Build wrapped policy (acquires its own pybullet GUI in parent) ────
@@ -1083,7 +1106,9 @@ def run_augmentation(
     wrapper.show_guidance_ghost = cfg.show_guidance_ghost
     wrapper.guidance_blend_strategy = GuidanceBlendStrategy(cfg.blend_strategy)
     wrapper.policy_guidance_representation = PolicyGuidanceRepresentation(cfg.guidance_repr)
-    wrapper.n_anchor_steps = cfg.n_anchor_steps
+    wrapper.anchor_prefix_steps = cfg.anchor_prefix_steps
+    wrapper.anchor_suffix_steps = cfg.anchor_suffix_steps
+    wrapper.anchor_every_denoise_step = cfg.anchor_every_denoise_step
     wrapper.rtc_prev_chunk_guidance = cfg.rtc_prev_chunk
     wrapper.rtc_max_guidance_weight = cfg.rtc_max_guidance_weight
     wrapper.rtc_execution_horizon = cfg.rtc_execution_horizon
@@ -1507,6 +1532,7 @@ def run_augmentation(
                                 progress_guidance_soft_hold=cfg.progress_guidance_soft_hold,
                                 progress_guidance_hard_lag=cfg.progress_guidance_hard_lag,
                                 blend_ratio_goal_taper=cfg.blend_ratio_goal_taper,
+                                guidance_from_dart_labels=cfg.guidance_from_dart_labels,
                                 blend_dev_regulation=cfg.blend_dev_regulation,
                                 blend_dev_full_below=cfg.blend_dev_full_below,
                                 blend_dev_zero_above=cfg.blend_dev_zero_above,
@@ -1906,7 +1932,10 @@ Augmented dataset generated by `augment_dataset_with_blending.py`.
 | `guidance_repr` | `{cfg.guidance_repr}` |
 | `blend_interval_frac` | `{cfg.blend_interval_frac}` |
 | `blend_mode` | `{cfg.blend_mode}` |
-| `n_anchor_steps` | `{cfg.n_anchor_steps}` |
+| `anchor_prefix_steps` | `{cfg.anchor_prefix_steps}` |
+| `anchor_suffix_steps` | `{cfg.anchor_suffix_steps}` |
+| `anchor_every_denoise_step` | `{cfg.anchor_every_denoise_step}` |
+| `guidance_from_dart_labels` | `{cfg.guidance_from_dart_labels}` |
 | `n_action_steps` | `{cfg.n_action_steps}` |
 | `pad_after_success` | `{cfg.pad_after_success}` |
 | `min_episode_length` | `{cfg.min_episode_length}` |

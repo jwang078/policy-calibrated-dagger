@@ -42,10 +42,12 @@ Example (bulk — all episodes 0–49):
 
 import csv
 import faulthandler
+import itertools
 import json
 import logging
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from pprint import pformat
@@ -289,6 +291,15 @@ class AugmentationConfig:
     # x_T draw, leaving the DDPM scheduler's per-step variance fresh), this
     # pins the entire sampling chain. -1 disables (legacy global-RNG draws).
     sample_seed: int = 42
+    # Independent blend rollouts per (source episode, ratio) — DART-style
+    # noise-ensemble sampling. Each sample k gets its own sample_seed salt and
+    # (when --fixed_base_noise) its own pinned base-noise draw, so the K
+    # blends explore K different deviations around the SAME intervention.
+    # K=1 (default) is the historical single-sample behavior, byte-identical
+    # seeds included. Every output episode records `blend_sample_idx` (and
+    # `blend_sample_seed`) next to `source_episode_idx`, so all K samples
+    # trace back to their intervention for visualization/merging.
+    samples_per_episode: int = 1
     # RTC-style previous-chunk guidance (Real-Time Chunking; see
     # SharedAutonomyConfig.rtc_* for full docs). Passes the previous blended
     # chunk's UNEXECUTED remainder into each re-blend's denoise, which pulls
@@ -797,8 +808,8 @@ def rollout_closed_loop_for_augmentation(
 # ---------------------------------------------------------------------------
 
 
-def _existing_provenance_pairs(target_root: Path) -> set[tuple[int, float]]:
-    """(source_episode_idx, blend_ratio) pairs already committed to the target.
+def _existing_provenance_pairs(target_root: Path) -> Counter:
+    """Count of committed episodes per (source_episode_idx, blend_ratio).
 
     Read from the target's per-episode metadata parquets. The blend loop skips
     pairs in this set, making re-invocation IDEMPOTENT: a run that died between
@@ -812,7 +823,7 @@ def _existing_provenance_pairs(target_root: Path) -> set[tuple[int, float]]:
     columns (foreign/legacy data) are ignored — they never match, so the run
     degrades to the old append behavior for them.
     """
-    pairs: set[tuple[int, float]] = set()
+    pairs: Counter = Counter()
     for f in sorted((Path(target_root) / "meta" / "episodes").glob("chunk-*/*.parquet")):
         try:
             df = pd.read_parquet(f)
@@ -822,7 +833,7 @@ def _existing_provenance_pairs(target_root: Path) -> set[tuple[int, float]]:
             continue
         for se, br in zip(df["source_episode_idx"], df["blend_ratio"]):
             if pd.notna(se) and pd.notna(br):
-                pairs.add((int(se), round(float(br), 6)))
+                pairs[(int(se), round(float(br), 6))] += 1
     return pairs
 
 
@@ -903,6 +914,7 @@ class AugmentedEpisodeResult:
     source_episode_idx: int
     source_scenario_idx: int | None
     blend_ratio: float
+    blend_sample_idx: int
     n_frames: int
     elapsed_s: float
 
@@ -952,11 +964,14 @@ def run_augmentation(
     episode_indices = _resolve_episode_selection(cfg, available_eps)
     if not episode_indices:
         raise ValueError("No source episodes selected.")
+    if cfg.samples_per_episode < 1:
+        raise ValueError(f"samples_per_episode must be >= 1 (got {cfg.samples_per_episode})")
     logger.info(
-        "Will augment %d source episode(s) × %d ratio(s) = %d output episode(s)",
+        "Will augment %d source episode(s) × %d ratio(s) × %d sample(s) = %d output episode(s)",
         len(episode_indices),
         len(cfg.forward_flow_ratios),
-        len(episode_indices) * len(cfg.forward_flow_ratios),
+        cfg.samples_per_episode,
+        len(episode_indices) * len(cfg.forward_flow_ratios) * cfg.samples_per_episode,
     )
 
     # ── Connect to externally-launched splatsim via ZMQ ───────────────────
@@ -1282,6 +1297,7 @@ def run_augmentation(
                 "source_episode_idx",
                 "source_scenario_idx",
                 "blend_ratio",
+                "blend_sample_idx",
                 "n_frames",
                 "elapsed_s",
             ]
@@ -1332,12 +1348,14 @@ def run_augmentation(
         _valid_source_eps.append(source_ep)
         _scen_idx = _resolve_source_scenario_idx(source_ep)
         for _ in cfg.forward_flow_ratios:
-            _playlist.append(_scen_idx)
+            for _ in range(cfg.samples_per_episode):
+                _playlist.append(_scen_idx)
     logger.info(
-        "Installing sim EVAL_BENCHMARK playlist: %d entries (%d source_eps × %d ratios). First 20: %s",
+        "Installing sim EVAL_BENCHMARK playlist: %d entries (%d source_eps × %d ratios × %d samples). First 20: %s",
         len(_playlist),
         len(_valid_source_eps),
         len(cfg.forward_flow_ratios),
+        cfg.samples_per_episode,
         _playlist[:20],
     )
     # ORDER + DUPLICATES preserved end-to-end (see set_env_benchmark_indices
@@ -1469,18 +1487,35 @@ def run_augmentation(
                     _noise_shape = (1, wrapper.config.horizon, _adim)
                 _base_noise = torch.randn(_noise_shape, device=cfg.device)
 
-            for ratio in cfg.forward_flow_ratios:
-                if (int(source_ep), round(float(ratio), 6)) in _done_pairs:
+            for ratio, sample_idx in itertools.product(
+                cfg.forward_flow_ratios, range(cfg.samples_per_episode)
+            ):
+                # Resume semantics with K samples: the target holds COUNT
+                # episodes for this (source_ep, ratio); samples are written in
+                # sample_idx order, so indices < COUNT already exist.
+                if _done_pairs[(int(source_ep), round(float(ratio), 6))] > sample_idx:
                     logger.info(
-                        "[resume] source_ep=%d ratio=%.2f already in target — skipping.",
+                        "[resume] source_ep=%d ratio=%.2f sample=%d already in target — skipping.",
                         source_ep,
                         ratio,
+                        sample_idx,
                     )
-                    # The playlist has one slot per (source_ep, ratio); keep
-                    # position in lockstep even when skipping so later
+                    # The playlist has one slot per (source_ep, ratio, sample);
+                    # keep position in lockstep even when skipping so later
                     # rollouts still reset to THEIR scenario slot.
                     _playlist_pos += 1
                     continue
+                # Per-sample seed base: sample 0 reproduces the historical
+                # single-sample seeds exactly; samples k>=1 salt by 7919*k so
+                # the K blends draw K independent noise realizations.
+                _seed_base = (
+                    cfg.sample_seed + int(source_ep) + 7919 * sample_idx if cfg.sample_seed >= 0 else -1
+                )
+                if cfg.sample_seed >= 0:
+                    wrapper.sample_seed = _seed_base
+                _bn = _base_noise
+                if _bn is not None and sample_idx > 0:
+                    _bn = torch.randn_like(_base_noise)
                 t0 = time.time()
                 _n_arm = max(1, guidance_actions_raw.shape[1] - 1)
                 _demo_end = np.asarray(guidance_actions_raw[-1, :_n_arm], dtype=np.float64)
@@ -1512,9 +1547,9 @@ def run_augmentation(
                             # The lottery is decided by the draw — same draw,
                             # same outcome.
                             if cfg.sample_seed >= 0:
-                                wrapper.sample_seed = cfg.sample_seed + int(source_ep) + 100_000 * _attempt_no
-                            if cfg.fixed_base_noise and _base_noise is not None:
-                                _base_noise = torch.randn_like(_base_noise)
+                                wrapper.sample_seed = _seed_base + 100_000 * _attempt_no
+                            if cfg.fixed_base_noise and _bn is not None:
+                                _bn = torch.randn_like(_bn)
                         try:
                             rollout = rollout_closed_loop_for_augmentation(
                                 wrapper=wrapper,
@@ -1545,7 +1580,7 @@ def run_augmentation(
                                 device=cfg.device,
                                 playlist_pos=_playlist_pos,
                                 env_state_dim=source_env_state_dim,
-                                base_noise=_base_noise,
+                                base_noise=_bn,
                                 pad_after_success=cfg.pad_after_success,
                                 min_episode_length=cfg.min_episode_length,
                                 expected_env_state=_expected_env_state,
@@ -1804,6 +1839,12 @@ def run_augmentation(
                     "source_dataset_repo_id": str(cfg.dataset_repo_id),
                     "blend_ratio": float(ratio),
                     "blend_ratio_effective": float(ratio_eff),
+                    # Which of the K DART noise samples of this intervention
+                    # this episode is (samples_per_episode>1) + the seed that
+                    # drew it — keeps every sample traceable to its source
+                    # intervention for viz/merging/debug.
+                    "blend_sample_idx": int(sample_idx),
+                    "blend_sample_seed": int(_seed_base),
                 }
                 if _mean_r_eff is not None:
                     episode_metadata["blend_ratio_effective_mean"] = float(_mean_r_eff)
@@ -1821,15 +1862,17 @@ def run_augmentation(
                     source_episode_idx=int(source_ep),
                     source_scenario_idx=source_scenario_idx,
                     blend_ratio=float(ratio),
+                    blend_sample_idx=int(sample_idx),
                     n_frames=n_frames,
                     elapsed_s=elapsed,
                 )
                 results.append(result)
                 logger.info(
-                    "Saved target ep %d ← source_ep=%d, ratio=%.2f, frames=%d (%.1fs).",
+                    "Saved target ep %d ← source_ep=%d, ratio=%.2f, sample=%d, frames=%d (%.1fs).",
                     target_ep_idx,
                     source_ep,
                     ratio,
+                    sample_idx,
                     n_frames,
                     elapsed,
                 )
@@ -1840,6 +1883,7 @@ def run_augmentation(
                             int(source_ep),
                             source_scenario_idx if source_scenario_idx is not None else "",
                             f"{float(ratio):.4f}",
+                            int(sample_idx),
                             n_frames,
                             f"{elapsed:.2f}",
                         ]
@@ -1938,6 +1982,7 @@ Augmented dataset generated by `augment_dataset_with_blending.py`.
 | `anchor_suffix_steps` | `{cfg.anchor_suffix_steps}` |
 | `anchor_every_denoise_step` | `{cfg.anchor_every_denoise_step}` |
 | `guidance_from_dart_labels` | `{cfg.guidance_from_dart_labels}` |
+| `samples_per_episode` | `{cfg.samples_per_episode}` |
 | `n_action_steps` | `{cfg.n_action_steps}` |
 | `pad_after_success` | `{cfg.pad_after_success}` |
 | `min_episode_length` | `{cfg.min_episode_length}` |

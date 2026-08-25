@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import os
 import threading
 from enum import Enum
 from typing import TYPE_CHECKING, cast
@@ -197,7 +198,9 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         policy_guidance_representation: PolicyGuidanceRepresentation = PolicyGuidanceRepresentation.DELTA,
         blend_mode: BlendMode | str = BlendMode.EVERY_STEP,
         guidance_blend_strategy: GuidanceBlendStrategy | str = GuidanceBlendStrategy.DENOISE,
-        n_anchor_steps: int = 0,
+        anchor_prefix_steps: int = 0,
+        anchor_suffix_steps: int = 0,
+        anchor_every_denoise_step: bool = True,
         rtc_prev_chunk_guidance: bool = False,
         rtc_max_guidance_weight: float = 10.0,
         rtc_execution_horizon: int | None = None,
@@ -391,6 +394,21 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # its state — `_guided_chunk`, `_chunk_step`, `_had_guidance_last_step`,
         # `_last_decoded_guidance_chunk` — via property shims further down.
         self._obs_teleop_source = ObservationTeleopGuidanceSource(self)
+        # Attach ourselves as the chunk-boundary authority for the rel-action
+        # decode anchor (RelativeActionsProcessorStep._policy_queue_empty
+        # walks to the outermost object exposing an action queue — see the
+        # _action_queue property). Without this, standalone scripts (viz,
+        # blend generation) never attach ANY policy, the gate defaults to
+        # "always refresh", and ONCE_PER_CHUNK t0-anchored chunks decode
+        # against per-tick drifting states — position k picks up ~k ticks of
+        # accumulated error (measured 2026-08-25: 11-med-step commands at
+        # n_action_steps=8, accel p95 8.3 at 32). lerobot_train/lerobot_eval
+        # attach explicitly, which is why regular eval never showed this.
+        # Deferred: relative_step wiring (factory._reconnect_relative_absolute_
+        # steps) may not have run yet at construction time in standalone
+        # scripts — attach lazily on first use (see _ensure_anchor_authority).
+        self._anchor_authority_attached = False
+        self._ensure_anchor_authority()
         # Method-triggered oracle-goal source for DAgger interventions. Builds
         # a linear-interpolation chunk from current q_start to the oracle's
         # q_goal_bias and plays it back verbatim. Triggered by external code
@@ -413,7 +431,18 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self.upper_limits: list[float] = [np.pi] * resolved_num_dofs
         self.skip_collision: bool = False  # set True for visualization (dataset guidance is known-safe)
         self.policy_guidance_representation = policy_guidance_representation
-        self.n_anchor_steps = n_anchor_steps
+        self.anchor_prefix_steps = anchor_prefix_steps
+        self.anchor_suffix_steps = anchor_suffix_steps
+        self.anchor_every_denoise_step = anchor_every_denoise_step
+        # Timestep correction for the anchor aim point, in guidance-chunk
+        # positions. Set PER TICK by the rollout loop (lib_sa_rollout) to the
+        # robot's current corridor deviation in demo med-steps: a robot d
+        # med-steps off-corridor spends ~d ticks of the chunk correcting (the
+        # DART servo's clock slowdown), so the chunk-end anchor should be the
+        # demo at (cursor + T - d), not (cursor + T). Consumed by the
+        # obs-teleop source as an index shift into the guidance chunk when
+        # building the ChunkAnchor. 0 = anchor to the un-shifted guidance.
+        self.anchor_clock_lag: int = 0
         # Clamp for encoded (normalized, rel-space) guidance; None disables.
         # See _normalize_policy_guidance_action for the rationale.
         self.clip_encoded_guidance: float | None = 1.0
@@ -1740,6 +1769,62 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
                 break
         return None
 
+    def _ensure_anchor_authority(self) -> bool:
+        """Attach this wrapper as the RelativeActionsProcessorStep's policy.
+
+        The step's anchor gate (_policy_queue_empty) then consults our
+        `_action_queue` property for chunk-boundary semantics — freezing the
+        rel-decode anchor mid-chunk for t0-anchored ONCE_PER_CHUNK content,
+        exactly like lerobot_eval's explicit attach. Standalone scripts (viz,
+        blend generation) never attach anything, so the gate used to default
+        to per-tick refresh: position k of a committed chunk decoded against
+        ~k ticks of accumulated state drift (measured 2026-08-25: 11-med-step
+        commands at n_action_steps=8). Lazy because the relative_step ref is
+        wired AFTER wrapper construction in those scripts.
+        """
+        if self._anchor_authority_attached:
+            return True
+        for _step in self.postprocessor.steps:
+            _rs = getattr(_step, "relative_step", None)
+            if _rs is not None and hasattr(_rs, "attach_policy"):
+                _rs.attach_policy(self)
+                self._anchor_authority_attached = True
+                if os.environ.get("DAG_ANCHOR_DEBUG"):
+                    print("[anchor-attach] wrapper attached as anchor authority")
+                return True
+        return False
+
+    @property
+    def _action_queue(self):
+        """Chunk-boundary signal for RelativeActionsProcessorStep's anchor gate.
+
+        len() == the guidance source's un-consumed guided-chunk remainder:
+        0 in EVERY_STEP mode (now-anchored per-tick content — refresh every
+        tick), the true remainder in ONCE_PER_CHUNK (freeze the t0 anchor
+        mid-chunk, exactly like regular eval's queue gating). Sources with
+        no guided chunk (RRT/teleop) report 0 — per-tick refresh, their
+        historical behavior.
+        """
+        try:
+            # PURE-POLICY PASSTHROUGH (ratio >= 1.0): the emitted actions come
+            # from the INNER policy's own action queue (see the ratio>=1.0
+            # branch in ObservationTeleopGuidanceSource._build_and_emit_blended),
+            # so the anchor gate must see THAT queue — empty exactly at chunk
+            # boundaries, non-empty mid-chunk — or the rel-decode anchor
+            # refreshes every tick and decodes committed chunk deltas against
+            # the wrong (current) state. This is byte-for-byte lerobot_eval's
+            # gating, where the inner policy itself is the attached authority.
+            if self.forward_flow_ratio >= 1.0:
+                inner_q = getattr(self.inner_policy, "_queues", None)
+                if isinstance(inner_q, dict) and ACTION in inner_q:
+                    return inner_q[ACTION]
+                inner_aq = getattr(self.inner_policy, "_action_queue", None)
+                if inner_aq is not None:
+                    return inner_aq
+            return range(self._obs_teleop_source.pending_chunk_steps())
+        except Exception:
+            return range(0)
+
     def refresh_relative_anchor(self) -> bool:
         """Sync the rel-action decode anchor (`_last_state`) to the newest observed state.
 
@@ -2046,6 +2131,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], base_noise: Tensor | None = None) -> Tensor:
+        self._ensure_anchor_authority()
         self._run_event.wait()  # blocks while paused
         self._last_raw_action = None  # reset; set by get_full_teleop_action if called
 

@@ -35,7 +35,12 @@ import matplotlib.pyplot as plt
 # they're now shared with the orchestrator + viz scripts via dagger_naming.py
 # so forward / inverse mappings can't drift.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dagger_naming import ROUND_SUFFIX_RE, base_lineage_of, lineage_of  # noqa: E402
+from dagger_naming import (  # noqa: E402
+    ROUND_SUFFIX_RE,
+    base_lineage_of,
+    lineage_of,
+    parse_round_variant,
+)
 
 TRAINING_ROOT = Path.home() / "code" / "lerobot" / "outputs" / "training"
 DEFAULT_OUT_DIR = Path.home() / "code" / "lerobot" / "outputs" / "dagger"
@@ -164,31 +169,46 @@ def scan_round(dir_path: Path, round_n: int | None = None, prefer_reeval: bool =
     `round_n` overrides the auto-detected round number from the dir name suffix.
     Used for round 0 (base policy dir has no _dag${N} suffix to parse).
     """
-    retrain_suffix: str | None = None
-    if round_n is None:
-        m = ROUND_SUFFIX_RE.search(dir_path.name)
-        if not m:
-            return None
-        round_n = int(m.group(1))
-        retrain_suffix = m.group(2)  # None unless --retrain_round was used
     # Variant — three classes, off the main DAgger curve:
     #   "ft":      canonical finetune round (or round 0 base). Main curve.
     #   "scratch": post-loop final-scratch reference (shares round number
     #              with ft round N).
     #   "retrain": --retrain_round run (shares round number with the
     #              canonical ft round, but uses different hyperparameters).
+    # The `--final_mode=base_finetune` reference (`_dag<N>_bft`) is also an
+    # off-curve run sharing round N; it is reported as "retrain" (so every
+    # existing ◆-variant consumer keeps picking it up) plus the explicit
+    # `is_base_finetune` flag for callers that plot it as its own series.
+    retrain_suffix: str | None = None
+    is_base_finetune = False
+    if round_n is None:
+        info = parse_round_variant(dir_path.name)
+        if info is None:
+            return None
+        round_n = info["round"]
+        retrain_suffix = info["suffix"]  # None unless --retrain_round / _bft
+        is_base_finetune = info["variant"] == "base_finetune"
+        variant = "retrain" if is_base_finetune else info["variant"]
+    else:
+        variant = "ft" if round_n == 0 else ("ft" if "_ft_dag" in dir_path.name else "scratch")
     if round_n == 0:
         variant = "ft"
-    elif retrain_suffix is not None:
-        variant = "retrain"
-    else:
-        variant = "ft" if "_ft_dag" in dir_path.name else "scratch"
     logs = sorted(dir_path.glob("wandb/run-*/files/output.log"), key=lambda p: p.stat().st_mtime)
     if not logs:
-        return {"round": round_n, "variant": variant, "retrain_suffix": retrain_suffix}
+        return {
+            "round": round_n,
+            "variant": variant,
+            "retrain_suffix": retrain_suffix,
+            "is_base_finetune": is_base_finetune,
+        }
     log = logs[-1].read_text(errors="ignore")
 
-    row: dict = {"round": round_n, "variant": variant, "retrain_suffix": retrain_suffix}
+    row: dict = {
+        "round": round_n,
+        "variant": variant,
+        "retrain_suffix": retrain_suffix,
+        "is_base_finetune": is_base_finetune,
+    }
 
     # Eval-metric source cascade. Same shape as dagger_progress.sh's print_row:
     #   (1) prefer the most-recent reeval eval_info.json if present (and the

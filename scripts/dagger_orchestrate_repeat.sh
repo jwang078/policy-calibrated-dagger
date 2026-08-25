@@ -181,6 +181,22 @@ build_rep_args() {
     fi
 }
 
+# Record the PRISTINE study-level command for every rep's sidecar. The
+# per-round dagger/config.json otherwise only captures the rep's REWRITTEN
+# argv (tags suffixed, seeds shifted: rep 12 of run_tag=03dag records
+# run_tag=03dag12, --seed=11, --sample_seed=53), which silently poisons any
+# command reconstructed from it — the seeds/tags look hand-chosen but are
+# rep artifacts. dagger_orchestrate.sh's sidecar writer picks these up as
+# `repeat_invocation` (argv = the original --repeats + sweep args, verbatim;
+# repeat_index = which rep that sidecar belongs to).
+DAGGER_REPEAT_INVOCATION_ARGV_JSON=$(python3 - "$REPEATS" "${SWEEP_ARGS[@]}" <<'PY'
+import json, sys
+print(json.dumps([f"--repeats={sys.argv[1]}"] + sys.argv[2:]))
+PY
+)
+export DAGGER_REPEAT_INVOCATION_ARGV_JSON
+export DAGGER_REPEAT_INVOCATION_WRAPPER="my_scripts/dagger_orchestrate_repeat.sh"
+
 echo "Repeat study: tag '$BASE_TAG', repetitions $REPEAT_FROM..$REPEATS (rep 1 = bare tag, rep k = '${BASE_TAG}<k>')"
 echo "  Per-rep seed variation: $REPEAT_VARY_SEEDS"
 echo
@@ -191,6 +207,7 @@ failures=()
 study_start=$(date +%s)
 for (( k = REPEAT_FROM; k <= REPEATS; k++ )); do
     build_rep_args "$k"
+    export DAGGER_REPEAT_INDEX="$k"
     rep_tag="$BASE_TAG"; (( k >= 2 )) && rep_tag="$BASE_TAG$k"
     echo "════════════════════════════════════════════════════════════════════════════════"
     echo "REPETITION $k / $REPEATS (tag: $rep_tag)"

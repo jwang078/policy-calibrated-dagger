@@ -87,6 +87,25 @@ set -euo pipefail
 #                                   finetune → skip the extra step; the last
 #                                              dag round's finetune is the
 #                                              deployable policy.
+#                                   base_finetune → ONE stationary finetune
+#                                              from the round-0 BASE checkpoint
+#                                              on the full aggregate (same data
+#                                              assembly as a step-6 finetune at
+#                                              r=NUM_ROUNDS: base + every
+#                                              round's raw interventions +
+#                                              raw blends, weighted). The step
+#                                              budget is INFERRED from the
+#                                              rounds on disk: target = round
+#                                              NUM_ROUNDS's terminal checkpoint
+#                                              step (compute-matched to the
+#                                              sequential chain; falls back to
+#                                              base_step + N*FINETUNE_STEPS).
+#                                              Output dir:
+#                                              ${BASE_POLICY_NAME}_dag${N}_bft
+#                                              → shows as row `dag${N}_bft` in
+#                                              dagger_progress. Requires
+#                                              --use_weighted_sampling and
+#                                              --intermediate_mode=finetune.
 #
 # Intervention recording:
 #   --intervention_n_episodes=N   Forwarded to lerobot-eval as --eval.n_episodes
@@ -353,6 +372,18 @@ set -euo pipefail
 #                                 the dagger config sidecar for reproducibility.
 #                                 Only meaningful with --use_weighted_sampling.
 #                                 Default: 0.3.
+#   --blend_data_fraction=B       ADDITIVE blend allocation: blends take a
+#                                 fixed batch share B out of the BASE slot
+#                                 (base = 1-F-B, interventions keep the full
+#                                 F) instead of splitting F with the
+#                                 interventions. Blends are synthetic (zero
+#                                 expert cost), so this tests "free extra
+#                                 data" rather than substitution. Inert for
+#                                 no-blend trainings (source lineages keep
+#                                 base = 1-F — one rerun repeat invocation
+#                                 yields the additive arm and its ints-only
+#                                 control). Requires exact mode + weighted
+#                                 sampling. Default: empty (substitution).
 #
 # Rerun-blends mode (reuse an existing lineage's intervention data, iterate on
 # blend ratios without re-collecting):
@@ -812,6 +843,28 @@ DAGGER_DATA_FRACTION="0.3"
 # "exact" (fixed target, upsampling DAgger when its natural share is lower).
 # See the --dagger_data_fraction_mode help block above.
 DAGGER_DATA_FRACTION_MODE="cap"
+# --blend_data_fraction=B (ADDITIVE blend allocation): when set (non-empty,
+# > 0), blends STOP sharing the DAgger slot with the interventions and take
+# their own fixed batch share B out of the BASE allocation instead:
+#   base = 1 - F - B,  interventions = F (frame-proportional across rounds),
+#   blends = B (frame-proportional across rounds).
+# The default (empty) keeps the historical substitution split (blends carved
+# out of F via the TIV slot logic). Rationale: blends are synthetic — they
+# cost no expert budget — so the additive design tests "free extra data"
+# rather than "replace half your expert corrections with synthetic
+# near-duplicates". Requires --dagger_data_fraction_mode=exact and
+# --use_weighted_sampling; silently inert for no-blend trainings (the source
+# lineage of a rerun sweep keeps base = 1 - F), so one repeat invocation
+# yields the additive arm AND its ints-only control per rep.
+BLEND_DATA_FRACTION=""
+# --blend_run_tag=SFX (blend CONTENT variant tag): appended to every blend
+# ratio tag by dagger_naming.blend_tag_for_ratio (via DAG_BLEND_RUN_TAG), so
+# blends generated with different --blend_extra_args (e.g. suffix anchoring:
+# SFX=anc8) get their OWN dataset names (`_blend050anc8`) and their own
+# blends tag (`b050anc8` -> distinct policy/lineage names) instead of
+# colliding with — and silently reusing — the cached blends of a previous
+# configuration. Lowercase alnum starting with a letter, <= 8 chars.
+BLEND_RUN_TAG=""
 # --exclude_gripper_from_state: forwarded verbatim to every downstream
 # training + intervention invocation. See train_sweep.sh's flag docstring
 # for the rationale (dropping the constant-0 gripper dim from
@@ -1136,6 +1189,12 @@ if dag_sum <= 0:
 natural = dag_sum / total
 f_eff   = f if frac_mode == 'exact' else min(f, natural)
 
+# ADDITIVE blend allocation (--blend_data_fraction): blends take their own
+# fixed share B out of the BASE slot; interventions keep the FULL F. Inert
+# when unset or when this training has no blend sub-datasets (e.g. the
+# no-blend source lineage of a rerun sweep) — those keep base = 1 - F.
+blend_f = float(os.environ.get('DAG_BLEND_DATA_FRACTION') or 0.0)
+
 # SLOT-EXACT species split: the raw-intervention species gets
 # raw_multiplier/(raw_multiplier + n_blends) of f_eff — with the sweep
 # default TIV = K+1 that is exactly 1/(1+K) — and the blend species shares
@@ -1150,16 +1209,29 @@ int_idx   = [j for j in range(len(dag_counts)) if j % group_size == 0]
 blend_idx = [j for j in range(len(dag_counts)) if j % group_size != 0]
 int_frames   = sum(dag_raw[j] for j in int_idx)
 blend_frames = sum(dag_raw[j] for j in blend_idx)
-if n_blends == 0 or blend_frames <= 0:
-    share_int = 1.0
+additive = blend_f > 0.0 and n_blends > 0 and blend_frames > 0
+if additive:
+    # frac_mode == 'exact' is enforced at CLI-parse time for
+    # --blend_data_fraction; assert as a backstop.
+    assert frac_mode == 'exact', '--blend_data_fraction requires exact mode'
+    dag_w = [0.0] * len(dag_counts)
+    for j in int_idx:
+        dag_w[j] = f_eff * (dag_raw[j] / int_frames)
+    for j in blend_idx:
+        dag_w[j] = blend_f * (dag_raw[j] / blend_frames)
+    weights = [1.0 - f_eff - blend_f] + dag_w
+    share_int = 1.0  # of F — blends live in their own slot, not in F
 else:
-    share_int = raw_multiplier / float(raw_multiplier + n_blends)
-dag_w = [0.0] * len(dag_counts)
-for j in int_idx:
-    dag_w[j] = f_eff * share_int * (dag_raw[j] / int_frames)
-for j in blend_idx:
-    dag_w[j] = f_eff * (1.0 - share_int) * (dag_raw[j] / blend_frames)
-weights = [1.0 - f_eff] + dag_w
+    if n_blends == 0 or blend_frames <= 0:
+        share_int = 1.0
+    else:
+        share_int = raw_multiplier / float(raw_multiplier + n_blends)
+    dag_w = [0.0] * len(dag_counts)
+    for j in int_idx:
+        dag_w[j] = f_eff * share_int * (dag_raw[j] / int_frames)
+    for j in blend_idx:
+        dag_w[j] = f_eff * (1.0 - share_int) * (dag_raw[j] / blend_frames)
+    weights = [1.0 - f_eff] + dag_w
 
 # Force exact sum=1 by absorbing FP error into the last non-zero weight
 # (avoid pinning the fix onto a 0-frame sub-dataset — the validator would
@@ -1177,7 +1249,13 @@ if frac_mode == 'exact':
     mode = 'EXACT@F'
 else:
     mode = 'CAP@F' if natural > f else 'NATURAL<F'
-mult_note = f'  split=int {share_int:.3f} / blends {1.0 - share_int:.3f} of F (slot-exact, tiv={tiv})'
+if additive:
+    mult_note = (
+        f'  alloc=ADDITIVE (int F={f:.3f} intact + blends B={blend_f:.3f} '
+        f'from the base share; base={1.0 - f - blend_f:.3f})'
+    )
+else:
+    mult_note = f'  split=int {share_int:.3f} / blends {1.0 - share_int:.3f} of F (slot-exact, tiv={tiv})'
 # In exact mode below the natural share, each DAgger frame is drawn
 # `oversample` times more often than proportional sampling would draw it.
 # Surface it (and warn when extreme) because heavy repetition of a small
@@ -1310,6 +1388,8 @@ for arg in "$@"; do
         --use_weighted_sampling)             USE_WEIGHTED_SAMPLING=true ;;
         --dagger_data_fraction=*)            DAGGER_DATA_FRACTION="${arg#*=}" ;;
         --dagger_data_fraction_mode=*)       DAGGER_DATA_FRACTION_MODE="${arg#*=}" ;;
+        --blend_data_fraction=*)             BLEND_DATA_FRACTION="${arg#*=}" ;;
+        --blend_run_tag=*)                   BLEND_RUN_TAG="${arg#*=}" ;;
         --exclude_gripper_from_state)        EXCLUDE_GRIPPER_FROM_STATE=true ;;
         --exclude_gripper_from_state=*)      EXCLUDE_GRIPPER_FROM_STATE="${arg#*=}" ;;
         --norm_mode=*)                       NORM_MODE="${arg#*=}" ;;
@@ -1681,8 +1761,72 @@ if [[ -n "$FROM_ROUND" ]]; then
     fi
 fi
 
-case "$INTERMEDIATE_MODE" in finetune|scratch) ;; *) echo "ERROR: --intermediate_mode must be 'finetune' or 'scratch'" >&2; exit 1;; esac
-case "$FINAL_MODE"        in finetune|scratch) ;; *) echo "ERROR: --final_mode must be 'finetune' or 'scratch'" >&2; exit 1;; esac
+case "$INTERMEDIATE_MODE" in finetune|scratch|none) ;; *) echo "ERROR: --intermediate_mode must be 'finetune', 'scratch', or 'none'" >&2; exit 1;; esac
+# --intermediate_mode=none: skip EVERY per-round training (step 6/6b) and run
+# only the post-loop phase — "just re-finetune on existing data with different
+# weights". Rounds still execute their DATA steps (intervention reuse, blend
+# generation, stats), so missing blends are still produced. Only meaningful
+# when the data comes from a source lineage (rerun mode: without per-round
+# policies of its own, a fresh lineage would record every round's
+# interventions from the same base policy — not DAgger) and when a post-loop
+# phase exists to do the training (base_finetune).
+if [[ "$INTERMEDIATE_MODE" == "none" ]]; then
+    if [[ "$FINAL_MODE" != "base_finetune" ]]; then
+        echo "ERROR: --intermediate_mode=none requires --final_mode=base_finetune" >&2
+        echo "  (with no per-round trainings, the post-loop base-finetune is the only training left)." >&2
+        exit 1
+    fi
+    if [[ "$RERUN_MODE_ENABLED" != "true" ]]; then
+        echo "ERROR: --intermediate_mode=none requires rerun mode (--rerun_blends_from=TAG," >&2
+        echo "  without --separate_blend_lineage) — a lineage with no per-round policies must" >&2
+        echo "  borrow its interventions and blend policies from a source lineage." >&2
+        exit 1
+    fi
+fi
+case "$FINAL_MODE"        in finetune|scratch|base_finetune) ;; *) echo "ERROR: --final_mode must be 'finetune', 'scratch', or 'base_finetune'" >&2; exit 1;; esac
+if [[ -n "$BLEND_DATA_FRACTION" ]]; then
+    if ! python3 -c "import sys; b=float(sys.argv[1]); sys.exit(0 if 0.0 < b < 1.0 else 1)" "$BLEND_DATA_FRACTION" 2>/dev/null; then
+        echo "ERROR: --blend_data_fraction must be a number in (0, 1) (got '$BLEND_DATA_FRACTION')." >&2
+        exit 1
+    fi
+    if [[ "$DAGGER_DATA_FRACTION_MODE" != "exact" ]]; then
+        echo "ERROR: --blend_data_fraction requires --dagger_data_fraction_mode=exact" >&2
+        echo "  (in cap mode the DAgger share floats with the natural frame share; a fixed" >&2
+        echo "  additive blend slot on top of a floating F is not well-defined)." >&2
+        exit 1
+    fi
+    if [[ "$USE_WEIGHTED_SAMPLING" != "true" ]]; then
+        echo "ERROR: --blend_data_fraction requires --use_weighted_sampling (merge mode has no per-source weights)." >&2
+        exit 1
+    fi
+    if ! python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) + float(sys.argv[2]) < 1.0 else 1)" "$DAGGER_DATA_FRACTION" "$BLEND_DATA_FRACTION"; then
+        echo "ERROR: --dagger_data_fraction + --blend_data_fraction must be < 1 (base share would be <= 0)." >&2
+        exit 1
+    fi
+fi
+if [[ -n "$BLEND_RUN_TAG" ]] && ! [[ "$BLEND_RUN_TAG" =~ ^[a-z][a-z0-9]{0,7}$ ]]; then
+    echo "ERROR: --blend_run_tag must match [a-z][a-z0-9]{0,7} (got '$BLEND_RUN_TAG')." >&2
+    exit 1
+fi
+# dagger_naming.blend_tag_for_ratio reads this from the environment — every
+# blend dataset / nocoll / blends-tag name derives through it.
+export DAG_BLEND_RUN_TAG="$BLEND_RUN_TAG"
+# The weights helper reads this from the environment (empty -> substitution
+# split, the historical behavior).
+export DAG_BLEND_DATA_FRACTION="$BLEND_DATA_FRACTION"
+if [[ "$FINAL_MODE" == "base_finetune" ]]; then
+    if [[ "$USE_WEIGHTED_SAMPLING" != "true" ]]; then
+        echo "ERROR: --final_mode=base_finetune requires --use_weighted_sampling (its data" >&2
+        echo "  assembly is the per-source weighted union; the merge path isn't wired)." >&2
+        exit 1
+    fi
+    if [[ "$INTERMEDIATE_MODE" == "scratch" ]]; then
+        echo "ERROR: --final_mode=base_finetune requires --intermediate_mode=finetune —" >&2
+        echo "  the step budget is inferred from the finetune chain's terminal checkpoint," >&2
+        echo "  which scratch rounds don't produce." >&2
+        exit 1
+    fi
+fi
 case "$MODEL"             in pi|diff|act)      ;; *) echo "ERROR: --model must be one of pi/diff/act" >&2; exit 1;; esac
 case "$INTERVENTION_METHOD" in rrt|oracle_goal) ;; *) echo "ERROR: --intervention_method must be 'rrt' or 'oracle_goal'" >&2; exit 1;; esac
 
@@ -2119,6 +2263,15 @@ if (( ${#BLENDS[@]} > 0 )); then
     # Delegate to dagger_naming.format_blends_tag — sorts descending,
     # zero-pads each pct, joins with `_`, prefixes `b`.
     BLENDS_TAG="$(_py_dagger_name format_blends_tag --blends="${BLENDS[*]}")"
+    # --blend_data_fraction changes every TRAINING in the lineage but NOT the
+    # blend datasets themselves (weights are a dataloader concern), so bake it
+    # into the blends tag: `b050` -> `b050a010` for B=0.1 ("a" = additive).
+    # Effect: policy dirs / lineage names disambiguate from the substitution
+    # lineage automatically, while the source-named blend datasets (and their
+    # caches) stay shared across both — reusing --run_tag is then safe.
+    if [[ -n "$BLEND_DATA_FRACTION" ]]; then
+        BLENDS_TAG="${BLENDS_TAG}a$(python3 -c "import sys; print(f'{round(float(sys.argv[1])*100):03d}')" "$BLEND_DATA_FRACTION")"
+    fi
 fi
 
 # Helper: combine BASE_DATASET_STEM + MODEL_TAG + METHOD_TAG with a given
@@ -2555,6 +2708,8 @@ write_dagger_config_sidecar() {
     DAG_CFG_USE_WEIGHTED_SAMPLING="$USE_WEIGHTED_SAMPLING" \
     DAG_CFG_DAGGER_DATA_FRACTION="$DAGGER_DATA_FRACTION" \
     DAG_CFG_DAGGER_DATA_FRACTION_MODE="$DAGGER_DATA_FRACTION_MODE" \
+    DAG_CFG_BLEND_DATA_FRACTION="$BLEND_DATA_FRACTION" \
+    DAG_CFG_BLEND_RUN_TAG="$BLEND_RUN_TAG" \
     DAG_CFG_NORM_MODE="$NORM_MODE" \
     DAG_CFG_RRT_OBSTACLE_CLEARANCE="$RRT_OBSTACLE_CLEARANCE" \
     DAG_CFG_RRT_SELF_COLLISION_CLEARANCE="$RRT_SELF_COLLISION_CLEARANCE" \
@@ -2568,6 +2723,9 @@ write_dagger_config_sidecar() {
     DAG_CFG_SPLAT_SHADOWS="$SPLAT_SHADOWS" \
     DAG_CFG_SWEEP_INVOCATION_ARGV_JSON="${DAGGER_SWEEP_INVOCATION_ARGV_JSON:-}" \
     DAG_CFG_SWEEP_INVOCATION_WRAPPER="${DAGGER_SWEEP_INVOCATION_WRAPPER:-}" \
+    DAG_CFG_REPEAT_INVOCATION_ARGV_JSON="${DAGGER_REPEAT_INVOCATION_ARGV_JSON:-}" \
+    DAG_CFG_REPEAT_INVOCATION_WRAPPER="${DAGGER_REPEAT_INVOCATION_WRAPPER:-}" \
+    DAG_CFG_REPEAT_INDEX="${DAGGER_REPEAT_INDEX:-}" \
     python3 - <<'PY'
 import json, os, datetime, socket, getpass
 rerun_mode = None
@@ -2626,6 +2784,8 @@ config = {
         "use_weighted_sampling":  os.environ["DAG_CFG_USE_WEIGHTED_SAMPLING"] == "true",
         "dagger_data_fraction":   float(os.environ["DAG_CFG_DAGGER_DATA_FRACTION"]),
         "dagger_data_fraction_mode":   os.environ.get("DAG_CFG_DAGGER_DATA_FRACTION_MODE", "cap"),
+        "blend_data_fraction":    float(os.environ["DAG_CFG_BLEND_DATA_FRACTION"]) if os.environ.get("DAG_CFG_BLEND_DATA_FRACTION") else None,
+        "blend_run_tag":          os.environ.get("DAG_CFG_BLEND_RUN_TAG") or None,
         "norm_mode":              os.environ["DAG_CFG_NORM_MODE"],
         "rrt_obstacle_clearance":      float(os.environ["DAG_CFG_RRT_OBSTACLE_CLEARANCE"]) if os.environ.get("DAG_CFG_RRT_OBSTACLE_CLEARANCE") else None,
         "rrt_self_collision_clearance": float(os.environ["DAG_CFG_RRT_SELF_COLLISION_CLEARANCE"]) if os.environ.get("DAG_CFG_RRT_SELF_COLLISION_CLEARANCE") else None,
@@ -2673,6 +2833,28 @@ if _sweep_argv_json:
     }
 else:
     config["sweep_invocation"] = None
+# When invoked via dagger_orchestrate_repeat.sh, record the PRISTINE
+# study-level command too. sweep_invocation/orchestrator_invocation carry the
+# rep's REWRITTEN argv (run_tag suffixed with the rep index, intervention
+# --seed and blend --sample_seed shifted by rep-1) — faithful to what THIS
+# rep ran, but reconstructing a study command from them bakes those rep
+# artifacts in as if hand-chosen. repeat_invocation.argv is the original
+# `--repeats=N + sweep args` byte-for-byte; repeat_index says which rep this
+# sidecar belongs to (1 = bare tag).
+_repeat_argv_json = os.environ.get("DAG_CFG_REPEAT_INVOCATION_ARGV_JSON") or ""
+if _repeat_argv_json:
+    try:
+        _repeat_argv = sorted(json.loads(_repeat_argv_json))
+    except json.JSONDecodeError:
+        _repeat_argv = []
+    _rep_idx = os.environ.get("DAG_CFG_REPEAT_INDEX") or ""
+    config["repeat_invocation"] = {
+        "wrapper":      os.environ.get("DAG_CFG_REPEAT_INVOCATION_WRAPPER", ""),
+        "repeat_index": int(_rep_idx) if _rep_idx.isdigit() else None,
+        "argv":         _repeat_argv,
+    }
+else:
+    config["repeat_invocation"] = None
 out_path = os.environ["DAG_CFG_OUT_PATH"]
 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 tmp_path = out_path + ".tmp"
@@ -2789,6 +2971,38 @@ train_output_dir_final_scratch() {
     echo "$LEROBOT_ROOT/outputs/training/${BASE_POLICY_NAME}_dag${NUM_ROUNDS}"
 }
 
+# Whether the post-loop "finetune the round-0 BASE on the full aggregate"
+# phase runs. Unlike do_final_scratch there is no intermediate-mode duplicate
+# concern (validated at startup: base_finetune requires intermediate finetune).
+do_final_base_finetune() {
+    [[ "$FINAL_MODE" == "base_finetune" ]]
+}
+
+# Any post-loop training phase requested? Generic gate for the callsites that
+# only care that SOMETHING runs after the rounds (resume detection, restart
+# deletion, completion messages) — the execution blocks dispatch per kind.
+do_final_phase() {
+    do_final_scratch || do_final_base_finetune
+}
+
+# Output dir for the post-loop base-finetune step. Naming pattern:
+# ${BASE_POLICY_NAME}_dag${NUM_ROUNDS}_bft — the `_dag${N}_<suffix>` shape
+# (like the `_ft_dag${N}_tfc` siblings) folds it into the SAME
+# dagger_progress lineage table as row `dag${N}_bft`, alongside the
+# `_ft_dag${N}` rounds and the `_dag${N}` final scratch.
+train_output_dir_final_base_finetune() {
+    echo "$LEROBOT_ROOT/outputs/training/${BASE_POLICY_NAME}_dag${NUM_ROUNDS}_bft"
+}
+
+# The requested post-loop phase's output dir (kind-dispatched).
+train_output_dir_final_phase() {
+    if do_final_scratch; then
+        train_output_dir_final_scratch
+    else
+        train_output_dir_final_base_finetune
+    fi
+}
+
 # Training output dir naming. Mode-aware so finetune rounds get an "_ft"
 # infix between the base policy name and the dag round suffix; scratch rounds
 # don't (no finetuning was done). Examples for BASE_POLICY_NAME=foo:
@@ -2801,7 +3015,10 @@ train_output_dir_for_round() {
     local mode
     mode="$(mode_for_round "$round_n")"
     local infix=""
-    [[ "$mode" == "finetune" ]] && infix="_ft"
+    # none-mode rounds never create dirs, but keep the _ft-style name so the
+    # paths that DO get derived (skip_succeeded probes, deletion sweeps, the
+    # bft step-target probe) can't collide with the `_dag<N>` final-scratch dir.
+    [[ "$mode" == "finetune" || "$mode" == "none" ]] && infix="_ft"
     # In retrain mode, the retrained round gets a suffix so we don't clobber
     # the original training dir. Other rounds (e.g. PREV_R when starting at
     # round N) resolve to their ORIGINAL non-suffixed dirs so we can pull the
@@ -3938,6 +4155,11 @@ for r in $(seq 1 "$NUM_ROUNDS"); do
         else
             (( step == 4 )) && stats_exists "$merged_short" && step=5
         fi
+        # --intermediate_mode=none: there IS no step 6 — a data-complete
+        # round is a complete round.
+        if [[ "$INTERMEDIATE_MODE" == "none" ]]; then
+            (( step == 5 )) && step=6
+        fi
     fi
     ROUND_COMPLETED_STEPS[$r]=$step
 done
@@ -4020,11 +4242,11 @@ for r in $(seq 1 "$NUM_ROUNDS"); do
     (( s < 6 )) && break
 done
 
-# Probe the optional post-loop final-scratch step.
-FINAL_SCRATCH_DONE=false
-if do_final_scratch; then
-    if training_exists "$(train_output_dir_final_scratch)"; then
-        FINAL_SCRATCH_DONE=true
+# Probe the optional post-loop phase (final-scratch or base-finetune).
+FINAL_PHASE_DONE=false
+if do_final_phase; then
+    if training_exists "$(train_output_dir_final_phase)"; then
+        FINAL_PHASE_DONE=true
     fi
 fi
 
@@ -4045,7 +4267,11 @@ fi
 if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
     echo "  4. (SKIPPED — --use_weighted_sampling) Cumulative merge"
     echo "  5. (SKIPPED — --use_weighted_sampling) Merged-dataset rel-action stats"
-    echo "  6. Train policy ($INTERMEDIATE_MODE) on weighted union of {base + every round's intervention + every round's blends}"
+    if [[ "$INTERMEDIATE_MODE" == "none" ]]; then
+        echo "  6. (SKIPPED — --intermediate_mode=none) Per-round training; only the post-loop base-finetune trains"
+    else
+        echo "  6. Train policy ($INTERMEDIATE_MODE) on weighted union of {base + every round's intervention + every round's blends}"
+    fi
     if [[ "$DAGGER_DATA_FRACTION_MODE" == "exact" ]]; then
         echo "     → DataLoader weights: DAgger forced to EXACTLY ${DAGGER_DATA_FRACTION} of every batch (--dagger_data_fraction_mode=exact); upsampled with replacement when its natural share is lower"
     else
@@ -4067,6 +4293,9 @@ fi
 if do_final_scratch; then
     echo "  + (post-loop) Extra from-scratch train on round $NUM_ROUNDS's merged data"
     echo "                → $(train_output_dir_final_scratch)"
+elif do_final_base_finetune; then
+    echo "  + (post-loop) Finetune the round-0 BASE on the full aggregate (steps inferred from the chain)"
+    echo "                → $(train_output_dir_final_base_finetune)"
 fi
 echo
 
@@ -4086,11 +4315,13 @@ for r in $(seq 1 "$NUM_ROUNDS"); do
         echo "      (fine for inspection/cleanup; a resume that must RE-merge this round would fail)"
     fi
 done
-if do_final_scratch; then
-    if [[ "$FINAL_SCRATCH_DONE" == true ]]; then
-        echo "  Final scratch: COMPLETE (policy ✓)"
+if do_final_phase; then
+    _final_label="Final scratch"
+    do_final_base_finetune && _final_label="Final base-finetune"
+    if [[ "$FINAL_PHASE_DONE" == true ]]; then
+        echo "  $_final_label: COMPLETE (policy ✓)"
     else
-        echo "  Final scratch: not done"
+        echo "  $_final_label: not done"
     fi
 fi
 echo
@@ -4186,7 +4417,9 @@ restart_from_scratch() {
         RESTART_PATHS+=( "$LEROBOT_ROOT/outputs/dagger/$(basename "$(train_output_dir_for_round "$r")")" )
         RESTART_PATHS+=( "$LEROBOT_ROOT/outputs/dagger/round_${r}" )
     done
-    do_final_scratch && RESTART_PATHS+=( "$(train_output_dir_final_scratch)" )
+    # Both post-loop dirs regardless of the CURRENT final_mode (a lineage may
+    # have been built under the other mode; rm is idempotent on missing paths).
+    do_final_phase && RESTART_PATHS+=( "$(train_output_dir_final_scratch)" "$(train_output_dir_final_base_finetune)" )
     EXISTING_PATHS=()
     for p in "${RESTART_PATHS[@]}"; do
         [[ -e "$p" ]] && EXISTING_PATHS+=( "$p" )
@@ -4425,7 +4658,8 @@ elif [[ "$FORCE_RESTART" == true ]]; then
             run_or_echo rm -rf "$LEROBOT_ROOT/outputs/dagger/$(basename "$_NC_TRAIN_DIR")"
         done < <(nocoll_train_output_dirs_all_for_round "$r")
     done
-    do_final_scratch && run_or_echo rm -rf "$(train_output_dir_final_scratch)"
+    # Both post-loop dirs — see the RESTART_PATHS comment above.
+    do_final_phase && run_or_echo rm -rf "$(train_output_dir_final_scratch)" "$(train_output_dir_final_base_finetune)"
     if [[ "$CLEANUP_ONLY" == true ]]; then
         echo "--cleanup_only: deletion complete; exiting without starting a new run."
         exit 0
@@ -4435,13 +4669,15 @@ elif (( FURTHEST_ROUND == 0 )); then
     EFFECTIVE_START_ROUND=1
     EFFECTIVE_START_STEP=1
     echo "No prior DAgger artifacts found; starting from round 1, step 1."
-elif [[ "$ALL_ROUNDS_DONE" == true ]] && { ! do_final_scratch || [[ "$FINAL_SCRATCH_DONE" == true ]]; }; then
-    # Everything is done — either no final-scratch was requested, or it
+elif [[ "$ALL_ROUNDS_DONE" == true ]] && { ! do_final_phase || [[ "$FINAL_PHASE_DONE" == true ]]; }; then
+    # Everything is done — either no post-loop phase was requested, or it
     # already exists. Offer restart-from-scratch as the only do-something path.
     if do_final_scratch; then
         MSG="all $NUM_ROUNDS dag rounds AND the post-loop final-scratch step are complete"
+    elif do_final_base_finetune; then
+        MSG="all $NUM_ROUNDS dag rounds AND the post-loop base-finetune step are complete"
     else
-        MSG="all $NUM_ROUNDS dag rounds complete (no final-scratch requested with --final_mode=$FINAL_MODE)"
+        MSG="all $NUM_ROUNDS dag rounds complete (no post-loop phase requested with --final_mode=$FINAL_MODE)"
     fi
     echo "Pipeline detected: $MSG."
     if [[ "$RETRAIN_ROUND0" == true ]]; then
@@ -4473,10 +4709,12 @@ else
     #   (b) furthest round fully trained → start next round at step 1
     #   (c) furthest round mid-flight → resume at step (furthest_step+1)
     if [[ "$ALL_ROUNDS_DONE" == true ]]; then
-        # do_final_scratch && !FINAL_SCRATCH_DONE (the other branches above caught the rest).
+        # do_final_phase && !FINAL_PHASE_DONE (the other branches above caught the rest).
         NEXT_R=$((NUM_ROUNDS + 1))
         NEXT_S=1
-        MSG="all $NUM_ROUNDS dag rounds complete; next is the post-loop final from-scratch train"
+        _final_kind="final from-scratch train"
+        do_final_base_finetune && _final_kind="base-finetune on the full aggregate"
+        MSG="all $NUM_ROUNDS dag rounds complete; next is the post-loop $_final_kind"
     elif (( FURTHEST_STEP == 6 )); then
         NEXT_R=$((FURTHEST_ROUND + 1))
         NEXT_S=1
@@ -4567,13 +4805,23 @@ if (( EFFECTIVE_START_ROUND > 1 )); then
     PREV_SCRATCH="$PREV_FT"
     if training_exists "$PREV_FT"; then
         CURRENT_POLICY="$(resolve_latest_checkpoint "$PREV_FT")"
+    elif [[ "$INTERMEDIATE_MODE" == "none" ]]; then
+        # No per-round policies exist by design; the base-finetune resolves
+        # its own starting checkpoint (the round-0 base) independently.
+        CURRENT_POLICY=""
     else
         echo "ERROR: starting at round $EFFECTIVE_START_ROUND requires a trained policy from round $PREV_R," >&2
         echo "  but $PREV_FT doesn't exist." >&2
         exit 1
     fi
     if (( EFFECTIVE_START_ROUND > NUM_ROUNDS )); then
-        echo "Post-loop final-scratch phase; last finetune-round policy: $CURRENT_POLICY"
+        _final_kind="final-scratch"
+        do_final_base_finetune && _final_kind="base-finetune"
+        if [[ -n "$CURRENT_POLICY" ]]; then
+            echo "Post-loop $_final_kind phase; last finetune-round policy: $CURRENT_POLICY"
+        else
+            echo "Post-loop $_final_kind phase (no per-round policies — --intermediate_mode=none)."
+        fi
     else
         echo "Round $EFFECTIVE_START_ROUND will resume from policy: $CURRENT_POLICY"
     fi
@@ -5830,7 +6078,9 @@ PYEOF
     fi
 
     # Step 6: Train.
-    if (( STEP <= 6 )); then
+    if (( STEP <= 6 )) && [[ "$MODE" == "none" ]]; then
+        echo "--- Round $r, Step 6: SKIPPED (--intermediate_mode=none; only the post-loop base-finetune trains) ---"
+    elif (( STEP <= 6 )); then
         echo "--- Round $r, Step 6: train ($MODE) ---"
         # External SplatSim was stopped right after step 2; lerobot-train
         # spawns its OWN in-process sim for inline eval, which pools its
@@ -6464,8 +6714,12 @@ print(c.get('policy',{}).get('optimizer_lr') or '')
         fi
     fi
 
-    # Roll the policy forward for the next round.
-    if [[ "$DRY_RUN" == true ]]; then
+    # Roll the policy forward for the next round. In none mode there is no
+    # round policy to roll to — rerun mode re-resolves CURRENT_POLICY from
+    # the SOURCE lineage at the top of every round anyway.
+    if [[ "$MODE" == "none" ]]; then
+        :
+    elif [[ "$DRY_RUN" == true ]]; then
         CURRENT_POLICY="$TRAIN_OUTPUT_DIR/checkpoints/last/pretrained_model"
     else
         CURRENT_POLICY="$(resolve_latest_checkpoint "$TRAIN_OUTPUT_DIR")"
@@ -6748,6 +7002,243 @@ if [[ -z "$RETRAIN_ROUND" ]] && do_final_scratch; then
             wandb artifact cache cleanup 5GB 2>&1 | sed 's/^/  /' || true
         fi
 
+        if [[ "$DRY_RUN" != true ]]; then
+            echo "--- Post-loop: refresh dagger_progress table + plot ---"
+            bash "$SCRIPT_DIR/dagger_progress.sh" \
+                --filter="$PROGRESS_LINEAGE_FILTER" \
+                --model="$TRAIN_OUTPUT_MODEL_PREFIX" 2>&1 | sed 's/^/  /' || true
+        fi
+    fi
+fi
+
+# ── post-loop phase: base-finetune on the full aggregate ─────────────────────
+# --final_mode=base_finetune: ONE stationary finetune from the round-0 BASE
+# checkpoint on the same weighted union a step-6 finetune at r=NUM_ROUNDS
+# would use (base + every round's raw interventions + raw blends). The step
+# budget is INFERRED from the rounds on disk — target = round NUM_ROUNDS's
+# terminal checkpoint step — so the run is compute-matched to the sequential
+# finetune chain by construction (base 75K + N×FINETUNE_STEPS on a standard
+# lineage). Falls back to base_step + N×FINETUNE_STEPS when the last round's
+# checkpoint can't be read (dry-run).
+if [[ -n "$RETRAIN_ROUND" ]] && do_final_base_finetune; then
+    echo
+    echo "Post-loop base-finetune phase: SKIPPED (in --retrain_round mode)."
+fi
+if [[ -z "$RETRAIN_ROUND" ]] && do_final_base_finetune; then
+    FINAL_BFT_DIR="$(train_output_dir_final_base_finetune)"
+    FINAL_BFT_RUN_NAME="$(basename "$FINAL_BFT_DIR")"
+    if training_exists "$FINAL_BFT_DIR"; then
+        echo
+        echo "════════════════════════════════════════════════════════════════"
+        echo "POST-LOOP BASE-FINETUNE: already complete at $FINAL_BFT_DIR"
+        echo "════════════════════════════════════════════════════════════════"
+        if [[ "$DRY_RUN" == true ]]; then
+            FINAL_POLICY_PATH="$FINAL_BFT_DIR/checkpoints/last/pretrained_model"
+        else
+            FINAL_POLICY_PATH="$(resolve_latest_checkpoint "$FINAL_BFT_DIR")"
+        fi
+    elif [[ "$PURE_POLICY_MODE" == "true" ]]; then
+        echo
+        echo "Post-loop base-finetune phase: SKIPPED (PURE_POLICY_MODE — no DAgger data to aggregate)."
+    else
+        echo
+        echo "════════════════════════════════════════════════════════════════"
+        echo "POST-LOOP BASE-FINETUNE: finetune the round-0 base on the weighted union of {base + every round's intervention + every round's blends}"
+        echo "  Training output: $FINAL_BFT_DIR"
+        echo "════════════════════════════════════════════════════════════════"
+
+        # resume_training.sh spawns its own in-process eval sim in managed
+        # mode; stop the orchestrator-managed one (mirrors the final-scratch
+        # phase). In unmanaged mode TRAIN_EXT_PORT_RESUME forwards the
+        # external port and the user's sim stays up.
+        stop_sim
+        print_gpu_state
+
+        # ── starting checkpoint: the round-0 base ──────────────────────
+        BFT_START=""
+        if [[ -n "$INITIAL_POLICY_PATH" ]]; then
+            if [[ -d "$INITIAL_POLICY_PATH/checkpoints/last/pretrained_model" ]]; then
+                BFT_START="$INITIAL_POLICY_PATH/checkpoints/last/pretrained_model"
+            elif [[ -d "$INITIAL_POLICY_PATH/pretrained_model" ]]; then
+                BFT_START="$INITIAL_POLICY_PATH/pretrained_model"
+            elif [[ -f "$INITIAL_POLICY_PATH/train_config.json" ]]; then
+                BFT_START="$INITIAL_POLICY_PATH"
+            else
+                BFT_START="$(resolve_latest_checkpoint "$INITIAL_POLICY_PATH")"
+            fi
+        elif [[ "$DRY_RUN" == true && ! -d "$BASE_TRAINING_DIR" ]]; then
+            BFT_START="$BASE_TRAINING_DIR/checkpoints/last/pretrained_model"
+        else
+            BFT_START="$(resolve_latest_checkpoint "$BASE_TRAINING_DIR")"
+        fi
+        echo "Base-finetune: starting checkpoint $BFT_START"
+
+        # ── target steps: inferred from the chain's terminal checkpoint ─
+        BFT_TARGET_STEPS=""
+        _bft_last_dir="$(train_output_dir_for_round "$NUM_ROUNDS")"
+        _bft_last_ckpt="$(resolve_latest_checkpoint "$_bft_last_dir" 2>/dev/null || true)"
+        if [[ -n "$_bft_last_ckpt" ]]; then
+            BFT_TARGET_STEPS="$(readlink -f "$_bft_last_ckpt" 2>/dev/null \
+                | grep -oE 'checkpoints/[0-9]+/' | head -1 \
+                | grep -oE '[0-9]+' || true)"
+        fi
+        if [[ -n "$BFT_TARGET_STEPS" ]]; then
+            BFT_TARGET_STEPS=$((10#${BFT_TARGET_STEPS}))
+            echo "Base-finetune: target step $BFT_TARGET_STEPS (= round $NUM_ROUNDS's terminal checkpoint — compute-matched to the finetune chain)"
+        else
+            # Fallback: base checkpoint step + N × FINETUNE_STEPS.
+            _bft_base_step="$(readlink -f "$BFT_START" 2>/dev/null \
+                | grep -oE 'checkpoints/[0-9]+/' | head -1 \
+                | grep -oE '[0-9]+' || true)"
+            if [[ -z "$_bft_base_step" ]]; then
+                if [[ "$DRY_RUN" == true ]]; then
+                    _bft_base_step=0
+                    echo "  [dry-run] no numeric checkpoint step readable; printed --steps is relative to round-0's end."
+                else
+                    echo "ERROR: could not infer the base-finetune step target — neither round $NUM_ROUNDS's" >&2
+                    echo "  checkpoint ($_bft_last_dir) nor the base checkpoint ($BFT_START) has a" >&2
+                    echo "  numeric .../checkpoints/{step}/ path." >&2
+                    exit 1
+                fi
+            fi
+            BFT_TARGET_STEPS=$((10#${_bft_base_step} + NUM_ROUNDS * FINETUNE_STEPS))
+            echo "Base-finetune: target step $BFT_TARGET_STEPS (= base step ${_bft_base_step} + ${NUM_ROUNDS} rounds × FINETUNE_STEPS=${FINETUNE_STEPS}; round $NUM_ROUNDS checkpoint not readable)"
+        fi
+
+        # ── scheduler / decay-lr auto-detection (mirrors step 6) ───────
+        BFT_SCHEDULER_NAME_ARG=()
+        BFT_DECAY_LR_ARG=()
+        _bft_effective_decay_lr="$FINETUNE_DECAY_LR"
+        _BFT_CFG_PATH=""
+        if [[ -e "$BFT_START" ]]; then
+            _BFT_CFG_PATH="$(readlink -f "$BFT_START")/train_config.json"
+        fi
+        if [[ -f "$_BFT_CFG_PATH" ]]; then
+            _bft_supports_decay="$(python3 -c "
+import json,sys
+c = json.load(open(sys.argv[1]))
+print('true' if 'scheduler_decay_lr' in c.get('policy',{}) else 'false')
+" "$_BFT_CFG_PATH")"
+            _bft_sched_type="$(python3 -c "
+import json,sys
+c = json.load(open(sys.argv[1]))
+print((c.get('scheduler') or {}).get('type') or '')
+" "$_BFT_CFG_PATH")"
+            if [[ "$_bft_supports_decay" != "true" ]]; then
+                _bft_effective_decay_lr=""
+                if [[ "$_bft_sched_type" == "diffuser" ]]; then
+                    BFT_SCHEDULER_NAME_ARG=(--scheduler.name=constant)
+                    echo "Base-finetune: auto-set --scheduler.name=constant (diffuser scheduler decays to 0 at end-of-training; flat LR keeps the finetune effective)."
+                fi
+            elif [[ -z "$_bft_effective_decay_lr" ]]; then
+                _bft_peak_lr="$(python3 -c "
+import json,sys
+c = json.load(open(sys.argv[1]))
+print(c.get('policy',{}).get('optimizer_lr') or '')
+" "$_BFT_CFG_PATH")"
+                if [[ -n "$_bft_peak_lr" ]]; then
+                    _bft_effective_decay_lr="$_bft_peak_lr"
+                    echo "Base-finetune: auto-set --scheduler_decay_lr=$_bft_effective_decay_lr (peak optimizer_lr from train_config.json — override with --finetune_decay_lr=<value>)."
+                fi
+            fi
+        elif [[ "$DRY_RUN" != true ]]; then
+            echo "WARNING: train_config.json not found at $_BFT_CFG_PATH; skipping scheduler/decay-lr auto-detection." >&2
+        fi
+        [[ -n "$_bft_effective_decay_lr" ]] && BFT_DECAY_LR_ARG=(--scheduler_decay_lr="$_bft_effective_decay_lr")
+        BFT_BATCH_SIZE_ARG=()
+        [[ -n "$FINETUNE_BATCH_SIZE" ]] && BFT_BATCH_SIZE_ARG=(--batch_size="$FINETUNE_BATCH_SIZE")
+
+        # ── weighted union at r=NUM_ROUNDS (mirrors step 6: RAW blends) ─
+        BFT_CHUNK="$(stats_horizon_from_policy_path "${INITIAL_POLICY_PATH:-$BASE_TRAINING_DIR}")"
+        if [[ -z "$BFT_CHUNK" ]]; then
+            if [[ "$DRY_RUN" == true ]]; then
+                BFT_CHUNK="<unknown-in-dry-run>"
+            else
+                echo "ERROR: could not read policy.horizon (or fallback policy.n_action_steps) from ${INITIAL_POLICY_PATH:-$BASE_TRAINING_DIR}/train_config.json" >&2
+                echo "  Needed to pick the right stats_rel{N}.json sidecar for the multi-source training." >&2
+                exit 1
+            fi
+        fi
+        BFT_W_REPO_IDS=( "$BASE_REPO" )
+        BFT_W_STATS_PATHS=( "$STATS_BASE/$BASE_REPO_DATASET_SHORT/stats_rel${BFT_CHUNK}.json" )
+        for _p in $(seq 1 "$NUM_ROUNDS"); do
+            _p_int_repo="$(int_repo_for_round "$_p")"
+            _p_int_short="$(int_short_for_round "$_p")"
+            BFT_W_REPO_IDS+=( "$_p_int_repo" )
+            BFT_W_STATS_PATHS+=( "$STATS_BASE/$_p_int_short/stats_rel${BFT_CHUNK}.json" )
+            for _R in "${BLENDS[@]}"; do
+                _b_repo="$(blend_repo_for_round "$_p" "$_R")"
+                _b_short="$(blend_short_for_round "$_p" "$_R")"
+                BFT_W_REPO_IDS+=( "$_b_repo" )
+                BFT_W_STATS_PATHS+=( "$STATS_BASE/$_b_short/stats_rel${BFT_CHUNK}.json" )
+            done
+        done
+        # Compute-on-demand for missing sidecars (same rationale as step 6).
+        for _i in "${!BFT_W_STATS_PATHS[@]}"; do
+            _wsp="${BFT_W_STATS_PATHS[$_i]}"
+            _wri="${BFT_W_REPO_IDS[$_i]}"
+            if [[ ! -f "$_wsp" ]]; then
+                echo "  [weighted-stats] missing stats_rel${BFT_CHUNK}.json for $_wri; computing now..."
+                run_or_echo bash "$SCRIPT_DIR/compute_relative_stats.sh" \
+                    --dataset_repo="$_wri" \
+                    --chunk_sizes="$BFT_CHUNK"
+            fi
+        done
+        _bft_n_dag=$(( ${#BFT_W_REPO_IDS[@]} - 1 ))
+        read -ra BFT_W_WEIGHTS <<< "$(_py_weighted_sample_weights "$DAGGER_DATA_FRACTION" "$NUM_ROUNDS" "${#BLENDS[@]}" "$TARGET_INTERVENTION_VOLUME" "$DRY_RUN" "$DAGGER_DATA_FRACTION_MODE" "${BFT_W_REPO_IDS[@]}")"
+        BFT_REPO_IDS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${BFT_W_REPO_IDS[@]}")
+        BFT_STATS_PATHS_JSON=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1:], separators=(',', ':')))" "${BFT_W_STATS_PATHS[@]}")
+        BFT_WEIGHTS_JSON=$(python3 -c "import json,sys; print(json.dumps([float(x) for x in sys.argv[1:]], separators=(',', ':')))" "${BFT_W_WEIGHTS[@]}")
+        echo "Base-finetune weighted sampling: ${#BFT_W_REPO_IDS[@]} sub-datasets (1 base + $_bft_n_dag DAgger); dagger_fraction=${DAGGER_DATA_FRACTION} mode=${DAGGER_DATA_FRACTION_MODE}; weights=${BFT_W_WEIGHTS[*]}; norm_mode=$NORM_MODE"
+
+        BFT_EVAL_BENCHMARK_ARG=( --env.eval_benchmark_repo_id="$EVAL_BENCHMARK_REPO_ID" )
+        if [[ -n "$INTERVENTION_SUBSET_JSON" ]]; then
+            BFT_EVAL_BENCHMARK_ARG+=( --env.eval_benchmark_subset="$INTERVENTION_SUBSET_JSON" )
+        fi
+
+        TRAIN_OUTPUT_DIR="$FINAL_BFT_DIR"   # consumed by run_training_step
+        cleanup_pre_train_partial "$TRAIN_OUTPUT_DIR"
+        stage_dagger_config_sidecar "$NUM_ROUNDS" "$FINAL_BFT_DIR"
+        # shellcheck disable=SC2086  # FINETUNE_EXTRA_ARGS_EFF is word-split intentionally
+        run_training_step bash "$SCRIPT_DIR/resume_training.sh" "$BFT_START" \
+            $FINETUNE_EXTRA_ARGS_EFF \
+            --dataset.repo_id= \
+            --dataset.repo_ids="$BFT_REPO_IDS_JSON" \
+            --dataset.sample_weights="$BFT_WEIGHTS_JSON" \
+            --dataset.stats_paths="$BFT_STATS_PATHS_JSON" \
+            --dataset.norm_mode="$NORM_MODE" \
+            --dataset.stats_path= \
+            --dataset.use_weighted_sampling=true \
+            --policy.repo_id="$FINAL_BFT_RUN_NAME" \
+            --output_dir="$FINAL_BFT_DIR" \
+            --job_name="$FINAL_BFT_RUN_NAME" \
+            --steps="$BFT_TARGET_STEPS" \
+            --eval_freq="$FINETUNE_EVAL_FREQ" \
+            --save_freq="$FINETUNE_SAVE_FREQ" \
+            "${TRAIN_EXT_PORT_RESUME[@]}" \
+            "${BFT_BATCH_SIZE_ARG[@]}" \
+            "${BFT_DECAY_LR_ARG[@]}" \
+            "${BFT_SCHEDULER_NAME_ARG[@]}" \
+            "${BFT_EVAL_BENCHMARK_ARG[@]}" \
+            "${HEADLESS_TRAIN_ARGS[@]}" \
+            "${SPLAT_SHADOW_TRAIN_ARGS[@]}" \
+            "${EXCLUDE_GRIPPER_TRAIN_ARG[@]}" \
+            "${NUM_WORKERS_FT_ARG[@]}" \
+            "${OFFLINE_POLICY_ARG[@]}" \
+            --eval.n_episodes="$EVAL_N_EPISODES"
+        write_dagger_config_sidecar "$NUM_ROUNDS" "$FINAL_BFT_DIR/dagger/config.json" "$FINAL_BFT_DIR"
+        promote_staged_dagger_config "$FINAL_BFT_DIR"
+
+        if [[ "$DRY_RUN" == true ]]; then
+            FINAL_POLICY_PATH="$FINAL_BFT_DIR/checkpoints/last/pretrained_model"
+        else
+            FINAL_POLICY_PATH="$(resolve_latest_checkpoint "$FINAL_BFT_DIR")"
+        fi
+
+        if [[ "$DRY_RUN" != true ]] && command -v wandb >/dev/null 2>&1; then
+            echo "--- Post-loop: wandb artifact cache cleanup (cap 5GB) ---"
+            wandb artifact cache cleanup 5GB 2>&1 | sed 's/^/  /' || true
+        fi
         if [[ "$DRY_RUN" != true ]]; then
             echo "--- Post-loop: refresh dagger_progress table + plot ---"
             bash "$SCRIPT_DIR/dagger_progress.sh" \

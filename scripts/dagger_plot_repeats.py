@@ -13,7 +13,10 @@ band (source family = black, blend families colored by ratio).
 Per-round success comes from dagger_plot.collect_lineage_rows — i.e. the
 same reeval > train-time-eval_info > wandb-log cascade the other DAgger
 plots use. Only main-curve rounds (variant == "ft", which includes round 0)
-are aggregated; scratch/retrain variants are ignored.
+are aggregated; scratch/retrain variants are ignored — except the
+`--final_mode=base_finetune` control (`..._dag<N>_bft`: one stationary
+finetune from the round-0 base on the full aggregate), which is overlaid as a
+star marker with its own mean ± std at round N.
 
 Usage:
     python my_scripts/dagger_plot_repeats.py --rep_tag=03dag --model=diff
@@ -78,6 +81,36 @@ def family_color(family: str, tag: str) -> tuple:
     return matplotlib.colormaps.get_cmap("rainbow")(first_pct / 100.0)
 
 
+def assign_family_colors(families, tag: str) -> dict:
+    """{family: (color, linestyle)} with every family visually distinct.
+
+    `family_color` is ratio-based, so two lineages that differ only outside the
+    blends tag (e.g. `..._03dag_b050` vs `..._03dag_rr_b050`, separate lineages
+    sharing ratio 0.5) would otherwise draw in the exact same color. Families
+    that collide on a base color are spread over a lightness ramp and given
+    distinct linestyles so each curve is readable on its own.
+    """
+    by_color: dict[tuple, list[str]] = {}
+    for fam in sorted(families):
+        by_color.setdefault(tuple(np.round(family_color(fam, tag), 6)), []).append(fam)
+
+    styles = ["-", "--", "-.", ":"]
+    out: dict[str, tuple] = {}
+    for base, fams in by_color.items():
+        rgb = np.asarray(base[:3])
+        for i, fam in enumerate(fams):
+            if len(fams) == 1:
+                color = tuple(base)
+            else:
+                # Darken along a ramp: member 0 keeps the base ratio color, the
+                # rest get progressively deeper shades of it (staying legible on
+                # white, unlike ramping toward white).
+                f = 1.0 - 0.55 * i / (len(fams) - 1)
+                color = (*(rgb * f), 1.0)
+            out[fam] = (color, styles[i % len(styles)])
+    return out
+
+
 def collect_family(
     lineages_by_rep: dict[int, str], model: str, prefer_reeval: bool
 ) -> dict[int, dict[int, float]]:
@@ -92,6 +125,60 @@ def collect_family(
         if per_round:
             out[rep] = per_round
     return out
+
+
+def collect_family_base_finetune(
+    lineages_by_rep: dict[int, str], model: str, prefer_reeval: bool
+) -> dict[int, dict[int, float]]:
+    """{rep: {round: succ}} for the `--final_mode=base_finetune` runs of a family.
+
+    These are off-curve: ONE stationary finetune from the round-0 base
+    checkpoint on the full aggregate, sharing the round number of the last
+    DAgger round (`..._dag<N>_bft`). Plotted as a separate marker — it's the
+    matched-compute "no DAgger loop" control for that round's finetune.
+    """
+    out: dict[int, dict[int, float]] = {}
+    for rep, lineage in sorted(lineages_by_rep.items()):
+        per_round: dict[int, float] = {}
+        for row in collect_lineage_rows(lineage, model, prefer_reeval=prefer_reeval):
+            if not row.get("is_base_finetune") or row.get("succ") is None:
+                continue
+            per_round[row["round"]] = float(row["succ"])
+        if per_round:
+            out[rep] = per_round
+    return out
+
+
+def draw_base_finetune(ax, bft_reps: dict[int, dict[int, float]], max_round: int, color, label=None):
+    """Scatter the base-finetune control(s) as mean ± std error bars.
+
+    One point per round that has data, drawn with a star marker so it reads as
+    off-curve against the DAgger line. Rounds beyond `max_round` (the plotted
+    x-range) are dropped.
+    """
+    rounds = sorted({r for pr in bft_reps.values() for r in pr if r <= max_round})
+    if not rounds:
+        return False
+    mean, err = [], []
+    for r in rounds:
+        vals = [pr[r] for pr in bft_reps.values() if r in pr]
+        mean.append(float(np.mean(vals)))
+        err.append(float(np.std(vals, ddof=1)) if len(vals) >= 2 else 0.0)
+    ax.errorbar(
+        rounds,
+        mean,
+        yerr=err,
+        fmt="*",
+        markersize=13,
+        color=color,
+        markeredgecolor="0.2",
+        markeredgewidth=0.6,
+        capsize=4,
+        linestyle="none",
+        label=label,
+        zorder=5,
+    )
+    return True
 
 
 def band_stats(reps: dict[int, dict[int, float]]) -> tuple[list[int], np.ndarray, np.ndarray, list[int]]:
@@ -109,7 +196,18 @@ def band_stats(reps: dict[int, dict[int, float]]) -> tuple[list[int], np.ndarray
     return rounds, np.asarray(mean), np.asarray(std), n
 
 
-def draw_band(ax, rounds, mean, std, color, band_color=None, band_alpha=0.3, label=None, band_from_round=1):
+def draw_band(
+    ax,
+    rounds,
+    mean,
+    std,
+    color,
+    band_color=None,
+    band_alpha=0.3,
+    label=None,
+    band_from_round=1,
+    linestyle="-",
+):
     """Mean line + shaded ±1 std band on `ax`.
 
     The band starts at `band_from_round` (default 1): round 0 is the shared
@@ -127,7 +225,7 @@ def draw_band(ax, rounds, mean, std, color, band_color=None, band_alpha=0.3, lab
             alpha=band_alpha,
             linewidth=0,
         )
-    ax.plot(rounds, mean, "o-", color=color, label=label, markersize=4)
+    ax.plot(rounds, mean, marker="o", linestyle=linestyle, color=color, label=label, markersize=4)
 
 
 def main() -> int:
@@ -202,7 +300,8 @@ def main() -> int:
             reps = {k: {r: pr[r] for r in sorted(pr)[: args.max_rounds + 1]} for k, pr in reps.items()}
             reps = {k: pr for k, pr in reps.items() if pr}
         rounds, mean, std, n = band_stats(reps)
-        family_stats[family] = (rounds, mean, std, n, reps)
+        bft_reps = collect_family_base_finetune(by_rep, model, prefer_reeval)
+        family_stats[family] = (rounds, mean, std, n, reps, bft_reps)
 
         fig, ax = plt.subplots(figsize=(9, 5.5))
         if args.plot_each:
@@ -218,9 +317,13 @@ def main() -> int:
                     label="individual reps" if rep == min(reps) else None,
                 )
         draw_band(ax, rounds, mean, std, color="tab:blue", band_color="0.5", label="mean ± 1 std")
+        draw_base_finetune(ax, bft_reps, max(rounds), color="tab:orange", label="base-finetune control")
         ax.set_xlabel("DAgger round")
         ax.set_ylabel("success rate (%)")
         ax.set_xticks(rounds)
+        # A touch of x padding so a base-finetune star on the last round isn't
+        # clipped by the axes spine.
+        ax.set_xlim(min(rounds) - 0.35, max(rounds) + 0.45)
         ax.set_ylim(0, 100)
         ax.grid(alpha=0.3)
         n_reps = len(reps)
@@ -233,7 +336,17 @@ def main() -> int:
         written.append((family, out))
         print(f"[{family}] reps={sorted(reps)} → {out}")
         for r, m_, s_, cnt in zip(rounds, mean, std, n):
-            print(f"    round {r:>2}: {m_:6.1f} ± {s_:5.1f} %  (n={cnt})")
+            if r == 0:
+                # round 0 is the shared base checkpoint (trained once for all reps),
+                # so there is no across-rep variation to report.
+                print(f"    round {r:>2}: {m_:6.1f} %          (shared base)")
+            else:
+                print(f"    round {r:>2}: {m_:6.1f} ± {s_:5.1f} %  (n={cnt})")
+        for r in sorted({rr for pr in bft_reps.values() for rr in pr if rr <= max(rounds)}):
+            vals = [pr[r] for pr in bft_reps.values() if r in pr]
+            m_ = float(np.mean(vals))
+            s_ = float(np.std(vals, ddof=1)) if len(vals) >= 2 else 0.0
+            print(f"    round {r:>2}: {m_:6.1f} ± {s_:5.1f} %  (n={len(vals)})  [base-finetune]")
 
     if not family_stats:
         print("No family had any eval data; nothing plotted.")
@@ -241,15 +354,19 @@ def main() -> int:
 
     # ── combined overlay ────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(10, 6))
-    for family, (rounds, mean, std, _n, _reps) in sorted(family_stats.items()):
-        color = family_color(family, args.rep_tag)
+    styles_by_family = assign_family_colors(family_stats.keys(), args.rep_tag)
+    for family, (rounds, mean, std, _n, _reps, bft_reps) in sorted(family_stats.items()):
+        color, linestyle = styles_by_family[family]
         # Label: the part of the family from the tag onward (short + unique).
         idx = family.find(args.rep_tag)
         label = family[idx:] if idx >= 0 else family
-        draw_band(ax, rounds, mean, std, color=color, band_alpha=0.15, label=label)
+        draw_band(ax, rounds, mean, std, color=color, band_alpha=0.15, label=label, linestyle=linestyle)
+        draw_base_finetune(ax, bft_reps, max(rounds), color=color, label=f"{label} bft")
     ax.set_xlabel("DAgger round")
     ax.set_ylabel("success rate (%)")
     ax.set_ylim(0, 100)
+    _all_rounds = [r for (rounds, *_rest) in family_stats.values() for r in rounds]
+    ax.set_xlim(min(_all_rounds) - 0.35, max(_all_rounds) + 0.45)
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.grid(alpha=0.3)
     ax.set_title(f"success rate across repetitions (mean ± 1 std) — tag '{args.rep_tag}'")

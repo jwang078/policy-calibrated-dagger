@@ -486,6 +486,11 @@ elif [[ -n "$COMBINATION_POOL" ]]; then
     # (the canonical naming module — keeps this length-check in lock-step
     # with the orchestrator's actual name derivation).
     for SWEEP_K_VAL in "${SWEEP_COMBO_K_LIST[@]}"; do
+    # dagger_naming's blend_tag_for_ratio reads DAG_BLEND_RUN_TAG — export it
+    # so the length predictions below match the orchestrator's real names.
+    for _a in "${ORCHESTRATOR_ARGS[@]}"; do
+        [[ "$_a" == --blend_run_tag=* ]] && export DAG_BLEND_RUN_TAG="${_a#*=}"
+    done
     COMBO_OUTPUT=$(PYTHONPATH="$SCRIPT_DIR" python3 - "$COMBINATION_POOL" "$SWEEP_K_VAL" "$HF_USER" "${ORCHESTRATOR_ARGS[@]}" <<'PY' || exit $?
 import sys
 from itertools import combinations
@@ -503,6 +508,22 @@ pool_str = sys.argv[1]
 k = int(sys.argv[2])
 hf_user = sys.argv[3]
 orch_args = sys.argv[4:]
+
+
+def _blends_tag_with_additive(combo):
+    """format_blends_tag + the orchestrator's --blend_data_fraction suffix.
+
+    Mirrors the orchestrator's BLENDS_TAG derivation: an additive blend
+    allocation appends `a<NNN>` (B=0.1 -> a010) so the prediction stays in
+    lock-step with the real names.
+    """
+    tag = format_blends_tag(list(combo))
+    for a in orch_args:
+        if a.startswith("--blend_data_fraction="):
+            v = a.split("=", 1)[1]
+            if v:
+                tag += f"a{round(float(v) * 100):03d}"
+    return tag
 
 def get_flag(name, default=None):
     pfx = f"--{name}="
@@ -625,7 +646,7 @@ def predicted_longest(combo):
 
     Uses dagger_naming's canonical helpers so this stays in lock-step with
     the orchestrator's actual derivation."""
-    blends_tag = format_blends_tag(list(combo))
+    blends_tag = _blends_tag_with_additive(combo)
     base_dataset_short = derive_base_dataset_short(
         stem, run_tag=run_tag, model_tag=model_tag, method_tag=method_tag, blends_tag=blends_tag
     )
@@ -663,7 +684,7 @@ def predicted_longest_nc_policy(combo):
         return None
     if not base_policy_stem:
         return None
-    blends_tag = format_blends_tag(list(combo))
+    blends_tag = _blends_tag_with_additive(combo)
     base_policy_name = derive_base_policy_name(
         base_policy_stem, run_tag=run_tag, model_tag=model_tag,
         method_tag=method_tag, blends_tag=blends_tag,
@@ -913,6 +934,12 @@ if [[ "$AUTO_CREATE_SOURCE" == "true" ]]; then
             # The source lineage IS the baseline; the flag only has meaning for
             # a blend iteration that would otherwise reuse the source's data.
             --separate_blend_lineage|--separate_blend_lineage=*) continue ;;
+            # --intermediate_mode=none is rerun-iteration-only (skip per-round
+            # training, post-loop base-finetune does the training). The SOURCE
+            # lineage can't use it: it isn't in rerun mode, and it needs its
+            # per-round policies to record each round's interventions. Map it
+            # back to the plain finetune loop for the create step.
+            --intermediate_mode=none) CREATE_ARGS+=( "--intermediate_mode=finetune" ) ;;
             *) CREATE_ARGS+=( "$a" ) ;;
         esac
     done

@@ -89,6 +89,8 @@ SHOW_BASE_ONLY=true    # default ON: show base-only (no-dag-rounds-yet) training
 # so you can tell when the training-time eval contributed.
 REEVAL_SEEDS=()
 TRAINING_ROOT="${HOME}/code/lerobot/outputs/training"
+# Canonical DAgger naming (round labels, dataset/policy names) — see module docstring.
+DAGGER_NAMING_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dagger_naming.py"
 
 # Known model prefixes — must match train_sweep.sh's run_job() prefix arg.
 KNOWN_MODEL_PREFIXES=(pi05 diffusion act)
@@ -783,27 +785,21 @@ print_table() {
         fi
     done
 
+    # Row labels come from dagger_naming.parse_round_variant (the canonical
+    # source for the `_ft_dag10` → "dag10" / `_dag10` → "dag10_s" /
+    # `_dag10_bft` → "dag10_s_bft" mapping). One batched call for the whole
+    # table — per-dir python startup would dominate this script's runtime.
+    local -a _raw_labels=()
+    if (( ${#_raw_dirs[@]} > 0 )); then
+        local -a _raw_basenames=()
+        for DIR in "${_raw_dirs[@]}"; do _raw_basenames+=( "$(basename "$DIR")" ); done
+        mapfile -t _raw_labels < <(python3 "$DAGGER_NAMING_PY" round_label "${_raw_basenames[@]}")
+    fi
+
+    local _i=0
     for DIR in "${_raw_dirs[@]}"; do
-        local round_label round_num variant retrain_suffix
-        # Distinguish three variants:
-        #   _ft_dag10               → "dag10"             (canonical finetune)
-        #   _dag10                  → "dag10_s"           (post-loop scratch)
-        #   _ft_dag1_${suffix}      → "dag1_${suffix}"    (--retrain_round=1)
-        #   _dag10_${suffix}        → "dag10_s_${suffix}" (scratch retrain, rare)
-        local _basename
-        _basename="$(basename "$DIR")"
-        if [[ "$_basename" == *_ft_dag[0-9]* ]]; then
-            variant=ft
-        else
-            variant=scratch
-        fi
-        round_num=$(echo "$_basename"   | sed -E 's/.*_dag([0-9]+)(_.*)?$/\1/')
-        retrain_suffix=$(echo "$_basename" | sed -E 's/.*_dag[0-9]+(_.*)?$/\1/')
-        if [[ "$variant" == "scratch" ]]; then
-            round_label="dag${round_num}_s${retrain_suffix}"
-        else
-            round_label="dag${round_num}${retrain_suffix}"
-        fi
+        local round_label="${_raw_labels[$_i]:-$(basename "$DIR")}"
+        _i=$(( _i + 1 ))
         print_row "$round_label" "$DIR" && found=1
     done
 

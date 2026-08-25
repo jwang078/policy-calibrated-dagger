@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import asdict, dataclass
@@ -41,14 +42,35 @@ from typing import Literal
 # ────────────────────────────────────────────────────────────────────────────
 
 
+def blend_run_tag() -> str:
+    """The active blend-content variant tag (env: DAG_BLEND_RUN_TAG).
+
+    Blend dataset names historically encode only the RATIO (`_blend050`), so
+    two runs with different blend-generation parameters (e.g. suffix
+    anchoring) would collide and silently reuse each other's cached blends.
+    The orchestrator's `--blend_run_tag=SFX` exports DAG_BLEND_RUN_TAG; this
+    single choke point appends it to every ratio tag, so blend datasets
+    (`_blend050anc8`), their collision-filtered siblings, the blends tag
+    (`b050anc8` → policy/lineage names), and the sweep's name predictions all
+    inherit the variant consistently. Empty (the default) is byte-identical
+    to the historical names. Must match ^[a-z][a-z0-9]{0,7}$ so the variant
+    can never be confused with the 3-digit percent or a `_nc`-style suffix.
+    """
+    v = os.environ.get("DAG_BLEND_RUN_TAG", "")
+    if v and not re.fullmatch(r"[a-z][a-z0-9]{0,7}", v):
+        raise ValueError(f"DAG_BLEND_RUN_TAG must match [a-z][a-z0-9]{{0,7}} (got {v!r})")
+    return v
+
+
 def blend_tag_for_ratio(ratio: float) -> str:
     """Convert a forward-flow ratio in [0, 1] to a 3-digit percent tag.
 
-    e.g. 0.9 → "090", 0.1 → "010", 0.95 → "095".
+    e.g. 0.9 → "090", 0.1 → "010", 0.95 → "095" — plus the active
+    `blend_run_tag()` suffix when one is set (0.5 → "050anc8").
 
     Mirrors `_blend_tag_for_ratio` in dagger_orchestrate.sh:1165.
     """
-    return f"{int(round(float(ratio) * 100)):03d}"
+    return f"{int(round(float(ratio) * 100)):03d}{blend_run_tag()}"
 
 
 def ratio_for_blend_tag(tag: str | int) -> float:
@@ -56,8 +78,13 @@ def ratio_for_blend_tag(tag: str | int) -> float:
 
     Used by cleanup / introspection scripts that need to round-trip a blend
     dataset name back to its ratio. Accepts the 3-digit zero-padded string
-    OR the integer percent value.
+    (with or without a trailing variant, e.g. "050anc8") OR the integer
+    percent value.
     """
+    if isinstance(tag, str):
+        m = re.match(r"^(\d{3})", tag)
+        if m:
+            tag = m.group(1)
     return round(int(tag) / 100, 2)
 
 
@@ -418,7 +445,7 @@ def derive_base_policy_name(stem: str, run_tag: str, model_tag: str, method_tag:
 # end in `_m`. Anything else is intervention.
 _DATASET_SHORT_RE = re.compile(
     r"^(?P<prefix>.+?)_(?P<infix>[ra])_dag(?P<round>\d+)"
-    r"(?:_(?P<suffix>blend\d{3}(?:_nc|_tfc|_nocoll)?|m))?$"
+    r"(?:_(?P<suffix>blend\d{3}(?:[a-z][a-z0-9]*)?(?:_nc|_tfc|_nocoll)?|m))?$"
 )
 
 DatasetKind = Literal["base", "intervention", "blend", "merged"]
@@ -480,9 +507,9 @@ def parse_dataset_short(name: str) -> ParsedDatasetName:
                 sfx = TRIM_SUFFIX
             else:
                 sfx = NOCOLL_SUFFIX
-            blend_pct = int(suffix[len("blend") : -len(sfx)])
+            blend_pct = int(suffix[len("blend") : len("blend") + 3])
         else:
-            blend_pct = int(suffix[len("blend") :])
+            blend_pct = int(suffix[len("blend") : len("blend") + 3])
     else:  # pragma: no cover  (regex alternation excludes anything else)
         raise AssertionError(f"unexpected suffix: {suffix!r}")
     return ParsedDatasetName(
@@ -503,6 +530,73 @@ def parse_dataset_short(name: str) -> ParsedDatasetName:
 # behavior. Kept as a module-level constant because scan_round() (and
 # similar callers) consume it directly.
 ROUND_SUFFIX_RE = re.compile(r"(?:_ft)?_dag(\d+)(?:_([^/]+))?$")
+
+# ── Off-curve training-dir variants ─────────────────────────────────────────
+# A DAgger round number can be carried by more than one training dir. Besides
+# the canonical per-round finetune (`_ft_dag<N>`), the orchestrator can emit:
+#   * post-loop from-scratch reference   → `_dag<N>`          (--final_mode=scratch)
+#   * post-loop base-finetune reference  → `_dag<N>_bft`      (--final_mode=base_finetune)
+#   * --retrain_round variants           → `_ft_dag<N>_<sfx>` / `_dag<N>_<sfx>`
+# The base-finetune run is ONE stationary finetune from the round-0 base
+# checkpoint on the full aggregate — the "same compute, no DAgger loop"
+# control for the round-N finetuned policy.
+BASE_FINETUNE_SUFFIX = "bft"
+
+# Row/label marker for dirs that are NOT `_ft_dag<N>` (i.e. trained from
+# scratch / from base rather than continuing the round chain).
+SCRATCH_LABEL_MARK = "s"
+
+
+def train_dir_suffix_finetune(round_n: int) -> str:
+    """Canonical per-round finetune dir suffix (`_ft_dag5`)."""
+    return f"_ft_dag{round_n}"
+
+
+def train_dir_suffix_scratch(round_n: int) -> str:
+    """Post-loop from-scratch reference dir suffix (`_dag10`)."""
+    return f"_dag{round_n}"
+
+
+def train_dir_suffix_base_finetune(round_n: int) -> str:
+    """Post-loop base-finetune reference dir suffix (`_dag10_bft`)."""
+    return f"_dag{round_n}_{BASE_FINETUNE_SUFFIX}"
+
+
+def parse_round_variant(dir_name: str) -> dict | None:
+    """Classify a training-dir basename into (round, variant, suffix, label).
+
+    Returns None when the name carries no `_dag<N>` suffix at all.
+
+    variant is one of:
+        "ft"            canonical per-round finetune (`_ft_dag5`)
+        "scratch"       post-loop from-scratch reference (`_dag10`)
+        "base_finetune" post-loop base-finetune reference (`_dag10_bft`)
+        "retrain"       --retrain_round variant (any other trailing suffix)
+
+    `label` is the short row label used by dagger_progress.sh / dagger_plot.py:
+    `dag5`, `dag10_s`, `dag10_s_bft`, `dag1_nc`, ... — the `_s` mark flags a
+    dir that did not continue the round chain.
+    """
+    m = ROUND_SUFFIX_RE.search(dir_name)
+    if not m:
+        return None
+    round_n = int(m.group(1))
+    suffix = m.group(2)
+    is_ft = "_ft_dag" in dir_name
+    if is_ft:
+        variant = "retrain" if suffix else "ft"
+    elif suffix == BASE_FINETUNE_SUFFIX:
+        variant = "base_finetune"
+    elif suffix:
+        variant = "retrain"
+    else:
+        variant = "scratch"
+    label = f"dag{round_n}"
+    if not is_ft:
+        label += f"_{SCRATCH_LABEL_MARK}"
+    if suffix:
+        label += f"_{suffix}"
+    return {"round": round_n, "variant": variant, "suffix": suffix, "label": label}
 
 
 def _argv_get_flag(argv: list[str], name: str, default: str | None = None) -> str | None:
@@ -692,7 +786,7 @@ def enumerate_blend_paths_on_disk(
         return []
     matches = sorted(parent.glob(f"{int_dir.name}_blend*"))
     out: list[tuple[int, Path]] = []
-    pct_re = re.compile(r"_blend(\d{3})$")
+    pct_re = re.compile(r"_blend(\d{3})(?:[a-z][a-z0-9]*)?$")
     for m in matches:
         mm = pct_re.search(m.name)
         if not (mm and m.is_dir()):
@@ -884,6 +978,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--model", required=True)
     sp.add_argument("dir_name", help="training dir basename (no path components)")
 
+    sp = sub.add_parser(
+        "round_label",
+        help="training-dir basename(s) → short row label (`dag5`, `dag10_s`, `dag10_s_bft`), one per line",
+    )
+    sp.add_argument("dir_name", nargs="+", help="training dir basename(s) (no path components)")
+
     # Camera-tag helpers -------------------------------------------------------
     sp = sub.add_parser(
         "camera_name_tag",
@@ -961,6 +1061,11 @@ def _cli_main(argv: list[str]) -> int:
         result = lineage_of(args.dir_name, args.model)
         # Bash convention: empty stdout = "no match". Caller checks `[[ -n "$out" ]]`.
         print(result if result is not None else "")
+    elif cmd == "round_label":
+        for _d in args.dir_name:
+            info = parse_round_variant(_d)
+            # Bash convention: empty line = "not a dag dir".
+            print(info["label"] if info else "")
     elif cmd == "camera_name_tag":
         print(
             camera_name_tag(

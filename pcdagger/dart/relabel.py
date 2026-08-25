@@ -631,6 +631,16 @@ class DartChunkDataset:
                 valid=out,
                 labels=np.stack([self._labels[int(i)] for i in out]),
             )
+            # Superseded caches (older fingerprints — e.g. from before a
+            # resume-extension appended more samples_per_episode blends) are
+            # never read again; delete them so extended datasets don't
+            # accumulate ~MBs of stale label archives per regeneration.
+            import contextlib
+
+            for stale in glob.glob(os.path.join(str(self.dataset.root), "dart_label_cache_*.npz")):
+                if os.path.abspath(stale) != os.path.abspath(cache_path):
+                    with contextlib.suppress(OSError):
+                        os.remove(stale)
         except Exception:
             import logging
 

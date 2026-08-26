@@ -5931,7 +5931,11 @@ PYEOF
     # distribution with their label chunks (visualize_dart_chunks
     # --state_noise_std). Same dart_check/ location, episodes, .cmd.txt
     # convention and idempotence as the blend dart-check plots.
-    if (( STEP <= 2 )) && [[ -n "$DART_NOISE" ]] && dataset_exists "$INT_REPO"; then
+    # Gate on STEP<=6 (not <=2): rerun-mode rounds resume straight at the
+    # training step — blends are skipped entirely — so a step-2 gate never
+    # fires and the previews silently vanish (observed on the first
+    # dart-noise sweep run). Idempotent + cheap, so any round pass may do it.
+    if (( STEP <= 6 )) && [[ -n "$DART_NOISE" ]] && dataset_exists "$INT_REPO"; then
         DART_VIZ_DIR="$TRAIN_OUTPUT_DIR/dagger/dart_check"
         run_or_echo mkdir -p "$DART_VIZ_DIR"
         _dart_eps="$(python3 - "$LEROBOT_CACHE/$INT_REPO" <<'PYEOF2'

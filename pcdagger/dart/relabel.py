@@ -525,7 +525,74 @@ class DartChunkDataset:
         self._fingerprinted = False
         if not self.self_relabel:
             self.geoms = load_source_geometries(source_repo_id, n_arm=self.n_arm, root=root)
+        # State-noise consistency for robot-derived env_state dims: some
+        # environments publish forward-kinematics-derived values (the planar
+        # oracle state ends with the EE position) inside
+        # observation.environment_state. Perturbing the joints without
+        # updating those dims hands the policy an internally inconsistent
+        # observation — and a shortcut to read the TRUE state and ignore the
+        # noise. Detect the moving dims (within-episode ptp, same 0.005
+        # convention as the blend script's static mask) and fit them as a
+        # linear function of [cos(cumsum q), sin(cumsum q), 1] — exact for
+        # planar FK — from the dataset's own frames; applied per obs row in
+        # __getitem__. Disabled (with a warning) if the fit is poor.
+        self._env_fk_w: np.ndarray | None = None
+        self._env_fk_dims: np.ndarray | None = None
+        if self.state_noise_std > 0.0:
+            self._fit_env_fk()
         self._valid = self._build_valid_window()
+
+    def _env_fk_features(self, q: np.ndarray) -> np.ndarray:
+        cs = np.cumsum(np.asarray(q, dtype=np.float64)[..., : self.n_arm], axis=-1)
+        return np.concatenate([np.cos(cs), np.sin(cs), np.ones(cs.shape[:-1] + (1,))], axis=-1)
+
+    def _fit_env_fk(self) -> None:
+        import logging
+
+        import pandas as pd
+
+        if "observation.environment_state" not in getattr(self.dataset.meta, "features", {}):
+            return
+        files = sorted(glob.glob(os.path.join(str(self.dataset.root), "data/**/*.parquet"), recursive=True))
+        cols = ["episode_index", "observation.state", "observation.environment_state"]
+        df = pd.concat([pd.read_parquet(f, columns=cols) for f in files])
+        env = np.stack(df["observation.environment_state"].to_numpy()).astype(np.float64)
+        q = np.stack(df["observation.state"].to_numpy()).astype(np.float64)
+        ptp = np.median(
+            np.stack(
+                [
+                    np.ptp(np.stack(g["observation.environment_state"].to_numpy()), axis=0)
+                    for _, g in df.groupby("episode_index")
+                ]
+            ),
+            axis=0,
+        )
+        moving = np.where(ptp > 0.005)[0]
+        if len(moving) == 0:
+            return
+        feats = self._env_fk_features(q)
+        w, *_ = np.linalg.lstsq(feats, env[:, moving], rcond=None)
+        resid = np.abs(feats @ w - env[:, moving])
+        rel = resid.max(axis=0) / np.maximum(np.ptp(env[:, moving], axis=0), 1e-9)
+        if (rel > 0.02).any():
+            logging.warning(
+                "dart_relabel %s: robot-derived env dims %s but FK fit residual %.4f of range — "
+                "state noise will leave env_state UNTOUCHED (inconsistent obs; consider disabling noise).",
+                self.dataset.repo_id,
+                moving.tolist(),
+                float(rel.max()),
+            )
+            return
+        self._env_fk_w = w
+        self._env_fk_dims = moving
+        logging.info(
+            "dart_relabel %s: state noise will recompute robot-derived env dims %s "
+            "(FK fit max residual %.5f, %.2f%% of range).",
+            self.dataset.repo_id,
+            moving.tolist(),
+            float(resid.max()),
+            100 * float(rel.max()),
+        )
 
     def _cache_key(self, horizon: int) -> str:
         """Fingerprint for the persistent window/label cache.
@@ -804,6 +871,17 @@ class DartChunkDataset:
                     for k in range(n_rows - 1):
                         state_t[k, : self.n_arm] = state_t[-1, : self.n_arm] - (n_rows - 1 - k) * v_t
                 item["observation.state"] = state_t
+                if self._env_fk_w is not None and "observation.environment_state" in item:
+                    env_t = item["observation.environment_state"].clone()
+                    qs = (state_t if state_t.dim() == 2 else state_t[None])[:, : self.n_arm].cpu().numpy()
+                    pred = self._env_fk_features(qs) @ self._env_fk_w  # (rows, n_moving)
+                    pv = torch.as_tensor(pred, dtype=env_t.dtype, device=env_t.device)
+                    dims = torch.as_tensor(self._env_fk_dims, device=env_t.device)
+                    if env_t.dim() == 2 and env_t.shape[0] == qs.shape[0]:
+                        env_t[:, dims] = pv
+                    elif env_t.dim() == 1:
+                        env_t[dims] = pv[-1]
+                    item["observation.environment_state"] = env_t
                 noised = True
         cached = None if noised else self._labels.get(int(idx))
         if cached is not None and cached.shape[0] == action.shape[0] and self._fingerprinted:

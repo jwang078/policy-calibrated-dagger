@@ -200,6 +200,7 @@ def scan_round(dir_path: Path, round_n: int | None = None, prefer_reeval: bool =
             "variant": variant,
             "retrain_suffix": retrain_suffix,
             "is_base_finetune": is_base_finetune,
+            "dir": str(dir_path),
         }
     log = logs[-1].read_text(errors="ignore")
 
@@ -208,6 +209,9 @@ def scan_round(dir_path: Path, round_n: int | None = None, prefer_reeval: bool =
         "variant": variant,
         "retrain_suffix": retrain_suffix,
         "is_base_finetune": is_base_finetune,
+        # Training dir this row came from — lets callers check on-disk state
+        # (e.g. whether the run reached its configured step target).
+        "dir": str(dir_path),
     }
 
     # Eval-metric source cascade. Same shape as dagger_progress.sh's print_row:

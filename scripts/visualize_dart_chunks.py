@@ -109,11 +109,20 @@ def _plot(
     out: str,
     jacobian_fn=None,
     cartesian_lambda: float = 4.0,
+    velocities: np.ndarray | None = None,
 ) -> dict:
     anchors = list(range(0, len(S) - 1, max(1, anchor_every)))
 
     def _smooth_vel(t: int, w: int = 3) -> np.ndarray:
-        """Windowed velocity — a 1-tick FD on a noisy blend path points anywhere."""
+        """Windowed velocity — a 1-tick FD on a noisy blend path points anywhere.
+
+        Overridden per-anchor by ``velocities`` when given (the base-DART
+        noise preview: independent draws have no meaningful frame-to-frame
+        velocity, so the caller supplies the demo tangent at each anchor's
+        projected index instead).
+        """
+        if velocities is not None:
+            return velocities[t]
         lo, hi = max(0, t - w), min(len(S) - 1, t + w)
         return (S[hi] - S[lo]) / max(1, hi - lo)
 
@@ -127,7 +136,7 @@ def _plot(
             horizon=horizon,
             rate=rate,
             ease_out=ease_out,
-            prev_state=S[t - 1] if t > 0 else None,
+            prev_state=(S[t - 1] if t > 0 else None) if velocities is None else None,
             velocity=_smooth_vel(t),
             jacobian_fn=jacobian_fn,
             cartesian_lambda=cartesian_lambda,
@@ -149,7 +158,7 @@ def _plot(
             horizon=TRAIN_H,
             rate=rate,
             ease_out=ease_out,
-            prev_state=S[t - 1] if t > 0 else None,
+            prev_state=(S[t - 1] if t > 0 else None) if velocities is None else None,
             velocity=_smooth_vel(t),
             jacobian_fn=jacobian_fn,
             cartesian_lambda=cartesian_lambda,
@@ -593,6 +602,13 @@ def main() -> None:
                 if d < best_d:
                     best_d, best_i = d, i + u
             idxs[t] = best_i
+        # anchor velocity = demo tangent at the projected index (matches the
+        # training-side assumption in dart_relabel's noise branch).
+        vels = np.empty_like(track)
+        for t in range(len(track)):
+            hi_i = min(idxs[t] + 1.0, float(len(geom.P) - 1))
+            lo_i = max(idxs[t] - 1.0, 0.0)
+            vels[t] = (_interp_rows(geom.P, hi_i) - _interp_rows(geom.P, lo_i)) / max(hi_i - lo_i, 1e-9)
         title = (
             f"Base-DART noise preview — sigma={args.state_noise_std:g} med-steps on "
             f"{args.source_repo_id} ep {src_ep}"
@@ -615,6 +631,7 @@ def main() -> None:
             out,
             jacobian_fn=jac_fn,
             cartesian_lambda=args.cartesian_lambda,
+            velocities=vels,
         )
         if args.sim_video:
             env = _load_episode(args.source_repo_id, src_ep, cols=("observation.environment_state",))

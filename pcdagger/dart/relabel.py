@@ -490,11 +490,13 @@ class DartChunkDataset:
         # without any relabel columns or blend rollouts.
         self.self_relabel = bool(self_relabel)
         # Train-time state-noise augmentation (classic DART): perturb the
-        # anchor state (both obs-history rows by the SAME offset, so the
-        # recorded velocity is preserved) by N(0, (std*med_step)^2) on the
-        # arm dims with probability p, re-project locally, and synthesize
-        # the label from the perturbed state. std is in DEMO MED-STEP units
-        # so one number transfers across episodes/tasks.
+        # anchor state by N(0, (std*med_step)^2) on the arm dims with
+        # probability p, re-project locally, and synthesize the label from
+        # the perturbed state. The anchor's assumed VELOCITY is the demo
+        # tangent at the progress-aligned (projected) index — a random
+        # offset has no velocity of its own, so the history rows are rebuilt
+        # backward along that tangent. std is in DEMO MED-STEP units so one
+        # number transfers across episodes/tasks.
         self.state_noise_std = float(state_noise_std)
         self.state_noise_p = float(state_noise_p)
         self.state_noise_seed = state_noise_seed
@@ -769,6 +771,7 @@ class DartChunkDataset:
         # ── classic-DART state noise: perturb the anchor, re-project, and
         # synthesize the label from the perturbed state ──
         noised = False
+        noise_vel: np.ndarray | None = None
         if self.state_noise_std > 0.0:
             if self._noise_rng is None:
                 self._noise_rng = np.random.default_rng(self.state_noise_seed)
@@ -777,15 +780,30 @@ class DartChunkDataset:
                 state_t = item["observation.state"].clone()
                 d_t = torch.as_tensor(delta, dtype=state_t.dtype, device=state_t.device)
                 if state_t.dim() == 2:
-                    # same offset on every obs-history row: recorded velocity
-                    # is preserved (DART perturbs position, not velocity).
                     state_t[:, : self.n_arm] += d_t
                 else:
                     state_t[: self.n_arm] += d_t
-                item["observation.state"] = state_t
                 q_pert = (state_t[-1] if state_t.dim() == 2 else state_t).cpu().numpy()
                 # tangential noise must move the clock, not read as deviation
                 di = project_state_local(q_pert, geom, di, window_steps=3.0 * self.state_noise_std + 4.0)
+                # A random offset has no velocity of its own, so assume the
+                # perturbed anchor was moving PARALLEL TO THE DEMO at the
+                # progress-aligned index: velocity = the demo tangent at the
+                # projected di (per tick). Rebuild the earlier obs-history
+                # rows backward along that tangent (a plain shared shift
+                # would carry frame t's velocity while the label launches at
+                # di), and hand the same tangent to the label synthesis.
+                _hi = min(di + 1.0, float(len(geom.P) - 1))
+                _lo = max(di - 1.0, 0.0)
+                noise_vel = (
+                    (_interp_rows(geom.P, _hi) - _interp_rows(geom.P, _lo)) / max(_hi - _lo, 1e-9)
+                ).astype(np.float64)
+                if state_t.dim() == 2 and state_t.shape[0] >= 2:
+                    v_t = torch.as_tensor(noise_vel, dtype=state_t.dtype, device=state_t.device)
+                    n_rows = state_t.shape[0]
+                    for k in range(n_rows - 1):
+                        state_t[k, : self.n_arm] = state_t[-1, : self.n_arm] - (n_rows - 1 - k) * v_t
+                item["observation.state"] = state_t
                 noised = True
         cached = None if noised else self._labels.get(int(idx))
         if cached is not None and cached.shape[0] == action.shape[0] and self._fingerprinted:
@@ -830,6 +848,8 @@ class DartChunkDataset:
         if vel is not None:
             vel = vel.cpu().numpy() if isinstance(vel, torch.Tensor) else np.asarray(vel)
             vel = vel[-1] if vel.ndim == 2 else vel  # last row when delta-stacked
+        if noise_vel is not None:
+            vel = noise_vel  # demo tangent at the projected index (see noise branch)
         info: dict = {}
         labels = chunk_labels(
             q.cpu().numpy(),

@@ -865,6 +865,18 @@ BLEND_DATA_FRACTION=""
 # colliding with — and silently reusing — the cached blends of a previous
 # configuration. Lowercase alnum starting with a letter, <= 8 chars.
 BLEND_RUN_TAG=""
+# --dart_noise=SIGMA ("base DART"): train-time state-noise augmentation on
+# the INTERVENTION datasets — no blend rollouts, no extra recording. Every
+# finetune gets --dataset.dart_relabel + a self-relabel pattern matching the
+# int repos + --dataset.dart_state_noise_std=SIGMA: the dataloader perturbs
+# sampled intervention states by N(0, (SIGMA*med_step)^2), re-projects, and
+# synthesizes the recovery label from the perturbed state (see
+# lerobot/datasets/dart_relabel.py). SIGMA is in demo med-step units. The
+# lineage gets a `dn<SIGMA>` tag in the blends-tag slot (03dag_rr_dn4) so
+# it resumes/plots/combines like any blend lineage. SIGMA=0 is a valid
+# ablation (labels + sampling window swap, no noise). Composable with
+# blends (tag becomes e.g. b050anc8dn4).
+DART_NOISE=""
 # --exclude_gripper_from_state: forwarded verbatim to every downstream
 # training + intervention invocation. See train_sweep.sh's flag docstring
 # for the rationale (dropping the constant-0 gripper dim from
@@ -1390,6 +1402,7 @@ for arg in "$@"; do
         --dagger_data_fraction_mode=*)       DAGGER_DATA_FRACTION_MODE="${arg#*=}" ;;
         --blend_data_fraction=*)             BLEND_DATA_FRACTION="${arg#*=}" ;;
         --blend_run_tag=*)                   BLEND_RUN_TAG="${arg#*=}" ;;
+        --dart_noise=*)                      DART_NOISE="${arg#*=}" ;;
         --exclude_gripper_from_state)        EXCLUDE_GRIPPER_FROM_STATE=true ;;
         --exclude_gripper_from_state=*)      EXCLUDE_GRIPPER_FROM_STATE="${arg#*=}" ;;
         --norm_mode=*)                       NORM_MODE="${arg#*=}" ;;
@@ -1477,6 +1490,19 @@ else
 fi
 
 # --blend_labels plumbing (see the declaration block above).
+DART_NOISE_TAG=""
+if [[ -n "$DART_NOISE" ]]; then
+    if ! [[ "$DART_NOISE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "ERROR: --dart_noise must be a non-negative number in demo med-step units (got '$DART_NOISE')." >&2
+        exit 1
+    fi
+    if [[ "$USE_WEIGHTED_SAMPLING" != "true" ]]; then
+        echo "ERROR: --dart_noise requires --use_weighted_sampling (the dataloader wrap runs on the multi-source path)." >&2
+        exit 1
+    fi
+    # Tag token: 4 -> dn4, 2.5 -> dn2p5, 0.5 -> dn0p5 (strip trailing zeros first).
+    DART_NOISE_TAG="dn$(python3 -c "import sys; s=sys.argv[1]; s=s.rstrip('0').rstrip('.') if '.' in s else s; print(s.replace('.','p') or '0')" "$DART_NOISE")"
+fi
 BLEND_LABELS_ARG=""
 if [[ "$BLEND_LABELS" == "dart" ]]; then
     if [[ "$USE_WEIGHTED_SAMPLING" != true ]]; then
@@ -1493,6 +1519,14 @@ if [[ "$BLEND_LABELS" == "dart" ]]; then
 elif [[ "$BLEND_LABELS" != "executed" ]]; then
     echo "ERROR: --blend_labels must be 'executed' or 'dart', got '$BLEND_LABELS'." >&2
     exit 1
+fi
+if [[ -n "$DART_NOISE" ]]; then
+    # Base-DART: wrap the intervention repos (self-relabel) with state noise.
+    # The pattern matches `..._r_dag<N>` intervention repo ids only — the base
+    # dataset and `_blend...` repos pass through. Round 0 is untouched (the
+    # shared base policy must stay identical across lineages).
+    FINETUNE_EXTRA_ARGS_EFF="$FINETUNE_EXTRA_ARGS_EFF --dataset.dart_relabel=true --dataset.dart_self_relabel_pattern=_r_dag\\d+\$ --dataset.dart_state_noise_std=$DART_NOISE"
+    echo "Base-DART: intervention datasets get self-relabel + state noise sigma=$DART_NOISE med-steps (lineage tag ${DART_NOISE_TAG})."
 fi
 
 # Emit --dataset.video_backend into BOTH arg strings unless the user already
@@ -2273,6 +2307,14 @@ if (( ${#BLENDS[@]} > 0 )); then
         BLENDS_TAG="${BLENDS_TAG}a$(python3 -c "import sys; print(f'{round(float(sys.argv[1])*100):03d}')" "$BLEND_DATA_FRACTION")"
     fi
 fi
+# --dart_noise changes every TRAINING in the lineage but no datasets (train-
+# time augmentation only), so — like --blend_data_fraction — it lives in the
+# blends-tag slot: `dn4` alone (no blends: lineage 03dag_rr_dn4) or appended
+# (b050anc8dn4). Resume detection, dagger_progress, dagger_plot_repeats and
+# --combine all see it as an ordinary lineage tag.
+if [[ -n "$DART_NOISE_TAG" ]]; then
+    BLENDS_TAG="${BLENDS_TAG}${DART_NOISE_TAG}"
+fi
 
 # Helper: combine BASE_DATASET_STEM + MODEL_TAG + METHOD_TAG with a given
 # (run_tag, blends_tag) pair. Used twice: once with the current command's
@@ -2518,7 +2560,7 @@ if [[ "$RERUN_MODE_ENABLED" == "true" ]]; then
         echo "  (Use --rerun_blends_from for the simple form, or set both flags.)" >&2
         exit 1
     fi
-    if (( ${#BLENDS[@]} == 0 )) && (( TARGET_INTERVENTION_VOLUME == 1 )); then
+    if (( ${#BLENDS[@]} == 0 )) && (( TARGET_INTERVENTION_VOLUME == 1 )) && [[ -z "$DART_NOISE" ]]; then
         echo "ERROR: rerun mode with no blends AND --target_intervention_volume=1 would reproduce source's training." >&2
         echo "  Add --blends, OR set --target_intervention_volume > 1 to create a meaningfully" >&2
         echo "  different lineage (= 'what would happen if I retrained with higher intervention" >&2
@@ -2710,6 +2752,7 @@ write_dagger_config_sidecar() {
     DAG_CFG_DAGGER_DATA_FRACTION_MODE="$DAGGER_DATA_FRACTION_MODE" \
     DAG_CFG_BLEND_DATA_FRACTION="$BLEND_DATA_FRACTION" \
     DAG_CFG_BLEND_RUN_TAG="$BLEND_RUN_TAG" \
+    DAG_CFG_DART_NOISE="$DART_NOISE" \
     DAG_CFG_NORM_MODE="$NORM_MODE" \
     DAG_CFG_RRT_OBSTACLE_CLEARANCE="$RRT_OBSTACLE_CLEARANCE" \
     DAG_CFG_RRT_SELF_COLLISION_CLEARANCE="$RRT_SELF_COLLISION_CLEARANCE" \
@@ -2786,6 +2829,7 @@ config = {
         "dagger_data_fraction_mode":   os.environ.get("DAG_CFG_DAGGER_DATA_FRACTION_MODE", "cap"),
         "blend_data_fraction":    float(os.environ["DAG_CFG_BLEND_DATA_FRACTION"]) if os.environ.get("DAG_CFG_BLEND_DATA_FRACTION") else None,
         "blend_run_tag":          os.environ.get("DAG_CFG_BLEND_RUN_TAG") or None,
+        "dart_noise":             float(os.environ["DAG_CFG_DART_NOISE"]) if os.environ.get("DAG_CFG_DART_NOISE") else None,
         "norm_mode":              os.environ["DAG_CFG_NORM_MODE"],
         "rrt_obstacle_clearance":      float(os.environ["DAG_CFG_RRT_OBSTACLE_CLEARANCE"]) if os.environ.get("DAG_CFG_RRT_OBSTACLE_CLEARANCE") else None,
         "rrt_self_collision_clearance": float(os.environ["DAG_CFG_RRT_SELF_COLLISION_CLEARANCE"]) if os.environ.get("DAG_CFG_RRT_SELF_COLLISION_CLEARANCE") else None,
@@ -5879,6 +5923,39 @@ PYEOF
         done
     elif (( STEP <= 2 )); then
         echo "--- Round $r, Step 2: SKIPPED (--blends is empty; no blended datasets to produce) ---"
+    fi
+
+    # Step 2-viz (base DART): with --dart_noise and no blends there is no
+    # blend dataset to QA, so render the noise-preview figure instead — the
+    # round's INTERVENTION episodes perturbed by the training-time noise
+    # distribution with their label chunks (visualize_dart_chunks
+    # --state_noise_std). Same dart_check/ location, episodes, .cmd.txt
+    # convention and idempotence as the blend dart-check plots.
+    if (( STEP <= 2 )) && [[ -n "$DART_NOISE" ]] && dataset_exists "$INT_REPO"; then
+        DART_VIZ_DIR="$TRAIN_OUTPUT_DIR/dagger/dart_check"
+        run_or_echo mkdir -p "$DART_VIZ_DIR"
+        _dart_eps="$(python3 - "$LEROBOT_CACHE/$INT_REPO" <<'PYEOF2'
+import sys
+
+import pandas as pd
+
+m = pd.read_parquet(sys.argv[1] + "/meta/episodes/chunk-000/file-000.parquet")
+n = len(m)
+print(" ".join(str(p) for p in sorted({0, n // 2, n - 1})))
+PYEOF2
+)"
+        _int_base="${INT_REPO##*/}"
+        for _ep in $_dart_eps; do
+            _dart_png="$DART_VIZ_DIR/dart_noise_${_int_base}_ep${_ep}_s${DART_NOISE}.png"
+            if [[ -f "$_dart_png" ]]; then
+                echo "  dart_noise=$DART_NOISE → $_dart_png already on disk; skipping preview plot."
+                continue
+            fi
+            _dart_cmd="python $SCRIPT_DIR/visualize_dart_chunks.py --source_repo_id=$INT_REPO --episode_index=$_ep --state_noise_std=$DART_NOISE --out=$_dart_png"
+            echo "  dart_noise=$DART_NOISE → noise-preview plot: $_dart_png"
+            run_or_echo $_dart_cmd || echo "  WARNING: dart noise-preview plot failed for ep $_ep (non-fatal)."
+            run_or_echo bash -c "echo '$_dart_cmd' > '${_dart_png%.png}.cmd.txt'"
+        done
     fi
 
     # Stop the orchestrator-managed external SplatSim now that the only

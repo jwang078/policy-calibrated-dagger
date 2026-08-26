@@ -263,6 +263,17 @@ case "$SEPARATE_BLEND_LINEAGE" in
     *) echo "ERROR: --separate_blend_lineage must be true or false (got '$SEPARATE_BLEND_LINEAGE')." >&2; exit 1 ;;
 esac
 
+# --dart_noise (base-DART, train-time state noise on the intervention repos —
+# see dagger_orchestrate.sh) changes every finetune but creates NO blend
+# datasets, so a dart-noise study is a legitimate sweep with ZERO blend
+# ratios: one no-blend rerun iteration per invocation. Detected here so the
+# mode logic below can (a) not collapse into SOURCE-ONLY mode and (b) seed a
+# single empty combination when no blend spec is given.
+DART_IN_ARGS=""
+for a in "${ORCHESTRATOR_ARGS[@]}"; do
+    [[ "$a" == --dart_noise=* ]] && DART_IN_ARGS="${a#*=}"
+done
+
 # Mode selection + mutual-exclusion validation.
 #
 # SOURCE-ONLY mode: with --auto_create_source and NO blend spec at all —
@@ -274,8 +285,16 @@ esac
 SOURCE_ONLY=false
 _POOL_STRIPPED="${COMBINATION_POOL//[ ,]/}"
 if [[ "$AUTO_CREATE_SOURCE" == "true" && -z "$SWEEP_BLENDS" && -z "$_POOL_STRIPPED" \
+      && -z "$DART_IN_ARGS" \
       && ( -z "$SWEEP_COMBINATIONS_OF" || "$SWEEP_COMBINATIONS_OF" == "0" ) ]]; then
     SOURCE_ONLY=true
+    COMBINATION_POOL=""
+    SWEEP_COMBINATIONS_OF=""
+fi
+# Dart-noise-only runs accept the same "empty pool + combinations_of=0"
+# spelling; normalize it so the pool/K set-together check below doesn't trip.
+if [[ -n "$DART_IN_ARGS" && -z "$_POOL_STRIPPED" \
+      && ( -z "$SWEEP_COMBINATIONS_OF" || "$SWEEP_COMBINATIONS_OF" == "0" ) ]]; then
     COMBINATION_POOL=""
     SWEEP_COMBINATIONS_OF=""
 fi
@@ -302,7 +321,7 @@ if [[ "$RETRAIN_ROUND0" == "true" && "$AUTO_CREATE_SOURCE" != "true" ]]; then
     exit 1
 fi
 
-if [[ "$SOURCE_ONLY" != "true" && -z "$SWEEP_BLENDS" && -z "$COMBINATION_POOL" ]]; then
+if [[ "$SOURCE_ONLY" != "true" && -z "$SWEEP_BLENDS" && -z "$COMBINATION_POOL" && -z "$DART_IN_ARGS" ]]; then
     echo "ERROR: must specify EITHER --sweep_blends='RATIO_LIST' OR --combination_pool + --sweep_combinations_of." >&2
     echo "  Examples:" >&2
     echo "    --sweep_blends='0.9 0.8 0.7'" >&2
@@ -784,6 +803,14 @@ PY
     done <<< "$COMBO_OUTPUT"
     done   # for SWEEP_K_VAL
 
+elif [[ -n "$DART_IN_ARGS" && -z "$SWEEP_BLENDS" ]]; then
+    # DART-NOISE-ONLY mode: one no-blend rerun iteration. The orchestrator
+    # receives --blends= (empty) + the forwarded --dart_noise; its dn<sigma>
+    # tag lands in the blends-tag slot, so the iteration builds the
+    # <source>_rr_dn<sigma> lineage off the source's interventions.
+    RATIO_LISTS_ARR=( "" )
+    echo "[dart_noise] no blend spec; running ONE no-blend rerun iteration with --dart_noise=$DART_IN_ARGS."
+
 else
     # SINGLE-RATIO mode. Parse the list (allow brackets/commas for ergonomics).
     _clean=$(echo "$SWEEP_BLENDS" | tr ',[]' '   ')
@@ -931,6 +958,11 @@ if [[ "$AUTO_CREATE_SOURCE" == "true" ]]; then
     for a in "${ORCHESTRATOR_ARGS[@]}"; do
         case "$a" in
             --rerun_blends_from=*|--run_tag=*|--blends=*|--final_mode=*) continue ;;
+            # Base-DART noise belongs to the RERUN lineage's finetunes only;
+            # forwarding it would fork a spurious <source>_dn<sigma> source
+            # lineage (new interventions and all) instead of reusing the
+            # plain source.
+            --dart_noise=*) continue ;;
             # The source lineage IS the baseline; the flag only has meaning for
             # a blend iteration that would otherwise reuse the source's data.
             --separate_blend_lineage|--separate_blend_lineage=*) continue ;;

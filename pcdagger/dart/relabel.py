@@ -122,6 +122,30 @@ def project_states(
     return out
 
 
+def project_state_local(q: np.ndarray, geom: DemoGeometry, center_index: float, window_steps: float) -> float:
+    """Project ONE state onto the demo polyline near ``center_index``.
+
+    Non-monotone local search over segments within ``window_steps`` demo
+    steps of the center — used by state-noise augmentation, where the
+    perturbed state's best projection may sit slightly ahead of or behind
+    the anchor frame's own index (a tangential noise component must advance
+    or retard the clock rather than masquerade as lateral deviation to
+    "correct"). Returns a continuous index ``i + f``.
+    """
+    lo = max(0, int(np.floor(center_index - window_steps)))
+    hi = min(len(geom.seg_len), int(np.ceil(center_index + window_steps)) + 1)
+    best_i, best_d = float(np.clip(center_index, 0, len(geom.seg_len))), np.inf
+    qa = np.asarray(q, dtype=np.float64)[: geom.n_arm]
+    for i in range(lo, hi):
+        if geom.seg_len[i] < 1e-9:
+            continue
+        u = float(np.clip(np.dot(qa - geom.P[i], geom.seg[i]) / (geom.seg_len[i] ** 2), 0.0, 1.0))
+        d = float(np.linalg.norm(qa - (geom.P[i] + u * geom.seg[i])))
+        if d < best_d:
+            best_d, best_i = d, i + u
+    return best_i
+
+
 def _interp_rows(mat: np.ndarray, i: float) -> np.ndarray:
     """Linear interpolation of row ``i`` (float, clamped) of matrix ``mat``."""
     idx = int(np.clip(np.floor(i), 0, len(mat) - 1))
@@ -439,6 +463,10 @@ class DartChunkDataset:
         root: str | None = None,
         collision_filter: str = "none",
         collision_margin: int = 10,
+        self_relabel: bool = False,
+        state_noise_std: float = 0.0,
+        state_noise_p: float = 1.0,
+        state_noise_seed: int | None = None,
     ):
         """Wrap ``dataset``, pairing its episodes to its source demos.
 
@@ -456,6 +484,21 @@ class DartChunkDataset:
             )
         self.collision_filter = collision_filter
         self.collision_margin = int(collision_margin)
+        # "Base DART" mode: treat every episode of THIS dataset as its own
+        # demo (identity pairing, geometry from its own states/actions,
+        # demo_index = frame_index) — lets intervention datasets be wrapped
+        # without any relabel columns or blend rollouts.
+        self.self_relabel = bool(self_relabel)
+        # Train-time state-noise augmentation (classic DART): perturb the
+        # anchor state (both obs-history rows by the SAME offset, so the
+        # recorded velocity is preserved) by N(0, (std*med_step)^2) on the
+        # arm dims with probability p, re-project locally, and synthesize
+        # the label from the perturbed state. std is in DEMO MED-STEP units
+        # so one number transfers across episodes/tasks.
+        self.state_noise_std = float(state_noise_std)
+        self.state_noise_p = float(state_noise_p)
+        self.state_noise_seed = state_noise_seed
+        self._noise_rng: np.random.Generator | None = None
         # label cache: flat index -> synthesized float32 chunk (filled by the
         # window sweep; __getitem__ becomes a lookup — the dataloader-side
         # synthesis cost drops to ~zero).
@@ -463,16 +506,23 @@ class DartChunkDataset:
         if n_arm is None:
             n_arm = max(1, int(dataset.meta.features["action"]["shape"][0]) - 1)
         self.n_arm = int(n_arm)
-        self.ep_to_source, meta_source = self._episode_pairing(dataset)
-        source_repo_id = source_repo_id or meta_source
-        if source_repo_id is None:
-            raise ValueError(
-                f"{dataset.root}: no source_repo_id given and episodes metadata lacks "
-                f"source_dataset_repo_id — re-record the blend or pass source_repo_id explicitly."
-            )
-        self.source_repo_id = source_repo_id
+        if self.self_relabel:
+            source_repo_id = source_repo_id or dataset.repo_id
+            self.geoms = load_source_geometries(source_repo_id, n_arm=self.n_arm, root=root)
+            self.ep_to_source = {ep: ep for ep in self.geoms}
+            self.source_repo_id = source_repo_id
+        else:
+            self.ep_to_source, meta_source = self._episode_pairing(dataset)
+            source_repo_id = source_repo_id or meta_source
+            if source_repo_id is None:
+                raise ValueError(
+                    f"{dataset.root}: no source_repo_id given and episodes metadata lacks "
+                    f"source_dataset_repo_id — re-record the blend or pass source_repo_id explicitly."
+                )
+            self.source_repo_id = source_repo_id
         self._fingerprinted = False
-        self.geoms = load_source_geometries(source_repo_id, n_arm=self.n_arm, root=root)
+        if not self.self_relabel:
+            self.geoms = load_source_geometries(source_repo_id, n_arm=self.n_arm, root=root)
         self._valid = self._build_valid_window()
 
     def _cache_key(self, horizon: int) -> str:
@@ -498,6 +548,7 @@ class DartChunkDataset:
                 f"ease={self.ease_out}",
                 f"cf={self.collision_filter}",
                 f"cm={self.collision_margin}",
+                f"self={self.self_relabel}",
                 f"n={len(self.dataset)}",
                 f"mtime={newest:.3f}",
             ]
@@ -533,7 +584,12 @@ class DartChunkDataset:
 
                 logging.warning("dart_relabel: ignoring unreadable label cache %s (%s)", cache_path, e)
         files = sorted(glob.glob(os.path.join(str(self.dataset.root), "data/**/*.parquet"), recursive=True))
-        cols = ["index", "episode_index", "frame_index", "observation.state", "relabel_demo_index"]
+        cols = ["index", "episode_index", "frame_index", "observation.state"]
+        has_di = "relabel_demo_index" in self.dataset.meta.features
+        if has_di:
+            cols.append("relabel_demo_index")
+        elif not self.self_relabel:
+            raise ValueError(f"{self.dataset.root}: no relabel_demo_index and self_relabel is off")
         has_vel = "relabel_velocity" in self.dataset.meta.features
         if has_vel:
             cols.append("relabel_velocity")
@@ -558,7 +614,11 @@ class DartChunkDataset:
             geom = self.geoms[src]
             g = g.sort_values("frame_index")
             states_ep = np.stack(g["observation.state"].to_numpy()).astype(np.float64)[:, : self.n_arm]
-            dis_ep = np.array([float(np.reshape(v, -1)[-1]) for v in g["relabel_demo_index"].to_numpy()])
+            if has_di:
+                dis_ep = np.array([float(np.reshape(v, -1)[-1]) for v in g["relabel_demo_index"].to_numpy()])
+            else:
+                # self-relabel: the state at frame t IS the polyline's point t.
+                dis_ep = g["frame_index"].to_numpy().astype(np.float64)
             vels_ep = (
                 np.stack(
                     [
@@ -694,7 +754,40 @@ class DartChunkDataset:
             idx = int(self._valid[idx % len(self._valid)])
         item = self.dataset[idx]
         action = item["action"]
-        cached = self._labels.get(int(idx))
+        geom = self.geoms[self.ep_to_source[int(item["episode_index"])]]
+        if "relabel_demo_index" in item:
+            _di_raw = item["relabel_demo_index"]
+            di = (
+                float(_di_raw.reshape(-1)[-1])
+                if isinstance(_di_raw, torch.Tensor)
+                else float(np.reshape(_di_raw, -1)[-1])
+            )
+        else:
+            # self-relabel: this frame IS point frame_index of its own demo.
+            _fi = item["frame_index"]
+            di = float(_fi.reshape(-1)[-1]) if isinstance(_fi, torch.Tensor) else float(_fi)
+        # ── classic-DART state noise: perturb the anchor, re-project, and
+        # synthesize the label from the perturbed state ──
+        noised = False
+        if self.state_noise_std > 0.0:
+            if self._noise_rng is None:
+                self._noise_rng = np.random.default_rng(self.state_noise_seed)
+            if self._noise_rng.random() < self.state_noise_p:
+                delta = self._noise_rng.normal(0.0, self.state_noise_std * geom.med_step, size=self.n_arm)
+                state_t = item["observation.state"].clone()
+                d_t = torch.as_tensor(delta, dtype=state_t.dtype, device=state_t.device)
+                if state_t.dim() == 2:
+                    # same offset on every obs-history row: recorded velocity
+                    # is preserved (DART perturbs position, not velocity).
+                    state_t[:, : self.n_arm] += d_t
+                else:
+                    state_t[: self.n_arm] += d_t
+                item["observation.state"] = state_t
+                q_pert = (state_t[-1] if state_t.dim() == 2 else state_t).cpu().numpy()
+                # tangential noise must move the clock, not read as deviation
+                di = project_state_local(q_pert, geom, di, window_steps=3.0 * self.state_noise_std + 4.0)
+                noised = True
+        cached = None if noised else self._labels.get(int(idx))
         if cached is not None and cached.shape[0] == action.shape[0] and self._fingerprinted:
             item["action"] = torch.as_tensor(
                 cached[:, : action.shape[1]], dtype=action.dtype, device=action.device
@@ -718,15 +811,8 @@ class DartChunkDataset:
                 .cpu()
                 .numpy()
             )
-            _di = item["relabel_demo_index"]
-            _di = (
-                float(_di.reshape(-1)[-1])
-                if isinstance(_di, torch.Tensor)
-                else float(_np.reshape(_di, -1)[-1])
-            )
-            _geom = self.geoms[self.ep_to_source[int(item["episode_index"])]]
             _lab = chunk_labels(
-                _q, _di, _geom, horizon=_stored.shape[0], rate=self.rate, ease_out=self.ease_out
+                _q, di, geom, horizon=_stored.shape[0], rate=self.rate, ease_out=self.ease_out
             )
             _diff = float(_np.abs(_lab[:, : _stored.shape[1]] - _stored).mean())
             import logging as _logging
@@ -739,9 +825,6 @@ class DartChunkDataset:
             )
         state = item["observation.state"]
         q = state[-1] if state.dim() == 2 else state  # last obs step conditions the chunk
-        di = item["relabel_demo_index"]
-        di = float(di.reshape(-1)[-1]) if isinstance(di, torch.Tensor) else float(np.reshape(di, -1)[-1])
-        geom = self.geoms[self.ep_to_source[int(item["episode_index"])]]
         prev = state[0].cpu().numpy() if (state.dim() == 2 and state.shape[0] >= 2) else None
         vel = item.get("relabel_velocity")
         if vel is not None:
@@ -811,18 +894,33 @@ def maybe_wrap_dart(
     ease_out: float = 0.3,
     collision_filter: str = "none",
     collision_margin: int = 10,
+    self_relabel_pattern: str = "",
+    state_noise_std: float = 0.0,
+    state_noise_p: float = 1.0,
 ):
-    """Wrap ``dataset`` in DartChunkDataset iff it carries ``relabel_demo_index``.
+    """Wrap ``dataset`` in DartChunkDataset when it qualifies.
 
-    The factory-side entry point for ``--dataset.dart_relabel=true``: relabeled
-    blend datasets (recorded with ``--relabel_actions=guidance``) get their
-    action chunks replaced by synthesized DART labels; every other dataset is
-    returned unchanged, so the flag is safe to set globally in mixed
-    (raw + blend) multi-source training.
+    Two qualification routes:
+      * it carries ``relabel_demo_index`` (a relabeled BLEND dataset —
+        the historical route for ``--dataset.dart_relabel=true``), or
+      * ``self_relabel_pattern`` is set and matches ``dataset.repo_id``
+        ("base DART": the dataset's own episodes serve as their own demos —
+        intervention datasets need no relabel columns and no blend rollouts).
+
+    ``state_noise_std`` (demo med-step units) adds classic-DART train-time
+    state noise to every wrapped dataset: perturb the anchor state, locally
+    re-project, synthesize the recovery label from the perturbed state.
+    Every other dataset is returned unchanged, so the flags are safe to set
+    globally in mixed (raw + blend + intervention) multi-source training.
     """
     import logging
+    import re as _re
 
-    if "relabel_demo_index" not in getattr(dataset.meta, "features", {}):
+    has_col = "relabel_demo_index" in getattr(dataset.meta, "features", {})
+    self_match = bool(self_relabel_pattern) and bool(
+        _re.search(self_relabel_pattern, getattr(dataset, "repo_id", "") or "")
+    )
+    if not has_col and not self_match:
         return dataset
     wrapped = DartChunkDataset(
         dataset,
@@ -831,6 +929,9 @@ def maybe_wrap_dart(
         ease_out=ease_out,
         collision_filter=collision_filter,
         collision_margin=collision_margin,
+        self_relabel=not has_col,
+        state_noise_std=state_noise_std,
+        state_noise_p=state_noise_p,
     )
     logging.info(
         "dart_relabel: wrapping %s with DART chunk labels (source %s, n_arm=%d, "

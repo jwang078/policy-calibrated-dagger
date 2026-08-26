@@ -487,6 +487,16 @@ def main() -> None:
         help="also render an mp4 of the corrections on the planar arm "
         "(offline PyBullet, no launch_nodes server). Bare flag = <out>.mp4",
     )
+    ap.add_argument(
+        "--state_noise_std",
+        type=float,
+        default=None,
+        help="base-DART preview (no --blend_repo_id needed): perturb the SOURCE "
+        "episode's own states by N(0, (std*med_step)^2) per frame — the same "
+        "draw distribution --dataset.dart_state_noise_std uses at train time — "
+        "and plot the label chunks servoing back. std in demo med-step units.",
+    )
+    ap.add_argument("--state_noise_seed", type=int, default=0)
     ap.add_argument("--sim_anchors", type=int, default=6, help="how many anchors to replay")
     ap.add_argument("--sim_size", type=int, default=720, help="video resolution (square)")
     ap.add_argument("--sim_stride", type=int, default=1, help="play every Nth rollout frame")
@@ -555,8 +565,66 @@ def main() -> None:
             _sim_video(args, track[:, :n], idxs, geom, res, env, out, title)
         return
 
+    if args.blend_repo_id is None and args.state_noise_std is not None:
+        # ── base-DART preview: the source episode is its own demo; anchors are
+        # its frames perturbed by the training-time noise distribution ──
+        src_ep = args.source_episode_index if args.source_episode_index is not None else args.episode_index
+        src = _load_episode(args.source_repo_id, src_ep)
+        geom = demo_geometry(src["observation.state"], src["action"], n_arm=n)
+        S = np.asarray(src["observation.state"], dtype=np.float64)[:, :n]
+        rng = np.random.default_rng(args.state_noise_seed)
+        track = S + rng.normal(0.0, args.state_noise_std * geom.med_step, size=S.shape)
+        # local (non-monotone) projection around each frame's own index — a
+        # tangential noise component must move the clock, not read as lateral
+        # deviation (mirrors dart_relabel.project_state_local).
+        w = 3.0 * args.state_noise_std + 4.0
+        idxs = np.empty(len(track))
+        for t in range(len(track)):
+            lo = max(0, int(np.floor(t - w)))
+            hi = min(len(geom.seg_len), int(np.ceil(t + w)) + 1)
+            best_i, best_d = float(np.clip(t, 0, len(geom.seg_len))), np.inf
+            for i in range(lo, hi):
+                if geom.seg_len[i] < 1e-9:
+                    continue
+                u = float(
+                    np.clip(np.dot(track[t] - geom.P[i], geom.seg[i]) / (geom.seg_len[i] ** 2), 0.0, 1.0)
+                )
+                d = float(np.linalg.norm(track[t] - (geom.P[i] + u * geom.seg[i])))
+                if d < best_d:
+                    best_d, best_i = d, i + u
+            idxs[t] = best_i
+        title = (
+            f"Base-DART noise preview — sigma={args.state_noise_std:g} med-steps on "
+            f"{args.source_repo_id} ep {src_ep}"
+        )
+        out = (
+            args.out
+            or f"dart_noise_{args.source_repo_id.split('/')[-1]}_ep{src_ep}_s{args.state_noise_std:g}.png"
+        )
+        res = _plot(
+            track,
+            idxs,
+            geom,
+            n,
+            args.horizon,
+            args.rate,
+            args.ease_out,
+            args.fps,
+            args.anchor_every,
+            title,
+            out,
+            jacobian_fn=jac_fn,
+            cartesian_lambda=args.cartesian_lambda,
+        )
+        if args.sim_video:
+            env = _load_episode(args.source_repo_id, src_ep, cols=("observation.environment_state",))
+            _sim_video(args, track, idxs, geom, res, env, out, title)
+        return
+
     if not args.blend_repo_id:
-        ap.error("pass either --blend_repo_id (dataset mode) or --npz (rollout mode)")
+        ap.error(
+            "pass either --blend_repo_id (dataset mode), --npz (rollout mode), or --state_noise_std (base-DART preview)"
+        )
     src_ep = (
         args.source_episode_index
         if args.source_episode_index is not None

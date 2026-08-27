@@ -467,6 +467,7 @@ class DartChunkDataset:
         state_noise_std: float = 0.0,
         state_noise_p: float = 1.0,
         state_noise_seed: int | None = None,
+        raw_mix: float = 0.0,
     ):
         """Wrap ``dataset``, pairing its episodes to its source demos.
 
@@ -501,6 +502,16 @@ class DartChunkDataset:
         self.state_noise_p = float(state_noise_p)
         self.state_noise_seed = state_noise_seed
         self._noise_rng: np.random.Generator | None = None
+        # Serve the ORIGINAL dataset item (real recorded action, untouched
+        # obs, original index over the FULL frame range — hold zone included)
+        # with this probability. Without it, a wrapped dataset contributes
+        # ZERO genuine states/actions and ZERO goal-arrival supervision (the
+        # anti-dawdle window excludes arrive-and-hold anchors by design):
+        # measured 2026-08-26, dn base-finetunes collapsed 6-14 points vs
+        # int-only while the per-round doses stayed neutral — prolonged
+        # training on all-synthetic corrections with no endgame is harmful.
+        # raw_mix restores the real data alongside the DART labels.
+        self.raw_mix = float(raw_mix)
         # label cache: flat index -> synthesized float32 chunk (filled by the
         # window sweep; __getitem__ becomes a lookup — the dataloader-side
         # synthesis cost drops to ~zero).
@@ -819,6 +830,13 @@ class DartChunkDataset:
         # Sample only from the precomputed hold-free window: indices map
         # uniformly onto valid anchors (len() is unchanged so multi-dataset
         # cumulative sizes stay correct).
+        if self.raw_mix > 0.0:
+            if self._noise_rng is None:
+                self._noise_rng = np.random.default_rng(self.state_noise_seed)
+            if self._noise_rng.random() < self.raw_mix:
+                # genuine sample: original index (full range incl. the demo
+                # endgame), original action, untouched observations.
+                return self.dataset[idx]
         if len(self._valid) and len(self._valid) < len(self.dataset):
             idx = int(self._valid[idx % len(self._valid)])
         item = self.dataset[idx]
@@ -995,6 +1013,7 @@ def maybe_wrap_dart(
     self_relabel_pattern: str = "",
     state_noise_std: float = 0.0,
     state_noise_p: float = 1.0,
+    raw_mix: float = 0.0,
 ):
     """Wrap ``dataset`` in DartChunkDataset when it qualifies.
 
@@ -1030,6 +1049,7 @@ def maybe_wrap_dart(
         self_relabel=not has_col,
         state_noise_std=state_noise_std,
         state_noise_p=state_noise_p,
+        raw_mix=raw_mix,
     )
     logging.info(
         "dart_relabel: wrapping %s with DART chunk labels (source %s, n_arm=%d, "

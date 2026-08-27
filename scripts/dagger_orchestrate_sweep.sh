@@ -962,7 +962,7 @@ if [[ "$AUTO_CREATE_SOURCE" == "true" ]]; then
             # forwarding it would fork a spurious <source>_dn<sigma> source
             # lineage (new interventions and all) instead of reusing the
             # plain source.
-            --dart_noise=*) continue ;;
+            --dart_noise=*|--dart_raw_mix=*) continue ;;
             # The source lineage IS the baseline; the flag only has meaning for
             # a blend iteration that would otherwise reuse the source's data.
             --separate_blend_lineage|--separate_blend_lineage=*) continue ;;

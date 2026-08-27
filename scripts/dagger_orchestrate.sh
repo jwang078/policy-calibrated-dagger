@@ -592,6 +592,10 @@ set -euo pipefail
 #                                 external sim available for intervention recording
 #                                 and the next round's interventions. The sim is
 #                                 also killed on orchestrator exit.
+#   --no_reclaim_stale_sim        Abort (legacy behavior) when --env_external_port
+#                                 is already bound, instead of killing an
+#                                 orphaned SplatSim launcher left behind by a
+#                                 crashed/killed earlier run and continuing.
 #   --no_manage_splatsim          Opt out: the user is responsible for launching
 #                                 and managing SplatSim manually on
 #                                 --env_external_port (legacy behavior). The
@@ -877,6 +881,14 @@ BLEND_RUN_TAG=""
 # ablation (labels + sampling window swap, no noise). Composable with
 # blends (tag becomes e.g. b050anc8dn4).
 DART_NOISE=""
+# --dart_raw_mix=Q (with --dart_noise): probability of serving the ORIGINAL
+# intervention sample (real action, untouched obs, endgame included) from the
+# dart-wrapped repos instead of a synthesized one. Without it the wrapped
+# repos contribute NO genuine intervention data and NO goal-arrival
+# supervision (the anti-dawdle window excludes arrive-and-hold anchors) —
+# measured 6-14 point base-finetune collapse. Encoded into the lineage tag
+# (dn4m5 for Q=0.5) so fixed runs never collide with raw_mix=0 lineages.
+DART_RAW_MIX=""
 # --exclude_gripper_from_state: forwarded verbatim to every downstream
 # training + intervention invocation. See train_sweep.sh's flag docstring
 # for the rationale (dropping the constant-0 gripper dim from
@@ -1015,6 +1027,10 @@ RETRAIN_SUFFIX="v2"
 SKIP_ALIAS_STEP=false
 PUSH_TO_HUB=false   # offline by default — see header for rationale
 MANAGE_SPLATSIM=true
+# When our port is squatted by an ORPHANED SplatSim launcher from an earlier
+# run, kill it and carry on instead of aborting the run (see
+# reclaim_stale_sim). --no_reclaim_stale_sim restores the hard error.
+RECLAIM_STALE_SIM=true
 # --headless: aggregator flag that disables every GUI/visualizer the
 # orchestrator controls — for fast batch runs where no human is watching.
 # Specifically:
@@ -1403,6 +1419,7 @@ for arg in "$@"; do
         --blend_data_fraction=*)             BLEND_DATA_FRACTION="${arg#*=}" ;;
         --blend_run_tag=*)                   BLEND_RUN_TAG="${arg#*=}" ;;
         --dart_noise=*)                      DART_NOISE="${arg#*=}" ;;
+        --dart_raw_mix=*)                    DART_RAW_MIX="${arg#*=}" ;;
         --exclude_gripper_from_state)        EXCLUDE_GRIPPER_FROM_STATE=true ;;
         --exclude_gripper_from_state=*)      EXCLUDE_GRIPPER_FROM_STATE="${arg#*=}" ;;
         --norm_mode=*)                       NORM_MODE="${arg#*=}" ;;
@@ -1435,6 +1452,7 @@ for arg in "$@"; do
         --push_to_hub)                PUSH_TO_HUB=true ;;
         --manage_splatsim)            MANAGE_SPLATSIM=true ;;
         --no_manage_splatsim)         MANAGE_SPLATSIM=false ;;
+        --no_reclaim_stale_sim)       RECLAIM_STALE_SIM=false ;;
         --headless)                   HEADLESS=true ;;
         --control_gui)                CONTROL_GUI=true ;;
         --splat_shadows)              SPLAT_SHADOWS=true ;;
@@ -1502,6 +1520,17 @@ if [[ -n "$DART_NOISE" ]]; then
     fi
     # Tag token: 4 -> dn4, 2.5 -> dn2p5, 0.5 -> dn0p5 (strip trailing zeros first).
     DART_NOISE_TAG="dn$(python3 -c "import sys; s=sys.argv[1]; s=s.rstrip('0').rstrip('.') if '.' in s else s; print(s.replace('.','p') or '0')" "$DART_NOISE")"
+    if [[ -n "$DART_RAW_MIX" ]]; then
+        if ! [[ "$DART_RAW_MIX" =~ ^0(\.[0-9]+)?$|^1(\.0+)?$ ]]; then
+            echo "ERROR: --dart_raw_mix must be in [0,1] (got '$DART_RAW_MIX')." >&2
+            exit 1
+        fi
+        # m<tenths>: 0.5 -> m5, 0.25 -> m25.
+        DART_NOISE_TAG="${DART_NOISE_TAG}m$(python3 -c "import sys; s=f'{float(sys.argv[1]):g}'.replace('0.','').rstrip('0'); print(s or '0')" "$DART_RAW_MIX")"
+    fi
+elif [[ -n "$DART_RAW_MIX" ]]; then
+    echo "ERROR: --dart_raw_mix requires --dart_noise." >&2
+    exit 1
 fi
 BLEND_LABELS_ARG=""
 if [[ "$BLEND_LABELS" == "dart" ]]; then
@@ -1526,6 +1555,9 @@ if [[ -n "$DART_NOISE" ]]; then
     # dataset and `_blend...` repos pass through. Round 0 is untouched (the
     # shared base policy must stay identical across lineages).
     FINETUNE_EXTRA_ARGS_EFF="$FINETUNE_EXTRA_ARGS_EFF --dataset.dart_relabel=true --dataset.dart_self_relabel_pattern=_r_dag\\d+\$ --dataset.dart_state_noise_std=$DART_NOISE"
+    if [[ -n "$DART_RAW_MIX" ]]; then
+        FINETUNE_EXTRA_ARGS_EFF="$FINETUNE_EXTRA_ARGS_EFF --dataset.dart_raw_mix=$DART_RAW_MIX"
+    fi
     echo "Base-DART: intervention datasets get self-relabel + state noise sigma=$DART_NOISE med-steps (lineage tag ${DART_NOISE_TAG})."
 fi
 
@@ -2753,6 +2785,7 @@ write_dagger_config_sidecar() {
     DAG_CFG_BLEND_DATA_FRACTION="$BLEND_DATA_FRACTION" \
     DAG_CFG_BLEND_RUN_TAG="$BLEND_RUN_TAG" \
     DAG_CFG_DART_NOISE="$DART_NOISE" \
+    DAG_CFG_DART_RAW_MIX="$DART_RAW_MIX" \
     DAG_CFG_NORM_MODE="$NORM_MODE" \
     DAG_CFG_RRT_OBSTACLE_CLEARANCE="$RRT_OBSTACLE_CLEARANCE" \
     DAG_CFG_RRT_SELF_COLLISION_CLEARANCE="$RRT_SELF_COLLISION_CLEARANCE" \
@@ -2830,6 +2863,7 @@ config = {
         "blend_data_fraction":    float(os.environ["DAG_CFG_BLEND_DATA_FRACTION"]) if os.environ.get("DAG_CFG_BLEND_DATA_FRACTION") else None,
         "blend_run_tag":          os.environ.get("DAG_CFG_BLEND_RUN_TAG") or None,
         "dart_noise":             float(os.environ["DAG_CFG_DART_NOISE"]) if os.environ.get("DAG_CFG_DART_NOISE") else None,
+        "dart_raw_mix":           float(os.environ["DAG_CFG_DART_RAW_MIX"]) if os.environ.get("DAG_CFG_DART_RAW_MIX") else None,
         "norm_mode":              os.environ["DAG_CFG_NORM_MODE"],
         "rrt_obstacle_clearance":      float(os.environ["DAG_CFG_RRT_OBSTACLE_CLEARANCE"]) if os.environ.get("DAG_CFG_RRT_OBSTACLE_CLEARANCE") else None,
         "rrt_self_collision_clearance": float(os.environ["DAG_CFG_RRT_SELF_COLLISION_CLEARANCE"]) if os.environ.get("DAG_CFG_RRT_SELF_COLLISION_CLEARANCE") else None,
@@ -3456,6 +3490,65 @@ wait_for_port() {
     return 1
 }
 
+# Reclaim a port held by a LEFTOVER SplatSim from an earlier run.
+#
+# Why this exists: the EXIT trap kills the managed sim on a normal exit, but a
+# SIGKILL'd / disconnected orchestrator (or a sweep iteration whose parent shell
+# died) leaves `launch_nodes.py` orphaned and still bound to $ENV_EXTERNAL_PORT.
+# Every later run then dies at start_sim with "port already in use", which
+# aborts an entire multi-hour sweep over a stale process nobody owns.
+#
+# Safety: only ever reclaims a process whose cmdline is a SplatSim launcher
+# bound to EXACTLY this port ("launch_nodes.py ... --robot_port <port>"). Any
+# other squatter still produces the hard error. And this only runs in managed
+# mode — in --no_manage_splatsim the caller owns the sim and start_sim returns
+# before ever reaching here.
+#
+# Args: $1=holder pid, $2=port, $3=label for messages.
+# Returns 0 when the port is free again, 1 when the holder is not ours (or
+# --no_reclaim_stale_sim was passed), i.e. "caller should error out".
+reclaim_stale_sim() {
+    local pid="$1" port="$2" label="${3:-SplatSim}"
+    [[ "$RECLAIM_STALE_SIM" == true ]] || return 1
+    local cmdline
+    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    [[ "$cmdline" == *launch_nodes.py* ]] || return 1
+    [[ "$cmdline" == *"--robot_port $port"* ]] || return 1
+    echo "WARNING: port $port is held by a leftover $label (pid $pid) from an earlier run:" >&2
+    echo "  ${cmdline% }" >&2
+    echo "  Reclaiming it (SIGTERM, then SIGKILL). Pass --no_reclaim_stale_sim to abort instead." >&2
+    # Kill the whole process group so the launcher subshell dies with it —
+    # unless that group is OURS (paranoia: never suicide the orchestrator).
+    local pgid our_pgid
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    our_pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+    if [[ -n "$pgid" && "$pgid" != "$our_pgid" ]]; then
+        kill -TERM -"$pgid" 2>/dev/null || true
+    else
+        kill -TERM "$pid" 2>/dev/null || true
+    fi
+    local i
+    for ((i=1; i<=30; i++)); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "  leftover sim ignored SIGTERM; sending SIGKILL." >&2
+        if [[ -n "$pgid" && "$pgid" != "$our_pgid" ]]; then
+            kill -KILL -"$pgid" 2>/dev/null || true
+        else
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+    # Wait for the kernel to actually release the listener.
+    for ((i=1; i<=15; i++)); do
+        [[ -z "$(port_in_use "$port")" ]] && { echo "  port $port reclaimed." >&2; return 0; }
+        sleep 1
+    done
+    echo "  port $port is STILL held after the kill — giving up on reclaim." >&2
+    return 1
+}
+
 start_sim() {
     echo "[start_sim] entering (managed=$MANAGE_SPLATSIM, dry-run=$DRY_RUN, pid=${MANAGED_SIM_PID:-<unset>})"
     [[ "$MANAGE_SPLATSIM" == true ]] || return 0
@@ -3484,7 +3577,7 @@ start_sim() {
     # Port already in use by someone else?
     local existing
     existing="$(port_in_use "$ENV_EXTERNAL_PORT")"
-    if [[ -n "$existing" ]]; then
+    if [[ -n "$existing" ]] && ! reclaim_stale_sim "$existing" "$ENV_EXTERNAL_PORT" "SplatSim"; then
         echo "ERROR: port $ENV_EXTERNAL_PORT already in use by pid $existing." >&2
         echo "  Either kill it, change --env_external_port, or pass --no_manage_splatsim." >&2
         exit 1
@@ -3680,7 +3773,7 @@ start_filter_sim() {
     fi
     local existing
     existing="$(port_in_use "$FILTER_COLLISION_ENV_PORT_RESOLVED")"
-    if [[ -n "$existing" ]]; then
+    if [[ -n "$existing" ]] && ! reclaim_stale_sim "$existing" "$FILTER_COLLISION_ENV_PORT_RESOLVED" "filter SplatSim"; then
         echo "ERROR: aux headless port $FILTER_COLLISION_ENV_PORT_RESOLVED already in use by pid $existing." >&2
         echo "  Either kill it, change --filter_collision_env_port, or skip the filter step." >&2
         exit 1
@@ -3797,7 +3890,15 @@ stop_filter_sim() {
 }
 
 # Cleanup on exit (success or crash). Idempotent. Both sims get stopped.
+# EXIT covers normal/`set -e` exits. INT/TERM/HUP are listed explicitly so a
+# Ctrl-C or a closed terminal also tears the sims down instead of orphaning
+# `launch_nodes.py` on $ENV_EXTERNAL_PORT (the leak reclaim_stale_sim exists to
+# clean up after). Re-raising the signal after cleanup preserves the correct
+# 128+N exit status for whoever is waiting on us (sweep / repeat wrappers).
 trap 'stop_sim; stop_filter_sim' EXIT
+trap 'stop_sim; stop_filter_sim; trap - INT;  kill -INT  $$' INT
+trap 'stop_sim; stop_filter_sim; trap - TERM; kill -TERM $$' TERM
+trap 'stop_sim; stop_filter_sim; trap - HUP;  kill -HUP  $$' HUP
 
 # ── pre-flight: validate every round's derived names ──────────────────────────
 # Skipped in --cleanup_only mode: that path only deletes already-existing

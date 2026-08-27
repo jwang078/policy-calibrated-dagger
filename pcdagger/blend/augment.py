@@ -1221,6 +1221,14 @@ def run_augmentation(
     # expected_features makes the resume-schema check refuse pre-relabel
     # targets instead of failing mid-write.
     extra_features: dict[str, dict] = {}
+    # Per-frame collision flag from the LIVE blend rollout — lets collision
+    # filtering happen at train time (loader-side window) instead of a
+    # destructive replay filter producing _nc/_tfc copies. Declared for BOTH
+    # label modes: the frame writer attaches it unconditionally, and gating
+    # the declaration on guidance-relabel made executed-label runs die with
+    # "Extra features: {'frame_in_collision'}" at the first add_frame
+    # (2026-08-27, first blend_labels=executed run since the flag landed).
+    extra_features["frame_in_collision"] = {"dtype": "float32", "shape": (1,), "names": None}
     if cfg.relabel_actions == "guidance":
         extra_features["relabel_demo_index"] = {"dtype": "float32", "shape": (1,), "names": None}
         extra_features["relabel_velocity"] = {
@@ -1228,11 +1236,7 @@ def run_augmentation(
             "shape": (cfg.num_dofs,),
             "names": None,
         }
-        # Per-frame collision flag from the LIVE blend rollout — lets
-        # collision filtering happen at train time (loader-side window)
-        # instead of a destructive replay filter producing _nc/_tfc copies.
-        extra_features["frame_in_collision"] = {"dtype": "float32", "shape": (1,), "names": None}
-        expected_features = {**expected_features, **extra_features}
+    expected_features = {**expected_features, **extra_features}
     existing = load_lerobot_dataset(cfg.target_dataset_repo_id)
     if existing is not None:
         _existing_feats = existing.meta.features

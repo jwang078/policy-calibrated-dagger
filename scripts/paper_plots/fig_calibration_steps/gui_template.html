@@ -1,0 +1,155 @@
+<title>Calibration Steps Styler</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{--bg:#f4f5f7;--panel:#ffffff;--ink:#1c2128;--muted:#5d6672;--line:#d9dde3;--accent:#2a5f9e;--accent-ink:#ffffff;--code:#eef1f5}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#171a1f;--panel:#1f242b;--ink:#e6e9ee;--muted:#9aa4b1;--line:#343b45;--accent:#6aa5e6;--accent-ink:#0f1318;--code:#262c35}}
+:root[data-theme="dark"]{--bg:#171a1f;--panel:#1f242b;--ink:#e6e9ee;--muted:#9aa4b1;--line:#343b45;--accent:#6aa5e6;--accent-ink:#0f1318;--code:#262c35}
+body{background:var(--bg);color:var(--ink);font-family:"IBM Plex Sans",system-ui,sans-serif;font-size:14px;padding-inline:16px;padding-block:14px}
+h1{font-size:17px;font-weight:600;margin:0 0 10px}
+.wrap{display:grid;grid-template-columns:minmax(0,1fr) 370px;gap:16px}
+@media (max-width:1000px){.wrap{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px}
+.chart{position:sticky;top:10px}
+svg{width:100%;height:auto;background:#fff;border-radius:4px;display:block}
+fieldset{border:1px solid var(--line);border-radius:6px;margin:0 0 10px;padding:8px 10px}
+legend{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);padding:0 4px}
+.row{display:flex;gap:8px;align-items:center;margin:5px 0;flex-wrap:wrap}
+.row label{flex:0 0 100px;color:var(--muted);font-size:12.5px}
+.row input[type=text],.row select{flex:1 1 120px;min-width:0;font:inherit;font-size:13px;padding:4px 6px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--ink)}
+.row input[type=range]{flex:1 1 100px}
+.row input[type=color]{width:34px;height:26px;padding:0;border:1px solid var(--line);border-radius:4px;background:none}
+.row .num{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--muted);width:44px;text-align:right}
+.chk{display:flex;align-items:center;gap:6px;font-size:13px}
+button{font:inherit;font-size:13px;padding:6px 12px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-ink);border-radius:5px;cursor:pointer}
+button.ghost{background:none;color:var(--accent)}
+pre{background:var(--code);border-radius:6px;padding:10px;font:12px/1.45 "IBM Plex Mono",monospace;overflow-x:auto;max-height:260px;white-space:pre}
+.hint{font-size:12px;color:var(--muted);margin:4px 0 0}
+</style>
+<h1>Calibration steps figure — styler</h1>
+<div class="wrap">
+  <div class="panel chart"><div class="row" style="margin:0 0 6px"><label>preview zoom</label><input type="range" id="zoom" min="1" max="3" step="0.05" value="1"><span class="num" id="zoomv">1.00</span></div>
+    <div id="scroller" style="overflow:auto"><svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg></div>
+    <p class="hint">Drag the blend legend and the formula text on panel (b) to place them. Placeholders: {WVAL} {TRMEAN} {SVAL} {SQRT_S} {YSTRETCH}; in the blend label {r} {x}. Wrap math in $…$ (matplotlib mathtext: \mathrm not \text). Copy CONFIG → paste over the CONFIG block in plot.py and re-run.</p></div>
+  <div class="panel" id="ctl"></div>
+</div>
+<script id="data" type="application/json">__DATA__</script>
+<script>window.MathJax = {startup: {typeset: false}, svg: {fontCache: 'none'}};</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg.js"></script>
+<script>
+const D = JSON.parse(document.getElementById('data').textContent);
+const C = JSON.parse(JSON.stringify(D.config));
+const PX = 100/72;                       // matplotlib points -> px at 100 dpi
+const [Wd, Ht] = D.fig_px;
+const svg = document.getElementById('svg'); svg.setAttribute('viewBox', `0 0 ${Wd} ${Ht}`);
+const NS = 'http://www.w3.org/2000/svg';
+const fmtv = {...D.fmt};
+function sub(t, extra={}) { const v = {...fmtv, ...extra};
+  return t.replace(/\{([A-Za-z_]\w*)(?::([^}]*))?\}/g, (m, k, spec) => { if (!(k in v)) return m; const val = v[k];
+    if (spec) { const mm = spec.match(/\.(\d)f/); if (mm) return Number(val).toFixed(+mm[1]); if (spec === 'g') return String(+Number(val).toPrecision(6)); }
+    return typeof val === 'number' ? String(+val.toFixed(3)) : String(val); }); }
+function el(n, a, txt) { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); if (txt != null) e.textContent = txt; return e; }
+function textOrTex(a, s) {
+  if (!s.includes('$') || !window.MathJax || !MathJax.tex2svg) return el('text', a, s);
+  const parts = s.split('$'); const tex = parts.map((p, i) => i % 2 ? p : (p ? '\\text{' + p.replace(/([\\{}$&#^_%])/g, '\\$1') + '}' : '')).join('');
+  let node; try { node = MathJax.tex2svg(tex, {display: false}).querySelector('svg'); } catch (e) { return el('text', a, s); }
+  const fs = +a['font-size'] || 14, exPx = fs * 0.5;
+  const w = parseFloat(node.getAttribute('width')) * exPx, h = parseFloat(node.getAttribute('height')) * exPx;
+  node.setAttribute('width', w); node.setAttribute('height', h);
+  const anchor = a['text-anchor'] || 'start', base = a['dominant-baseline'] || 'auto';
+  const dx = anchor === 'middle' ? -w/2 : anchor === 'end' ? -w : 0;
+  const va = parseFloat((node.style.verticalAlign || '0ex')) * exPx;
+  const dy = base === 'hanging' ? 0 : base === 'middle' ? -h/2 : -(h + va);
+  node.setAttribute('x', (+a.x) + dx); node.setAttribute('y', (+a.y) + dy);
+  node.querySelectorAll('[fill="currentColor"], g[fill]').forEach(g => g.setAttribute('fill', a.fill || '#222'));
+  node.setAttribute('fill', a.fill || '#222'); node.style.color = a.fill || '#222';
+  if (a.transform) { const g = el('g', {transform: a.transform}); g.appendChild(node); return g; }
+  for (const k of ['id', 'cursor']) if (a[k]) node.setAttribute(k, a[k]);
+  return node;
+}
+// per-axis data->px transforms (from matplotlib's own axes boxes)
+const AX = D.axes.map(b => ({...b, X: x => b.x0 + (x - b.xlim[0]) / (b.xlim[1] - b.xlim[0]) * (b.x1 - b.x0), Y: y => b.y1 - (y - b.ylim[0]) / (b.ylim[1] - b.ylim[0]) * (b.y1 - b.y0)}));
+function poly(ax, pts) { return pts.map((p, i) => (i ? 'L' : 'M') + ax.X(p[0]).toFixed(2) + ' ' + ax.Y(p[1]).toFixed(2)).join(' '); }
+function union(ax, polys, color, alpha, z) { const d = polys.map(P => poly(ax, P) + ' Z').join(' '); return el('path', {d, fill: color, 'fill-opacity': alpha, 'fill-rule': 'nonzero', stroke: 'none'}); }
+function line(ax, pts, color, lw, alpha) { return el('path', {d: poly(ax, pts), fill: 'none', stroke: color, 'stroke-width': lw * PX, 'stroke-opacity': alpha == null ? 1 : alpha, 'stroke-linecap': 'round'}); }
+function ticks(ax, i) {
+  const g = el('g', {});
+  const nice = (lo, hi) => { const span = hi - lo, step = [0.1, 0.2, 0.25, 0.5, 1, 2][Math.max(0, [0.1, 0.2, 0.25, 0.5, 1, 2].findIndex(s => span / s <= 8))] || 1; const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(6)); return out; };
+  nice(ax.xlim[0], ax.xlim[1]).forEach(v => { const x = ax.X(v); g.appendChild(el('line', {x1: x, x2: x, y1: ax.y0, y2: ax.y1, stroke: '#e4e4e4', 'stroke-width': 0.6 * PX})); g.appendChild(el('line', {x1: x, x2: x, y1: ax.y1, y2: ax.y1 + 3.5 * PX, stroke: '#222'})); g.appendChild(el('text', {x, y: ax.y1 + 3.5 * PX + C.size_tick * PX + 2, 'text-anchor': 'middle', 'font-size': C.size_tick * PX, fill: '#222'}, String(v))); });
+  nice(ax.ylim[0], ax.ylim[1]).forEach(v => { const y = ax.Y(v); g.appendChild(el('line', {x1: ax.x0, x2: ax.x1, y1: y, y2: y, stroke: '#e4e4e4', 'stroke-width': 0.6 * PX})); if (i === 0) { g.appendChild(el('line', {x1: ax.x0 - 3.5 * PX, x2: ax.x0, y1: y, y2: y, stroke: '#222'})); g.appendChild(el('text', {x: ax.x0 - 3.5 * PX - 4, y: y + C.size_tick * PX * 0.35, 'text-anchor': 'end', 'font-size': C.size_tick * PX, fill: '#222'}, String(v))); } });
+  g.appendChild(el('line', {x1: ax.x0, x2: ax.x1, y1: ax.y1, y2: ax.y1, stroke: '#222'})); g.appendChild(el('line', {x1: ax.x0, x2: ax.x0, y1: ax.y0, y2: ax.y1, stroke: '#222'}));
+  return g;
+}
+function wMarker(ax) {
+  const P = D.path, n = P.length, tm = Math.round(C.w_mark_frac * (n - 1));
+  const a = P[Math.max(tm - 3, 0)], b = P[Math.min(tm + 3, n - 1)]; let tx = b[0] - a[0], ty = b[1] - a[1]; const L = Math.hypot(tx, ty) || 1; tx /= L; ty /= L;
+  const nx = -ty * C.w_mark_side, ny = tx * C.w_mark_side; const p0 = P[tm], p1 = [p0[0] + nx * D.w_marker_fn.W_ms, p0[1] + ny * D.w_marker_fn.W_ms];
+  const g = el('g', {}); const x0 = ax.X(p0[0]), y0 = ax.Y(p0[1]), x1 = ax.X(p1[0]), y1 = ax.Y(p1[1]);
+  g.appendChild(el('line', {x1: x0, y1: y0, x2: x1, y2: y1, stroke: C.col_wmark, 'stroke-width': 1.2 * PX}));
+  const cx = x1 - x0, cy = y1 - y0, cl = Math.hypot(cx, cy) || 1, px = -cy / cl * 4, py = cx / cl * 4;
+  for (const [x, y] of [[x0, y0], [x1, y1]]) g.appendChild(el('line', {x1: x - px, y1: y - py, x2: x + px, y2: y + py, stroke: C.col_wmark, 'stroke-width': 1.2 * PX}));
+  const mx = (x0 + x1) / 2 + 0.06 * D.w_marker_fn.W_ms * tx * (ax.x1 - ax.x0) / (ax.xlim[1] - ax.xlim[0]), my = (y0 + y1) / 2;
+  g.appendChild(textOrTex({x: mx + 3, y: my, 'font-size': 10 * PX, fill: C.col_wmark, 'dominant-baseline': 'middle'}, C.w_label));
+  return g;
+}
+let dragging = null;
+function drag(node, onmove) { node.style.cursor = 'move'; node.addEventListener('pointerdown', ev => { ev.preventDefault(); const mv = e2 => { const pt = svg.createSVGPoint(); pt.x = e2.clientX; pt.y = e2.clientY; const p = pt.matrixTransform(svg.getScreenCTM().inverse()); onmove(p); draw(); sync(); }; const up = () => { window.removeEventListener('pointermove', mv); window.removeEventListener('pointerup', up); }; window.addEventListener('pointermove', mv); window.addEventListener('pointerup', up); }); }
+function draw() {
+  svg.innerHTML = '';
+  const titles = C.titles.map(t => sub(t));
+  const panels = [ // which geometry each axis shows
+    () => { const ax = AX[0]; const g = el('g', {}); g.appendChild(union(ax, D.tube_open, C.col_open, C.alpha_open)); D.outl_open.forEach(P => g.appendChild(line(ax, P.concat([P[0]]), C.col_open_outline, 0.9, 0.75))); return g; },
+    () => { const ax = AX[1]; const g = el('g', {}); g.appendChild(union(ax, D.tube_w, C.col_wtube, C.alpha_wtube)); D.blend_tags.forEach((t, i) => g.appendChild(line(ax, D.blends[t], C.col_blends[i], C.lw_blend, 0.85))); g.appendChild(wMarker(ax)); return g; },
+    () => { const ax = AX[2]; const g = el('g', {}); g.appendChild(union(ax, D.tube_pa, C.col_dep, C.alpha_dep)); D.outl_pa.forEach(P => g.appendChild(line(ax, P.concat([P[0]]), C.col_dep_outline, 0.9, 0.75))); return g; },
+    () => { const ax = AX[3]; const g = el('g', {}); g.appendChild(union(ax, D.tube_dep, C.col_dep, C.alpha_dep)); D.outl_dep.forEach(P => g.appendChild(line(ax, P.concat([P[0]]), C.col_dep_outline, 0.9, 0.75))); D.labels.forEach((l, i) => { g.appendChild(line(ax, l.curve, C.col_labels[i % C.col_labels.length], C.lw_label)); g.appendChild(el('circle', {cx: ax.X(l.start[0]), cy: ax.Y(l.start[1]), r: 2.25 * PX, fill: C.col_labels[i % C.col_labels.length]})); }); return g; },
+  ];
+  AX.forEach((ax, i) => {
+    svg.appendChild(ticks(ax, i));
+    if (i < panels.length) svg.appendChild(panels[i]());
+    const path = line(ax, D.path, C.col_expert, C.lw_expert, 1.0); svg.appendChild(path);   // expert path on top of tubes
+    svg.appendChild(el('circle', {cx: ax.X(D.path[0][0]), cy: ax.Y(D.path[0][1]), r: 2.5 * PX, fill: C.col_expert}));
+    if (i === 1) { D.blend_tags.forEach((t, k) => svg.appendChild(line(ax, D.blends[t], C.col_blends[k], C.lw_blend, 0.85))); svg.appendChild(wMarker(ax)); }
+    if (i === 3) D.labels.forEach((l, k) => { svg.appendChild(line(ax, l.curve, C.col_labels[k % C.col_labels.length], C.lw_label)); svg.appendChild(el('circle', {cx: ax.X(l.start[0]), cy: ax.Y(l.start[1]), r: 2.25 * PX, fill: C.col_labels[k % C.col_labels.length]})); });
+    svg.appendChild(textOrTex({x: (ax.x0 + ax.x1) / 2, y: ax.y0 - 6, 'text-anchor': 'middle', 'font-size': C.size_title * PX, fill: '#111'}, titles[i]));
+    svg.appendChild(textOrTex({x: (ax.x0 + ax.x1) / 2, y: ax.y1 + 3.5 * PX + C.size_tick * PX + 6 + C.size_label * PX, 'text-anchor': 'middle', 'font-size': C.size_label * PX, fill: '#111'}, sub(C.xlabel)));
+  });
+  const a0 = AX[0]; svg.appendChild(textOrTex({x: a0.x0 - 3.5 * PX - 8 - C.size_tick * PX * 2.6, y: (a0.y0 + a0.y1) / 2, 'text-anchor': 'middle', 'font-size': C.size_label * PX, fill: '#111', transform: `rotate(-90 ${a0.x0 - 3.5 * PX - 8 - C.size_tick * PX * 2.6} ${(a0.y0 + a0.y1) / 2})`}, sub(C.ylabel)));
+  if (C.suptitle) svg.appendChild(textOrTex({x: Wd / 2, y: Math.min(...AX.map(a => a.y0)) - 6 - C.size_title * PX - 10, 'text-anchor': 'middle', 'font-size': C.size_suptitle * PX, fill: '#111'}, sub(C.suptitle)));
+  // legend (panel b), anchored at C.legend_xy (axes fraction) by C.legend_align corner
+  const ax = AX[1]; const lh = C.size_legend * PX * 1.45; const n = D.blend_tags.length; const lwid = 140 * C.size_legend / 7.5;
+  const ex = ax.x0 + C.legend_xy[0] * (ax.x1 - ax.x0), ey = ax.y1 - C.legend_xy[1] * (ax.y1 - ax.y0);
+  const lx = C.legend_align.includes('right') ? ex - lwid : C.legend_align.includes('center') ? ex - lwid / 2 : ex;
+  const ly = C.legend_align.includes('lower') ? ey - n * lh : C.legend_align.includes('center') && !C.legend_align.includes('upper') ? ey - n * lh / 2 : ey;
+  const lg = el('g', {id: 'legend'}); lg.appendChild(el('rect', {x: lx - 4, y: ly - 2, width: lwid + 8, height: n * lh + 4, fill: 'white', 'fill-opacity': 0.0}));
+  D.blend_tags.forEach((t, i) => { const cy = ly + i * lh + lh * 0.55; lg.appendChild(el('line', {x1: lx, x2: lx + 18, y1: cy, y2: cy, stroke: C.col_blends[i], 'stroke-width': C.lw_blend * PX})); lg.appendChild(textOrTex({x: lx + 24, y: cy + C.size_legend * PX * 0.35, 'font-size': C.size_legend * PX, fill: '#222'}, sub(C.blend_label, {r: +t / 100, x: D.settle[t]}))); });
+  svg.appendChild(lg);
+  drag(lg, p => { const fx = (p.x + (C.legend_align.includes('right') ? lwid : C.legend_align.includes('center') ? lwid / 2 : 0) - ax.x0) / (ax.x1 - ax.x0); const fy = (ax.y1 - (p.y + (C.legend_align.includes('lower') ? n * lh : 0))) / (ax.y1 - ax.y0); C.legend_xy = [+fx.toFixed(3), +fy.toFixed(3)]; });
+  // formula text (panel b), bottom-left anchored at axes fraction
+  const fx = ax.x0 + C.formula_xy[0] * (ax.x1 - ax.x0), fy = ax.y1 - C.formula_xy[1] * (ax.y1 - ax.y0);
+  const ft = textOrTex({x: fx, y: fy, 'font-size': C.size_formula * PX, fill: '#333', id: 'formula'}, sub(C.formula_text)); svg.appendChild(ft);
+  drag(ft, p => { C.formula_xy = [+((p.x - ax.x0) / (ax.x1 - ax.x0)).toFixed(3), +((ax.y1 - p.y) / (ax.y1 - ax.y0)).toFixed(3)]; });
+}
+// ── controls ──
+const ctl = document.getElementById('ctl');
+function textRow(lbl, get, set) { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = `<label>${lbl}</label><input type="text">`; const i = r.querySelector('input'); i.value = get(); i.addEventListener('input', () => { set(i.value); draw(); sync(); }); return r; }
+function colorRow(lbl, get, set) { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = `<label>${lbl}</label><input type="color"><input type="text" style="flex:0 1 90px">`; const c = r.querySelector('[type=color]'), t = r.querySelector('[type=text]'); c.value = get(); t.value = get(); c.addEventListener('input', () => { set(c.value); t.value = c.value; draw(); sync(); }); t.addEventListener('change', () => { set(t.value); c.value = t.value; draw(); sync(); }); return r; }
+function rangeRow(lbl, min, max, step, get, set) { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = `<label>${lbl}</label><input type="range" min="${min}" max="${max}" step="${step}"><span class="num"></span>`; const i = r.querySelector('input'), n = r.querySelector('.num'); const upd = () => { i.value = get(); n.textContent = get(); }; upd(); i.addEventListener('input', () => { set(+i.value); n.textContent = i.value; draw(); sync(); }); r.refresh = upd; return r; }
+function selRow(lbl, opts, get, set) { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = `<label>${lbl}</label><select>${opts.map(o => `<option>${o}</option>`).join('')}</select>`; const s = r.querySelector('select'); s.value = get(); s.addEventListener('change', () => { set(s.value); draw(); sync(); }); return r; }
+function fs(title, ...kids) { const f = document.createElement('fieldset'); f.innerHTML = `<legend>${title}</legend>`; kids.forEach(k => f.appendChild(k)); return f; }
+const lx = rangeRow('legend x', 0, 1.2, 0.005, () => C.legend_xy[0], v => C.legend_xy[0] = v), ly = rangeRow('legend y', 0, 1.2, 0.005, () => C.legend_xy[1], v => C.legend_xy[1] = v);
+const fx = rangeRow('formula x', 0, 1, 0.005, () => C.formula_xy[0], v => C.formula_xy[0] = v), fy = rangeRow('formula y', 0, 1, 0.005, () => C.formula_xy[1], v => C.formula_xy[1] = v);
+ctl.append(
+  fs('Titles & labels', textRow('figure title', () => C.suptitle, v => C.suptitle = v), ...C.titles.map((t, i) => textRow(`title (${'abcd'[i]})`, () => C.titles[i], v => C.titles[i] = v)), textRow('x label', () => C.xlabel, v => C.xlabel = v), textRow('y label', () => C.ylabel, v => C.ylabel = v)),
+  fs('Panel (b): legend', textRow('entry template', () => C.blend_label, v => C.blend_label = v), selRow('anchor corner', ['upper right', 'upper left', 'lower right', 'lower left', 'center right', 'center left'], () => C.legend_align, v => C.legend_align = v), lx, ly),
+  fs('Panel (b): formula & W', textRow('formula', () => C.formula_text, v => C.formula_text = v), fx, fy, textRow('W label', () => C.w_label, v => C.w_label = v), rangeRow('W marker at', 0, 1, 0.01, () => C.w_mark_frac, v => C.w_mark_frac = v), selRow('W marker side', ['1', '-1'], () => String(C.w_mark_side), v => C.w_mark_side = +v)),
+  fs('Colors', colorRow('expert path', () => C.col_expert, v => C.col_expert = v), ...[0, 1, 2].map(i => colorRow(`blend ${['0.10', '0.20', '0.30'][i]}`, () => C.col_blends[i], v => C.col_blends[i] = v)), colorRow('W tube', () => C.col_wtube, v => C.col_wtube = v), colorRow('W marker', () => C.col_wmark, v => C.col_wmark = v), colorRow('open-loop tube', () => C.col_open, v => C.col_open = v), colorRow('open-loop outline', () => C.col_open_outline, v => C.col_open_outline = v), colorRow('injected tube', () => C.col_dep, v => C.col_dep = v), colorRow('injected outline', () => C.col_dep_outline, v => C.col_dep_outline = v), ...[0, 1, 2].map(i => colorRow(`servo label ${i + 1}`, () => C.col_labels[i], v => C.col_labels[i] = v))),
+  fs('Opacity & widths', rangeRow('open-loop α', 0.05, 1, 0.05, () => C.alpha_open, v => C.alpha_open = v), rangeRow('injected α', 0.05, 1, 0.05, () => C.alpha_dep, v => C.alpha_dep = v), rangeRow('W tube α', 0.05, 1, 0.05, () => C.alpha_wtube, v => C.alpha_wtube = v), rangeRow('expert lw', 0.5, 6, 0.1, () => C.lw_expert, v => C.lw_expert = v), rangeRow('blend lw', 0.5, 4, 0.1, () => C.lw_blend, v => C.lw_blend = v), rangeRow('label lw', 0.5, 4, 0.1, () => C.lw_label, v => C.lw_label = v)),
+  fs('Font sizes (pt)', rangeRow('figure title', 6, 18, 0.5, () => C.size_suptitle, v => C.size_suptitle = v), rangeRow('panel titles', 6, 16, 0.5, () => C.size_title, v => C.size_title = v), rangeRow('axis labels', 6, 16, 0.5, () => C.size_label, v => C.size_label = v), rangeRow('ticks', 6, 14, 0.5, () => C.size_tick, v => C.size_tick = v), rangeRow('legend', 5, 12, 0.5, () => C.size_legend, v => C.size_legend = v), rangeRow('formula', 5, 12, 0.5, () => C.size_formula, v => C.size_formula = v)),
+);
+const out = document.createElement('div'); out.innerHTML = `<div class="row"><button id="copy">Copy CONFIG</button><button class="ghost" id="reset">Reset</button></div><pre id="cfg"></pre>`; ctl.appendChild(out);
+function pyRepr(v) { if (typeof v === 'string') { return v.includes('\\') ? 'r"' + v.replace(/"/g, '\\"') + '"' : JSON.stringify(v); } if (typeof v === 'boolean') return v ? 'True' : 'False'; if (typeof v === 'number') return String(v); if (Array.isArray(v)) return '[' + v.map(pyRepr).join(', ') + ']'; return '{' + Object.entries(v).map(([k, x]) => `${JSON.stringify(k)}: ${pyRepr(x)}`).join(', ') + '}'; }
+function sync() { const lines = Object.entries(C).map(([k, v]) => `    ${JSON.stringify(k)}: ${pyRepr(v)},`); document.getElementById('cfg').textContent = 'CONFIG = {\n' + lines.join('\n') + '\n}'; lx.refresh(); ly.refresh(); fx.refresh(); fy.refresh(); }
+document.getElementById('copy').addEventListener('click', () => { navigator.clipboard.writeText(document.getElementById('cfg').textContent).then(() => { document.getElementById('copy').textContent = 'Copied'; setTimeout(() => document.getElementById('copy').textContent = 'Copy CONFIG', 1200); }); });
+document.getElementById('reset').addEventListener('click', () => location.reload());
+document.getElementById('zoom').addEventListener('input', e => { const z = +e.target.value; svg.style.width = (z * 100) + '%'; document.getElementById('zoomv').textContent = z.toFixed(2); });
+(window.MathJax && MathJax.startup ? MathJax.startup.promise : Promise.resolve()).then(() => { draw(); sync(); });
+</script>

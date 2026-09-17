@@ -1,0 +1,94 @@
+<title>Lever Teaser Styler</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{--bg:#f4f5f7;--panel:#ffffff;--ink:#1c2128;--muted:#5d6672;--line:#d9dde3;--accent:#2a5f9e;--accent-ink:#ffffff;--code:#eef1f5}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#171a1f;--panel:#1f242b;--ink:#e6e9ee;--muted:#9aa4b1;--line:#343b45;--accent:#6aa5e6;--accent-ink:#0f1318;--code:#262c35}}
+:root[data-theme="dark"]{--bg:#171a1f;--panel:#1f242b;--ink:#e6e9ee;--muted:#9aa4b1;--line:#343b45;--accent:#6aa5e6;--accent-ink:#0f1318;--code:#262c35}
+body{background:var(--bg);color:var(--ink);font-family:"IBM Plex Sans",system-ui,sans-serif;font-size:14px;padding-inline:16px;padding-block:14px}
+h1{font-size:17px;font-weight:600;margin:0 0 10px}
+.wrap{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:16px}
+@media (max-width:1000px){.wrap{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px}
+.chart{position:sticky;top:10px}
+svg{width:100%;height:auto;background:#fff;border-radius:4px;display:block}
+fieldset{border:1px solid var(--line);border-radius:6px;margin:0 0 10px;padding:8px 10px}
+legend{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);padding:0 4px}
+.row{display:flex;gap:8px;align-items:center;margin:5px 0;flex-wrap:wrap}
+.row label{flex:0 0 108px;color:var(--muted);font-size:12.5px}
+.row input[type=text],.row select{flex:1 1 110px;min-width:0;font:inherit;font-size:13px;padding:4px 6px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--ink)}
+.row input[type=range]{flex:1 1 100px}
+.row input[type=color]{width:34px;height:26px;padding:0;border:1px solid var(--line);border-radius:4px;background:none}
+.row .num{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--muted);width:48px;text-align:right}
+.chk{display:flex;align-items:center;gap:6px;font-size:13px;margin:5px 0}
+button{font:inherit;font-size:13px;padding:6px 12px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-ink);border-radius:5px;cursor:pointer}
+button.ghost{background:none;color:var(--accent)}
+pre{background:var(--code);border-radius:6px;padding:10px;font:12px/1.45 "IBM Plex Mono",monospace;overflow-x:auto;max-height:260px;white-space:pre}
+.hint{font-size:12px;color:var(--muted);margin:6px 0 0}
+</style>
+<h1>Lever teaser — styler</h1>
+<div class="wrap">
+  <div class="panel chart"><svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg>
+    <p class="hint">Real-data preview: photoreal render, expert path, calibrated noise band (per-frame k·σ pixel ellipses) and recovery arcs, all from geom_*.json. Path range trims both the path and the band. Copy CONFIG → paste over the CONFIG block in plot.py and run <code>python plot.py __TAG__</code>.</p></div>
+  <div class="panel" id="ctl"></div>
+</div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+const D = JSON.parse(document.getElementById('data').textContent);
+const C = JSON.parse(JSON.stringify(D.config));
+const W = D.W, H = D.H, TITLE_H = 58;
+const svg = document.getElementById('svg'); const NS = 'http://www.w3.org/2000/svg';
+function el(n, a, txt) { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); if (txt != null) e.textContent = txt; return e; }
+function ellipse(mu, cov, k, n = 40) {   // 2x2 symmetric eigen
+  const a = cov[0][0], b = cov[0][1], c = cov[1][1]; const tr = a + c, det = a * c - b * b; const disc = Math.sqrt(Math.max(tr * tr / 4 - det, 0));
+  let l1 = tr / 2 + disc, l2 = tr / 2 - disc; l1 = Math.max(l1, 1e-6); l2 = Math.max(l2, 1e-6);
+  let vx = b, vy = l1 - a; if (Math.abs(vx) + Math.abs(vy) < 1e-9) { vx = 1; vy = 0; } const L = Math.hypot(vx, vy); vx /= L; vy /= L;
+  const pts = []; for (let i = 0; i < n; i++) { const t = 2 * Math.PI * i / n; const x = Math.cos(t) * Math.sqrt(l1) * k, y = Math.sin(t) * Math.sqrt(l2) * k; pts.push([mu[0] + x * vx - y * vy, mu[1] + x * vy + y * vx]); } return pts;
+}
+function dist2path(p, P) { let m = 1e9; for (const q of P) { const d = Math.hypot(p[0] - q[0], p[1] - q[1]); if (d < m) m = d; } return m; }
+function trim(arc) { const s = arc[0]; for (let i = 0; i < arc.length; i++) { const moved = Math.hypot(arc[i][0] - s[0], arc[i][1] - s[1]) > C.arc_min_travel_px; if (moved && dist2path(arc[i], D.px_path) < C.arc_trim_px) return arc.slice(0, i + 1); } return arc; }
+function poly(pts, close) { return pts.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ') + (close ? ' Z' : ''); }
+function draw() {
+  svg.innerHTML = '';
+  const [x0, y0, x1, y1] = C.crop; const X0 = x0 * W, Y0 = y0 * H, X1 = x1 * W, Y1 = y1 * H; const cw = X1 - X0, ch = Y1 - Y0;
+  const scale = 640 / cw; svg.setAttribute('viewBox', `0 0 640 ${(ch * scale + TITLE_H).toFixed(0)}`);
+  // title (two lines, colored parts)
+  const lines = [[]]; for (const [txt, col] of C.title) { const parts = txt.split('\n'); parts.forEach((pt, i) => { if (i) lines.push([]); if (pt) lines[lines.length - 1].push([pt, col]); }); }
+  lines.forEach((line, li) => { const t = el('text', {x: 320, y: 22 + li * 24, 'text-anchor': 'middle', 'font-size': C.title_size * 1.35, 'font-family': 'DejaVu Sans, Verdana, sans-serif'}); for (const [txt, col] of line) { const ts = el('tspan', {fill: col}, txt); t.appendChild(ts); } svg.appendChild(t); });
+  const g = el('g', {transform: `translate(0 ${TITLE_H}) scale(${scale}) translate(${-X0} ${-Y0})`}); svg.appendChild(g);
+  const clip = el('clipPath', {id: 'crop'}); clip.appendChild(el('rect', {x: X0, y: Y0, width: cw, height: ch})); g.appendChild(clip);
+  const gi = el('g', {'clip-path': 'url(#crop)'}); g.appendChild(gi);
+  gi.appendChild(el('image', {href: D.bg, x: 0, y: 0, width: W, height: H, preserveAspectRatio: 'none'}));
+  const [ta, tbRaw] = C.path_t_range; const tb = Math.min(tbRaw, D.px_path.length - 1); const P = D.px_path.slice(ta, tb + 1); const band = D.band.filter(b => b.t >= ta && b.t <= tb);
+  for (const [k, a] of C.band_strokes) gi.appendChild(el('path', {d: band.map(b => poly(ellipse(b.mu, b.cov, k), true)).join(' '), fill: C.col_band, 'fill-opacity': a, 'fill-rule': 'nonzero'}));
+  gi.appendChild(el('path', {d: poly(P), fill: 'none', stroke: C.col_path, 'stroke-width': C.lw_path * 1.4, 'stroke-linecap': 'round', 'stroke-linejoin': 'round'}));
+  for (const [t0, di] of C.arc_picks) { const a = D.arcs.find(x => x.t0 === t0 && x.draw === di); if (!a) continue; const tr = trim(a.px);
+    gi.appendChild(el('path', {d: poly(tr), fill: 'none', stroke: C.col_arc, 'stroke-width': C.lw_arc * 1.4, 'stroke-linecap': 'round', 'stroke-linejoin': 'round'}));
+    gi.appendChild(el('circle', {cx: tr[0][0], cy: tr[0][1], r: C.arc_start_ms * 0.9, fill: C.col_arc})); }
+  if (C.show_anchor) gi.appendChild(el('circle', {cx: D.px_anchor[0], cy: D.px_anchor[1], r: C.anchor_ms * 0.9, fill: C.col_anchor, stroke: 'white', 'stroke-width': 1.5}));
+}
+// ── controls ──
+const ctl = document.getElementById('ctl');
+function textRow(lbl, get, set) { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = `<label>${lbl}</label><input type="text">`; const i = r.querySelector('input'); i.value = get(); i.addEventListener('input', () => { set(i.value); draw(); sync(); }); return r; }
+function colorRow(lbl, get, set) { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = `<label>${lbl}</label><input type="color"><input type="text" style="flex:0 1 90px">`; const c = r.querySelector('[type=color]'), t = r.querySelector('[type=text]'); c.value = get(); t.value = get(); c.addEventListener('input', () => { set(c.value); t.value = c.value; draw(); sync(); }); t.addEventListener('change', () => { set(t.value); c.value = t.value; draw(); sync(); }); return r; }
+function rangeRow(lbl, min, max, step, get, set) { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = `<label>${lbl}</label><input type="range" min="${min}" max="${max}" step="${step}"><span class="num"></span>`; const i = r.querySelector('input'), n = r.querySelector('.num'); i.value = get(); n.textContent = get(); i.addEventListener('input', () => { set(+i.value); n.textContent = i.value; draw(); sync(); }); return r; }
+function selRow(lbl, opts, get, set) { const r = document.createElement('div'); r.className = 'row'; r.innerHTML = `<label>${lbl}</label><select>${opts.map(o => `<option value="${o[0]}">${o[1]}</option>`).join('')}</select>`; const s = r.querySelector('select'); s.value = get(); s.addEventListener('change', () => { set(s.value); draw(); sync(); }); return r; }
+function chkRow(lbl, get, set) { const r = document.createElement('label'); r.className = 'chk'; r.innerHTML = `<input type="checkbox"> ${lbl}`; const i = r.querySelector('input'); i.checked = get(); i.addEventListener('change', () => { set(i.checked); draw(); sync(); }); return r; }
+function fs(title, ...kids) { const f = document.createElement('fieldset'); f.innerHTML = `<legend>${title}</legend>`; kids.forEach(k => f.appendChild(k)); return f; }
+const T = D.px_path.length; const anchors = [...new Set(D.arcs.map(a => a.t0))].sort((a, b) => a - b);
+function arcOpts(t0) { return [['none', '(none)']].concat(D.arcs.filter(a => a.t0 === t0).map(a => [String(a.draw), `draw ${a.draw}  (${a.mahal.toFixed(2)} σ)`])); }
+const arcsFs = fs('Recovery arcs (per anchor time)', ...anchors.map(t0 => selRow(`arc @ t=${t0}`, arcOpts(t0), () => { const p = C.arc_picks.find(x => x[0] === t0); return p ? String(p[1]) : 'none'; }, v => { C.arc_picks = C.arc_picks.filter(x => x[0] !== t0); if (v !== 'none') C.arc_picks.push([t0, +v]); C.arc_picks.sort((a, b) => a[0] - b[0]); })));
+arcsFs.appendChild(Object.assign(document.createElement('p'), {className: 'hint', textContent: 'Each anchor time has 8 sampled draws (σ = Mahalanobis distance of the noised start). To sample at other times re-run render.py with ARC_TIMES=4,32,64,96.'}));
+ctl.append(
+  fs('Expert path & band', rangeRow('path start t', 0, T - 1, 1, () => C.path_t_range[0], v => C.path_t_range[0] = Math.min(v, C.path_t_range[1])), rangeRow('path end t', 0, T - 1, 1, () => C.path_t_range[1], v => C.path_t_range[1] = Math.max(v, C.path_t_range[0])), colorRow('path color', () => C.col_path, v => C.col_path = v), rangeRow('path width', 0.5, 8, 0.1, () => C.lw_path, v => C.lw_path = v), colorRow('band color', () => C.col_band, v => C.col_band = v), ...C.band_strokes.map((s, i) => rangeRow(`band ${s[0]}σ alpha`, 0, 1, 0.02, () => C.band_strokes[i][1], v => C.band_strokes[i][1] = v)), chkRow('show anchor dot', () => C.show_anchor, v => C.show_anchor = v), colorRow('anchor color', () => C.col_anchor, v => C.col_anchor = v)),
+  arcsFs,
+  fs('Arc style', colorRow('arc color', () => C.col_arc, v => C.col_arc = v), rangeRow('arc width', 0.5, 6, 0.1, () => C.lw_arc, v => C.lw_arc = v), rangeRow('trim distance px', 0, 15, 0.5, () => C.arc_trim_px, v => C.arc_trim_px = v), rangeRow('min travel px', 0, 80, 1, () => C.arc_min_travel_px, v => C.arc_min_travel_px = v)),
+  fs('Crop (fractions)', rangeRow('left', 0, 0.6, 0.01, () => C.crop[0], v => C.crop[0] = v), rangeRow('top', 0, 0.6, 0.01, () => C.crop[1], v => C.crop[1] = v), rangeRow('right', 0.4, 1, 0.01, () => C.crop[2], v => C.crop[2] = v), rangeRow('bottom', 0.4, 1, 0.01, () => C.crop[3], v => C.crop[3] = v)),
+  fs('Title parts', ...C.title.map((t, i) => textRow(`text ${i + 1}`, () => C.title[i][0], v => C.title[i][0] = v)), ...C.title.map((t, i) => colorRow(`color ${i + 1}`, () => C.title[i][1], v => C.title[i][1] = v)), rangeRow('title size', 8, 20, 0.5, () => C.title_size, v => C.title_size = v)),
+);
+const out = document.createElement('div'); out.innerHTML = `<div class="row"><button id="copy">Copy CONFIG</button><button class="ghost" id="reset">Reset</button></div><pre id="cfg"></pre>`; ctl.appendChild(out);
+function pyRepr(v) { if (typeof v === 'string') return JSON.stringify(v); if (typeof v === 'boolean') return v ? 'True' : 'False'; if (typeof v === 'number') return String(v); if (Array.isArray(v)) return '[' + v.map(pyRepr).join(', ') + ']'; return '{' + Object.entries(v).map(([k, x]) => `${JSON.stringify(k)}: ${pyRepr(x)}`).join(', ') + '}'; }
+function sync() { const lines = Object.entries(C).map(([k, v]) => `    ${JSON.stringify(k)}: ${pyRepr(v)},`); document.getElementById('cfg').textContent = 'CONFIG = {\n' + lines.join('\n') + '\n}'; }
+document.getElementById('copy').addEventListener('click', () => { navigator.clipboard.writeText(document.getElementById('cfg').textContent).then(() => { document.getElementById('copy').textContent = 'Copied'; setTimeout(() => document.getElementById('copy').textContent = 'Copy CONFIG', 1200); }); });
+document.getElementById('reset').addEventListener('click', () => location.reload());
+draw(); sync();
+</script>

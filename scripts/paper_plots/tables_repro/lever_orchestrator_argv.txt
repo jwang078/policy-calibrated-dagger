@@ -1,0 +1,37 @@
+--action_format=rel
+--base_short=approach_lever_13_smooth
+--blend_extra_args=--blend_mode=every_step --drain_chunk=false --fixed_base_noise=false --clip_sample=false --show_guidance_ghost=true --progress_guidance=true
+--cameras=basewrist
+--control_gui
+--dag_short_override=lever
+--dagger_data_fraction=0.3
+--dagger_data_fraction_mode=exact
+--dagger_skip_succeeded_in_prev_eval=true
+--env_external_port=6001
+--env_profile=small_engine
+--eval_benchmark=JennyWWW/eval_splatsim_approach_lever_13_benchmark
+--exclude_gripper_from_state
+--filter_blend_collisions
+--final_mode=finetune
+--finetune_eval_freq=20000
+--finetune_extra_args=--optimizer.lr=1e-6 --dataset.multi_source_feature_intersection=true
+--finetune_save_freq=20000
+--finetune_steps=20000
+--headless
+--include_env_state_obs=false
+--intermediate_mode=finetune
+--intervention_extra_args=--intervention.max_cycles_per_scenario=5 --policy.shared_autonomy_config.rrt_ik_goal_selection=joint_distance --policy.shared_autonomy_config.rrt_num_ik_candidates=32 --policy.shared_autonomy_config.rrt_num_path_candidates_per_ik=5  --policy.shared_autonomy_config.rrt_max_path_attempts_per_ik=15  --policy.shared_autonomy_config.rrt_path_perturbation_scale=0.05   --policy.shared_autonomy_config.rrt_path_selection=ee_arc_length     --policy.shared_autonomy_config.rrt_segment_at_sharp_corners=false   --policy.shared_autonomy_config.pre_jump_lookback.steps_min=50   --policy.shared_autonomy_config.pre_jump_lookback.steps_max=100   --policy.shared_autonomy_config.rrt_obstacle_clearance=0.02  --policy.shared_autonomy_config.rrt_self_collision_clearance=0.005 --policy.shared_autonomy_config.rrt_in_progress_obstacle_clearance=0.02 --policy.shared_autonomy_config.rrt_in_progress_self_collision_clearance=0.005 --policy.shared_autonomy_config.future_chunk.plan_fail_cooldown_ticks=1  --policy.shared_autonomy_config.rrt_diagnostic_log_pairs=first --policy.shared_autonomy_config.rrt_collision_detection=hybrid --policy.shared_autonomy_config.future_chunk.horizon_frames=8 --policy.shared_autonomy_config.future_chunk.obstacle_clearance=0.019 --policy.shared_autonomy_config.future_chunk.self_collision_clearance=0.005 --policy.shared_autonomy_config.future_chunk.rrt_obstacle_clearance=0.01 --policy.shared_autonomy_config.future_chunk.rrt_self_collision_clearance=0.005 --intervention.stuck_threshold_rad_per_tick=0.01 --intervention.stuck_consecutive_ticks=5 --policy.shared_autonomy_config.rrt_ik_skip_gripper_obstacle_pairs=false --intervention.policy_steps_between_rrt_min=200  --intervention.policy_steps_between_rrt_max=300 --intervention.policy_steps_before_rrt=600 --env.teleop_pad_short_episodes=false
+--intervention_n_episodes=100
+--intervention_sample_from_first=100
+--intervention_sample_seed=0
+--keep_sa_gui
+--model=diff
+--norm_mode=aggregated
+--num_rounds=10
+--resume
+--resume
+--round0_extra_args=--policy.down_dims=[128,256,512] --dataset.observation_noise_std={"observation.state":0.01,"observation.environment_state":0.005} --eval_benchmark_loss_freq=5000 --eval_benchmark_loss_max_batches=32 --eval.n_episodes=100 --seed=0 --env.terminate_on_collision=true --env.episode_length=1000 --optimizer.lr=1e-5 --policy.normalize_env_state=true
+--run_tag=d100_03dagcap_cam
+--skip_alias_step
+--target_intervention_volume=2
+--use_weighted_sampling

@@ -34,16 +34,12 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 
-class GuidanceMode(Enum):
-    """Method-triggered lifecycle state of a source.
-
-    For observation-driven sources, this stays at IDLE; activation is
-    decided by `is_active()` based on observation content.
-    """
-
-    IDLE = "idle"
-    PLANNING = "planning"
-    EXECUTING = "executing"
+# `GuidanceMode` is owned by SplatSim (`splatsim.configs.guidance`) and
+# re-exported here so every guidance source, the SA wrapper and the
+# intervention controller keep importing it from this module. It has to be the
+# SAME object the canonical planner's `RRTRuntimeState.mode` carries, and the
+# planner lives in SplatSim — so SplatSim is the owner and this side imports.
+from splatsim.configs.guidance import GuidanceMode  # noqa: F401
 
 
 class IntegrationMode(Enum):

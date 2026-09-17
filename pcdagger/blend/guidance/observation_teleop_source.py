@@ -100,6 +100,9 @@ class ObservationTeleopGuidanceSource:
         # time-invariant; the model-space rel encoding is not.
         self._guided_chunk_abs: Tensor | None = None
         self._chunk_step: int = 99_999_999_999
+        # Goal-hold tail of the most recent fill (positions sourcing the
+        # repeated final demo pose); consumed by anchor_suffix_to_goal.
+        self._goal_hold_steps: int = 0
         self._had_guidance_last_step: bool = False
         self._last_decoded_guidance_chunk: np.ndarray | None = None
         # Per-tick state set by update().
@@ -626,10 +629,32 @@ class ObservationTeleopGuidanceSource:
                 torch.arange(guidance_chunk.shape[1], device=guidance_chunk.device) - _lag, min=0
             )
             _anchor_src = guidance_chunk[:, _idx]
+        # GOAL-ADAPTIVE SUFFIX (anchor_suffix_to_goal): grow the suffix to the
+        # chunk's whole goal-hold tail (set by the fill: positions sourcing the
+        # repeated final demo pose). The -_lag keeps the pinned set to
+        # positions whose lag-SHIFTED source is still the hold pose — pinning
+        # beyond that would demand correction and full pace at once, the
+        # documented anchor_clock_lag failure. Far from the goal
+        # _goal_hold_steps is 0 and the static suffix applies unchanged. The
+        # hold tail never extends before chunk_step (it is <= n_remaining), so
+        # the dynamic suffix cannot pin already-executed positions.
+        _n_suffix = int(getattr(wrapper, "anchor_suffix_steps", 0) or 0)
+        if getattr(wrapper, "anchor_suffix_to_goal", False):
+            _n_suffix = max(_n_suffix, int(getattr(self, "_goal_hold_steps", 0)) - _lag)
+            # Dart-label servo tracks embed the hold INSIDE their fixed
+            # horizon (no fill shortfall); the rollout loop publishes the
+            # track-row index where the clock saturates instead. Track row
+            # t_rel lands at chunk position chunk_step + t_rel, so the hold
+            # tail within the chunk is n_remaining - start. Already servo-
+            # lag-corrected — no -_lag here (the same branch forces
+            # anchor_clock_lag = 0).
+            _hold_start = getattr(wrapper, "anchor_goal_hold_start", None)
+            if _hold_start is not None:
+                _n_suffix = max(_n_suffix, (anchor_len - self._chunk_step) - int(_hold_start))
         chunk_anchor = ChunkAnchor.build(
             _anchor_src,
             prefix_steps=int(getattr(wrapper, "anchor_prefix_steps", 0) or 0),
-            suffix_steps=int(getattr(wrapper, "anchor_suffix_steps", 0) or 0),
+            suffix_steps=_n_suffix,
             chunk_step=self._chunk_step,
             action_dim=action_dim,
             every_step=bool(getattr(wrapper, "anchor_every_denoise_step", True)),
@@ -639,7 +664,7 @@ class ObservationTeleopGuidanceSource:
             max_abs=getattr(wrapper, "clip_encoded_guidance", None),
         )
         if os.environ.get("DAG_ANCHOR_DEBUG"):
-            _n_suf_dbg = int(getattr(wrapper, "anchor_suffix_steps", 0) or 0)
+            _n_suf_dbg = _n_suffix
             _n_pre_dbg = int(getattr(wrapper, "anchor_prefix_steps", 0) or 0)
             _kept = int(chunk_anchor.mask.sum().item()) if chunk_anchor is not None else 0
             _sat = 0
@@ -814,6 +839,10 @@ class ObservationTeleopGuidanceSource:
         n_provided = guidance_chunk_raw.shape[1]
         n_remaining = anchor_len - self._chunk_step
         n_fill = min(n_provided, n_remaining)
+        # Goal-hold tail length: guidance_chunk_raw is the demo track from the
+        # cursor to its END, so a shortfall vs the chunk means the tail is the
+        # repeated final pose. Consumed by anchor_suffix_to_goal.
+        self._goal_hold_steps = max(0, n_remaining - n_fill)
         # REJOIN RAMP (rel-action basin capture). The policy's rel encoding
         # is guidance - CURRENT anchor: once the rollout deviates from the
         # demo by d, every encoded delta carries a flat +d offset — a chunk
@@ -881,6 +910,8 @@ class ObservationTeleopGuidanceSource:
         guidance_chunk_np = guidance_chunk_raw.cpu().numpy()
         n_provided = guidance_chunk_np.shape[1]
         n_remaining = anchor_len - self._chunk_step
+        # See _fill_chunk_absolute: repeated-last-delta tail = goal hold.
+        self._goal_hold_steps = max(0, n_remaining - n_provided)
 
         if not use_legacy_anchor_seeded_delta:
             # Step-by-step DELTA integration. Seed from _desired_q and apply each

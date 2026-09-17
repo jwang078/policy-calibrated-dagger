@@ -34,11 +34,13 @@ per-frame stored labels structurally cannot do.
 from __future__ import annotations
 
 import glob
+import math
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
+import torch
 
 
 @dataclass
@@ -465,8 +467,13 @@ class DartChunkDataset:
         collision_margin: int = 10,
         self_relabel: bool = False,
         state_noise_std: float = 0.0,
+        vel_noise_std: float = 0.0,
         state_noise_p: float = 1.0,
+        state_noise_schedule: str = "",
+        state_noise_scale: float = 1.0,
         state_noise_seed: int | None = None,
+        state_noise_min_sigma: float = 0.0,
+        mask_hold_tail: bool = False,
         raw_mix: float = 0.0,
     ):
         """Wrap ``dataset``, pairing its episodes to its source demos.
@@ -499,9 +506,42 @@ class DartChunkDataset:
         # backward along that tangent. std is in DEMO MED-STEP units so one
         # number transfers across episodes/tasks.
         self.state_noise_std = float(state_noise_std)
+        # Phase-space DART: Gaussian residual on the anchor's assumed
+        # velocity around the demo tangent, med-steps PER TICK per arm dim
+        # (cruise ~ 1). Applied only when a draw carries no velocity of its
+        # own (constant-sigma and v1/v2 schedule paths); v3+ joint schedules
+        # already sample a correlated velocity residual and win.
+        self.vel_noise_std = float(vel_noise_std)
         self.state_noise_p = float(state_noise_p)
         self.state_noise_seed = state_noise_seed
+        # Truncated sampling: reject-and-redraw DART position draws whose
+        # vector norm is below min_sigma*sqrt(3) med-steps (the obs-jitter
+        # shell) — the keep-the-label jitter augmentation already covers
+        # sub-jitter perturbations with the opposite (ignore) lesson, so
+        # every DART sample should be a meaningful correction example.
+        # Units: med-steps per axis (0.55 = the 0.01 rad jitter's scale).
+        self.state_noise_min_sigma = float(state_noise_min_sigma)
+        # HOLD-TAIL MASKING (pair with --policy.do_mask_loss_for_padding=true):
+        # instead of excluding every anchor whose chunk tail holds at the demo
+        # end (which leaves the last horizon of frames without ANY noise
+        # supervision), accept chunks with >= MIN_GENUINE moving steps and
+        # mark the held tail in action_is_pad so the (masked) loss ignores it.
+        # Reopens the endgame to noise anchors on every episode, including
+        # short interventions whose valid window was previously empty.
+        self.mask_hold_tail = bool(mask_hold_tail)
+        self.MIN_GENUINE = 8
         self._noise_rng: np.random.Generator | None = None
+        # Adaptive (blend-calibrated) noise schedule: JSON mapping
+        # {source_repo_id: {source_ep: [sigma per demo frame]}} in med-step
+        # units. When set, the per-anchor sigma is looked up at (source ep,
+        # demo index) instead of the constant state_noise_std — the schedule
+        # is measured from blend-rollout deviations (policy proposes the
+        # amplitude, gaussian provides the support). state_noise_scale
+        # multiplies the looked-up sigma (r=0.5 blends need scale 1.0 under
+        # the lambda_g ~= lambda_pi assumption; see 2026-09-01 notes).
+        self._noise_schedule: dict[int, np.ndarray] | None = None
+        self._noise_schedule_path = str(state_noise_schedule or "")
+        self.state_noise_scale = float(state_noise_scale)
         # Serve the ORIGINAL dataset item (real recorded action, untouched
         # obs, original index over the FULL frame range — hold zone included)
         # with this probability. Without it, a wrapped dataset contributes
@@ -549,9 +589,184 @@ class DartChunkDataset:
         # __getitem__. Disabled (with a warning) if the fit is poor.
         self._env_fk_w: np.ndarray | None = None
         self._env_fk_dims: np.ndarray | None = None
-        if self.state_noise_std > 0.0:
+        if self._noise_active:
             self._fit_env_fk()
         self._valid = self._build_valid_window()
+
+    def _ensure_schedule(self) -> None:
+        """Load the schedule lazily (source_repo_id is set after __init__'s branch)."""
+        if self._noise_schedule is not None or not self._noise_schedule_path:
+            return
+        import json as _json
+
+        with open(self._noise_schedule_path) as _f:
+            _sched_all = _json.load(_f)
+        _sched = _sched_all.get(self.source_repo_id)
+        if _sched is None:
+            raise ValueError(
+                f"{self._noise_schedule_path}: no entry for source repo {self.source_repo_id!r} "
+                f"(has {list(_sched_all)})"
+            )
+        self._noise_schedule = {int(k): np.asarray(v, dtype=np.float64) for k, v in _sched.items()}
+
+    def _sigma_at(self, source_ep: int, di: float) -> float:
+        """Per-anchor scalar sigma (med-step units): schedule lookup or constant.
+
+        For an anisotropic (v2) schedule this returns the RMS sigma —
+        sqrt(trace Sigma) — used for window sizing; the actual draw uses
+        the full covariance via :meth:`_noise_draw`.
+        """
+        self._ensure_schedule()
+        if self._noise_schedule is None:
+            return self.state_noise_std
+        prof = self._noise_schedule.get(int(source_ep))
+        if prof is None or len(prof) == 0:
+            return self.state_noise_std if self.state_noise_std > 0 else 2.0
+        i = int(np.clip(round(di), 0, len(prof) - 1))
+        row = prof[i]
+        if np.ndim(row) == 0:
+            return float(row) * self.state_noise_scale
+        if np.ndim(row) == 2 and np.shape(row)[-1] == 9:
+            # v5 mixture-of-v4 (one component per chunk age): marginal RMS
+            tot = float(
+                np.mean(row[:, 0] ** 2 + row[:, 1] ** 2 + row[:, 2] ** 2 + row[:, 3] + row[:, 4] + row[:, 5])
+            )
+            return float(np.sqrt(max(tot, 1e-9))) * self.state_noise_scale
+        if len(row) == 21:
+            if self.n_arm == 6:
+                # full 6x6 POSITION covariance (6-joint arms): diagonal at IU
+                # indices 0, 6, 11, 15, 18, 20
+                return (
+                    float(np.sqrt(max(row[0] + row[6] + row[11] + row[15] + row[18] + row[20], 1e-9)))
+                    * self.state_noise_scale
+                )
+            # v3 joint 6x6: position trace at IU indices 0, 6, 11
+            return float(np.sqrt(max(row[0] + row[6] + row[11], 1e-9))) * self.state_noise_scale
+        if len(row) == 9:
+            # v4 one-sided: [mu(3), cov6 about mean]; sigma = sqrt total 2nd moment
+            tot = row[0] ** 2 + row[1] ** 2 + row[2] ** 2 + row[3] + row[4] + row[5]
+            return float(np.sqrt(max(tot, 1e-9))) * self.state_noise_scale
+        # v2 row = [s11, s22, s33, s12, s13, s23] in med-step^2 units
+        return float(np.sqrt(max(row[0] + row[1] + row[2], 1e-9))) * self.state_noise_scale
+
+    _IU6 = [(i, j) for i in range(6) for j in range(i, 6)]
+
+    def _noise_draw(self, source_ep: int, di: float, med_step: float):
+        """One noise draw: (dq [rad], dv [rad/tick] or None), plus the
+        phase-space velocity residual when ``vel_noise_std`` > 0 and the
+        underlying draw carried none (constant-sigma / v1 / v2 paths).
+        Drawn only on demand, so vel_noise_std=0 leaves the RNG stream --
+        and therefore every historical position draw -- untouched."""
+        dq, dv = self._noise_draw_pos(source_ep, di, med_step)
+        if dv is None and self.vel_noise_std > 0.0:
+            if self._noise_rng is None:
+                self._noise_rng = np.random.default_rng(self.state_noise_seed)
+            dv = self._noise_rng.normal(0.0, self.vel_noise_std * med_step, size=self.n_arm)
+        return dq, dv
+
+    def _noise_draw_pos(self, source_ep: int, di: float, med_step: float):
+        """One position draw: returns (dq [rad], dv [rad/tick] or None).
+
+        v1 scalar / v2 3x3 schedules sample position only (dv None); v3
+        joint 6x6 schedules sample correlated (position, velocity residual).
+
+        ``state_noise_min_sigma`` > 0 truncates the position draw's inner
+        ball: draws whose position norm falls below min_sigma*sqrt(3)
+        med-steps (the obs-jitter shell) are rejected and redrawn — every
+        DART sample is then a meaningful correction example, never a
+        sub-jitter perturbation the keep-the-label jitter augmentation
+        already covers with the opposite (ignore) lesson.
+        """
+        if self.state_noise_min_sigma > 0:
+            thresh = self.state_noise_min_sigma * math.sqrt(3.0) * med_step
+            for _ in range(64):
+                dq, dv = self._noise_draw_once(source_ep, di, med_step)
+                if float(np.linalg.norm(dq[: min(3, self.n_arm)])) >= thresh:
+                    return dq, dv
+            # pathological sigma << threshold: project radially onto the shell
+            n = float(np.linalg.norm(dq[: min(3, self.n_arm)]))
+            if n > 1e-12:
+                dq = dq * (thresh / n)
+            return dq, dv
+        return self._noise_draw_once(source_ep, di, med_step)
+
+    def _noise_draw_once(self, source_ep: int, di: float, med_step: float):
+        self._ensure_schedule()
+        if self._noise_rng is None:
+            self._noise_rng = np.random.default_rng(self.state_noise_seed)
+        prof = None if self._noise_schedule is None else self._noise_schedule.get(int(source_ep))
+        if prof is not None and len(prof) > 0 and np.ndim(prof[0]) == 2 and np.shape(prof[0])[-1] == 9:
+            # v5 MIXTURE of v4 components, one per chunk age: Layer-1 sampled
+            # literally (draw an execution age uniformly, then from that age's
+            # Gaussian) instead of collapsing to the moment-matched Gaussian —
+            # the mixture keeps the heavy tails the collapse loses.
+            i = int(np.clip(round(di), 0, len(prof) - 1))
+            comps = prof[i]
+            r9 = comps[int(self._noise_rng.integers(len(comps)))]
+            return self._v4_draw(r9, med_step)
+        if prof is not None and len(prof) > 0 and np.ndim(prof[0]) > 0 and len(prof[0]) == 21:
+            i = int(np.clip(round(di), 0, len(prof) - 1))
+            sg = np.empty((6, 6))
+            for (a, b), val in zip(self._IU6, prof[i], strict=True):
+                sg[a, b] = sg[b, a] = float(val)
+            sg = sg * (self.state_noise_scale * med_step) ** 2
+            try:
+                chol = np.linalg.cholesky(sg + 1e-12 * np.eye(6))
+            except np.linalg.LinAlgError:
+                dq = self._noise_rng.normal(0.0, self._sigma_at(source_ep, di) * med_step, size=self.n_arm)
+                return dq, None
+            z = chol @ self._noise_rng.standard_normal(6)
+            if self.n_arm == 6:
+                # 21 entries on a 6-joint arm = full position covariance, no
+                # velocity component (the v3 pos3+vel3 layout is planar-only)
+                return z, None
+            dq = np.zeros(self.n_arm)
+            dq[: min(3, self.n_arm)] = z[:3][: self.n_arm]
+            return dq, z[3:]
+        if prof is not None and len(prof) > 0 and np.ndim(prof[0]) > 0 and len(prof[0]) == 9:
+            # v4 ONE-SIDED draw: mean shift toward the measured failure side
+            # plus centered anisotropic scatter — no mirror-side symmetrization.
+            i = int(np.clip(round(di), 0, len(prof) - 1))
+            return self._v4_draw(prof[i], med_step)
+        if prof is not None and len(prof) > 0 and np.ndim(prof[0]) > 0:
+            i = int(np.clip(round(di), 0, len(prof) - 1))
+            s11, s22, s33, s12, s13, s23 = (float(v) for v in prof[i])
+            sg = np.array([[s11, s12, s13], [s12, s22, s23], [s13, s23, s33]])
+            sg = sg * (self.state_noise_scale * med_step) ** 2
+            try:
+                chol = np.linalg.cholesky(sg + 1e-12 * np.eye(3))
+            except np.linalg.LinAlgError:
+                return self._noise_rng.normal(
+                    0.0, self._sigma_at(source_ep, di) * med_step, size=self.n_arm
+                ), None
+            z = self._noise_rng.standard_normal(3)
+            out = chol @ z
+            if self.n_arm != 3:
+                full = self._noise_rng.normal(0.0, self._sigma_at(source_ep, di) * med_step, size=self.n_arm)
+                full[:3] = out[: min(3, self.n_arm)]
+                return full, None
+            return out, None
+        return self._noise_rng.normal(0.0, self._sigma_at(source_ep, di) * med_step, size=self.n_arm), None
+
+    def _v4_draw(self, row9, med_step: float):
+        """Draw from one v4 component [mu(3), C11,C22,C33,C12,C13,C23]."""
+        r9 = [float(v) for v in row9]
+        mu = np.array(r9[:3]) * self.state_noise_scale * med_step
+        c11, c22, c33, c12, c13, c23 = r9[3:]
+        cg = np.array([[c11, c12, c13], [c12, c22, c23], [c13, c23, c33]])
+        cg = cg * (self.state_noise_scale * med_step) ** 2
+        try:
+            chol = np.linalg.cholesky(cg + 1e-12 * np.eye(3))
+            z = chol @ self._noise_rng.standard_normal(3)
+        except np.linalg.LinAlgError:
+            z = self._noise_rng.normal(0.0, np.sqrt(max(c11 + c22 + c33, 1e-9) / 3) * med_step, size=3)
+        dq = np.zeros(self.n_arm)
+        dq[: min(3, self.n_arm)] = (mu + z)[: self.n_arm]
+        return dq, None
+
+    @property
+    def _noise_active(self) -> bool:
+        return self.state_noise_std > 0.0 or bool(self._noise_schedule_path)
 
     def _env_fk_features(self, q: np.ndarray) -> np.ndarray:
         cs = np.cumsum(np.asarray(q, dtype=np.float64)[..., : self.n_arm], axis=-1)
@@ -630,7 +845,9 @@ class DartChunkDataset:
                 f"cm={self.collision_margin}",
                 f"self={self.self_relabel}",
                 f"n={len(self.dataset)}",
+                f"eps={sorted(int(e) for e in getattr(self.dataset, 'episodes', None) or [])}",
                 f"mtime={newest:.3f}",
+                f"maskhold={self.mask_hold_tail}",
             ]
         )
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
@@ -686,6 +903,17 @@ class DartChunkDataset:
                 self.collision_filter,
             )
         df = pd.concat([pd.read_parquet(f, columns=cols) for f in files])
+        # Episode-subsetted datasets (dataset.episodes set, e.g. the scarcity
+        # fraction arms) serve items POSITIONALLY over the selected episodes,
+        # while this sweep reads the full on-disk parquets whose `index`
+        # column is the full-dataset global index. Filter to the subset and
+        # remap `index` to subset positions, or the served indices run past
+        # the wrapped dataset (observed: IndexError 4176 >= 2949 on f50_dn4).
+        _eps_sel = getattr(self.dataset, "episodes", None)
+        if _eps_sel is not None:
+            df = df[df["episode_index"].isin({int(e) for e in _eps_sel})]
+            df = df.sort_values(["episode_index", "frame_index"]).reset_index(drop=True)
+            df["index"] = np.arange(len(df), dtype=np.int64)
         valid: list[np.ndarray] = []
         for ep, g in df.groupby("episode_index"):
             src = self.ep_to_source.get(int(ep))
@@ -751,7 +979,12 @@ class DartChunkDataset:
                     velocity=vels_ep[t] if vels_ep is not None else None,
                     info=info,
                 )
-                if chunk_ok(labels, info, geom)[0]:
+                _ok, _reason = chunk_ok(labels, info, geom)
+                if _ok or (
+                    self.mask_hold_tail
+                    and _reason == "hold"
+                    and self._hold_start(labels[:, : self.n_arm]) >= self.MIN_GENUINE
+                ):
                     keep[t] = True
                     self._labels[int(flat[t])] = labels.astype(np.float32)
             valid.append(flat[keep])
@@ -857,20 +1090,44 @@ class DartChunkDataset:
         # synthesize the label from the perturbed state ──
         noised = False
         noise_vel: np.ndarray | None = None
-        if self.state_noise_std > 0.0:
+        delta = _dvel = None  # set only when a valid (end-guarded) draw lands
+        if self._noise_active:
             if self._noise_rng is None:
                 self._noise_rng = np.random.default_rng(self.state_noise_seed)
             if self._noise_rng.random() < self.state_noise_p:
-                delta = self._noise_rng.normal(0.0, self.state_noise_std * geom.med_step, size=self.n_arm)
+                _ep_raw = item["episode_index"]
+                _ep_idx = int(
+                    np.reshape(np.asarray(_ep_raw.cpu() if hasattr(_ep_raw, "cpu") else _ep_raw), -1)[-1]
+                )
+                _src_ep = self.ep_to_source.get(_ep_idx, _ep_idx)
+                _std_here = self._sigma_at(_src_ep, di)
+                # END-GUARD RESAMPLE: a draw whose along-track component
+                # shifts the projected index near the demo end would
+                # synthesize a hold-tail chunk (brake-early-and-sit
+                # supervision) that the valid window only screened for
+                # UNPERTURBED anchors. Reject draws whose projected index
+                # leaves < horizon of genuine demo ahead; after a few
+                # retries fall back to serving the anchor unperturbed
+                # (its cached label is valid by construction).
+                _di0 = di
+                _end_free = float(self.MIN_GENUINE if self.mask_hold_tail else 64)
+                _di_max = max(0.0, float(len(geom.P) - 1) - _end_free)
+                for _try in range(6):
+                    _delta, _dv = self._noise_draw(_src_ep, _di0, geom.med_step)
+                    _q_try = item["observation.state"]
+                    _q_try = (_q_try[-1] if _q_try.dim() == 2 else _q_try).cpu().numpy().copy()
+                    _q_try[: self.n_arm] += np.asarray(_delta)[: self.n_arm]
+                    _di_try = project_state_local(_q_try, geom, _di0, window_steps=3.0 * _std_here + 4.0)
+                    if _di_try <= _di_max or _di0 > _di_max:
+                        delta, _dvel, di = _delta, _dv, _di_try
+                        break
+            if delta is not None:
                 state_t = item["observation.state"].clone()
                 d_t = torch.as_tensor(delta, dtype=state_t.dtype, device=state_t.device)
                 if state_t.dim() == 2:
                     state_t[:, : self.n_arm] += d_t
                 else:
                     state_t[: self.n_arm] += d_t
-                q_pert = (state_t[-1] if state_t.dim() == 2 else state_t).cpu().numpy()
-                # tangential noise must move the clock, not read as deviation
-                di = project_state_local(q_pert, geom, di, window_steps=3.0 * self.state_noise_std + 4.0)
                 # A random offset has no velocity of its own, so assume the
                 # perturbed anchor was moving PARALLEL TO THE DEMO at the
                 # progress-aligned index: velocity = the demo tangent at the
@@ -883,6 +1140,10 @@ class DartChunkDataset:
                 noise_vel = (
                     (_interp_rows(geom.P, _hi) - _interp_rows(geom.P, _lo)) / max(_hi - _lo, 1e-9)
                 ).astype(np.float64)
+                if _dvel is not None:
+                    # joint (v3) schedule: sampled velocity residual widens the
+                    # velocity distribution around the demo tangent
+                    noise_vel = noise_vel + np.asarray(_dvel[: len(noise_vel)], dtype=np.float64)
                 if state_t.dim() == 2 and state_t.shape[0] >= 2:
                     v_t = torch.as_tensor(noise_vel, dtype=state_t.dtype, device=state_t.device)
                     n_rows = state_t.shape[0]
@@ -906,6 +1167,11 @@ class DartChunkDataset:
             item["action"] = torch.as_tensor(
                 cached[:, : action.shape[1]], dtype=action.dtype, device=action.device
             )
+            if self.mask_hold_tail:
+                _lab = self._mask_and_dehold(np.asarray(cached, dtype=np.float64), item, geom)
+                item["action"] = torch.as_tensor(
+                    _lab[:, : action.shape[1]], dtype=action.dtype, device=action.device
+                )
             return item
         if not self._fingerprinted:
             # One-time (per process) positive evidence that relabeling is
@@ -970,7 +1236,40 @@ class DartChunkDataset:
         item["action"] = torch.as_tensor(
             labels[:, : action.shape[1]], dtype=action.dtype, device=action.device
         )
+        if self.mask_hold_tail:
+            _lab = self._mask_and_dehold(np.asarray(labels, dtype=np.float64), item, geom)
+            item["action"] = torch.as_tensor(
+                _lab[:, : action.shape[1]], dtype=action.dtype, device=action.device
+            )
         return item
+
+    def _mask_and_dehold(self, labels_np, item, geom):
+        """mask_hold_tail serving: mark the synthesized hold tail in
+        action_is_pad and REPLACE the repeated end-position values with a
+        constant-velocity continuation along the last genuine step — served
+        labels never contain a stop pattern (Jenny 2026-09-03: with the loss
+        mask on, repeats are dead weight at best and brake-early leakage at
+        worst). Returns possibly-rewritten labels (numpy, full width)."""
+        hs = self._hold_start(labels_np[:, : self.n_arm])
+        if hs >= labels_np.shape[0]:
+            return labels_np
+        if "action_is_pad" in item:
+            item["action_is_pad"] = item["action_is_pad"].clone()
+            item["action_is_pad"][hs:] = True
+        # canonical short-chunk semantics (Jenny): the label's REAL steps end
+        # at the demo's final index; the remainder is ordinary padding —
+        # values repeat the last real step (the standard pad filler) and the
+        # mask covers them. No fabricated values, no stop-teaching (masked).
+        return labels_np
+
+    @staticmethod
+    def _hold_start(labels: np.ndarray) -> int:
+        """Index of the first label of the terminal zero-motion run (== len(labels) if none)."""
+        d = np.linalg.norm(np.diff(labels, axis=0), axis=1)
+        k = len(labels)
+        while k >= 2 and d[k - 2] < 1e-9:
+            k -= 1
+        return k
 
     @staticmethod
     def _chunk_holds(labels: np.ndarray, info: dict) -> bool:
@@ -1012,8 +1311,13 @@ def maybe_wrap_dart(
     collision_margin: int = 10,
     self_relabel_pattern: str = "",
     state_noise_std: float = 0.0,
+    vel_noise_std: float = 0.0,
     state_noise_p: float = 1.0,
     raw_mix: float = 0.0,
+    state_noise_schedule: str = "",
+    state_noise_scale: float = 1.0,
+    state_noise_min_sigma: float = 0.0,
+    mask_hold_tail: bool = False,
 ):
     """Wrap ``dataset`` in DartChunkDataset when it qualifies.
 
@@ -1048,8 +1352,13 @@ def maybe_wrap_dart(
         collision_margin=collision_margin,
         self_relabel=not has_col,
         state_noise_std=state_noise_std,
+        vel_noise_std=vel_noise_std,
         state_noise_p=state_noise_p,
         raw_mix=raw_mix,
+        state_noise_schedule=state_noise_schedule,
+        state_noise_scale=state_noise_scale,
+        state_noise_min_sigma=state_noise_min_sigma,
+        mask_hold_tail=mask_hold_tail,
     )
     logging.info(
         "dart_relabel: wrapping %s with DART chunk labels (source %s, n_arm=%d, "
@@ -1063,3 +1372,29 @@ def maybe_wrap_dart(
         len(wrapped._labels),
     )
     return wrapped
+
+
+class ClearPadFlags(torch.utils.data.Dataset):
+    """Passthrough that clears action_is_pad — pairs with
+    do_mask_loss_for_padding=true to KEEP training a dataset's copy-padded
+    terminal steps (repeat-the-goal-pose settle supervision) while wrapped
+    intervention datasets carry their synthesized-hold masks."""
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __getattr__(self, name):
+        if name == "dataset":
+            # unpickling creates the instance without __init__; without this
+            # guard the lookup of self.dataset recurses forever
+            raise AttributeError(name)
+        return getattr(self.dataset, name)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        if "action_is_pad" in item:
+            item["action_is_pad"] = torch.zeros_like(item["action_is_pad"])
+        return item

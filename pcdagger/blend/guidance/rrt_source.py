@@ -1056,20 +1056,21 @@ class RRTGuidanceSource:
                         q_start_full = wrapper._desired_q.reshape(-1).copy()
                 elif len(_hist) > effective_lookback:
                     q_start_full = _hist[-(effective_lookback + 1)].reshape(-1).copy()
-                    # Velocity AT the rewound tick, from the frames the
-                    # policy drove immediately AFTER it (inside the rewind
-                    # window, so policy-driven by construction): the plan
-                    # and the physical teleport both restore it, so the
-                    # rewound intervention continues the motion the robot
-                    # was in instead of cold-starting from rest.
-                    _w = min(3, effective_lookback)
-                    if _w >= 1 and len(_hist) > effective_lookback:
-                        _later = _hist[-(effective_lookback + 1 - _w)].reshape(-1)
-                        lookback_vel_per_tick = (
-                            _later[: wrapper.num_dofs] - q_start_full[: wrapper.num_dofs]
-                        ) / float(_w)
-                        if float(np.linalg.norm(lookback_vel_per_tick)) < 1e-4:
-                            lookback_vel_per_tick = None  # effectively at rest
+                    # RESTART-FROM-REST (2026-09-05): stall-triggered rewinds
+                    # deliberately do NOT restore the historical velocity at
+                    # the rewound tick. Carrying it (the previous behavior)
+                    # made every stalled takeover launch at cruise within a
+                    # tick — exact-carry honors the handed speed — producing
+                    # onset labels the policy measurably cannot imitate
+                    # (onset imitation gap ~1.8x vs ramped-onset data;
+                    # start-speed audits: 03dag 0.3-0.6 vs 04dagpl/05dag
+                    # ~1.1x cruise). A large rewind is a restart: leaving
+                    # this None means the teleport zeroes sim velocity and
+                    # the parametrizer ramps from rest via its strict onset
+                    # (rrt_path_utils). Shield micro-rewinds (few frames,
+                    # moving robot, collision-triggered) keep their velocity
+                    # carry in the branch above.
+                    lookback_vel_per_tick = None
                 elif len(_hist) > 0:
                     q_start_full = _hist[0].reshape(-1).copy()
                 elif wrapper._latest_actual_q is not None:
@@ -1125,7 +1126,14 @@ class RRTGuidanceSource:
                 # robot is about to be rewound away from.
                 _start_vel = lookback_vel_per_tick * _fps
             else:
-                _start_vel = None
+                # A handoff with no derivable velocity is a handoff AT REST
+                # (stalled robot / rewound state with no history), not "no
+                # handoff": pass explicit zeros so the parametrizer applies
+                # its strict jerk-limited onset ramp. Leaving this None made
+                # every stall-triggered plan launch at cruise within one
+                # tick (start-speed audit 04dagpl/05dag vs 03dag, 2026-09-05)
+                # — onset labels the policy cannot imitate from a takeover.
+                _start_vel = np.zeros(int(wrapper.num_dofs))
             # Refresh the planner's policy-history context so its
             # highest-priority escape method (`_escape_via_policy_history_rewind`)
             # can walk the wrapper's recent `_actual_q_history` deque and

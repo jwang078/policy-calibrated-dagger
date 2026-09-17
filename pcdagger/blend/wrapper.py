@@ -200,6 +200,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         guidance_blend_strategy: GuidanceBlendStrategy | str = GuidanceBlendStrategy.DENOISE,
         anchor_prefix_steps: int = 0,
         anchor_suffix_steps: int = 0,
+        anchor_suffix_to_goal: bool = False,
         anchor_every_denoise_step: bool = True,
         rtc_prev_chunk_guidance: bool = False,
         rtc_max_guidance_weight: float = 10.0,
@@ -433,6 +434,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         self.policy_guidance_representation = policy_guidance_representation
         self.anchor_prefix_steps = anchor_prefix_steps
         self.anchor_suffix_steps = anchor_suffix_steps
+        self.anchor_suffix_to_goal = anchor_suffix_to_goal
         self.anchor_every_denoise_step = anchor_every_denoise_step
         # Timestep correction for the anchor aim point, in guidance-chunk
         # positions. Set PER TICK by the rollout loop (lib_sa_rollout) to the
@@ -443,6 +445,14 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         # obs-teleop source as an index shift into the guidance chunk when
         # building the ChunkAnchor. 0 = anchor to the un-shifted guidance.
         self.anchor_clock_lag: int = 0
+        # Track-row index where the CURRENT guidance track's clock saturates
+        # at the demo end — set per tick by the rollout loop when the track
+        # embeds its own goal hold (dart-label servo tracks: fixed horizon,
+        # clock holds at the demo end, so the fill-shortfall detection in the
+        # obs-teleop source sees none). Consumed by anchor_suffix_to_goal,
+        # which converts it to a chunk-tail length; already lag-corrected by
+        # the servo clock. None = no in-track hold (rely on fill shortfall).
+        self.anchor_goal_hold_start: int | None = None
         # Clamp for encoded (normalized, rel-space) guidance; None disables.
         # See _normalize_policy_guidance_action for the rationale.
         self.clip_encoded_guidance: float | None = 1.0

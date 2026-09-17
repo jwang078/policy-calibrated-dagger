@@ -1,0 +1,7 @@
+analysis/*.npz
+analysis/noise_schedule_*.json
+*.log
+*.out
+__pycache__/
+table_full_benchmark.tex
+analysis/table_lever.tex

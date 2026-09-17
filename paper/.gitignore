@@ -1,0 +1,9 @@
+# figure-folder caches and scratch: regenerable from tables_repro/analysis (schedules, sigma deltas) or by the plot scripts
+*.npz
+noise_schedule_*.json
+fig_data*.json
+*.aux
+*.log
+*.out
+cands/
+__pycache__/

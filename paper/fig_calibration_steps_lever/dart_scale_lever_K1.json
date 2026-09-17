@@ -1,0 +1,11 @@
+{
+ "W_med": 8.77,
+ "tr_mean_med2": 327.0,
+ "scale": 0.2352076452599388,
+ "alpha_dart_per_step_med2": 76.9129,
+ "note": "DART: Sigma^alpha = alpha/(T tr Sigma_hat) * Sigma_hat with alpha = T*W^2 (cumulative squared error); scale = alpha/(T tr Sigma_hat) = W^2 / mean_t tr(Sigma_hat_t); tr Sigma^alpha = W^2. W in median-step units.",
+ "rounds": [
+  1
+ ],
+ "source": "lever_calib_gate: measure_w_lever rounds=1 (6 ratios), build_pooled_schedule_lever K=1"
+}

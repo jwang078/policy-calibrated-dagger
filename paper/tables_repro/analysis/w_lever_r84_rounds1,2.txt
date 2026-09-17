@@ -1,0 +1,16 @@
+pybullet build time: Dec  4 2025 15:17:40
+dag1 r=0.10: stable=16 escaped=0 rej_start=5 rej_short=0 RMS=6.00 med  (median 5.85, p95 8.80)
+dag1 r=0.20: stable=10 escaped=6 rej_start=5 rej_short=0 RMS=7.12 med  (median 6.27, p95 10.04)
+dag1 r=0.30: stable=8 escaped=8 rej_start=5 rej_short=0 RMS=7.82 med  (median 6.65, p95 11.51)
+dag1 r=0.50: stable=7 escaped=9 rej_start=5 rej_short=0 RMS=9.14 med  (median 9.45, p95 12.31)
+dag1 r=0.75: stable=4 escaped=12 rej_start=5 rej_short=0 RMS=7.29 med  (median 6.25, p95 10.58)
+dag1 r=0.90: stable=3 escaped=13 rej_start=5 rej_short=0 RMS=7.90 med  (median 7.07, p95 10.67)
+dag2 r=0.10: stable=23 escaped=0 rej_start=3 rej_short=0 RMS=4.68 med  (median 4.39, p95 6.12)
+dag2 r=0.20: stable=22 escaped=1 rej_start=3 rej_short=0 RMS=6.99 med  (median 6.99, p95 9.78)
+dag2 r=0.30: stable=19 escaped=4 rej_start=3 rej_short=0 RMS=8.49 med  (median 8.84, p95 11.94)
+dag2 r=0.50: stable=13 escaped=10 rej_start=3 rej_short=0 RMS=7.33 med  (median 7.58, p95 9.37)
+dag2 r=0.75: stable=9 escaped=14 rej_start=3 rej_short=0 RMS=6.65 med  (median 5.55, p95 9.23)
+dag2 r=0.90: stable=7 escaped=16 rej_start=3 rej_short=0 RMS=8.14 med  (median 9.07, p95 11.34)
+
+dial fit over 12 cells: W = 7.94 (±0.29), R = 0.015, RMSE 0.70
+bootstrap 95% CI for W: [7.41, 8.57]

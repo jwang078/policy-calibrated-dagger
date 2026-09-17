@@ -1,0 +1,10 @@
+{
+ "W_med": 8.1,
+ "tr_mean_med2": 435.1,
+ "scale": 0.1508,
+ "alpha_dart_per_step_med2": 65.61,
+ "rounds": [
+  1
+ ],
+ "note": "lever 84px lineage, round 1: W from 6-ratio blend dial fit (CI 7.47-9.07), Sigma-hat with the 84px BC on dag1 (42 eps); scale = W^2 / mean_t tr(Sigma_hat_t)"
+}

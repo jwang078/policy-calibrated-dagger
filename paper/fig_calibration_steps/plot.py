@@ -72,27 +72,40 @@ _OUT_OVERRIDE = os.environ.get(
 )  # optional output path override (e.g. a .pdf for the merged method figure)
 # ─────────────────────────────────────────────────────────────────────────────
 HERE = os.path.dirname(os.path.abspath(__file__))
+# calibration inputs (sigma deltas, schedules) live in tables_repro/analysis; a copy next to this
+# script takes precedence (e.g. a variant not in the tables).
+_ANALYSIS = os.path.join(os.path.dirname(HERE), "tables_repro", "analysis")
+
+
+def _find(name, *dirs):
+    for d in list(dirs) + [_ANALYSIS]:
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(f"{name}: not in {list(dirs) + [_ANALYSIS]} (bash tables_repro/analysis/unpack_schedules.sh?)")
+
+
 if TASK == "lever_r84":  # 84px lineage, round 1 (BC on dag1): s = 0.15 -> (c) is visibly narrower than (a)
     R84 = os.path.join(os.path.dirname(HERE), "fig_calibration_steps_lever_r84")
     OUT = os.path.join(R84, "fig_calibration_steps_lever_r84.png")
     SRC_REPO = "lever_d100_03dagcap_r84_diff_r_dag1"
     NARM = 6
-    SIGMA_NPZ = os.path.join(R84, "sigma_deltas_lever_r84_q1_dag1.npz")
-    SCHED_JSON = os.path.join(R84, "noise_schedule_pooled_lever_r84_K1.json")
+    SIGMA_NPZ = _find("sigma_deltas_lever_r84_q1_dag1.npz", R84)
+    SCHED_JSON = _find("noise_schedule_pooled_lever_r84_K1.json", R84)
     SCALE_JSON = os.path.join(R84, "dart_scale_lever_r84_K1.json")
 elif TASK == "lever":
     OUT = os.path.join(HERE, "fig_calibration_steps_lever.png")
     SRC_REPO = "lever_d100_03dagcap_cam_diff_r_dag1"
     NARM = 6
-    SIGMA_NPZ = os.path.join(HERE, "sigma_deltas_lever_q1_dag1.npz")
-    SCHED_JSON = os.path.join(HERE, "noise_schedule_pooled_lever_K1.json")
+    SIGMA_NPZ = _find("sigma_deltas_lever_q1_dag1.npz", HERE)  # 224 px lineage, not in the tables
+    SCHED_JSON = _find("noise_schedule_pooled_lever_K1.json", HERE)
     SCALE_JSON = os.path.join(HERE, "dart_scale_lever_K1.json")
 else:
     OUT = os.path.join(HERE, "fig_calibration_steps.png")
     SRC_REPO = "planar_12_05dag_diff_r_dag3"
     NARM = 3
-    SIGMA_NPZ = os.path.join(HERE, "sigma_deltas_s1q3_dag3.npz")
-    SCHED_JSON = os.path.join(HERE, "noise_schedule_pooled_s1_K3.json")
+    SIGMA_NPZ = _find("sigma_deltas_s1q3_dag3.npz", HERE)
+    SCHED_JSON = _find("noise_schedule_pooled_s1_K3.json", HERE)
     SCALE_JSON = os.path.join(HERE, "dart_scale_s1_K3.json")
 IU = [(i, j) for i in range(NARM) for j in range(i, NARM)]
 sys.path.insert(0, os.path.expanduser("~/code/lerobot/src"))

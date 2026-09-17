@@ -36,9 +36,9 @@ DPI = 150
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "fig_calibration_steps.png")
-SCRATCH = "/tmp/claude-1000/-home-jennyw2-code-SplatSim/74005341-2b66-4c2f-b778-056deb6aff45/scratchpad"
-SIGMA_NPZ = os.path.join(SCRATCH, "analysis", "sigma_deltas_s1q3_dag3.npz")
-SCHED_JSON = os.path.join(SCRATCH, "analysis", "noise_schedule_pooled_s1_K3.json")
+_ANALYSIS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tables_repro", "analysis")
+SIGMA_NPZ = os.path.join(_ANALYSIS, "sigma_deltas_s1q3_dag3.npz")
+SCHED_JSON = os.path.join(_ANALYSIS, "noise_schedule_pooled_s1_K3.json")
 for _f in (SIGMA_NPZ, SCHED_JSON):  # local copies win if present
     _l = os.path.join(HERE, os.path.basename(_f))
     if os.path.exists(_l):

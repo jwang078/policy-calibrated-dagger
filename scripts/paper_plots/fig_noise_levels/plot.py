@@ -15,9 +15,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-S = os.environ.get("DELTAS_DIR", "/home/jennyw2/code/lerobot/my_scripts/paper_plots/tables_repro/analysis")
-if not glob.glob(f"{S}/sigma_deltas_s1q5_dag1.npz"):
-    S = "/tmp/claude-1000/-home-jennyw2-code-SplatSim/74005341-2b66-4c2f-b778-056deb6aff45/scratchpad/analysis"
+S = os.environ.get("DELTAS_DIR", os.path.join(os.path.dirname(HERE), "tables_repro", "analysis"))  # sigma_deltas_*.npz caches
 OUT = os.environ.get("OUT", os.path.join(HERE, "fig_noise_levels.pdf"))
 FIXED = [2, 4, 8, 12, 16]
 PLANAR_W = 8.0

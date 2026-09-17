@@ -30,7 +30,7 @@ import pandas as pd
 sys.path.insert(0, os.path.expanduser("~/code/SplatSim"))
 sys.path.insert(0, os.path.expanduser("~/code/lerobot/src"))
 HERE = os.path.dirname(os.path.abspath(__file__))
-S = "/tmp/claude-1000/-home-jennyw2-code-SplatSim/74005341-2b66-4c2f-b778-056deb6aff45/scratchpad"
+_ANALYSIS = os.path.join(os.path.dirname(HERE), "tables_repro", "analysis")  # pooled schedules (unpack_schedules.sh)
 REPO = sys.argv[1] if len(sys.argv) > 1 else "lever_d100_03dagcap_r84_diff_r_dag3"
 EPISODE = int(sys.argv[2]) if len(sys.argv) > 2 else 7
 T0 = int(sys.argv[3]) if len(sys.argv) > 3 else 4
@@ -47,7 +47,7 @@ _B = os.path.expanduser(
 )
 CSV = {
     "dag1": f"{_B}1/dagger/interventions/intervention_per_scenario.csv",
-    "dag3": f"{S}/r84_dag3_dagger_backup/interventions/intervention_per_scenario.csv",
+    "dag3": f"{HERE}/intervention_per_scenario_dag3.csv",  # copy of the round-3 orchestrator CSV (its training dir was cleaned)
 }.get(REPO[-4:])
 # ── episode data ─────────────────────────────────────────────────────────────
 C = os.path.expanduser(f"~/.cache/huggingface/lerobot/JennyWWW/{REPO}")
@@ -83,7 +83,7 @@ if scenario is None:
     raise SystemExit(f"scenario unknown for {REPO} episode {EPISODE}; known: {sorted(m)}")
 # ── pooled schedule -> rad^2 ─────────────────────────────────────────────────
 if SCHED is None:
-    cands = sorted(glob.glob(f"{S}/analysis/noise_schedule_pooled_lever_r84_K*.json"))
+    cands = sorted(glob.glob(f"{_ANALYSIS}/noise_schedule_pooled_lever_r84_K*.json"))
     cands = [c for c in cands if f"JennyWWW/{REPO}" in json.load(open(c))]
     if not cands:
         raise SystemExit("no schedule contains this repo yet")

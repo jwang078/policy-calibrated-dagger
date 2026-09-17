@@ -1,90 +1,34 @@
 #!/bin/bash
-# Smoke test for the reproduction recipes: runs every command SHAPE the two
-# tables depend on, but short (+20 training steps, 2 eval episodes), into
-# lerobot/outputs/smoke/ and a scratch copy of this directory. Needs the GPU,
-# the datasets in ~/.cache/huggingface/lerobot/JennyWWW and the base
-# checkpoints under lerobot/outputs/training; nothing under this directory
-# is modified. ~10 minutes. Usage:
+# Smoke test for the reproduction scripts: runs the real scripts in miniature
+# (+20 training steps, 2 eval episodes) against the real base checkpoints,
+# datasets and cached calibration deltas, everything redirected to
+# lerobot/outputs/smoke/ so nothing under this directory or outputs/training
+# is touched. Needs the GPU. ~10 minutes.
 #
-#   bash smoke_test.sh            # everything
-#   PARTS="train eval" bash smoke_test.sh
+#   bash smoke_test.sh                     # everything
+#   PARTS="dry train" bash smoke_test.sh   # a subset of: dry train eval analysis table
 #
-# Parts: train (planar q / dn4 / pooled / per-step arms, lever HG / calibrated
-# arms), eval (planar + lever lerobot-eval against a fresh sim node), analysis
-# (planar sigma measurement + schedule builders, lever W fit + schedule
-# builder; rebuilt schedules are compared with the shipped ones), table (both
-# table generators). Last run 2026-09-17: all parts passed, see README.
-set -u
-S=$(cd "$(dirname "$0")" && pwd); LR=/home/jennyw2/code/lerobot; PY=$HOME/miniforge3/envs/splatsim/bin/python; EV=$HOME/miniforge3/envs/splatsim/bin/lerobot-eval
-PARTS=${PARTS:-"train eval analysis table"}
-OUT=$LR/outputs/smoke; SCRATCH=$OUT/tables_repro_scratch; mkdir -p "$OUT" "$SCRATCH/analysis"
-SW='--dataset.dart_mask_hold_tail=true --dataset.dart_selective_mask=true --policy.do_mask_loss_for_padding=true'
-log() { echo "[smoke $(date +%H:%M:%S)] $*"; }
-FAIL=0; check() { if [ "$1" = 0 ]; then log "PASS $2"; else log "FAIL $2 (rc=$1)"; FAIL=1; fi; }
-cd "$LR"
-
-# ---------------------------------------------------------------- train ----
-train_one() {  # NAME BASE_CKPT extra-args...
-  local NAME=$1 BASE=$2; shift 2; local DIR=$OUT/$NAME; rm -rf "$DIR"
-  bash my_scripts/resume_training.sh "$BASE" "$@" --steps=75020 --eval_freq=0 --env_eval_freq=0 --save_freq=75020 \
-    --output_dir="$DIR" --job_name=smoke_$NAME --policy.repo_id=smoke_$NAME --policy.push_to_hub=false --wandb.enable=false > "$DIR.log" 2>&1
-  local RC=$?; [ -d "$DIR/checkpoints/075020/pretrained_model" ] || RC=$((RC+100)); check $RC "train $NAME"; }
-if [[ " $PARTS " == *" train "* ]]; then
-  PB=$LR/outputs/training/diffusion_planar_3joint_12_delta_stateng/checkpoints/last/pretrained_model; K=2; TAG=05dag
-  REPOS=$($PY -c "import json;print(json.dumps(['JennyWWW/planar_3joint_12']+[f'JennyWWW/planar_12_${TAG}_diff_r_dag{i}' for i in range(1,$K+1)]))")
-  STATS=$($PY -c "import json;print(json.dumps(['outputs/dataset_stats/planar_3joint_12/stats_rel64.json']+[f'outputs/dataset_stats/planar_12_${TAG}_diff_r_dag{i}/stats_rel64.json' for i in range(1,$K+1)]))")
-  WTS=$($PY -c "import json;print(json.dumps([0.7]+[round(0.3/$K,6)]*$K))")
-  COMMON=(--optimizer.lr=1e-5 --num_workers=4 --dataset.multi_source_feature_intersection=true --dataset.repo_id= --dataset.repo_ids="$REPOS" --dataset.sample_weights="$WTS" --dataset.stats_paths="$STATS" --dataset.norm_mode=aggregated --dataset.stats_path= --dataset.use_weighted_sampling=true --eval.n_episodes=100)
-  DART=(--dataset.dart_relabel=true '--dataset.dart_self_relabel_pattern=_r_dag\d+$' --dataset.dart_vel_noise_std=0.3 $SW)
-  train_one planar_q2         "$PB" "${COMMON[@]}" --dataset.dart_relabel=false
-  train_one planar_q2_dn4swv  "$PB" "${COMMON[@]}" "${DART[@]}" --dataset.dart_state_noise_std=4
-  train_one planar_q2_dnpool  "$PB" "${COMMON[@]}" "${DART[@]}" --dataset.dart_state_noise_std=0 --dataset.dart_state_noise_schedule=$S/analysis/noise_schedule_pooled_s1_K2.json --dataset.dart_state_noise_scale=1.0
-  train_one planar_q2_dnsig   "$PB" "${COMMON[@]}" "${DART[@]}" --dataset.dart_state_noise_std=0 --dataset.dart_state_noise_schedule=$S/analysis/noise_schedule_sigma_alpha_s1_K2.json --dataset.dart_state_noise_scale=1.0
-  RES=84; LB=$LR/outputs/training/diffusion_approach_lever_13_smooth_r${RES}_delta_basewrist/checkpoints/last/pretrained_model; PFX=lever_d100_03dagcap_r${RES}_diff; C=$HOME/.cache/huggingface/lerobot/JennyWWW
-  WTS=$($PY -c "
-import json; f=[json.load(open(f'$C/${PFX}_r_dag{i}/meta/info.json'))['total_frames'] for i in range(1,$K+1)]; s=sum(f)
-print('[0.7, '+', '.join(str(round(0.3*x/s,9)) for x in f)+']')")
-  REPOS=$($PY -c "import json;print(json.dumps(['JennyWWW/splatsim_approach_lever_13_smooth_r${RES}']+['JennyWWW/${PFX}_r_dag%d'%i for i in range(1,$K+1)]))")
-  STATS=$($PY -c "import json;print(json.dumps(['$LR/outputs/dataset_stats/approach_lever_13_smooth_r${RES}/stats_rel64.json']+['$LR/outputs/dataset_stats/${PFX}_r_dag%d/stats_rel64.json'%i for i in range(1,$K+1)]))")
-  LCOMMON=(--optimizer.lr=1e-6 --scheduler.name=constant --num_workers=8 --dataset.multi_source_feature_intersection=true --dataset.repo_id= --dataset.repo_ids="$REPOS" --dataset.sample_weights="$WTS" --dataset.stats_paths="$STATS" --dataset.norm_mode=aggregated --dataset.stats_path= --dataset.use_weighted_sampling=true)
-  train_one lever_hg2  "$LB" "${LCOMMON[@]}"
-  train_one lever_cal2 "$LB" "${LCOMMON[@]}" "${DART[@]}" --dataset.dart_state_noise_std=0 --dataset.dart_state_noise_schedule=$S/analysis/noise_schedule_pooled_lever_r${RES}_K${K}.json --dataset.dart_state_noise_scale=1.0
-fi
-
-# ----------------------------------------------------------------- eval ----
-start_node() {  # ROBOT PORT BENCH extra-args... ; echoes pid
-  cd /home/jennyw2/code/SplatSim; python -u scripts/launch_nodes.py --robot "$1" --robot_port "$2" --hostname 127.0.0.1 --eval_benchmark_repo_id "$3" --headless --control_gui "${@:4}" > "$OUT/node_$2.log" 2>&1 & echo $!; cd "$LR"; }
-wait_port() { for i in $(seq 1 150); do (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null && { sleep 5; return 0; }; sleep 2; done; return 1; }
-if [[ " $PARTS " == *" eval "* ]]; then
-  # planar: the shipped q5 checkpoint of lineage s1 (falls back to the smoke arm)
-  CK=$LR/outputs/training/scarcity_study/q5/checkpoints/last/pretrained_model; [ -d "$CK" ] || CK=$OUT/planar_q2/checkpoints/075020/pretrained_model
-  SIM=$(start_node sim_pybullet_planar_interactive 6023 JennyWWW/eval_planar_3joint_benchmark --robot_name planar_3joint); wait_port 6023
-  D=$OUT/eval_planar; rm -rf "$D"; mkdir -p "$D"
-  $EV --env.type=splatsim --env.task=planar_3joint --env.camera_names='["base_rgb"]' --env.image_resize_modes='["letterbox"]' \
-    --env.fps=30 --env.eval_benchmark_repo_id=JennyWWW/eval_planar_3joint_benchmark --policy.path="$CK" --eval.n_episodes=2 --output_dir="$D" \
-    --eval.batch_size=1 --eval.use_async_envs=false --seed=0 --rename_map='{}' --env.episode_length=1000 --env.eval_benchmark_subset="[0,1]" \
-    --env.external_port=6023 --env.max_parallel_tasks=1 --env.robot_name=planar_3joint --env.cam_i=3 --env.use_gripper=true \
-    --env.debug_mode=off --env.headless=true --env.control_gui=true --env.splat_shadows=false --env.include_oracle_info=false \
-    --env.terminate_on_collision=true --env.wrist_cam_ver=2 --env.teleop_pad_short_episodes=true --env.teleop_state_jump_split_threshold_rad=0.15 \
-    --env.num_dofs=3 --env.state_dim=4 --env.action_dim=4 --env.env_state_dim=8 > "$D/log.txt" 2>&1
-  RC=$?; [ -f "$D/eval_info.json" ] || RC=$((RC+100)); check $RC "eval planar (2 episodes)"; kill $SIM 2>/dev/null; wait $SIM 2>/dev/null
-  # lever: the shipped calibrated K=1 checkpoint (falls back to the smoke arm)
-  CK=$LR/outputs/training/lever_r84_calib/q1_dnpool/checkpoints/095000/pretrained_model; [ -d "$CK" ] || CK=$OUT/lever_cal2/checkpoints/075020/pretrained_model
-  SIM=$(start_node sim_ur_pybullet_small_engine_new_interactive 6045 JennyWWW/eval_splatsim_approach_lever_13_benchmark --render_mode splat); wait_port 6045
-  D=$OUT/eval_lever; rm -rf "$D"; mkdir -p "$D"
-  $EV --env.type=splatsim --env.task=upright_small_engine_new --env.camera_names='["base_rgb","wrist_rgb"]' --env.image_resize_modes='["stretch"]' \
-    --env.fps=30 --env.eval_benchmark_repo_id=JennyWWW/eval_splatsim_approach_lever_13_benchmark --policy.path="$CK" --eval.n_episodes=2 --output_dir="$D" \
-    --eval.batch_size=1 --eval.use_async_envs=false --seed=0 --rename_map='{}' --env.episode_length=1000 --env.eval_benchmark_subset="[0,1]" \
-    --env.external_port=6045 --env.max_parallel_tasks=1 --env.robot_name=robot_iphone_w_engine_curtain --env.cam_i=3 --env.use_gripper=true \
-    --env.debug_mode=off --env.headless=true --env.control_gui=true --env.include_oracle_info=false --env.terminate_on_collision=true --env.wrist_cam_ver=2 \
-    --env.teleop_pad_short_episodes=true --env.teleop_state_jump_split_threshold_rad=0.15 --env.num_dofs=6 --env.state_dim=7 --env.action_dim=7 --env.env_state_dim=0 > "$D/log.txt" 2>&1
-  RC=$?; [ -f "$D/eval_info.json" ] || RC=$((RC+100)); check $RC "eval lever (2 episodes)"; kill $SIM 2>/dev/null; wait $SIM 2>/dev/null
-fi
-
-# ------------------------------------------------------------- analysis ----
-# The analysis scripts read/write $TABLES_REPRO_DIR/analysis; point them at a
-# scratch copy (delta caches linked in) so the shipped schedules stay intact.
-sched_diff() {  # NEW SHIPPED -> prints max |diff| over all rows
+#   dry       DRY=1 planar_arms.sh prints the full-size training commands (175k steps) without running
+#   train     planar_arms.sh (hg, dn4, pool, sig arms of s1 at K=2) and lever_seeds.sh (hg2/cal2 with a
+#             fresh training seed, incl. the reseeded BC copy) — each +20 steps, then 2-episode evals
+#   eval      planar_eval.sh on the smoke q2 arm (fresh planar node)
+#   analysis  planar_calibrate.sh: K=2 schedules rebuilt from cached deltas (must match the shipped ones
+#             bit-for-bit), K=1 re-measured with the real q1 policy (stochastic, pooled row within a few %);
+#             lever: measure_w_lever (must reproduce W = 7.94), build_pooled_schedule_lever K=2 (bit-for-bit),
+#             measure_sigma_lever K=1 with the BC policy
+#   table     gen_table.py (tabular identical to table1_tabular.tex) and analysis/lever_table.py
+# Last run: see README (2026-09-17, all parts passed).
+S=$(cd "$(dirname "$0")" && pwd); LR=/home/jennyw2/code/lerobot; PY=$HOME/miniforge3/envs/splatsim/bin/python
+PARTS=${PARTS:-"dry train eval analysis table"}
+SM=$LR/outputs/smoke; rm -rf "$SM"; mkdir -p "$SM/training" "$SM/eval300" "$SM/tables_repro/analysis"
+ln -sf "$S"/analysis/*.npz "$S"/analysis/*.json "$S"/analysis/*.txt "$SM/tables_repro/analysis/" 2>/dev/null
+# the environment every script call below runs under
+export OUT_TRAIN=$SM/training OUT_EVAL=$SM/eval300 TABLES_REPRO_DIR=$SM/tables_repro
+export PLANAR_BASE=$LR/outputs/training/diffusion_planar_3joint_12_delta_stateng LEVER_BASE=$LR/outputs/training/diffusion_approach_lever_13_smooth_r84_delta_basewrist
+export PLANAR_STEPS=75020 LEVER_STEPS=75020 N_EPISODES=2 LEVER_N=2
+FAIL=0; log() { echo "[smoke $(date +%H:%M:%S)] $*"; }
+check() { if [ "$1" = 0 ]; then log "PASS $2"; else log "FAIL $2 (rc=$1)"; FAIL=1; fi; }
+sched_diff() {  # NEW SHIPPED -> max |diff| over all rows
   $PY -c "
 import json,numpy as np,sys
 a=json.load(open(sys.argv[1])); b=json.load(open(sys.argv[2])); md=0.0
@@ -92,35 +36,52 @@ for r in a:
     for e in a[r]:
         x=np.array(a[r][e]); y=np.array(b[r][e]); md=max(md, float(np.max(np.abs(x-y))) if x.shape==y.shape else float('inf'))
 print(f'{md:.3g}')" "$1" "$2"; }
-if [[ " $PARTS " == *" analysis "* ]]; then
-  export TABLES_REPRO_DIR=$SCRATCH; ln -sf "$S"/analysis/*.npz "$SCRATCH/analysis/"
-  # planar: rebuild the K=2 schedules of s1 from the cached deltas (deterministic -> identical)
-  $PY $S/analysis/build_sigma_schedule_k.py s1 05dag 2 > /dev/null; RC=$?
-  D=$(sched_diff $SCRATCH/analysis/noise_schedule_pooled_s1_K2.json $S/analysis/noise_schedule_pooled_s1_K2.json); log "pooled s1 K2 rebuilt, max|diff| vs shipped = $D"
-  check $RC "analysis planar build_sigma_schedule_k (K=2)"
-  # planar: re-measure round 1 with the q1 policy (stochastic policy samples -> pooled covariance within a few %)
-  rm -f $SCRATCH/analysis/sigma_deltas_s1q1_dag1.npz
-  $PY $S/analysis/measure_sigma_multi.py s1q1 $LR/outputs/training/scarcity_study/q1/checkpoints/last/pretrained_model 05dag "1" > $SCRATCH/measure_sigma_s1q1.log 2>&1; RC=$?
-  [ -f $SCRATCH/analysis/sigma_deltas_s1q1_dag1.npz ] || RC=$((RC+100)); check $RC "analysis planar measure_sigma_multi (s1 K=1)"
-  $PY $S/analysis/build_sigma_schedule_k.py s1 05dag 1 > /dev/null && log "pooled s1 K1 re-measured, max|diff| vs shipped = $(sched_diff $SCRATCH/analysis/noise_schedule_pooled_s1_K1.json $S/analysis/noise_schedule_pooled_s1_K1.json) (shipped rows are O(10-30))"
-  # lever: W fit from the blend datasets and the K=2 pooled schedule from cached deltas (both deterministic)
-  PFX=lever_d100_03dagcap_r84_diff
-  INT_PREFIX=$PFX $PY $S/analysis/measure_w_lever.py 1,2 > "$SCRATCH/w_lever_r84_rounds1,2.txt" 2>&1; RC=$?
-  W=$(grep -oE "W = [0-9.]+" "$SCRATCH/w_lever_r84_rounds1,2.txt" | head -1 | awk '{print $3}'); WS=$(grep -oE "W = [0-9.]+" "$S/analysis/w_lever_r84_rounds1,2.txt" | head -1 | awk '{print $3}')
-  [ "$W" = "$WS" ] || RC=$((RC+100)); check $RC "analysis lever measure_w_lever (W=$W, shipped $WS)"
-  INT_PREFIX=$PFX TAGPFX=r84_ $PY $S/analysis/build_pooled_schedule_lever.py 2 $W > /dev/null; RC=$?
-  D=$(sched_diff $SCRATCH/analysis/noise_schedule_pooled_lever_r84_K2.json $S/analysis/noise_schedule_pooled_lever_r84_K2.json); [ "$D" = 0 ] || RC=$((RC+100)); check $RC "analysis lever build_pooled_schedule_lever (K=2, max|diff| $D)"
-  # lever: re-measure round 1 with the BC policy (stochastic; needs the GPU)
-  rm -f $SCRATCH/analysis/sigma_deltas_lever_r84_q1_dag1.npz
-  $PY $S/analysis/measure_sigma_lever.py r84_q1_dag1 $LR/outputs/training/diffusion_approach_lever_13_smooth_r84_delta_basewrist/checkpoints/last/pretrained_model ${PFX}_r_dag1 > $SCRATCH/measure_sigma_lever.log 2>&1; RC=$?
-  [ -f $SCRATCH/analysis/sigma_deltas_lever_r84_q1_dag1.npz ] || RC=$((RC+100)); check $RC "analysis lever measure_sigma_lever (K=1)"
-fi
 
-# ---------------------------------------------------------------- table ----
+if [[ " $PARTS " == *" dry "* ]]; then
+  OUT=$(PLANAR_STEPS=175000 DRY=1 ARMS="hg dn4 pool" bash $S/planar_arms.sh s1 1 2>&1); RC=$?
+  echo "$OUT" | grep -q -- "--steps=175000" && echo "$OUT" | grep -q -- "--dataset.dart_state_noise_schedule=" || RC=$((RC+100))
+  check $RC "dry-run planar_arms.sh s1 K=1 (hg, dn4, pool): full-size commands printed"
+fi
+if [[ " $PARTS " == *" train "* ]]; then
+  ARMS="hg dn4 pool sig" bash $S/planar_arms.sh s1 2 > "$SM/planar_arms.log" 2>&1; RC=$?
+  for A in q2 q2_dn4swv q2_dnpool q2_dnsig; do [ -d "$OUT_TRAIN/scarcity_study/$A/checkpoints/075020/pretrained_model" ] || { RC=$((RC+100)); log "missing $A"; }; done
+  check $RC "train planar_arms.sh s1 K=2: q2, q2_dn4swv, q2_dnpool, q2_dnsig (+20 steps)"
+  SEEDS=7 ROUNDS=2 bash $S/lever_seeds.sh > "$SM/lever_seeds.log" 2>&1; RC=$?
+  for A in lever_r84_fb/hg2_s7 lever_r84_calib/q2_dnpool_s7; do [ -d "$OUT_TRAIN/$A/checkpoints/075020/pretrained_model" ] || { RC=$((RC+100)); log "missing $A"; }; done
+  [ -f "$OUT_TRAIN/diffusion_approach_lever_13_smooth_r84_delta_basewrist_seed7/checkpoints/075000/training_state/rng_state.safetensors" ] || RC=$((RC+100))
+  check $RC "train lever_seeds.sh seed 7 round 2: reseeded BC copy, hg2_s7, q2_dnpool_s7 (+20 steps)"
+  for A in r84_hg2_20k_s7 r84_cal2_20k_s7; do [ -f "$OUT_EVAL/lever_cam/$A/eval_info.json" ]; check $? "eval lever $A (2 episodes, seed 7)"; done
+fi
+if [[ " $PARTS " == *" eval "* ]]; then
+  bash $S/planar_eval.sh 6023 s1 q2 > "$SM/planar_eval.log" 2>&1; RC=$?
+  [ -f "$OUT_EVAL/scarcity_study/q2/eval_info.json" ] || RC=$((RC+100)); check $RC "eval planar_eval.sh s1 q2 (2 episodes, port 6023)"
+fi
+if [[ " $PARTS " == *" analysis "* ]]; then
+  A=$TABLES_REPRO_DIR/analysis
+  rm -f $A/noise_schedule_pooled_s1_K2.json $A/noise_schedule_sigma_alpha_s1_K2.json     # rebuild from the cached deltas
+  POLICY=$LR/outputs/training/scarcity_study/q2/checkpoints/last/pretrained_model bash $S/planar_calibrate.sh s1 2 > "$SM/calibrate_k2.log" 2>&1; RC=$?
+  D=$(sched_diff $A/noise_schedule_pooled_s1_K2.json $S/analysis/noise_schedule_pooled_s1_K2.json); [ "$D" = 0 ] || RC=$((RC+100))
+  check $RC "analysis planar_calibrate.sh s1 K=2 from cached deltas (pooled max|diff| vs shipped = $D)"
+  rm -f $A/sigma_deltas_s1q1_dag1.npz $A/noise_schedule_pooled_s1_K1.json $A/noise_schedule_sigma_alpha_s1_K1.json
+  POLICY=$LR/outputs/training/scarcity_study/q1/checkpoints/last/pretrained_model bash $S/planar_calibrate.sh s1 1 > "$SM/calibrate_k1.log" 2>&1; RC=$?
+  [ -f $A/sigma_deltas_s1q1_dag1.npz ] || RC=$((RC+100))
+  check $RC "analysis planar_calibrate.sh s1 K=1 re-measured with q1 (pooled max|diff| vs shipped = $(sched_diff $A/noise_schedule_pooled_s1_K1.json $S/analysis/noise_schedule_pooled_s1_K1.json), rows are O(10-30), stochastic)"
+  PFX=lever_d100_03dagcap_r84_diff; cd $LR
+  INT_PREFIX=$PFX $PY $S/analysis/measure_w_lever.py 1,2 > "$A/w_lever_r84_rounds1,2.smoke.txt" 2>&1; RC=$?
+  W=$(grep -oE "W = [0-9.]+" "$A/w_lever_r84_rounds1,2.smoke.txt" | head -1 | awk '{print $3}'); WS=$(grep -oE "W = [0-9.]+" "$S/analysis/w_lever_r84_rounds1,2.txt" | head -1 | awk '{print $3}')
+  [ "$W" = "$WS" ] || RC=$((RC+100)); check $RC "analysis lever measure_w_lever rounds 1,2 (W=$W, shipped $WS)"
+  rm -f $A/noise_schedule_pooled_lever_r84_K2.json
+  INT_PREFIX=$PFX TAGPFX=r84_ $PY $S/analysis/build_pooled_schedule_lever.py 2 $W > /dev/null; RC=$?
+  D=$(sched_diff $A/noise_schedule_pooled_lever_r84_K2.json $S/analysis/noise_schedule_pooled_lever_r84_K2.json); [ "$D" = 0 ] || RC=$((RC+100))
+  check $RC "analysis lever build_pooled_schedule_lever K=2 from cached deltas (max|diff| vs shipped = $D)"
+  rm -f $A/sigma_deltas_lever_r84_q1_dag1.npz
+  $PY $S/analysis/measure_sigma_lever.py r84_q1_dag1 $LEVER_BASE/checkpoints/last/pretrained_model ${PFX}_r_dag1 > "$SM/measure_sigma_lever.log" 2>&1; RC=$?
+  [ -f $A/sigma_deltas_lever_r84_q1_dag1.npz ] || RC=$((RC+100)); check $RC "analysis lever measure_sigma_lever K=1 with the BC policy"
+fi
 if [[ " $PARTS " == *" table "* ]]; then
-  $PY $S/gen_table.py > /dev/null; RC=$?
-  diff -q <(grep -v '^%' $S/table_full_benchmark.tex | sed -n '/begin{tabular}/,/end{tabular}/p') <(grep -v '^%' $S/table1_tabular.tex | sed -n '/begin{tabular}/,/end{tabular}/p') > /dev/null || RC=$((RC+100))
-  check $RC "table I gen_table.py (tabular identical to table1_tabular.tex)"
-  $PY $S/analysis/lever_table.py > /dev/null; check $? "table II analysis/lever_table.py"
+  cd $LR; $PY $S/gen_table.py > /dev/null; RC=$?
+  diff -q <(sed -n '/begin{tabular}/,/end{tabular}/p' $S/table_full_benchmark.tex) <(sed -n '/begin{tabular}/,/end{tabular}/p' $S/table1_tabular.tex) > /dev/null || RC=$((RC+100))
+  check $RC "table gen_table.py: tabular identical to table1_tabular.tex"
+  $PY $S/analysis/lever_table.py > /dev/null; check $? "table analysis/lever_table.py"
 fi
 [ $FAIL = 0 ] && log "SMOKE OK" || log "SMOKE FAILED"; exit $FAIL

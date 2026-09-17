@@ -40,6 +40,8 @@ FIG_DPI = 140
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fig1_teaser.png")
 SCRATCH = os.path.dirname(os.path.abspath(__file__))
 SCHED_PATH = os.path.join(SCRATCH, SCHEDULE)
+if not os.path.exists(SCHED_PATH):  # the schedules live in tables_repro/analysis (unpack_schedules.sh)
+    SCHED_PATH = os.path.join(os.path.dirname(SCRATCH), "tables_repro", "analysis", SCHEDULE)
 STATES_JSON = os.path.join(SCRATCH, "servo_states_ep24_f61.json")  # saved anchor + draws
 # ─────────────────────────────────────────────────────────────────────────────
 

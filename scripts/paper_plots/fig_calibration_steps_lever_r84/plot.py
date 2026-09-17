@@ -55,6 +55,19 @@ FIGSIZE = (12.6, 3.6)
 DPI = 150
 # ─────────────────────────────────────────────────────────────────────────────
 HERE = os.path.dirname(os.path.abspath(__file__))
+# calibration inputs (sigma deltas, schedules) live in tables_repro/analysis; a copy next to this
+# script takes precedence (e.g. a variant not in the tables).
+_ANALYSIS = os.path.join(os.path.dirname(HERE), "tables_repro", "analysis")
+
+
+def _find(name, *dirs):
+    for d in list(dirs) + [_ANALYSIS]:
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(f"{name}: not in {list(dirs) + [_ANALYSIS]} (bash tables_repro/analysis/unpack_schedules.sh?)")
+
+
 OUT = os.environ.get("OUT", os.path.join(HERE, "fig_calibration_steps_lever_r84.png"))
 SRC_REPO = "lever_d100_03dagcap_r84_diff_r_dag1"
 NARM = 6
@@ -153,7 +166,7 @@ for tag in BLEND_TAGS:
     dv = np.array(dv)
     settle[tag] = float(np.sqrt(np.mean(dv[40 : min(len(dv), 120)] ** 2)))  # RMS over ticks 40:120, med-steps
 # open-loop deltas (base policy, K=4 draws, stride 2)
-z = np.load(os.path.join(HERE, "sigma_deltas_lever_r84_q1_dag1.npz"))
+z = np.load(_find("sigma_deltas_lever_r84_q1_dag1.npz", HERE))
 d = z[f"ep{EPISODE}_d"]
 ta = z[f"ep{EPISODE}_t"].astype(int)
 order = np.argsort(ta)
@@ -179,7 +192,7 @@ def C_at(t, smooth=None):  # nearest anchor, optionally averaged over +-smooth a
 # deployed pooled schedule (21 upper-triangle entries, med^2) -> rad^2
 IU6 = [(i, j) for i in range(6) for j in range(i, 6)]
 row = np.asarray(
-    json.load(open(os.path.join(HERE, "noise_schedule_pooled_lever_r84_K1.json")))[f"JennyWWW/{SRC_REPO}"][
+    json.load(open(_find("noise_schedule_pooled_lever_r84_K1.json", HERE)))[f"JennyWWW/{SRC_REPO}"][
         str(EPISODE)
     ][0],
     dtype=float,

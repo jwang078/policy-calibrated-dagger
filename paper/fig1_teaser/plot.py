@@ -57,12 +57,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 # ── data ─────────────────────────────────────────────────────────────────────
-CACHE = os.path.expanduser("~/.cache/huggingface/lerobot/JennyWWW")
-df = pd.read_parquet(f"{CACHE}/{SOURCE_REPO}/data/chunk-000/file-000.parquet")
-g = df[df.episode_index == EPISODE].sort_values("frame_index")
-St = np.stack([np.asarray(v, dtype=float) for v in g["observation.state"]])
-Ac = np.stack([np.asarray(v, dtype=float) for v in g["action"]])
-env = np.stack([np.asarray(v, dtype=float) for v in g["observation.environment_state"]])
+sys.path.insert(0, os.path.dirname(SCRATCH))
+import figdata  # noqa: E402  (snapshots the raw inputs into paper_plots/data)
+
+_ep = figdata.episode(SOURCE_REPO, EPISODE, ("observation.state", "action", "observation.environment_state"))
+St, Ac, env = _ep["observation.state"], _ep["action"], _ep["observation.environment_state"]
 T = FRAME
 states = json.load(open(STATES_JSON))
 anchor = np.array(states["anchor_q"])

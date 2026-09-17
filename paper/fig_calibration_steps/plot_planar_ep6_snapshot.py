@@ -63,16 +63,13 @@ from lerobot.datasets.dart_relabel import chunk_labels, demo_geometry  # noqa: E
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-CACHE = os.path.expanduser("~/.cache/huggingface/lerobot/JennyWWW")
+sys.path.insert(0, os.path.dirname(HERE))
+import figdata  # noqa: E402  (snapshots the raw inputs into paper_plots/data)
 
 
 def joints_of(repo, episode):
-    df = pd.read_parquet(f"{CACHE}/{repo}/data/chunk-000/file-000.parquet")
-    g = df[df.episode_index == episode].sort_values("frame_index")
-    return (
-        np.stack([np.asarray(v, dtype=float) for v in g["observation.state"]]),
-        np.stack([np.asarray(v, dtype=float) for v in g["action"]]),
-    )
+    e = figdata.episode(repo, episode, ("observation.state", "action"))
+    return e["observation.state"], e["action"]
 
 
 St, Ac = joints_of("planar_12_05dag_diff_r_dag3", EPISODE)

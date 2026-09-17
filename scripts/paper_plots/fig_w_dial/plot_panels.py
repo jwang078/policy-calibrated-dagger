@@ -15,17 +15,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 S = os.path.dirname(os.path.abspath(__file__))
+import sys  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(S))
+import figdata  # noqa: E402
+
 D = json.load(open(f"{S}/w_dial_data.json"))
 W, R, Wlo, Whi = D["W"], D["R"], D["W_lo"], D["W_hi"]
 cells = [c for c in D["cells"] if c["rms"] is not None and np.isfinite(c["rms"])]
 rdcol = {1: "#2a78d6", 2: "#eda100", 3: "#008300", 4: "#e87ba4", 5: "#4a3aa7"}
 
 # g(beta) from the trained model's DDPM schedule (squaredcos_cap_v2, T=100)
-cfg = json.load(
-    open(
-        "/home/jennyw2/code/lerobot/outputs/training/diffusion_planar_3joint_12_delta_stateng/"
-        "checkpoints/last/pretrained_model/config.json"
-    )
+cfg = figdata.json_file(
+    "planar_bc_policy_config.json",
+    "~/code/lerobot/outputs/training/diffusion_planar_3joint_12_delta_stateng/checkpoints/last/pretrained_model/config.json",
 )
 T = int(cfg["num_train_timesteps"])
 _ab = lambda t: np.cos((t + 0.008) / 1.008 * np.pi / 2) ** 2

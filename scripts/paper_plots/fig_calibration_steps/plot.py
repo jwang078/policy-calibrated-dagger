@@ -77,11 +77,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 _ANALYSIS = os.path.join(os.path.dirname(HERE), "tables_repro", "analysis")
 
 
-def _find(name, *dirs):
+def _find(name, *dirs, missing_ok=False):
     for d in list(dirs) + [_ANALYSIS]:
         p = os.path.join(d, name)
         if os.path.exists(p):
             return p
+    if missing_ok:  # a per-episode snapshot in paper_plots/data may still serve it (figdata.deltas_episode)
+        return os.path.join(_ANALYSIS, name)
     raise FileNotFoundError(f"{name}: not in {list(dirs) + [_ANALYSIS]} (bash tables_repro/analysis/unpack_schedules.sh?)")
 
 
@@ -90,21 +92,21 @@ if TASK == "lever_r84":  # 84px lineage, round 1 (BC on dag1): s = 0.15 -> (c) i
     OUT = os.path.join(R84, "fig_calibration_steps_lever_r84.png")
     SRC_REPO = "lever_d100_03dagcap_r84_diff_r_dag1"
     NARM = 6
-    SIGMA_NPZ = _find("sigma_deltas_lever_r84_q1_dag1.npz", R84)
+    SIGMA_NPZ = _find("sigma_deltas_lever_r84_q1_dag1.npz", R84, missing_ok=True)
     SCHED_JSON = _find("noise_schedule_pooled_lever_r84_K1.json", R84)
     SCALE_JSON = os.path.join(R84, "dart_scale_lever_r84_K1.json")
 elif TASK == "lever":
     OUT = os.path.join(HERE, "fig_calibration_steps_lever.png")
     SRC_REPO = "lever_d100_03dagcap_cam_diff_r_dag1"
     NARM = 6
-    SIGMA_NPZ = _find("sigma_deltas_lever_q1_dag1.npz", HERE)  # 224 px lineage, not in the tables
+    SIGMA_NPZ = _find("sigma_deltas_lever_q1_dag1.npz", HERE, missing_ok=True)  # 224 px lineage, not in the tables
     SCHED_JSON = _find("noise_schedule_pooled_lever_K1.json", HERE)
     SCALE_JSON = os.path.join(HERE, "dart_scale_lever_K1.json")
 else:
     OUT = os.path.join(HERE, "fig_calibration_steps.png")
     SRC_REPO = "planar_12_05dag_diff_r_dag3"
     NARM = 3
-    SIGMA_NPZ = _find("sigma_deltas_s1q3_dag3.npz", HERE)
+    SIGMA_NPZ = _find("sigma_deltas_s1q3_dag3.npz", HERE, missing_ok=True)
     SCHED_JSON = _find("noise_schedule_pooled_s1_K3.json", HERE)
     SCALE_JSON = os.path.join(HERE, "dart_scale_s1_K3.json")
 IU = [(i, j) for i in range(NARM) for j in range(i, NARM)]
@@ -119,21 +121,13 @@ import matplotlib.pyplot as plt  # noqa
 from matplotlib.path import Path as _Path
 from matplotlib.patches import PathPatch as _PathPatch
 
-CACHE = os.path.expanduser("~/.cache/huggingface/lerobot/JennyWWW")
+sys.path.insert(0, os.path.dirname(HERE))
+import figdata  # noqa: E402  (snapshots the raw inputs into paper_plots/data)
 
 
-def joints_of(repo, episode):
-    df = pd.concat(
-        [
-            pd.read_parquet(f, columns=["episode_index", "frame_index", "observation.state", "action"])
-            for f in glob.glob(f"{CACHE}/{repo}/data/**/*.parquet", recursive=True)
-        ]
-    )
-    g = df[df.episode_index == episode].sort_values("frame_index")
-    return (
-        np.stack([np.asarray(v, dtype=float) for v in g["observation.state"]]),
-        np.stack([np.asarray(v, dtype=float) for v in g["action"]]),
-    )
+def joints_of(repo, episode):  # (states, actions) of one episode, from the paper_plots/data snapshot
+    e = figdata.episode(repo, episode, ("observation.state", "action"))
+    return e["observation.state"], e["action"]
 
 
 St, Ac = joints_of(SRC_REPO, EPISODE)
@@ -143,13 +137,7 @@ ms = float(np.median(dm[dm > 1e-6]))
 # fixed 2-D projection used by EVERY panel: points -> (q - mu) @ P, covariances -> P^T S P
 if PROJ in ("pca", "pca_dataset"):
     if PROJ == "pca_dataset":
-        _all = pd.concat(
-            [
-                pd.read_parquet(f, columns=["observation.state"])
-                for f in glob.glob(f"{CACHE}/{SRC_REPO}/data/**/*.parquet", recursive=True)
-            ]
-        )
-        _fit = np.stack([np.asarray(v, dtype=float)[:NARM] for v in _all["observation.state"]])
+        _fit = figdata.all_states(SRC_REPO, NARM).astype(float)
     else:
         _fit = D
     _mu = _fit.mean(0)
@@ -203,7 +191,7 @@ for tag in BLEND_TAGS:
     dv = np.array(dv)
     settle[tag] = float(np.sqrt(np.mean(dv[40 : min(len(dv), 120)] ** 2)))  # RMS over ticks 40:120, med-steps
 # open-loop deltas (base policy, K=4 draws, stride 2)
-z = np.load(SIGMA_NPZ)
+z = figdata.deltas_episode(f"{os.path.basename(SIGMA_NPZ)[:-4]}__ep{EPISODE}.npz", SIGMA_NPZ, EPISODE)
 d = z[f"ep{EPISODE}_d"]
 ta = z[f"ep{EPISODE}_t"].astype(int)
 order = np.argsort(ta)

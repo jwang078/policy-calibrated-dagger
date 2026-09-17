@@ -35,6 +35,9 @@ sys.path.insert(0, os.path.expanduser("~/code/lerobot/my_scripts"))
 from lib_sa_rollout import progress_guidance_index
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+import figdata  # noqa: E402  (snapshots the raw inputs into paper_plots/data)
+
 DATA_JSON = os.path.join(HERE, "w_dial_data.json")
 # --cached: skip the (slow) blend re-measurement and draw from w_dial_data.json
 CACHED = "--cached" in sys.argv and os.path.exists(DATA_JSON)
@@ -122,12 +125,11 @@ def settles(repo, rd):
 
 # ── g(r): policy authority from the trained policy's DDPM schedule ───────────
 
-CFG = (
-    "/home/jennyw2/code/lerobot/outputs/training/"
-    "diffusion_planar_3joint_12_delta_stateng/checkpoints/last/"
-    "pretrained_model/config.json"
+# the planar BC policy's DDPM schedule (snapshot of its config.json)
+cfg = figdata.json_file(
+    "planar_bc_policy_config.json",
+    "~/code/lerobot/outputs/training/diffusion_planar_3joint_12_delta_stateng/checkpoints/last/pretrained_model/config.json",
 )
-cfg = json.load(open(CFG))
 T = int(cfg["num_train_timesteps"])
 assert cfg["beta_schedule"] == "squaredcos_cap_v2", cfg["beta_schedule"]
 assert cfg["noise_scheduler_type"] == "DDPM", cfg["noise_scheduler_type"]

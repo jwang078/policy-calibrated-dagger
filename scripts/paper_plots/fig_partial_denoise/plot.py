@@ -54,124 +54,126 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 REPO = f"JennyWWW/planar_12_05dag_diff_r_dag{3}"
-policy = DiffusionPolicy.from_pretrained(POLICY).cuda().eval()
-pre = PolicyProcessorPipeline.from_pretrained(POLICY, config_filename="policy_preprocessor.json")
-stt = load_file(POLICY + "/policy_preprocessor_step_5_normalizer_processor.safetensors")
-lo = stt["action.min"].cuda()
-rng_ = (stt["action.max"].cuda() - lo).clamp(min=1e-8)
-cfg = policy.config
-fps = 30
-N_ACT, start = cfg.n_action_steps, cfg.n_obs_steps - 1
-dts = {
-    "observation.state": [i / fps for i in range(1 - cfg.n_obs_steps, 1)],
-    "observation.environment_state": [i / fps for i in range(1 - cfg.n_obs_steps, 1)],
-    "action": [i / fps for i in range(1 - cfg.n_obs_steps, 1 - cfg.n_obs_steps + cfg.horizon)],
-}
-ds = LeRobotDataset(REPO, delta_timestamps=dts, episodes=[EPISODE])
-epi = np.array(ds.hf_dataset["episode_index"])
-fri = np.array(ds.hf_dataset["frame_index"])
-idx = np.where(epi == EPISODE)[0]
-idx = idx[np.argsort(fri[idx])]
-item = ds[int(idx[ANCHOR])]
-ns = policy.diffusion.noise_scheduler
-T_train = ns.config.num_train_timesteps
-raw = {k: item[k][None] for k in ("observation.state", "observation.environment_state", "action")}
-proc = pre(raw)
-nb = {k: proc[k].cuda() for k in ("observation.state", "observation.environment_state")}
-ng = proc["action"].cuda()
-torch.manual_seed(SEED)
-# the policy predicts actions RELATIVE to the current observed state (rel stats): add the anchor state back
-q_anchor = item["observation.state"][-1][:3].numpy().astype(float)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import figdata  # noqa: E402  (snapshots the raw inputs into paper_plots/data)
 
+# The policy samples are snapshotted to paper_plots/data/partial_denoise_ep<E>_a<A>.json; with the
+# checkpoint gone (or FROM_CACHE=1) the figure is drawn from that snapshot.
+SNAP = os.path.join(figdata.DATA_DIR, f"partial_denoise_ep{EPISODE}_a{ANCHOR}.json")
+REPLAY = os.environ.get("FROM_CACHE") == "1" or (not os.path.isdir(POLICY) and os.path.exists(SNAP))
+if REPLAY:
+    import json as _json
 
-def unnorm(a):
-    return ((a + 1) / 2 * rng_ + lo)[:, :, :3].cpu().numpy() + q_anchor
-
-
-expert = unnorm(ng[:, start : start + N_ACT])[0]
-_raw = item["action"][start : start + N_ACT, :3].numpy()
-assert np.abs(expert - _raw).max() < 2e-2, (
-    f"relative-action convention mismatch: {np.abs(expert - _raw).max()}"
-)
-samples = {}
-with torch.no_grad():
-    for r in RATIOS:
-        if r in RESEED:
-            torch.manual_seed(RESEED[r])
-        nbk = {k: v.repeat_interleave(N_SAMPLES, 0) for k, v in nb.items()}
-        ngk = ng.repeat_interleave(N_SAMPLES, 0)
-        if r >= 1.0:
-            x = torch.randn_like(ngk)
-            pred = policy.diffusion.generate_actions(nbk, noise=x, sa_noise_ratio=1.0)
-        else:
-            t_sw = int(r * T_train)
-            x = ns.add_noise(
-                ngk,
-                torch.randn_like(ngk),
-                torch.full((ngk.shape[0],), t_sw - 1, dtype=torch.long, device="cuda"),
-            )
-            pred = policy.diffusion.generate_actions(nbk, noise=x, sa_noise_ratio=r)
-        samples[r] = unnorm(pred[:, :N_ACT] if pred.shape[1] > N_ACT else pred)
-# end-effector FK (finger-pad midpoint, same convention as the teaser)
-cid = pb.connect(pb.DIRECT)
-body = pb.loadURDF(dsv.PLANAR_URDF, useFixedBase=True, physicsClientId=cid)
-
-
-def fk(q):
-    dsv._pose(pb, cid, body, q)
-    pl = np.array(pb.getLinkState(body, 8, computeForwardKinematics=True, physicsClientId=cid)[0])
-    pr = np.array(pb.getLinkState(body, 13, computeForwardKinematics=True, physicsClientId=cid)[0])
-    return ((pl + pr) / 2)[[0, 2]]
-
-
-St = np.stack(
-    [
-        np.asarray(v, dtype=float)
-        for v in pd.concat(
-            [
-                pd.read_parquet(f, columns=["episode_index", "frame_index", "observation.state"])
-                for f in glob.glob(
-                    os.path.expanduser(f"~/.cache/huggingface/lerobot/{REPO}/data/**/*.parquet"),
-                    recursive=True,
-                )
-            ]
-        )
-        .query(f"episode_index=={EPISODE}")
-        .sort_values("frame_index")["observation.state"]
-    ]
-)[:, :3]
-if SPACE == "pca":
-    # same convention as fig_calibration_steps: PCA of ALL intervention states of this dataset, plane rotated so this episode's net motion is +x
-    _all = pd.concat(
-        [
-            pd.read_parquet(f, columns=["observation.state"])
-            for f in glob.glob(
-                os.path.expanduser(f"~/.cache/huggingface/lerobot/{REPO}/data/**/*.parquet"), recursive=True
-            )
-        ]
-    )
-    _fit = np.stack([np.asarray(v, dtype=float)[:3] for v in _all["observation.state"]])
-    _mu = _fit.mean(0)
-    _u, _sv, _vt = np.linalg.svd(_fit - _mu, full_matrices=False)
-    P2 = _vt[:2].T
-    EXPL = _sv[:2] ** 2 / (_sv**2).sum()
-    _d = (St[-1] - St[0]) @ P2
-    _th = np.arctan2(_d[1], _d[0])
-    _Rm = np.array([[np.cos(-_th), -np.sin(-_th)], [np.sin(-_th), np.cos(-_th)]])
-    P2 = P2 @ _Rm.T
-    fk = lambda q: (np.asarray(q, dtype=float) - _mu) @ P2
-    AXL = (
-        "PCA projection of joint space (dim 1) [rad]",
-        "PCA projection of joint space (dim 2) [rad]"
-        + (f"  (axis ×{Y_STRETCH:g})" if Y_STRETCH not in ("auto", 1) else ""),
-    )
-    print(f"dataset PCA plane explains {EXPL.sum() * 100:.0f}% of joint variance")
+    _snap = _json.load(open(SNAP))
+    assert [float(r) for r in _snap["ratios"]] == list(RATIOS), "snapshot has different ratios; set RATIOS to match"
+    path, ee_exp = np.array(_snap["path"]), np.array(_snap["expert"])
+    ee_s = {r: np.array(s) for r, s in zip(RATIOS, _snap["samples"])}
+    AXL = tuple(_snap["axl"])
+    print(f"(replay) {SNAP}")
 else:
-    AXL = ("end-effector x [m]", "end-effector z [m]")
-path = np.array([fk(q) for q in St])
-ee_exp = np.array([fk(q) for q in expert])
-ee_s = {r: np.array([[fk(q) for q in s] for s in samples[r]]) for r in RATIOS}
-pb.disconnect(cid)
+    policy = DiffusionPolicy.from_pretrained(POLICY).cuda().eval()
+    pre = PolicyProcessorPipeline.from_pretrained(POLICY, config_filename="policy_preprocessor.json")
+    stt = load_file(POLICY + "/policy_preprocessor_step_5_normalizer_processor.safetensors")
+    lo = stt["action.min"].cuda()
+    rng_ = (stt["action.max"].cuda() - lo).clamp(min=1e-8)
+    cfg = policy.config
+    fps = 30
+    N_ACT, start = cfg.n_action_steps, cfg.n_obs_steps - 1
+    dts = {
+        "observation.state": [i / fps for i in range(1 - cfg.n_obs_steps, 1)],
+        "observation.environment_state": [i / fps for i in range(1 - cfg.n_obs_steps, 1)],
+        "action": [i / fps for i in range(1 - cfg.n_obs_steps, 1 - cfg.n_obs_steps + cfg.horizon)],
+    }
+    ds = LeRobotDataset(REPO, delta_timestamps=dts, episodes=[EPISODE])
+    epi = np.array(ds.hf_dataset["episode_index"])
+    fri = np.array(ds.hf_dataset["frame_index"])
+    idx = np.where(epi == EPISODE)[0]
+    idx = idx[np.argsort(fri[idx])]
+    item = ds[int(idx[ANCHOR])]
+    ns = policy.diffusion.noise_scheduler
+    T_train = ns.config.num_train_timesteps
+    raw = {k: item[k][None] for k in ("observation.state", "observation.environment_state", "action")}
+    proc = pre(raw)
+    nb = {k: proc[k].cuda() for k in ("observation.state", "observation.environment_state")}
+    ng = proc["action"].cuda()
+    torch.manual_seed(SEED)
+    # the policy predicts actions RELATIVE to the current observed state (rel stats): add the anchor state back
+    q_anchor = item["observation.state"][-1][:3].numpy().astype(float)
+
+
+    def unnorm(a):
+        return ((a + 1) / 2 * rng_ + lo)[:, :, :3].cpu().numpy() + q_anchor
+
+
+    expert = unnorm(ng[:, start : start + N_ACT])[0]
+    _raw = item["action"][start : start + N_ACT, :3].numpy()
+    assert np.abs(expert - _raw).max() < 2e-2, (
+        f"relative-action convention mismatch: {np.abs(expert - _raw).max()}"
+    )
+    samples = {}
+    with torch.no_grad():
+        for r in RATIOS:
+            if r in RESEED:
+                torch.manual_seed(RESEED[r])
+            nbk = {k: v.repeat_interleave(N_SAMPLES, 0) for k, v in nb.items()}
+            ngk = ng.repeat_interleave(N_SAMPLES, 0)
+            if r >= 1.0:
+                x = torch.randn_like(ngk)
+                pred = policy.diffusion.generate_actions(nbk, noise=x, sa_noise_ratio=1.0)
+            else:
+                t_sw = int(r * T_train)
+                x = ns.add_noise(
+                    ngk,
+                    torch.randn_like(ngk),
+                    torch.full((ngk.shape[0],), t_sw - 1, dtype=torch.long, device="cuda"),
+                )
+                pred = policy.diffusion.generate_actions(nbk, noise=x, sa_noise_ratio=r)
+            samples[r] = unnorm(pred[:, :N_ACT] if pred.shape[1] > N_ACT else pred)
+    # end-effector FK (finger-pad midpoint, same convention as the teaser)
+    cid = pb.connect(pb.DIRECT)
+    body = pb.loadURDF(dsv.PLANAR_URDF, useFixedBase=True, physicsClientId=cid)
+
+
+    def fk(q):
+        dsv._pose(pb, cid, body, q)
+        pl = np.array(pb.getLinkState(body, 8, computeForwardKinematics=True, physicsClientId=cid)[0])
+        pr = np.array(pb.getLinkState(body, 13, computeForwardKinematics=True, physicsClientId=cid)[0])
+        return ((pl + pr) / 2)[[0, 2]]
+
+
+    St = figdata.episode(REPO.split("/", 1)[1], EPISODE, ("observation.state",))["observation.state"][:, :3]
+    if SPACE == "pca":
+        # same convention as fig_calibration_steps: PCA of ALL intervention states of this dataset, plane rotated so this episode's net motion is +x
+        _fit = figdata.all_states(REPO.split("/", 1)[1], 3).astype(float)
+        _mu = _fit.mean(0)
+        _u, _sv, _vt = np.linalg.svd(_fit - _mu, full_matrices=False)
+        P2 = _vt[:2].T
+        EXPL = _sv[:2] ** 2 / (_sv**2).sum()
+        _d = (St[-1] - St[0]) @ P2
+        _th = np.arctan2(_d[1], _d[0])
+        _Rm = np.array([[np.cos(-_th), -np.sin(-_th)], [np.sin(-_th), np.cos(-_th)]])
+        P2 = P2 @ _Rm.T
+        fk = lambda q: (np.asarray(q, dtype=float) - _mu) @ P2
+        AXL = (
+            "PCA projection of joint space (dim 1) [rad]",
+            "PCA projection of joint space (dim 2) [rad]"
+            + (f"  (axis ×{Y_STRETCH:g})" if Y_STRETCH not in ("auto", 1) else ""),
+        )
+        print(f"dataset PCA plane explains {EXPL.sum() * 100:.0f}% of joint variance")
+    else:
+        AXL = ("end-effector x [m]", "end-effector z [m]")
+    path = np.array([fk(q) for q in St])
+    ee_exp = np.array([fk(q) for q in expert])
+    ee_s = {r: np.array([[fk(q) for q in s] for s in samples[r]]) for r in RATIOS}
+    pb.disconnect(cid)
+    import json as _json
+
+    os.makedirs(figdata.DATA_DIR, exist_ok=True)
+    _json.dump(
+        {"ratios": list(RATIOS), "episode": EPISODE, "anchor": ANCHOR, "space": SPACE, "axl": list(AXL),
+         "path": path.tolist(), "expert": ee_exp.tolist(), "samples": [ee_s[r].tolist() for r in RATIOS]},
+        open(SNAP, "w"),
+    )
 # ── CONFIG (style; the GUI built by build_gui.py emits this block) ──────────
 CONFIG = {
     "title": "Partial denoising at one observation",

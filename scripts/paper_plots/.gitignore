@@ -7,3 +7,6 @@ fig_data*.json
 *.out
 cands/
 __pycache__/
+# the per-figure input snapshots (figdata.py) ARE committed
+!data/**
+!dart_chunks_src47/*.npz

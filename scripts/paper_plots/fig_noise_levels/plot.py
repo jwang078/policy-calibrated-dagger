@@ -16,6 +16,9 @@ import matplotlib.pyplot as plt
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 S = os.environ.get("DELTAS_DIR", os.path.join(os.path.dirname(HERE), "tables_repro", "analysis"))  # sigma_deltas_*.npz caches
+# pooled covariances are snapshotted to paper_plots/data/noise_levels_covs.json (the deltas are 320 MB, git-ignored)
+_SNAP = os.path.join(os.path.dirname(HERE), "data", "noise_levels_covs.json")
+_snap = {} if os.environ.get("FIGDATA_REFRESH") == "1" or not os.path.exists(_SNAP) else __import__("json").load(open(_SNAP))
 OUT = os.environ.get("OUT", os.path.join(HERE, "fig_noise_levels.pdf"))
 FIXED = [2, 4, 8, 12, 16]
 PLANAR_W = 8.0
@@ -28,6 +31,17 @@ MED_PLANAR, MED_LEVER = 0.0176, 0.0166
 
 
 def cbar(prefix, K, nj):
+    key = f"{prefix}|{K}"
+    if key in _snap:
+        return None if _snap[key] is None else np.array(_snap[key])
+    C = _cbar(prefix, K, nj)
+    _snap[key] = None if C is None else C.tolist()
+    os.makedirs(os.path.dirname(_SNAP), exist_ok=True)
+    __import__("json").dump(_snap, open(_SNAP, "w"))
+    return C
+
+
+def _cbar(prefix, K, nj):
     covs = []
     for R in range(1, K + 1):
         p = f"{S}/{prefix}q{K}_dag{R}.npz"

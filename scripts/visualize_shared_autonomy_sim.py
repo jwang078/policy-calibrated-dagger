@@ -766,6 +766,7 @@ def parse_args():
     parser.add_argument("--guidance_from_dart_labels", type=lambda s: s.lower() != "false", default=False)
     parser.add_argument("--anchor_prefix_steps", type=int, default=0)
     parser.add_argument("--anchor_suffix_steps", type=int, default=0)
+    parser.add_argument("--anchor_suffix_to_goal", type=lambda s: s.lower() == "true", default=False)
     parser.add_argument("--anchor_every_denoise_step", type=lambda s: s.lower() != "false", default=True)
     parser.add_argument(
         "--total_steps",
@@ -1109,6 +1110,7 @@ def main():
         wrapper.blend_tube_steps = float(args.blend_tube_steps)
     wrapper.anchor_prefix_steps = args.anchor_prefix_steps
     wrapper.anchor_suffix_steps = args.anchor_suffix_steps
+    wrapper.anchor_suffix_to_goal = args.anchor_suffix_to_goal
     wrapper.anchor_every_denoise_step = args.anchor_every_denoise_step
     wrapper.rtc_prev_chunk_guidance = args.rtc_prev_chunk
     wrapper.rtc_max_guidance_weight = args.rtc_max_guidance_weight
@@ -1384,6 +1386,8 @@ def main():
             if (args.anchor_prefix_steps > 0 or args.anchor_suffix_steps > 0)
             else "noanchor"
         )
+        if args.anchor_suffix_to_goal:
+            anchor_tag += "g"
         nas_tag = f"nas{n_action_steps}"
         noise_tag = "" if args.fixed_base_noise else "_freshnoise"
         pg_tag = "_pg" if args.progress_guidance else ""

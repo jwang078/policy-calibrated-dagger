@@ -2,13 +2,15 @@
 # Shared helpers for managing a SplatSim sim process from bash wrappers.
 #
 # This file is meant to be `source`'d, not executed directly. It defines
-# four functions (prefixed `splat_*`) used by callers that need to spin up
+# five functions (prefixed `splat_*`) used by callers that need to spin up
 # their own sim process instead of requiring a pre-launched one on
 # --env_external_port:
 #   splat_port_in_use <port>            → echo pid (or empty) bound to port
 #   splat_wait_for_port <port> <max_s>  → block until port comes up; rc=0/1
 #   splat_start_sim                     → launch SplatSim in background
 #   splat_stop_sim                      → SIGTERM (then SIGKILL) the sim
+#   splat_reclaim_stale_sim <pid> <port> → kill an ORPHANED SplatSim squatting
+#                                         on our port so the run can continue
 #
 # Mirrors the orchestrator's own sim lifecycle in
 # my_scripts/dagger_orchestrate.sh:1774-1911 (~80 lines). Callers set the
@@ -88,6 +90,57 @@ splat_port_in_use() {
 }
 
 
+# Reclaim a port held by a LEFTOVER SplatSim launcher from an earlier run.
+# Mirrors reclaim_stale_sim() in dagger_orchestrate.sh — see the long rationale
+# there. Short version: an orchestrator that is SIGKILL'd (or whose parent shell
+# dies) leaves `launch_nodes.py` orphaned on the port, and every later run then
+# aborts at startup over a stale process nobody owns.
+#
+# Only ever kills a process whose cmdline is a SplatSim launcher bound to
+# EXACTLY this port; any other squatter still yields the hard error.
+# Set SPLAT_RECLAIM_STALE_SIM=false to restore the abort-instead behavior.
+: "${SPLAT_RECLAIM_STALE_SIM:=true}"
+splat_reclaim_stale_sim() {
+    # Args: $1=holder pid, $2=port. rc=0 when the port is free again, rc=1 when
+    # the holder is not ours (caller should error out).
+    local pid="$1" port="$2"
+    [[ "$SPLAT_RECLAIM_STALE_SIM" == "true" ]] || return 1
+    local cmdline
+    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    [[ "$cmdline" == *launch_nodes.py* ]] || return 1
+    [[ "$cmdline" == *"--robot_port $port"* ]] || return 1
+    echo "WARNING: port $port is held by a leftover SplatSim (pid $pid) from an earlier run:" >&2
+    echo "  ${cmdline% }" >&2
+    echo "  Reclaiming it (SIGTERM, then SIGKILL). Set SPLAT_RECLAIM_STALE_SIM=false to abort instead." >&2
+    local pgid our_pgid i
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    our_pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+    if [[ -n "$pgid" && "$pgid" != "$our_pgid" ]]; then
+        kill -TERM -"$pgid" 2>/dev/null || true
+    else
+        kill -TERM "$pid" 2>/dev/null || true
+    fi
+    for ((i=1; i<=30; i++)); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "  leftover sim ignored SIGTERM; sending SIGKILL." >&2
+        if [[ -n "$pgid" && "$pgid" != "$our_pgid" ]]; then
+            kill -KILL -"$pgid" 2>/dev/null || true
+        else
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+    for ((i=1; i<=15; i++)); do
+        [[ -z "$(splat_port_in_use "$port")" ]] && { echo "  port $port reclaimed." >&2; return 0; }
+        sleep 1
+    done
+    echo "  port $port is STILL held after the kill — giving up on reclaim." >&2
+    return 1
+}
+
+
 splat_wait_for_port() {
     # Args: $1=port, $2=max_wait_seconds. rc=0 once a TCP connect succeeds,
     # rc=1 on timeout.
@@ -144,7 +197,7 @@ splat_start_sim() {
     # Port already in use by someone else?
     local existing
     existing="$(splat_port_in_use "$ENV_EXTERNAL_PORT")"
-    if [[ -n "$existing" ]]; then
+    if [[ -n "$existing" ]] && ! splat_reclaim_stale_sim "$existing" "$ENV_EXTERNAL_PORT"; then
         echo "ERROR: port $ENV_EXTERNAL_PORT already in use by pid $existing." >&2
         echo "  Either kill it, change --env_external_port, or change ENV_EXTERNAL_PORT and re-run." >&2
         exit 1

@@ -389,6 +389,8 @@ def run_blended_rollout(
     progress_guidance_lag_tol: int = 2,
     progress_guidance_soft_hold: float = 0.0,
     progress_guidance_hard_lag: int = 8,
+    guidance_delay_steps: int = 0,
+    guidance_lapse_start: int = 0,
     blend_ratio_goal_taper: int = 0,
     blend_dev_regulation: bool = False,
     blend_dev_full_below: float = 3.0,
@@ -452,6 +454,7 @@ def run_blended_rollout(
     blend_interval = max(1, math.ceil(frac * n_action_steps))
 
     wrapper.reset()
+    _lapse_anchor_saved = int(getattr(wrapper, "anchor_suffix_steps", 0) or 0)
     wrapper.forward_flow_ratio = ratio
     wrapper.blend_mode = blend_mode
 
@@ -720,7 +723,9 @@ def run_blended_rollout(
                 # clock slowdown), so the chunk-end aim point is the demo at
                 # (cursor + T - _dev). Published every tick; the obs-teleop
                 # source consumes it as an index shift at anchor-build time.
-                if int(getattr(wrapper, "anchor_suffix_steps", 0) or 0) > 0:
+                if int(getattr(wrapper, "anchor_suffix_steps", 0) or 0) > 0 or getattr(
+                    wrapper, "anchor_suffix_to_goal", False
+                ):
                     wrapper.anchor_clock_lag = max(0, int(round(_dev)))
                 if abort_dev_steps > 0.0 and _dev > abort_dev_steps:
                     _breach_run += 1
@@ -758,6 +763,23 @@ def run_blended_rollout(
                         _tube_engaged_since = None
                 wrapper.forward_flow_ratio = ratio * _scale
                 _r_eff_sum += ratio * _scale
+            # LAPSE (guidance_delay_steps > 0): for ticks in
+            # [guidance_lapse_start, guidance_lapse_start + guidance_delay_steps)
+            # the policy drives free — guidance fully renoised, suffix anchor
+            # off — then shared control (re-)engages. lapse_start=0 simulates
+            # 'the expert grabbed it tau ticks later'; a mid-episode window
+            # simulates an attention lapse anywhere along the intervention,
+            # supplying the departure states the guided measurement
+            # structurally suppresses — at every trajectory region.
+            if guidance_delay_steps > 0:
+                _l0 = int(guidance_lapse_start)
+                _l1 = _l0 + int(guidance_delay_steps)
+                if _l0 <= t < _l1:
+                    wrapper.forward_flow_ratio = 1.0
+                    wrapper.anchor_suffix_steps = 0
+                elif t == _l1 or (t < _l0):
+                    wrapper.forward_flow_ratio = ratio * _scale if ratio not in (0.0, 1.0) else ratio
+                    wrapper.anchor_suffix_steps = _lapse_anchor_saved
                 _r_eff_n += 1
             if guidance_from_dart_labels:
                 # DART-track guidance: same label function as training.
@@ -849,10 +871,25 @@ def run_blended_rollout(
                     # The track already embeds the servo's slowed clock — the
                     # suffix anchor must NOT apply a second timestep shift.
                     wrapper.anchor_clock_lag = 0
+                    # Goal-hold start for anchor_suffix_to_goal: the dart
+                    # track is fixed-horizon with its clock HOLDING at the
+                    # demo end, so the hold lives INSIDE the provided rows
+                    # (the fill's shortfall detection sees none). Publish the
+                    # track-row index where the clock saturates; the obs-
+                    # teleop source converts it to a chunk-tail length (the
+                    # track may be longer than the chunk). Lag is already
+                    # embedded in the servo clock — no further -lag applies.
+                    _clk = _dart_info.get("clock") or []
+                    _end_clk = float(len(_dart_geom.A) - 1)
+                    wrapper.anchor_goal_hold_start = next(
+                        (i for i, c in enumerate(_clk) if float(c) >= _end_clk - 1e-6), None
+                    )
             else:
                 guidance_chunk = None if suppress_guidance else guidance_actions_raw[_j_exec:]
+                wrapper.anchor_goal_hold_start = None
         else:
             guidance_chunk = None if suppress_guidance else guidance_actions_raw[t:]
+            wrapper.anchor_goal_hold_start = None
 
         batch = _build_sim_batch(
             env_obs,

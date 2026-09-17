@@ -181,6 +181,10 @@ class AugmentationConfig:
     # clamps clean at the end (hard guarantee); False = one soft injection.
     anchor_prefix_steps: int = 0
     anchor_suffix_steps: int = 0
+    # Grow the suffix to cover the chunk's whole goal-hold tail near the demo
+    # end: effective suffix = max(anchor_suffix_steps, hold_tail - clock_lag).
+    # Closes the dawdle window between goal arrival and a short fixed suffix.
+    anchor_suffix_to_goal: bool = False
     anchor_every_denoise_step: bool = True
     # Guidance chunk = DART label track (dart_labels.chunk_labels at the
     # current state/projection) instead of the raw demo window — rollout
@@ -300,6 +304,34 @@ class AugmentationConfig:
     # `blend_sample_seed`) next to `source_episode_idx`, so all K samples
     # trace back to their intervention for visualization/merging.
     samples_per_episode: int = 1
+    # Per-sample gaussian offset (demo med-step units, like dart_state_noise_std)
+    # added to the ARM joints of the seed/teleport state before each rollout —
+    # the perturbation happens at t=0 (a teleport, before any motion), so the
+    # excursion amplitude comes from the start offset instead of from tube
+    # width, and the return leg stays guidance-shaped at feasible speeds. Each
+    # sample_idx draws an independent offset (seeded from the sample's own
+    # seed base), so K samples start in K different directions around the
+    # intervention start. 0 disables (historical behavior). The seed obs
+    # history keeps the demo's handoff velocity; the world-match guard is
+    # unaffected (robot-derived env_state dims carry 10x slack).
+    start_state_noise_std: float = 0.0
+    # Measured onset library: JSON {source_ep: [[dq per arm joint], ...]} of
+    # RAW-radian start offsets (e.g. states from free-run probes = "the expert
+    # intervened a bit earlier/later"). Per attempt one entry is drawn
+    # (salted rng, same scheme as start_state_noise_std). Mutually exclusive
+    # with start_state_noise_std.
+    start_offsets_file: str = ""
+    # LAPSE measurement: per sample, guidance engages after tau ~ U{0..max}
+    # ticks of free policy rollout (0 = off). Generalizes the onset library:
+    # the free segment is generated in-rollout instead of pre-seeded.
+    guidance_delay_max_ticks: int = 0
+
+    # How many TRAILING environment_state dims are robot-derived (the planar
+    # oracle state ends with the 2-D EE). Only consulted when
+    # start_state_noise_std > 0: those dims are forced to the loose robot-dim
+    # tolerance in the world-match guard, since the deliberate start offset
+    # moves them even when the source handoff was at rest.
+    start_noise_env_state_ee_dims: int = 2
     # RTC-style previous-chunk guidance (Real-Time Chunking; see
     # SharedAutonomyConfig.rtc_* for full docs). Passes the previous blended
     # chunk's UNEXECUTED remainder into each re-blend's denoise, which pulls
@@ -646,6 +678,8 @@ def rollout_closed_loop_for_augmentation(
     progress_guidance_window: int = 45,
     progress_guidance_soft_hold: float = 0.0,
     progress_guidance_hard_lag: int = 8,
+    guidance_delay_steps: int = 0,
+    guidance_lapse_start: int = 0,
     blend_ratio_goal_taper: int = 0,
     guidance_from_dart_labels: bool = False,
     blend_dev_regulation: bool = False,
@@ -733,6 +767,8 @@ def rollout_closed_loop_for_augmentation(
         progress_guidance_soft_hold=progress_guidance_soft_hold,
         progress_guidance_hard_lag=progress_guidance_hard_lag,
         blend_ratio_goal_taper=blend_ratio_goal_taper,
+        guidance_delay_steps=guidance_delay_steps,
+        guidance_lapse_start=guidance_lapse_start,
         guidance_from_dart_labels=guidance_from_dart_labels,
         blend_dev_regulation=blend_dev_regulation,
         blend_dev_full_below=blend_dev_full_below,
@@ -752,6 +788,25 @@ def rollout_closed_loop_for_augmentation(
     if result.in_collision is not None:
         for _fr, _c in zip(frames, result.in_collision):
             _fr["frame_in_collision"] = np.array([float(_c)], dtype=np.float32)
+
+    # STATE-PAIRING ALIGNMENT (2026-08-27). The client loop records
+    # (pre-command obs, action) — but the source demos/interventions were
+    # recorded server-side as (post-command obs, action), and the PD servo
+    # carries a steady one-command tracking lag, so client-paired episodes
+    # come out one frame off: action[t] ~ state[t+2] here vs state[t+1] in
+    # every server-recorded dataset (measured: base/int best-k=1, all blend
+    # datasets best-k=2, residual 0.22-0.24 either way — a clean index
+    # shift, not settling noise). Re-pair each action with the NEXT frame's
+    # observation side (state, env_state, images, collision flag), matching
+    # the traj-gen recorder's post-command convention; the last frame loses
+    # its observation successor and is dropped. Hold frames reuse the frozen
+    # terminal obs, so the shift is the identity across the hold zone.
+    if len(frames) >= 2:
+        for _i in range(len(frames) - 1):
+            for _k, _v in frames[_i + 1].items():
+                if _k not in ("action", "task"):
+                    frames[_i][_k] = _v
+        frames.pop()
 
     if not pad_after_success:
         # No padding of any kind: the rollout was truncated at the success tick
@@ -1125,6 +1180,7 @@ def run_augmentation(
     wrapper.policy_guidance_representation = PolicyGuidanceRepresentation(cfg.guidance_repr)
     wrapper.anchor_prefix_steps = cfg.anchor_prefix_steps
     wrapper.anchor_suffix_steps = cfg.anchor_suffix_steps
+    wrapper.anchor_suffix_to_goal = cfg.anchor_suffix_to_goal
     wrapper.anchor_every_denoise_step = cfg.anchor_every_denoise_step
     wrapper.rtc_prev_chunk_guidance = cfg.rtc_prev_chunk
     wrapper.rtc_max_guidance_weight = cfg.rtc_max_guidance_weight
@@ -1435,6 +1491,19 @@ def run_augmentation(
                     ]
                 )
                 _env_state_static_mask = np.ptp(_es_head, axis=0) < 0.005
+                # The ptp heuristic classifies robot-derived dims as SCENARIO
+                # dims whenever the handoff was at rest (EE static over the
+                # opening frames) — fine normally, but --start_state_noise_std
+                # deliberately displaces the seeded EE, so those dims must get
+                # the loose robot-dim tolerance or ~30% of samples (exactly
+                # the at-rest handoffs) are dropped as false world mismatches
+                # (observed 2026-08-31: sn4 r1 lost 72/240 slots, deltas
+                # 0.02-0.09 all on the trailing EE dims; k5/wide runs with no
+                # start noise dropped zero).
+                if (
+                    cfg.start_state_noise_std > 0 or cfg.start_offsets_file
+                ) and cfg.start_noise_env_state_ee_dims > 0:
+                    _env_state_static_mask[-int(cfg.start_noise_env_state_ee_dims) :] = False
             guidance_actions_raw = np.stack(
                 [
                     np.asarray(row["action"], dtype=np.float32)
@@ -1531,6 +1600,7 @@ def run_augmentation(
                 )
                 _med_step = float(np.median(_g_steps[_g_steps > 1e-9])) if (_g_steps > 1e-9).any() else 1e-3
                 _gap_gate = cfg.max_blend_end_gap_steps * _med_step
+                _seed_js = seed_joint_state
                 # Ratio ladder: requested ratio first, then halvings (backoff).
                 _ratio_ladder = [float(ratio)]
                 if cfg.blend_ratio_backoff:
@@ -1554,6 +1624,56 @@ def run_augmentation(
                                 wrapper.sample_seed = _seed_base + 100_000 * _attempt_no
                             if cfg.fixed_base_noise and _bn is not None:
                                 _bn = torch.randn_like(_bn)
+                        # DART-at-the-start: per-sample offset on the arm
+                        # joints of the seed/teleport state (demo med-step
+                        # units). Drawn PER ATTEMPT (salted by _attempt_no) so
+                        # a tube-breach retry gets a fresh start offset, not
+                        # just fresh policy noise — a doomed offset (e.g. one
+                        # seeded near an obstacle) would otherwise fail all
+                        # retries and drop the sample (lost ep 9's sample 5/5
+                        # on the hard wrap-around scenario, 2026-08-31).
+                        if cfg.start_state_noise_std > 0:
+                            _sn_rng = np.random.default_rng(
+                                (_seed_base if _seed_base >= 0 else int(source_ep))
+                                + 424243
+                                + 1_000_003 * _attempt_no
+                            )
+                            _off = _sn_rng.normal(0.0, cfg.start_state_noise_std * _med_step, size=_n_arm)
+                            _seed_js = np.asarray(seed_joint_state, dtype=np.float32).copy()
+                            _seed_js[:_n_arm] += _off.astype(np.float32)
+                        elif cfg.start_offsets_file:
+                            global _ONSET_LIB
+                            if "_ONSET_LIB" not in globals():
+                                import json as _json
+
+                                _ONSET_LIB = _json.load(open(cfg.start_offsets_file))
+                            _entries = _ONSET_LIB.get(str(int(source_ep)))
+                            if _entries:
+                                _sn_rng = np.random.default_rng(
+                                    (_seed_base if _seed_base >= 0 else int(source_ep))
+                                    + 424243
+                                    + 1_000_003 * _attempt_no
+                                )
+                                _off = np.asarray(
+                                    _entries[int(_sn_rng.integers(len(_entries)))],
+                                    dtype=np.float32,
+                                )[:_n_arm]
+                                _seed_js = np.asarray(seed_joint_state, dtype=np.float32).copy()
+                                _seed_js[:_n_arm] += _off
+
+                        _lapse_ticks = 0
+                        _lapse_start = 0
+                        if cfg.guidance_delay_max_ticks > 0:
+                            _lp_rng = np.random.default_rng(
+                                (_seed_base if _seed_base >= 0 else int(source_ep))
+                                + 777001
+                                + 1_000_003 * _attempt_no
+                            )
+                            _lapse_ticks = int(_lp_rng.integers(0, cfg.guidance_delay_max_ticks + 1))
+                            # lapse can begin ANYWHERE the guidance still has
+                            # runway: uniform over [0, total - tau - 20]
+                            _hi = max(1, int(total_steps) - _lapse_ticks - 20)
+                            _lapse_start = int(_lp_rng.integers(0, _hi))
                         try:
                             rollout = rollout_closed_loop_for_augmentation(
                                 wrapper=wrapper,
@@ -1561,7 +1681,7 @@ def run_augmentation(
                                 vec_env=vec_env,
                                 env_preprocessor=env_pre,
                                 env_postprocessor=env_post,
-                                seed_joint_state=seed_joint_state,
+                                seed_joint_state=_seed_js,
                                 seed_joint_velocity=seed_joint_velocity,
                                 guidance_actions_raw=guidance_actions_raw,
                                 ratio=ratio_eff,
@@ -1573,6 +1693,8 @@ def run_augmentation(
                                 progress_guidance_soft_hold=cfg.progress_guidance_soft_hold,
                                 progress_guidance_hard_lag=cfg.progress_guidance_hard_lag,
                                 blend_ratio_goal_taper=cfg.blend_ratio_goal_taper,
+                                guidance_delay_steps=_lapse_ticks,
+                                guidance_lapse_start=_lapse_start,
                                 guidance_from_dart_labels=cfg.guidance_from_dart_labels,
                                 blend_dev_regulation=cfg.blend_dev_regulation,
                                 blend_dev_full_below=cfg.blend_dev_full_below,
@@ -1850,12 +1972,19 @@ def run_augmentation(
                     "blend_sample_idx": int(sample_idx),
                     "blend_sample_seed": int(_seed_base),
                 }
-                if _mean_r_eff is not None:
-                    episode_metadata["blend_ratio_effective_mean"] = float(_mean_r_eff)
-                if _dev_p50 is not None:
-                    episode_metadata["blend_dev_steps_p50"] = float(_dev_p50)
-                if _dev_p95 is not None:
-                    episode_metadata["blend_dev_steps_p95"] = float(_dev_p95)
+                # ALWAYS present (NaN when unmeasured): a conditional key makes
+                # ragged metadata columns when an episode ends before any
+                # regulated tick (e.g. terminated inside a guidance lapse) —
+                # pyarrow batch flush then fails on column length mismatch.
+                episode_metadata["blend_ratio_effective_mean"] = (
+                    float(_mean_r_eff) if _mean_r_eff is not None else float("nan")
+                )
+                episode_metadata["blend_dev_steps_p50"] = (
+                    float(_dev_p50) if _dev_p50 is not None else float("nan")
+                )
+                episode_metadata["blend_dev_steps_p95"] = (
+                    float(_dev_p95) if _dev_p95 is not None else float("nan")
+                )
                 if source_scenario_idx is not None:
                     episode_metadata["source_scenario_idx"] = int(source_scenario_idx)
                 target_ds.save_episode(episode_metadata=episode_metadata)
@@ -1984,9 +2113,11 @@ Augmented dataset generated by `augment_dataset_with_blending.py`.
 | `blend_mode` | `{cfg.blend_mode}` |
 | `anchor_prefix_steps` | `{cfg.anchor_prefix_steps}` |
 | `anchor_suffix_steps` | `{cfg.anchor_suffix_steps}` |
+| `anchor_suffix_to_goal` | `{cfg.anchor_suffix_to_goal}` |
 | `anchor_every_denoise_step` | `{cfg.anchor_every_denoise_step}` |
 | `guidance_from_dart_labels` | `{cfg.guidance_from_dart_labels}` |
 | `samples_per_episode` | `{cfg.samples_per_episode}` |
+| `start_state_noise_std` | `{cfg.start_state_noise_std}` |
 | `n_action_steps` | `{cfg.n_action_steps}` |
 | `pad_after_success` | `{cfg.pad_after_success}` |
 | `min_episode_length` | `{cfg.min_episode_length}` |

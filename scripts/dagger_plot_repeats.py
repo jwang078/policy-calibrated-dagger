@@ -48,7 +48,13 @@ import numpy as np
 from matplotlib.ticker import MaxNLocator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dagger_plot import DEFAULT_OUT_DIR, collect_lineage_rows, discover_lineages  # noqa: E402
+from dagger_naming import lineage_of, parse_round_variant  # noqa: E402
+from dagger_plot import (  # noqa: E402
+    DEFAULT_OUT_DIR,
+    TRAINING_ROOT,
+    collect_lineage_rows,
+    discover_lineages,
+)
 
 # --model accepts the orchestrator's short spelling or the training-dir prefix.
 MODEL_PREFIXES = {"diff": "diffusion", "pi": "pi05", "act": "act"}
@@ -137,6 +143,48 @@ def collect_family(
         if per_round:
             out[rep] = per_round
     return out
+
+
+def _activity_mtime(d: Path) -> float:
+    """Newest mtime anywhere that a live training touches.
+
+    A training dir's own mtime stops moving once the run is under way, so an
+    in-progress round would look older than a finished one. Checkpoint dirs and
+    the active wandb run dir keep ticking, so take the max over all three.
+    """
+    times = [d.stat().st_mtime]
+    for sub in list((d / "checkpoints").glob("*")) + list(d.glob("wandb/run-*")):
+        try:
+            times.append(sub.stat().st_mtime)
+        except OSError:
+            continue
+    return max(times)
+
+
+def latest_training_dir(lineages_by_rep: dict[int, str], model: str) -> tuple[int, str, Path] | None:
+    """(rep, round-label, dir) for the family's most recently active training dir.
+
+    Scans every round dir on disk for every rep of the family — including runs
+    still in progress with no eval data yet, which is exactly what the
+    aggregation tables can't show. Absolute path, so it's click-through in a
+    VS Code terminal.
+    """
+    best: tuple[float, int, str, Path] | None = None
+    for rep, lineage in lineages_by_rep.items():
+        for d in TRAINING_ROOT.glob(f"{model}_{lineage}*_dag*"):
+            if not d.is_dir() or lineage_of(d.name, model) != lineage:
+                continue
+            info = parse_round_variant(d.name)
+            label = f"round {info['round']} ({info['variant']})" if info else d.name
+            try:
+                mt = _activity_mtime(d)
+            except OSError:
+                continue
+            if best is None or mt > best[0]:
+                best = (mt, rep, label, d.resolve())
+    if best is None:
+        return None
+    return best[1], best[2], best[3]
 
 
 def training_progress(dir_path: Path) -> tuple[int | None, int | None]:
@@ -528,6 +576,10 @@ def main() -> int:
         plt.close(fig)
         written.append((family, out))
         print(f"[{family}] reps={sorted(reps)} → {out}")
+        _latest = latest_training_dir(by_rep, model)
+        if _latest:
+            _rep, _label, _dir = _latest
+            print(f"    latest: rep {_rep} {_label}: {_dir}")
         for r, m_, s_, cnt in zip(rounds, mean, std, n):
             if r == 0:
                 # round 0 is the shared base checkpoint (trained once for all reps),

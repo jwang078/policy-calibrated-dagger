@@ -180,6 +180,7 @@ def main() -> None:
     ap.add_argument("--dataset_repo_id", required=True)
     ap.add_argument("--ratio", type=float, default=0.5)
     ap.add_argument("--anchor_suffix_steps", type=int, default=8)
+    ap.add_argument("--anchor_suffix_to_goal", type=lambda s: s.lower() == "true", default=False)
     ap.add_argument("--rtc_hard_prefix_xfade", type=int, default=8)
     ap.add_argument("--rtc_max_guidance_weight", type=float, default=3.0)
     ap.add_argument("--exec_prefix", type=int, default=16, help="blend_interval ticks per rebuild")
@@ -189,6 +190,9 @@ def main() -> None:
     ap.add_argument("--robot_name", default="planar_3joint")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--dump_csv", default=None, help="append per-anchor rows: iter,episode,frame,dev_med_steps"
+    )
     args = ap.parse_args()
 
     wrapper, obs_pre = load_wrapped_policy(
@@ -205,6 +209,7 @@ def main() -> None:
     wrapper.blend_mode = BlendMode.EVERY_STEP
     wrapper.anchor_prefix_steps = 0
     wrapper.anchor_suffix_steps = args.anchor_suffix_steps
+    wrapper.anchor_suffix_to_goal = args.anchor_suffix_to_goal
     wrapper.anchor_every_denoise_step = True
     wrapper.rtc_prev_chunk_guidance = True
     wrapper.rtc_max_guidance_weight = args.rtc_max_guidance_weight
@@ -241,6 +246,9 @@ def main() -> None:
             vec = end - _interp(geom.P, di_end)
             vecs.append(vec)
             devs.append(np.linalg.norm(vec) / geom.med_step)
+            if args.dump_csv:
+                with open(args.dump_csv, "a") as f:
+                    f.write(f"{it},{int(e)},{t},{np.linalg.norm(vec) / geom.med_step:.4f}\n")
             for k in range(npfx):
                 di_k = _project_local(chunk[k], geom, float(t + k), 12.0)
                 frame_devs.append(np.linalg.norm(chunk[k] - _interp(geom.P, di_k)) / geom.med_step)

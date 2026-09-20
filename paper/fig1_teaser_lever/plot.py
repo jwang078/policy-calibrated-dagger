@@ -22,6 +22,11 @@ from matplotlib.path import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TAG = sys.argv[1] if len(sys.argv) > 1 else "dag1_ep9_t4"
+# video-still mode (make_video_assets.sh): no title, output at the background's exact pixel size,
+# and each overlay layer switchable: TITLE=0 BAND=0/1 ARCS=0/1 ANCHOR=0/1 OUT=<png>
+_on = lambda k, d="1": os.environ.get(k, d) == "1"  # noqa: E731
+SHOW_TITLE, SHOW_BAND, SHOW_ARCS = _on("TITLE"), _on("BAND"), _on("ARCS")
+SHOW_ANCHOR = os.environ.get("ANCHOR")  # None = CONFIG["show_anchor"]
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 CONFIG = {
     "title": [
@@ -89,27 +94,33 @@ def trim(arc):  # keep the arc until it first comes within arc_trim_px of the pa
 x0, y0, x1, y1 = CONFIG["crop"]
 X0, Y0, X1, Y1 = int(x0 * W), int(y0 * H), int(x1 * W), int(y1 * H)
 fig_w = CONFIG["fig_width"]
-fig_h = fig_w * (Y1 - Y0) / (X1 - X0) + 0.75
-fig = plt.figure(figsize=(fig_w, fig_h), dpi=CONFIG["fig_dpi"])
-ax = fig.add_axes([0, 0, 1, (fig_h - 0.75) / fig_h])
+if SHOW_TITLE:
+    fig_h = fig_w * (Y1 - Y0) / (X1 - X0) + 0.75
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=CONFIG["fig_dpi"])
+    ax = fig.add_axes([0, 0, 1, (fig_h - 0.75) / fig_h])
+else:  # exact pixel size of the cropped background, no title band
+    DPI = 100
+    fig = plt.figure(figsize=((X1 - X0) / DPI, (Y1 - Y0) / DPI), dpi=DPI)
+    ax = fig.add_axes([0, 0, 1, 1])
 ax.imshow(img, zorder=0)
 ax.set_xlim(X0, X1)
 ax.set_ylim(Y1, Y0)
 ax.axis("off")
-for k, a in CONFIG["band_strokes"]:
+for k, a in CONFIG["band_strokes"] if SHOW_BAND else []:
     ax.add_patch(union_patch([ellipse(b["mu"], b["cov"], k) for b in BAND], CONFIG["col_band"], a, 2))
-ax.plot(
-    P[:, 0], P[:, 1], "-", color=CONFIG["col_path"], lw=CONFIG["lw_path"], solid_capstyle="round", zorder=4
-)
+if SHOW_BAND:
+    ax.plot(
+        P[:, 0], P[:, 1], "-", color=CONFIG["col_path"], lw=CONFIG["lw_path"], solid_capstyle="round", zorder=4
+    )
 by_key = {(a.get("t0", G["T0"]), a.get("draw", i)): a for i, a in enumerate(G["arcs"])}
-arcs = [by_key[tuple(k)] for k in CONFIG["arc_picks"] if tuple(k) in by_key]
+arcs = [by_key[tuple(k)] for k in CONFIG["arc_picks"] if tuple(k) in by_key] if SHOW_ARCS else []
 for a in arcs:
     t = trim(a["px"])
     ax.plot(
         t[:, 0], t[:, 1], "-", color=CONFIG["col_arc"], lw=CONFIG["lw_arc"], solid_capstyle="round", zorder=5
     )
     ax.plot([t[0, 0]], [t[0, 1]], "o", ms=CONFIG["arc_start_ms"], color=CONFIG["col_arc"], zorder=6)
-if CONFIG["show_anchor"]:
+if (CONFIG["show_anchor"] if SHOW_ANCHOR is None else SHOW_ANCHOR == "1"):
     ax.plot(
         [anchor[0]],
         [anchor[1]],
@@ -130,7 +141,7 @@ for txt, col in CONFIG["title"]:
         if part:
             lines[-1].append((part, col))
 
-for li, line in enumerate(lines):
+for li, line in enumerate(lines if SHOW_TITLE else []):
     y = 1 - (0.3 + 0.42 * li) * 0.75 / fig_h
     r = fig.canvas.get_renderer()
     widths = []
@@ -142,9 +153,10 @@ for li, line in enumerate(lines):
     for (txt, col), w in zip(line, widths):
         fig.text(x, y, txt, fontsize=CONFIG["title_size"], color=col, ha="left", va="center")
         x += w
-out = f"{HERE}/fig1_teaser_lever_{TAG}.png"
-fig.savefig(out, dpi=CONFIG["fig_dpi"])
-json.dump({"config": CONFIG, "tag": TAG}, open(f"{HERE}/fig_config_{TAG}.json", "w"))
+out = os.environ.get("OUT") or f"{HERE}/fig1_teaser_lever_{TAG}.png"
+fig.savefig(out, dpi=fig.dpi)
+if SHOW_TITLE and not os.environ.get("OUT"):
+    json.dump({"config": CONFIG, "tag": TAG}, open(f"{HERE}/fig_config_{TAG}.json", "w"))
 print(
     "wrote",
     out,

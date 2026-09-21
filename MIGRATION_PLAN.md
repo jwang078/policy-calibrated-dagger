@@ -161,7 +161,7 @@ the *new* location.
    (`$SCRIPT_DIR/..`); they now require `LEROBOT_ROOT` from `pcdagger/paths.sh`, which every moved shell script
    sources first. Verified: smoke 13/13, all figures, orchestrator dry-run resolves every round and calls
    `scripts/{resume_training,compute_relative_stats,dagger_orchestrate}.sh`.
-5. **Shrink the fork — DONE 2026-09-21 (first half); rebase pending.** The fork's `lerobot_train.py` and
+5. **Shrink the fork — DONE 2026-09-21.** The fork's `lerobot_train.py` and
    `lerobot_eval.py` are back to upstream; their fork versions are `pcdagger/train.py` and
    `pcdagger/dagger/eval.py`, installed as the console scripts `pcdagger-train` / `pcdagger-eval`, which every
    script and `paper/tables_repro/lib_repro.sh` now call (`PCDAGGER_TRAIN` / `PCDAGGER_EVAL` override). The
@@ -172,8 +172,10 @@ the *new* location.
    `policies/pi05/{modeling,configuration}_shared_autonomy.py` (modeling_pi05 uses them). Fork over
    upstream: 5203/313 → 3597/207 lines, 73 → 49 files, no `pcdagger` import anywhere in it. Verified:
    smoke 13/13, figures, orchestrator dry-run.
-   Still to do: rebase onto upstream/main on a branch (`main` stays at tag `paper-icra2027-frozen`); the
-   remaining diff is config fields, the diffusion/pi05 model changes, processors and dataset internals.
+   Upstream sync: branch `upstream-sync-2026-09-21` = fork main + merge of upstream/main (60 commits, 7
+   conflicting files, all resolved by keeping both sides — see the merge commit). `main` stays frozen at the
+   paper code (tag `paper-icra2027-frozen`). On the merged branch: smoke 13/13 (planar q5 episodes identical),
+   figures, orchestrator dry-run. The checkout (and so the editable install) is on the sync branch now.
 6. **Publish.** `lerobot_env_splatsim` + hub env repo; `JennyWWW/splatsim-scenes` dataset with the two
    scenes; the archive (`~/paper_archive/pcdagger_icra2027`, 77 GB) as Hub model + dataset repos, one per
    table (checkpoints as `JennyWWW/pcdagger-planar-table1`, evals as a dataset); README links. Open the

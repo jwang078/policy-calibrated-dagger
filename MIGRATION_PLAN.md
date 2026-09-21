@@ -142,15 +142,25 @@ the *new* location.
    shims for `teleop_recording` / `sim_seeding` until step 3. Both evals reproduce Sept-16 step for step.
    Gotcha: install the plugin with `--no-deps`; the fork's editable metadata was stale (0.4.3 pins) and a
    plain `pip install -e` downgraded huggingface_hub/draccus. Refreshed with `pip install --no-deps -e lerobot`.
-3. **Move the pure-python method code** (`dart_relabel`, `chunk_anchor`, `guidance/`,
+3. **DONE 2026-09-21 — Move the pure-python method code** (`dart_relabel`, `chunk_anchor`, `guidance/`,
    `shared_autonomy_wrapper`, `multi_source_normalizing_dataset`, `intervention_controller`,
    `lib_sa_rollout`, `augment_dataset_with_blending`) into `pcdagger/`, leaving one-line re-export shims
    at the old lerobot paths (`from pcdagger.dart.relabel import *`) so every script keeps running
    unchanged. Smoke green. Then repoint the scripts and delete the shims. *Two days; the imports are the
    whole job.*
-4. **Scripts.** Move `my_scripts/*.sh` and the remaining `.py` into `scripts/`; the bash orchestrator stays
+4. **DONE 2026-09-21 — Scripts.** Move `my_scripts/*.sh` and the remaining `.py` into `scripts/`; the bash orchestrator stays
    bash (7.5k lines, works, documented) but its `python -c` snippets call `pcdagger` functions. Delete
    `my_scripts/` from the fork. *One day.*
+   Done (3 and 4 together, one filter-repo extraction of 159 commits): `pcdagger/{dart,blend,dagger,datasets,viz,extras}`
+   and `scripts/` are populated, every import rewritten, `pip install --no-deps -e .` makes `pcdagger` importable.
+   The fork keeps 23 one-line re-export shims (`lerobot.policies.shared_autonomy_wrapper` etc. → `pcdagger.*`)
+   for its factory / eval hooks, and `my_scripts/` is gone from it. Kept in the fork on purpose (lerobot's own
+   config classes embed them): `configs/{shared_autonomy,intervention,last_mile,temporal_ensemble}.py`,
+   `policies/common/chunk_anchor.py`, `processor/select_observation_dims_processor.py`.
+   Gotchas: the orchestrator, cleanup and lineage scripts derived the lerobot root from their own location
+   (`$SCRIPT_DIR/..`); they now require `LEROBOT_ROOT` from `pcdagger/paths.sh`, which every moved shell script
+   sources first. Verified: smoke 13/13, all figures, orchestrator dry-run resolves every round and calls
+   `scripts/{resume_training,compute_relative_stats,dagger_orchestrate}.sh`.
 5. **Shrink the fork.** Replace the DART/shared-autonomy branches in the two factories with the two
    `wrap()` calls; move the eval intervention loop into `pcdagger.dagger.record`. Rebase the fork on
    upstream/main (it is 6 weeks behind) — with the paper code gone the conflicts are only in the hook

@@ -1,8 +1,8 @@
 # Hub upload: the simulator scenes (review before uploading)
 
 Decision 2026-09-21: policies and the intervention datasets stay in the local archive
-(`~/paper_archive/pcdagger_icra2027`, built by `archive_tables.sh`); only the simulator data goes to the
-Hugging Face Hub. The three datasets the reproduction scripts pull by name are already there and match the
+(`~/paper_archive/pcdagger_icra2027`, built by `archive_tables.sh`); only the simulator goes to the
+Hugging Face Hub: its two scenes and an EnvHub entry. The three datasets the reproduction scripts pull by name are already there and match the
 archive: `JennyWWW/planar_3joint_12`, `JennyWWW/eval_planar_3joint_benchmark`,
 `JennyWWW/eval_splatsim_approach_lever_13_benchmark`.
 
@@ -25,10 +25,18 @@ tarball is a working scene. The planar task has no scan (pybullet only), and the
 After uploading, point the SplatSim README's "Download the example scenes" section at the Hub
 (`hf download JennyWWW/splatsim-scenes --repo-type dataset --local-dir ...`) and keep or drop the Drive links.
 
+## `JennyWWW/splatsim-env` (EnvHub entry; a model repo, 3 files)
+
+Source in `hub/splatsim-env/`, copied into the staging folder by the script. `env.py` is a short forwarder to
+the `lerobot_env_splatsim` plugin: `make_env(n_envs, use_async_envs, cfg)` returns `cfg.create_envs(...)`, or
+one of two presets (`SPLATSIM_TASK=planar_3joint|upright_small_engine_new`, `SPLATSIM_PORT` for a running node)
+when called with the string API. `requirements.txt` says to install SplatSim from source (`install.sh`), like
+the leisaac / IsaacLab EnvHub entries do for their simulators. Tested 2026-09-21 through lerobot's own hub
+loader (`_import_hub_module` + `_call_make_env` + `_normalize_hub_result`) against a planar node: both API
+forms reset and step. After upload, the real check is `make_env("JennyWWW/splatsim-env", trust_remote_code=True)`.
+
 ## Not uploaded
 
 - Policies (224 checkpoints, 16 GB) and the 130 intervention / blend datasets: in the local archive only.
-- An EnvHub `env.py` repo: lerobot's EnvHub promises "no install", which SplatSim cannot keep (CUDA
-  rasterizer, pybullet, gello); the `lerobot_env_splatsim` plugin in the SplatSim repo is the integration.
 - Code is on GitHub: `jwang078/policy-calibrated-dagger`, `jwang078/lerobot` (tags `paper-icra2027-frozen`,
   `pcdagger-compat-2026-09-21`), `jwang078/SplatSim` (tag `pcdagger-compat-2026-09-21`).

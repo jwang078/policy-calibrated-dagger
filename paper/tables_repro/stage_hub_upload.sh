@@ -1,6 +1,7 @@
 #!/bin/bash
-# Stage the simulator data for the Hugging Face Hub: the two SplatSim scene tarballs the SplatSim README
-# tells people to download (today from Google Drive). Nothing is uploaded; the tree under $HUB_STAGE is
+# Stage the simulator for the Hugging Face Hub: the two SplatSim scene tarballs the SplatSim README tells
+# people to download (today from Google Drive), and the EnvHub entry (hub/splatsim-env: env.py forwarding to the
+# lerobot_env_splatsim plugin, tested through lerobot's hub loader on 2026-09-21). Nothing is uploaded; the tree under $HUB_STAGE is
 # hard links / copies to review, and the upload command is printed at the end.
 #
 #   bash stage_hub_upload.sh
@@ -41,7 +42,9 @@ tar xzf /tmp/splatsim-scenes/robot_iphone_w_engine_curtain.tar.gz -C data/stages
 tar xzf /tmp/splatsim-scenes/vine_scene.tar.gz -C data/stages
 ```
 CARD
-echo "== staged under $HUB_STAGE:"; ls -la "$HUB_STAGE/splatsim-scenes"
+cp -r "$(dirname "${BASH_SOURCE[0]}")/hub/splatsim-env" "$HUB_STAGE/splatsim-env"
+echo "== staged under $HUB_STAGE:"; ls -la "$HUB_STAGE/splatsim-scenes" "$HUB_STAGE/splatsim-env"
 echo
 echo "== upload command (after review):"
 echo "  hf upload --repo-type dataset JennyWWW/splatsim-scenes $HUB_STAGE/splatsim-scenes ."
+echo "  hf upload --repo-type model   JennyWWW/splatsim-env    $HUB_STAGE/splatsim-env ."   # EnvHub repos are model repos

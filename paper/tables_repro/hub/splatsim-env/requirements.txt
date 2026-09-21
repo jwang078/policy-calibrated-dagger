@@ -1,0 +1,4 @@
+# SplatSim is not pip-only: run SplatSim/install.sh (CUDA rasterizer, pybullet, gello), which also installs
+# the lerobot_env_splatsim plugin that env.py forwards to.
+splatsim @ git+https://github.com/jwang078/SplatSim.git
+lerobot_env_splatsim @ git+https://github.com/jwang078/SplatSim.git#subdirectory=lerobot_env_splatsim

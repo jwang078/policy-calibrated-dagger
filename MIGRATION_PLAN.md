@@ -108,13 +108,13 @@ After the move the fork is a *thin* branch of hooks, ideally < 800 lines, each a
 | Hook | Lines today | Why it can't be a plugin | Path to upstream |
 | --- | --- | --- | --- |
 | `train_utils.resume_after_prepare` re-applies `--optimizer.lr` | 31 | bug fix | PR as-is (it's a real upstream bug) |
-| dataset factory: call `pcdagger.lerobot_glue.dataset_factory.wrap(cfg, dataset)` | ~15 | lerobot builds the dataset before `train()` | propose a `dataset.wrapper` entry-point hook |
-| policy factory: call `pcdagger.lerobot_glue.policy_factory.wrap(cfg, policy)` | ~15 | same | propose a `policy.wrapper` hook |
+| dataset factory: multi-dataset build (`repo_ids`, `exclude_features`, unconsumed-camera exclusion) | ~150 | dataset classes are lerobot-side | small PRs; the DART/normalizing wrap is in `pcdagger.lerobot_glue.dataset` |
+| policy factory: `rename_map` / `obs_dim_slice` processors, relative-step reconnect | ~60 | processors are lerobot-side | small PR; the policy wrappers are in `pcdagger.lerobot_glue.policy` |
 | `TrainPipelineConfig` / `DatasetConfig` extra fields (`dart_*`, `multi_source_*`, `shared_autonomy`) | ~200 | draccus needs the fields on the config class | generic `dataset.extra: dict` + `policy.wrappers: list` would remove this |
-| `lerobot_eval.py` intervention mode (the DAgger recording loop) | ~900 | a different rollout loop | becomes `pcdagger.dagger.record` — its own script that reuses `lerobot.envs` + `rollout()`; then the fork edit disappears |
+| ~~`lerobot_eval.py` intervention mode~~ | 0 | moved: `pcdagger.dagger.eval` (`pcdagger-eval`), the fork script is upstream's | done |
 | `modeling_diffusion.py` (`generate_actions(noise=, sa_noise_ratio=)`, pending-chunk access) | 241 | partial denoising needs the scheduler hooks | PR: "expose `noise` and `start_timestep` in `generate_actions`" is a small, defensible upstream change |
 | relative-action processor anchoring, select-obs-dims processor | 300 | processors are lerobot-side | small PRs |
-| multi-source dataset / normalizer stats | 478 | dataset class | keep in `pcdagger.datasets`, register via the factory hook |
+| ~~multi-source dataset / normalizer stats~~ | 0 | in `pcdagger.datasets.multi_source`, applied by `pcdagger.lerobot_glue.dataset` | done |
 
 Everything else in the 19.5k lines is paper code and moves.
 
@@ -161,10 +161,19 @@ the *new* location.
    (`$SCRIPT_DIR/..`); they now require `LEROBOT_ROOT` from `pcdagger/paths.sh`, which every moved shell script
    sources first. Verified: smoke 13/13, all figures, orchestrator dry-run resolves every round and calls
    `scripts/{resume_training,compute_relative_stats,dagger_orchestrate}.sh`.
-5. **Shrink the fork.** Replace the DART/shared-autonomy branches in the two factories with the two
-   `wrap()` calls; move the eval intervention loop into `pcdagger.dagger.record`. Rebase the fork on
-   upstream/main (it is 6 weeks behind) — with the paper code gone the conflicts are only in the hook
-   lines. *Two to three days; this is where the fork stops hurting.*
+5. **Shrink the fork — DONE 2026-09-21 (first half); rebase pending.** The fork's `lerobot_train.py` and
+   `lerobot_eval.py` are back to upstream; their fork versions are `pcdagger/train.py` and
+   `pcdagger/dagger/eval.py`, installed as the console scripts `pcdagger-train` / `pcdagger-eval`, which every
+   script and `paper/tables_repro/lib_repro.sh` now call (`PCDAGGER_TRAIN` / `PCDAGGER_EVAL` override). The
+   DART + multi-source wrapping left `datasets/factory.py` for `pcdagger/lerobot_glue/dataset.py`
+   (`make_train_eval_datasets`), the `_wrap_with_*` policy wrappers left `policies/factory.py` for
+   `pcdagger/lerobot_glue/policy.py`; the 23 re-export shims are deleted. Two modules went the other way
+   because lerobot's own classes import them: `policies/temporal_ensembler.py` (ACT uses it) and
+   `policies/pi05/{modeling,configuration}_shared_autonomy.py` (modeling_pi05 uses them). Fork over
+   upstream: 5203/313 → 3597/207 lines, 73 → 49 files, no `pcdagger` import anywhere in it. Verified:
+   smoke 13/13, figures, orchestrator dry-run.
+   Still to do: rebase onto upstream/main on a branch (`main` stays at tag `paper-icra2027-frozen`); the
+   remaining diff is config fields, the diffusion/pi05 model changes, processors and dataset internals.
 6. **Publish.** `lerobot_env_splatsim` + hub env repo; `JennyWWW/splatsim-scenes` dataset with the two
    scenes; the archive (`~/paper_archive/pcdagger_icra2027`, 77 GB) as Hub model + dataset repos, one per
    table (checkpoints as `JennyWWW/pcdagger-planar-table1`, evals as a dataset); README links. Open the

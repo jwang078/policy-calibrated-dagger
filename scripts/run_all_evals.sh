@@ -465,7 +465,7 @@ for exp_dir in "${EXP_PATTERNS[@]}"; do
         echo "Log file: $log_file"
         echo "----------------------------------------"
 
-        eval_cmd="lerobot-eval \\
+        eval_cmd="${PCDAGGER_EVAL:-pcdagger-eval} \\
             --env.type=splatsim \\
             --env.task=upright_small_engine_new \\
             --env.camera_names='$camera_names' \\

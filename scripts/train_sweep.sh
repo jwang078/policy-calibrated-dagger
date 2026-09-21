@@ -536,7 +536,7 @@ else
     echo "Multi-dataset mode: skipping single-dataset name validation (DATASET_REPO unused)."
 fi
 
-TRAIN_SCRIPT="lerobot-train"  # make sure this is in your PATH (e.g. via lerobot's install.sh)
+TRAIN_SCRIPT="${PCDAGGER_TRAIN:-pcdagger-train}"  # console script installed with `pip install -e ~/code/policy-calibrated-dagger`
 
 # ── Shared env/eval args (same for every run) ────────────────
 # Resolve eval-related overrides UP FRONT so SHARED_ARGS carries the final

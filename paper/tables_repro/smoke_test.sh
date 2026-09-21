@@ -17,7 +17,7 @@
 #             lever: measure_w_lever (must reproduce W = 7.94), build_pooled_schedule_lever K=2 (bit-for-bit),
 #             measure_sigma_lever K=1 with the BC policy
 #   table     gen_table.py (tabular identical to table1_tabular.tex) and analysis/lever_table.py
-# Last run: 2026-09-20, all parts passed (evals now checked for episode length and success, see eval_sane).
+# Last run: 2026-09-21, all parts passed via pcdagger-train / pcdagger-eval (evals checked for episode length and success, see eval_sane).
 S=$(cd "$(dirname "$0")" && pwd); source "$S/../../pcdagger/paths.sh"; LR=$LEROBOT_ROOT; PY=$PCDAGGER_PY
 PARTS=${PARTS:-"dry train eval analysis table"}
 SM=$PCDAGGER_OUTPUTS/smoke; rm -rf "$SM"; mkdir -p "$SM/training" "$SM/eval300" "$SM/tables_repro/analysis"

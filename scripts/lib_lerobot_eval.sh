@@ -177,7 +177,7 @@ lle_build_eval_cmd() {
 
     # Single-quote JSON fields so embedded spaces / brackets survive the eval.
     local cmd
-    cmd="lerobot-eval \\
+    cmd="${PCDAGGER_EVAL:-pcdagger-eval} \\
         --env.type=splatsim \\
         --env.task=$task \\
         --env.camera_names='$camera_names' \\

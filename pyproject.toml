@@ -22,6 +22,12 @@ dependencies = [
     "lerobot @ git+https://github.com/jwang078/lerobot.git",
 ]
 
+[project.scripts]
+# Drop-in replacements for lerobot-train / lerobot-eval that add the paper's training and
+# evaluation machinery (multi-source + DART datasets, policy wrappers, intervention mode).
+pcdagger-train = "pcdagger.train:main"
+pcdagger-eval = "pcdagger.dagger.eval:main"
+
 [project.optional-dependencies]
 # The two simulated tasks of the paper (planar reacher, engine lever) and the RRT oracle expert.
 splatsim = [

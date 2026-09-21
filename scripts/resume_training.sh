@@ -357,7 +357,7 @@ except Exception:
 # PYTORCH_CUDA_ALLOC_CONF is exported so it sticks for the lerobot-train
 # child without needing a separate `env` wrapper around the array exec.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-CMD_ARGS=( lerobot-train --resume=true --config_path="$CONFIG_PATH" )
+CMD_ARGS=( "${PCDAGGER_TRAIN:-pcdagger-train}" --resume=true --config_path="$CONFIG_PATH" )
 [[ -n "$STEPS" ]]                  && CMD_ARGS+=( --steps="$STEPS" )
 # Upstream renamed --eval_freq → --env_eval_freq (env-eval cadence) and added
 # a separate --eval_steps for dataset-eval. We only care about env-eval.

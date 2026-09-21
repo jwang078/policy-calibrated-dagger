@@ -12,7 +12,7 @@ source "$S/../../pcdagger/paths.sh"      # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER
 LR=${LR:-$LEROBOT_ROOT}
 SPLATSIM=${SPLATSIM:-$SPLATSIM_ROOT}
 PY=${PY:-$PCDAGGER_PY}
-EV=${EV:-$HOME/miniforge3/envs/splatsim/bin/lerobot-eval}
+EV=${EV:-$HOME/miniforge3/envs/splatsim/bin/pcdagger-eval}
 HF=${HF:-$LEROBOT_CACHE_DIR}
 OUT_TRAIN=${OUT_TRAIN:-$PCDAGGER_OUTPUTS/training}      # training dirs (scarcity_study*, lever_r84_*)
 OUT_EVAL=${OUT_EVAL:-$PCDAGGER_OUTPUTS/eval300}         # eval dirs (<group>/<arm>[_e<seed>]/eval_info.json)

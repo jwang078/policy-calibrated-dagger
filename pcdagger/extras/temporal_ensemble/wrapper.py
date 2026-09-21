@@ -34,7 +34,7 @@ from torch import Tensor, nn
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
-from pcdagger.extras.temporal_ensemble.ensembler import TemporalEnsembler
+from lerobot.policies.temporal_ensembler import TemporalEnsembler
 
 if TYPE_CHECKING:
     from lerobot.configs.temporal_ensemble import TemporalEnsembleConfig

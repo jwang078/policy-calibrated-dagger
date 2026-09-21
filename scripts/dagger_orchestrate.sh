@@ -834,7 +834,7 @@ ROUND0_EXTRA_ARGS_STR=""
 # per-round blends} via lerobot-train's --dataset.repo_ids / sample_weights
 # / stats_paths multi-dataset path. Per-source normalization happens inside
 # the DataLoader; the policy's normalize layer is a no-op (see
-# src/lerobot/datasets/multi_source_normalizing_dataset.py + lerobot_train.py).
+# pcdagger/datasets/multi_source.py + pcdagger/train.py).
 # DAGGER_DATA_FRACTION is a CEILING on the DAgger share (see the --help block
 # above for the full semantics): if the sub-datasets' natural frame fraction is
 # below F, weights fall back to fully proportional (every frame equally likely,
@@ -4399,7 +4399,7 @@ fi
 # Print the step legend so the user understands what "5/6 steps complete"
 # refers to in the detection table below.
 echo "Steps per round:"
-echo "  1. Record interventions (lerobot-eval --intervention.method=...) + sidecar rel-action stats"
+echo "  1. Record interventions (pcdagger-eval --intervention.method=...) + sidecar rel-action stats"
 if (( ${#BLENDS[@]} > 0 )); then
     echo "  2. Produce blended-intervention datasets at ratios ${BLENDS[*]} (augment_dataset_with_blending.py) + sidecar stats"
 else
@@ -5809,7 +5809,7 @@ for r in $(seq "$EFFECTIVE_START_ROUND" "$EFFECTIVE_END_ROUND"); do
             EVAL_LOG=/dev/null
         fi
         # shellcheck disable=SC2086  # INTERVENTION_EXTRA_ARGS may contain multiple flags
-        run_or_echo lerobot-eval \
+        run_or_echo "${PCDAGGER_EVAL:-pcdagger-eval}" \
             --policy.path="$CURRENT_POLICY" \
             --policy.shared_autonomy_config.enabled=true \
             --env.type=splatsim \

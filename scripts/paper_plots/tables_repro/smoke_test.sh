@@ -17,7 +17,7 @@
 #             lever: measure_w_lever (must reproduce W = 7.94), build_pooled_schedule_lever K=2 (bit-for-bit),
 #             measure_sigma_lever K=1 with the BC policy
 #   table     gen_table.py (tabular identical to table1_tabular.tex) and analysis/lever_table.py
-# Last run: see README (2026-09-17, all parts passed).
+# Last run: 2026-09-20, all parts passed (evals now checked for episode length and success, see eval_sane).
 S=$(cd "$(dirname "$0")" && pwd); LR=/home/jennyw2/code/lerobot; PY=$HOME/miniforge3/envs/splatsim/bin/python
 PARTS=${PARTS:-"dry train eval analysis table"}
 SM=$LR/outputs/smoke; rm -rf "$SM"; mkdir -p "$SM/training" "$SM/eval300" "$SM/tables_repro/analysis"
@@ -27,6 +27,14 @@ export OUT_TRAIN=$SM/training OUT_EVAL=$SM/eval300 TABLES_REPRO_DIR=$SM/tables_r
 export PLANAR_BASE=$LR/outputs/training/diffusion_planar_3joint_12_delta_stateng LEVER_BASE=$LR/outputs/training/diffusion_approach_lever_13_smooth_r84_delta_basewrist
 export PLANAR_STEPS=75020 LEVER_STEPS=75020 N_EPISODES=2 LEVER_N=2
 FAIL=0; log() { echo "[smoke $(date +%H:%M:%S)] $*"; }
+# an eval_info.json whose episodes all ended at step 1 means the sim spawned in collision (seen 2026-09-20:
+# a SplatSim refactor dropped the gripper self-collision skip pairs for legacy assets) — a file existing is not enough
+eval_sane() {  # FILE [MIN_SUCCESSES]
+  $PY -c "
+import json,sys; m=json.load(open(sys.argv[1]))['per_task'][0]['metrics']; L=m['info_metrics']['episode_length']; s=sum(m['successes'])
+bad = [l for l in L if l <= 1]
+print(f'    episodes {L} successes {s}')
+sys.exit(1 if bad or s < int(sys.argv[2]) else 0)" "$1" "${2:-0}"; }
 check() { if [ "$1" = 0 ]; then log "PASS $2"; else log "FAIL $2 (rc=$1)"; FAIL=1; fi; }
 sched_diff() {  # NEW SHIPPED -> max |diff| over all rows
   $PY -c "
@@ -50,11 +58,12 @@ if [[ " $PARTS " == *" train "* ]]; then
   for A in lever_r84_fb/hg2_s7 lever_r84_calib/q2_dnpool_s7; do [ -d "$OUT_TRAIN/$A/checkpoints/075020/pretrained_model" ] || { RC=$((RC+100)); log "missing $A"; }; done
   [ -f "$OUT_TRAIN/diffusion_approach_lever_13_smooth_r84_delta_basewrist_seed7/checkpoints/075000/training_state/rng_state.safetensors" ] || RC=$((RC+100))
   check $RC "train lever_seeds.sh seed 7 round 2: reseeded BC copy, hg2_s7, q2_dnpool_s7 (+20 steps)"
-  for A in r84_hg2_20k_s7 r84_cal2_20k_s7; do [ -f "$OUT_EVAL/lever_cam/$A/eval_info.json" ]; check $? "eval lever $A (2 episodes, seed 7)"; done
+  for A in r84_hg2_20k_s7 r84_cal2_20k_s7; do eval_sane "$OUT_EVAL/lever_cam/$A/eval_info.json"; check $? "eval lever $A (2 episodes, seed 7, episodes ran > 1 step)"; done
 fi
 if [[ " $PARTS " == *" eval "* ]]; then
-  bash $S/planar_eval.sh 6023 s1 q2 > "$SM/planar_eval.log" 2>&1; RC=$?
-  [ -f "$OUT_EVAL/scarcity_study/q2/eval_info.json" ] || RC=$((RC+100)); check $RC "eval planar_eval.sh s1 q2 (2 episodes, port 6023)"
+  # the real q5 arm of s5, not the +20-step smoke arm, so success is meaningful (its 300-ep eval scored 84%)
+  OUT_TRAIN=$LR/outputs/training bash $S/planar_eval.sh 6023 s5 q5 > "$SM/planar_eval.log" 2>&1; RC=$?
+  eval_sane "$OUT_EVAL/scarcity_study_s5/q5/eval_info.json" 1 || RC=$((RC+100)); check $RC "eval planar_eval.sh s5 q5 (2 episodes: ran > 1 step and >= 1 success)"
 fi
 if [[ " $PARTS " == *" analysis "* ]]; then
   A=$TABLES_REPRO_DIR/analysis
@@ -80,8 +89,10 @@ if [[ " $PARTS " == *" analysis "* ]]; then
 fi
 if [[ " $PARTS " == *" table "* ]]; then
   cd $LR; $PY $S/gen_table.py > /dev/null; RC=$?
-  diff -q <(sed -n '/begin{tabular}/,/end{tabular}/p' $S/table_full_benchmark.tex) <(sed -n '/begin{tabular}/,/end{tabular}/p' $S/table1_tabular.tex) > /dev/null || RC=$((RC+100))
-  check $RC "table gen_table.py: tabular identical to table1_tabular.tex"
+  # table1_tabular.tex is the SUBMITTED table (3 cells from 100-ep inline evals); table1_tabular_all300.tex is what the
+  # complete 300-episode evals give (see README audit) and is what a regeneration must match
+  diff -q <(sed -n '/begin{tabular}/,/end{tabular}/p' $S/table_full_benchmark.tex) <(sed -n '/begin{tabular}/,/end{tabular}/p' $S/table1_tabular_all300.tex) > /dev/null || RC=$((RC+100))
+  check $RC "table gen_table.py: tabular identical to table1_tabular_all300.tex"
   $PY $S/analysis/lever_table.py > /dev/null; check $? "table analysis/lever_table.py"
 fi
 [ $FAIL = 0 ] && log "SMOKE OK" || log "SMOKE FAILED"; exit $FAIL

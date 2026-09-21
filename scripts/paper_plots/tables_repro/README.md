@@ -71,6 +71,13 @@ Details:
   shared with s1), re-measuring the schedule on the collecting checkpoint each round; the table arm is then
   trained from base on those datasets like every other cell (`q{K}_dnpoolcl` in `scarcity_study_cl`).
 - The ± on the closed-loop and BC rows is the SE over three evaluation seeds of one checkpoint, not over lineages.
+- **Audit (2026-09-20).** Three of the 200 lineage cells in the submitted Table I (s4/q5_dnsig, s5/q5_dnpool,
+  s5/q5_dnsig) had no 300-episode run when the table was generated; `gen_table.py` silently fell back to the
+  100-episode inline eval from training. The generator now prints a WARNING naming any such cell. The three
+  300-episode evals were run afterwards (see `outputs/eval300`), so a regeneration differs from the submitted
+  numbers only in those cells: pooled K=5 88.3±0.6 → 89.3±0.5 and per-step K=5 88.9±0.8 → 88.5±0.8 (`table1_tabular_all300.tex`;
+  `table1_tabular.tex` stays the submitted version, and the smoke test compares against it with the three
+  fallback cells excluded).
 
 ## Table II — engine lever, image observations (84 px)
 
@@ -96,16 +103,29 @@ Details:
   base. The collecting policy (BC for round 1, HG r(K−1) after) is also the one blended and measured: W is
   refit on rounds 1..K each round (`analysis/measure_w_lever.py`; 8.10 / 7.94 / 8.07 / 8.06 for K=1..4),
   Σ̂ comes from `analysis/measure_sigma_lever.py`, the schedule from `analysis/build_pooled_schedule_lever.py`.
+- Seed-0 arms of both rounds were trained to 115k (+40k) with a checkpoint at 95k; the paper reports the
+  95k (+20k) checkpoint for every arm, and `lever_round.sh` trains to 95k (`LEVER_FT=40000` reproduces the
+  longer run). Seed-1/2 arms were trained to 95k directly.
 - `lever_seeds.sh`: lerobot's resume restores the checkpoint RNG _after_ applying `--seed`, so a plain seed
   flag replicates seed 0; each seed gets a hard-linked copy of the BC checkpoint with a freshly seeded
   `training_state/rng_state.safetensors`.
 - Evals are GPU-bound (splat rendering): concurrent lever evals give no throughput gain over one, so lanes only reorder work.
 
+## Archive
+
+`bash archive_tables.sh [DEST]` hard-links every dataset, checkpoint and eval the two tables depend on into one
+folder (default `~/paper_archive/pcdagger_icra2027`, ~77 GB apparent, zero extra disk on the same filesystem),
+copies this kit with the schedules unpacked, verifies every table cell has its checkpoint and eval, and
+regenerates both tables from the archive alone (`OUTPUTS_ROOT=$DEST`). `MANIFEST.txt` records the result.
+Once the archive exists, everything else under `outputs/training` and the dataset cache can be deleted
+without affecting the tables (the archive's links keep the files alive).
+
 ## Environment knobs (see the top of `lib_repro.sh`)
 
 `OUT_TRAIN`, `OUT_EVAL` (output roots), `TABLES_REPRO_DIR` (where `analysis/*.py` read and write deltas and
 schedules), `PLANAR_STEPS` / `LEVER_STEPS` / `PLANAR_LR` / `*_WORKERS`, `N_EPISODES` (planar evals, 300),
-`LEVER_N` (lever evals, 100), `SEED` (planar eval seed), `DRY=1` (print training commands only).
+`LEVER_N` (lever evals, 100), `SEED` (planar eval seed), `DRY=1` (print training commands only),
+`OUTPUTS_ROOT` (table generators: read evals from an archive copy).
 Lever calibration scripts take `INT_PREFIX` (intervention repo prefix) and `TAGPFX` (`r84_`).
 
 ## Machine notes that bit us

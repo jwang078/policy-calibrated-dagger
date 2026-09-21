@@ -134,10 +134,14 @@ the *new* location.
    `paper_plots/.gitignore` had never actually tracked `paper_plots/data/` (a `!data/**` negation under a
    `*.npz` rule does not re-include), so the snapshots were rebuilt from the sources here and the root
    `.gitignore` negates the directory explicitly.
-2. **SplatSim plugin.** Create `lerobot_env_splatsim` inside SplatSim from the fork's `SplatSimEnv`;
+2. **DONE 2026-09-21 — SplatSim plugin.** Create `lerobot_env_splatsim` inside SplatSim from the fork's `SplatSimEnv`;
    delete that class from the fork; `lerobot-eval --env.type=splatsim` still works because the plugin
    registers it. Move `teleop_recording.py`, `sim_seeding.py`, `robots/splatsim_lerobot` into SplatSim.
    Run one 2-episode planar and lever eval. *One day.*
+   Done: `SplatSim/lerobot_env_splatsim/` (config, robot, recording, seeding); fork keeps two re-export
+   shims for `teleop_recording` / `sim_seeding` until step 3. Both evals reproduce Sept-16 step for step.
+   Gotcha: install the plugin with `--no-deps`; the fork's editable metadata was stale (0.4.3 pins) and a
+   plain `pip install -e` downgraded huggingface_hub/draccus. Refreshed with `pip install --no-deps -e lerobot`.
 3. **Move the pure-python method code** (`dart_relabel`, `chunk_anchor`, `guidance/`,
    `shared_autonomy_wrapper`, `multi_source_normalizing_dataset`, `intervention_controller`,
    `lib_sa_rollout`, `augment_dataset_with_blending`) into `pcdagger/`, leaving one-line re-export shims

@@ -1,0 +1,180 @@
+{
+    "type": "diffusion",
+    "n_obs_steps": 2,
+    "n_action_steps": 32,
+    "input_features": {
+        "observation.state": {
+            "type": "STATE",
+            "shape": [
+                3
+            ]
+        },
+        "observation.environment_state": {
+            "type": "ENV",
+            "shape": [
+                8
+            ]
+        }
+    },
+    "output_features": {
+        "action": {
+            "type": "ACTION",
+            "shape": [
+                4
+            ]
+        }
+    },
+    "device": "cuda",
+    "use_amp": false,
+    "use_peft": false,
+    "push_to_hub": false,
+    "repo_id": "diffusion_planar_3joint_12_delta_stateng",
+    "private": null,
+    "tags": null,
+    "license": null,
+    "pretrained_path": null,
+    "pretrained_revision": null,
+    "horizon": 64,
+    "use_relative_actions": true,
+    "relative_exclude_joints": [
+        "gripper"
+    ],
+    "action_feature_names": [
+        "joint_1",
+        "joint_2",
+        "joint_3",
+        "gripper"
+    ],
+    "normalization_mapping": {
+        "VISUAL": "MEAN_STD",
+        "STATE": "MIN_MAX",
+        "ACTION": "MIN_MAX",
+        "ENV": "MIN_MAX"
+    },
+    "normalize_env_state": true,
+    "vision_backbone": "resnet18",
+    "resize_shape": null,
+    "crop_ratio": 1.0,
+    "crop_shape": [
+        224,
+        224
+    ],
+    "crop_is_random": false,
+    "pretrained_backbone_weights": null,
+    "use_group_norm": true,
+    "spatial_softmax_num_keypoints": 32,
+    "use_separate_rgb_encoder_per_camera": true,
+    "down_dims": [
+        128,
+        256,
+        512
+    ],
+    "kernel_size": 5,
+    "n_groups": 8,
+    "diffusion_step_embed_dim": 128,
+    "use_film_scale_modulation": true,
+    "gradient_checkpointing": false,
+    "noise_scheduler_type": "DDPM",
+    "num_train_timesteps": 100,
+    "beta_schedule": "squaredcos_cap_v2",
+    "beta_start": 0.0001,
+    "beta_end": 0.02,
+    "prediction_type": "epsilon",
+    "clip_sample": true,
+    "clip_sample_range": 1.0,
+    "num_inference_steps": null,
+    "compile_model": false,
+    "compile_mode": "reduce-overhead",
+    "shared_autonomy_config": {
+        "enabled": false,
+        "forward_flow_ratio": 0.4,
+        "policy_guidance_action_buffer_size": 1,
+        "apply_to_first_action_only": true,
+        "show_slider": true,
+        "pybullet_gui": false,
+        "start_paused": false,
+        "robot_name": null,
+        "max_joint_delta": 0.016,
+        "num_dofs": null,
+        "blend_mode": "every_step",
+        "n_anchor_steps": 0,
+        "rtc_prev_chunk_guidance": false,
+        "rtc_max_guidance_weight": 10.0,
+        "rtc_execution_horizon": null,
+        "rtc_inference_delay": 0,
+        "rtc_prefix_attention_schedule": "linear",
+        "debug": false,
+        "debug_maxlen": 100,
+        "shield_check_every_n_ticks": 1,
+        "debug_shield_force_trigger": false,
+        "debug_shield_trace_anchor": false,
+        "debug_rrt_drift_log": false,
+        "fps": 30,
+        "rrt_collision_detection": "pre_jump_lookback",
+        "pre_jump_lookback": {
+            "steps_min": 5,
+            "steps_max": null
+        },
+        "future_chunk": {
+            "horizon_frames": null,
+            "obstacle_clearance": 0.0,
+            "self_collision_clearance": 0.0,
+            "rrt_obstacle_clearance": null,
+            "rrt_self_collision_clearance": null,
+            "plan_fail_cooldown_ticks": 15
+        },
+        "rrt_teleport_to_q_start": true,
+        "rrt_blocking_plan": true,
+        "rrt_path_selection": null,
+        "rrt_camera_score_weight": null,
+        "rrt_ik_camera_weight": null,
+        "rrt_wrist_camera_link_name": "wrist_camera_link",
+        "rrt_path_score_joint_arc_weight": 0.0,
+        "rrt_ik_goal_selection": null,
+        "rrt_ik_accept_arc_chord_ratio": 2.0,
+        "rrt_num_path_candidates_per_ik": 1,
+        "rrt_max_path_attempts_per_ik": 5,
+        "rrt_path_perturbation_scale": 0.001,
+        "rrt_num_ik_candidates": 16,
+        "rrt_obstacle_clearance": null,
+        "rrt_self_collision_clearance": null,
+        "rrt_in_progress_obstacle_clearance": 0.01,
+        "rrt_in_progress_self_collision_clearance": 0.002,
+        "rrt_self_collision_skip_pairs": null,
+        "rrt_ik_skip_gripper_obstacle_pairs": false,
+        "rrt_escape_clearance_factor": 1.5,
+        "rrt_rewind_clearance_factor": null,
+        "rrt_max_joint_vel": null,
+        "rrt_max_joint_acc": null,
+        "rrt_max_joint_jerk": null,
+        "rrt_smooth_iterations": null,
+        "rrt_elastic_smooth_passes": null,
+        "rrt_final_approach_dist": null,
+        "rrt_final_approach_vel_scale": null,
+        "rrt_final_approach_acc_scale": null,
+        "rrt_uniform_path_speed": null,
+        "rrt_trajopt_passes": null,
+        "rrt_trajopt_lr": null,
+        "rrt_trajopt_smoothness_weight": null,
+        "rrt_trajopt_collision_weight": null,
+        "rrt_trajopt_collision_threshold": null,
+        "rrt_trajopt_fd_step": null,
+        "rrt_segment_at_sharp_corners": null,
+        "rrt_diagnostic_log_pairs": "off",
+        "rrt_abort_on_drift_rad": 0.15,
+        "rrt_abort_on_drift_ticks": 8,
+        "rrt_drift_trigger": "lookback"
+    },
+    "temporal_ensemble_config": null,
+    "last_mile_config": null,
+    "do_mask_loss_for_padding": false,
+    "optimizer_lr": 1e-05,
+    "optimizer_betas": [
+        0.95,
+        0.999
+    ],
+    "optimizer_eps": 1e-08,
+    "optimizer_weight_decay": 1e-06,
+    "scheduler_name": "cosine",
+    "scheduler_warmup_steps": 500
+}

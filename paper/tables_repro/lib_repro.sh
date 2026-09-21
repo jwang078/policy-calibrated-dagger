@@ -8,13 +8,14 @@
 # in miniature; DRY=1 prints the training commands instead of running them.
 set -u
 S=${S:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
-LR=${LR:-/home/jennyw2/code/lerobot}
-SPLATSIM=${SPLATSIM:-/home/jennyw2/code/SplatSim}
-PY=${PY:-$HOME/miniforge3/envs/splatsim/bin/python}
+source "$S/../../pcdagger/paths.sh"      # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR, PCDAGGER_PY
+LR=${LR:-$LEROBOT_ROOT}
+SPLATSIM=${SPLATSIM:-$SPLATSIM_ROOT}
+PY=${PY:-$PCDAGGER_PY}
 EV=${EV:-$HOME/miniforge3/envs/splatsim/bin/lerobot-eval}
-HF=${HF:-$HOME/.cache/huggingface/lerobot/JennyWWW}
-OUT_TRAIN=${OUT_TRAIN:-$LR/outputs/training}      # training dirs (scarcity_study*, lever_r84_*)
-OUT_EVAL=${OUT_EVAL:-$LR/outputs/eval300}         # eval dirs (<group>/<arm>[_e<seed>]/eval_info.json)
+HF=${HF:-$LEROBOT_CACHE_DIR}
+OUT_TRAIN=${OUT_TRAIN:-$PCDAGGER_OUTPUTS/training}      # training dirs (scarcity_study*, lever_r84_*)
+OUT_EVAL=${OUT_EVAL:-$PCDAGGER_OUTPUTS/eval300}         # eval dirs (<group>/<arm>[_e<seed>]/eval_info.json)
 export TABLES_REPRO_DIR=${TABLES_REPRO_DIR:-$S}   # where analysis/*.py read and write deltas + schedules
 A=$TABLES_REPRO_DIR/analysis
 DRY=${DRY:-0}

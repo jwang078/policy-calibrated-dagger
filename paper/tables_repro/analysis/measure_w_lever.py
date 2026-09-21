@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import curve_fit
 
-sys.path.insert(0, os.path.expanduser("~/code/lerobot/my_scripts"))
+sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "my_scripts"))
 from lib_sa_rollout import progress_guidance_index
 
 ROUNDS = [int(x) for x in (sys.argv[1] if len(sys.argv) > 1 else "1,2").split(",")]
@@ -23,7 +23,7 @@ TAGS = ["010", "020", "030", "050", "075", "090"]
 NARM = 6
 CACHE = os.path.expanduser("~/.cache/huggingface/lerobot/JennyWWW")
 INT_PREFIX = os.environ.get(
-    "INT_PREFIX", "lever_d100_03dagcap_cam_diff"
+    "INT_PREFIX", "lever_d100_03dagcap_r84_diff"
 )  # intervention repo short prefix (…_r_dag{R}, …_r_dag{R}_blend{TTT})
 
 
@@ -85,13 +85,15 @@ def settles(repo, rd):
     return out, rj0, rjs
 
 
-cfg = json.load(
-    open(
-        os.path.expanduser(
-            "~/code/lerobot/outputs/training/diffusion_approach_lever_13_smooth_delta_basewristng/checkpoints/075000/pretrained_model/config.json"
-        )
-    )
-)
+# The policy's DDPM schedule (num_train_timesteps, beta_schedule): read from the 84 px BC checkpoint the
+# tables use; every diffusion policy of the paper shares it, so the planar snapshot is an equal fallback.
+_OUT = os.environ.get("PCDAGGER_OUTPUTS", os.path.expanduser("~/code/lerobot/outputs"))
+_CFG_CANDIDATES = [
+    os.environ.get("POLICY_CONFIG", ""),
+    f"{_OUT}/training/diffusion_approach_lever_13_smooth_r84_delta_basewrist/checkpoints/last/pretrained_model/config.json",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "planar_bc_policy_config.json"),
+]
+cfg = json.load(open(next(p for p in _CFG_CANDIDATES if p and os.path.exists(p))))
 T = int(cfg["num_train_timesteps"])
 assert cfg["beta_schedule"] == "squaredcos_cap_v2"
 

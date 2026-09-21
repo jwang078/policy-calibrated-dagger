@@ -9,7 +9,7 @@ import re
 
 import numpy as np
 
-_R = os.environ.get("OUTPUTS_ROOT", "/home/jennyw2/code/lerobot/outputs")  # archive_tables.sh points this at the archive
+_R = os.environ.get("OUTPUTS_ROOT", os.environ.get("PCDAGGER_OUTPUTS", os.path.expanduser("~/code/lerobot/outputs")))  # archive_tables.sh points this at the archive
 E = f"{_R}/eval300/lever_cam"
 
 

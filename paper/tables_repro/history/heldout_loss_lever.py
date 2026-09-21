@@ -11,12 +11,12 @@ import sys
 import numpy as np
 import torch
 
-sys.path.insert(0, "/home/jennyw2/code/lerobot/src")
+sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "src"))
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.processor import PolicyProcessorPipeline
 
-TR = "/home/jennyw2/code/lerobot/outputs/training"
+TR = os.environ.get("PCDAGGER_OUTPUTS", os.path.expanduser("~/code/lerobot/outputs")) + "/training"
 B0 = f"{TR}/diffusion_approach_lever_13_smooth_delta_basewristng"
 CKPTS = {
     "bc_075k": f"{B0}/checkpoints/075000/pretrained_model",

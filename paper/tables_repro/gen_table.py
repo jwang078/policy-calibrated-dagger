@@ -31,7 +31,7 @@ DIRS = {
     "s5": "scarcity_study_s5",
 }
 # OUTPUTS_ROOT lets the generator run against an archive copy (archive_tables.sh); default = this machine
-_R = os.environ.get("OUTPUTS_ROOT", "/home/jennyw2/code/lerobot/outputs")
+_R = os.environ.get("OUTPUTS_ROOT", os.environ.get("PCDAGGER_OUTPUTS", os.path.expanduser("~/code/lerobot/outputs")))
 T = f"{_R}/training"
 E = f"{_R}/eval300"
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "table_full_benchmark.tex")

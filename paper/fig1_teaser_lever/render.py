@@ -27,8 +27,8 @@ import sys
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.expanduser("~/code/SplatSim"))
-sys.path.insert(0, os.path.expanduser("~/code/lerobot/src"))
+sys.path.insert(0, os.environ.get("SPLATSIM_ROOT", os.path.expanduser("~/code/SplatSim")))
+sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "src"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 _ANALYSIS = os.path.join(os.path.dirname(HERE), "tables_repro", "analysis")  # pooled schedules (unpack_schedules.sh)
 REPO = sys.argv[1] if len(sys.argv) > 1 else "lever_d100_03dagcap_r84_diff_r_dag3"
@@ -42,9 +42,7 @@ N_ARCS = 3
 ARC_SEED = 0
 BAND_EVERY = 2
 TAG = f"{REPO[-4:]}_ep{EPISODE}_t{T0}"
-_B = os.path.expanduser(
-    "~/code/lerobot/outputs/training/diffusion_approach_lever_13_smooth_r84_delta_basewrist_d100_03dagcap_r84_ft_dag"
-)
+_B = os.path.join(os.environ.get("PCDAGGER_OUTPUTS", os.path.expanduser("~/code/lerobot/outputs")), "training/diffusion_approach_lever_13_smooth_r84_delta_basewrist_d100_03dagcap_r84_ft_dag")
 CSV = {
     "dag1": f"{_B}1/dagger/interventions/intervention_per_scenario.csv",
     "dag3": f"{HERE}/intervention_per_scenario_dag3.csv",  # copy of the round-3 orchestrator CSV (its training dir was cleaned)

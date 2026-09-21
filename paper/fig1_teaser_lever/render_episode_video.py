@@ -17,8 +17,8 @@ import sys
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.expanduser("~/code/SplatSim"))
-sys.path.insert(0, os.path.expanduser("~/code/lerobot/src"))
+sys.path.insert(0, os.environ.get("SPLATSIM_ROOT", os.path.expanduser("~/code/SplatSim")))
+sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "src"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = sys.argv[1] if len(sys.argv) > 1 else "lever_d100_03dagcap_r84_diff_r_dag1"
 EPISODE = int(sys.argv[2]) if len(sys.argv) > 2 else 9

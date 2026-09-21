@@ -12,8 +12,8 @@
 #   tables_repro/          this kit (git archive of HEAD) with the schedules unpacked and the delta caches
 #   MANIFEST.txt           what was linked, sizes, and the per-cell verification
 set -u
-S=$(cd "$(dirname "$0")" && pwd); LR=/home/jennyw2/code/lerobot; HF=$HOME/.cache/huggingface/lerobot/JennyWWW
-DEST=${1:-$HOME/paper_archive/pcdagger_icra2027}; PY=$HOME/miniforge3/envs/splatsim/bin/python
+S=$(cd "$(dirname "$0")" && pwd); source "$S/../../pcdagger/paths.sh"; LR=$LEROBOT_ROOT; HF=$LEROBOT_CACHE_DIR; OUT=$PCDAGGER_OUTPUTS
+DEST=${1:-$HOME/paper_archive/pcdagger_icra2027}; PY=$PCDAGGER_PY
 log() { echo "[archive $(date +%H:%M:%S)] $*"; }
 mkdir -p "$DEST"/{datasets,training,eval300}; M=$DEST/MANIFEST.txt; : > "$M"
 MISSING=0
@@ -32,7 +32,7 @@ for K in 1 2 3 4 5; do DS+=(lever_d100_03dagcap_r84_diff_r_dag$K); for r in 010 
 log "linking ${#DS[@]} datasets"; for d in "${DS[@]}"; do link "$HF/$d" "$DEST/datasets"; done
 
 # ---- training dirs -----------------------------------------------------------
-TR=$LR/outputs/training
+TR=$OUT/training
 link "$TR/diffusion_planar_3joint_12_delta_stateng" "$DEST/training"; link "$TR/bc175k" "$DEST/training"
 for tag in 05dag 06dag 07dag 08dag 09dag 10cl; do for K in 1 2 3 4 5; do link "$TR/diffusion_planar_3joint_12_delta_stateng_${tag}_ft_dag$K" "$DEST/training"; done; done
 for G in scarcity_study scarcity_study_s2 scarcity_study_s3 scarcity_study_s4 scarcity_study_s5; do
@@ -44,15 +44,15 @@ mkdir -p "$DEST/training/scarcity_study_cl"; for K in 1 2 3 4 5; do link "$TR/sc
 for d in diffusion_approach_lever_13_smooth_r84_delta_basewrist diffusion_approach_lever_13_smooth_r84_delta_basewrist_seed1 diffusion_approach_lever_13_smooth_r84_delta_basewrist_seed2 \
          lever_r84_fb lever_r84_calib; do link "$TR/$d" "$DEST/training"; done
 for K in 1 2 3 4 5; do link "$TR/diffusion_approach_lever_13_smooth_r84_delta_basewrist_d100_03dagcap_r84_ft_dag$K" "$DEST/training"; done
-log "linking evals + stats"; for g in $(ls $LR/outputs/eval300); do link "$LR/outputs/eval300/$g" "$DEST/eval300"; done
-link "$LR/outputs/dataset_stats" "$DEST"
+log "linking evals + stats"; for g in $(ls $OUT/eval300); do link "$OUT/eval300/$g" "$DEST/eval300"; done
+link "$OUT/dataset_stats" "$DEST"
 
 # ---- this kit ----------------------------------------------------------------
 rm -rf "$DEST/tables_repro"; mkdir -p "$DEST/tables_repro"
-(cd "$LR" && git archive HEAD my_scripts/paper_plots/tables_repro | tar -x -C "$DEST/tables_repro" --strip-components=3)
+(cd "$S/../.." && git archive HEAD paper/tables_repro | tar -x -C "$DEST/tables_repro" --strip-components=2)
 (cd "$DEST/tables_repro" && bash analysis/unpack_schedules.sh > /dev/null)
 for f in "$S"/analysis/*.npz; do link "$f" "$DEST/tables_repro/analysis" > /dev/null; done
-echo "kit: lerobot $(cd $LR && git rev-parse --short HEAD), SplatSim $(cd $HOME/code/SplatSim && git rev-parse --short HEAD)" >> "$M"
+echo "kit: pcdagger $(cd $S && git rev-parse --short HEAD), lerobot $(cd $LR && git rev-parse --short HEAD), SplatSim $(cd $SPLATSIM_ROOT && git rev-parse --short HEAD)" >> "$M"
 
 # ---- verify every table cell -------------------------------------------------
 log "verifying table cells against the archive"

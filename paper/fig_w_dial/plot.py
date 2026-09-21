@@ -31,7 +31,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 
-sys.path.insert(0, os.path.expanduser("~/code/lerobot/my_scripts"))
+sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "my_scripts"))
 from lib_sa_rollout import progress_guidance_index
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -128,7 +128,7 @@ def settles(repo, rd):
 # the planar BC policy's DDPM schedule (snapshot of its config.json)
 cfg = figdata.json_file(
     "planar_bc_policy_config.json",
-    "~/code/lerobot/outputs/training/diffusion_planar_3joint_12_delta_stateng/checkpoints/last/pretrained_model/config.json",
+    os.path.join(os.environ.get("PCDAGGER_OUTPUTS", os.path.expanduser("~/code/lerobot/outputs")), "training/diffusion_planar_3joint_12_delta_stateng/checkpoints/last/pretrained_model/config.json"),
 )
 T = int(cfg["num_train_timesteps"])
 assert cfg["beta_schedule"] == "squaredcos_cap_v2", cfg["beta_schedule"]

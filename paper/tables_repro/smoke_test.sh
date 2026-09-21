@@ -18,13 +18,13 @@
 #             measure_sigma_lever K=1 with the BC policy
 #   table     gen_table.py (tabular identical to table1_tabular.tex) and analysis/lever_table.py
 # Last run: 2026-09-20, all parts passed (evals now checked for episode length and success, see eval_sane).
-S=$(cd "$(dirname "$0")" && pwd); LR=/home/jennyw2/code/lerobot; PY=$HOME/miniforge3/envs/splatsim/bin/python
+S=$(cd "$(dirname "$0")" && pwd); source "$S/../../pcdagger/paths.sh"; LR=$LEROBOT_ROOT; PY=$PCDAGGER_PY
 PARTS=${PARTS:-"dry train eval analysis table"}
-SM=$LR/outputs/smoke; rm -rf "$SM"; mkdir -p "$SM/training" "$SM/eval300" "$SM/tables_repro/analysis"
+SM=$PCDAGGER_OUTPUTS/smoke; rm -rf "$SM"; mkdir -p "$SM/training" "$SM/eval300" "$SM/tables_repro/analysis"
 ln -sf "$S"/analysis/*.npz "$S"/analysis/*.json "$S"/analysis/*.txt "$SM/tables_repro/analysis/" 2>/dev/null
 # the environment every script call below runs under
 export OUT_TRAIN=$SM/training OUT_EVAL=$SM/eval300 TABLES_REPRO_DIR=$SM/tables_repro
-export PLANAR_BASE=$LR/outputs/training/diffusion_planar_3joint_12_delta_stateng LEVER_BASE=$LR/outputs/training/diffusion_approach_lever_13_smooth_r84_delta_basewrist
+export PLANAR_BASE=$PCDAGGER_OUTPUTS/training/diffusion_planar_3joint_12_delta_stateng LEVER_BASE=$PCDAGGER_OUTPUTS/training/diffusion_approach_lever_13_smooth_r84_delta_basewrist
 export PLANAR_STEPS=75020 LEVER_STEPS=75020 N_EPISODES=2 LEVER_N=2
 FAIL=0; log() { echo "[smoke $(date +%H:%M:%S)] $*"; }
 # an eval_info.json whose episodes all ended at step 1 means the sim spawned in collision (seen 2026-09-20:
@@ -62,17 +62,17 @@ if [[ " $PARTS " == *" train "* ]]; then
 fi
 if [[ " $PARTS " == *" eval "* ]]; then
   # the real q5 arm of s5, not the +20-step smoke arm, so success is meaningful (its 300-ep eval scored 84%)
-  OUT_TRAIN=$LR/outputs/training bash $S/planar_eval.sh 6023 s5 q5 > "$SM/planar_eval.log" 2>&1; RC=$?
+  OUT_TRAIN=$PCDAGGER_OUTPUTS/training bash $S/planar_eval.sh 6023 s5 q5 > "$SM/planar_eval.log" 2>&1; RC=$?
   eval_sane "$OUT_EVAL/scarcity_study_s5/q5/eval_info.json" 1 || RC=$((RC+100)); check $RC "eval planar_eval.sh s5 q5 (2 episodes: ran > 1 step and >= 1 success)"
 fi
 if [[ " $PARTS " == *" analysis "* ]]; then
   A=$TABLES_REPRO_DIR/analysis
   rm -f $A/noise_schedule_pooled_s1_K2.json $A/noise_schedule_sigma_alpha_s1_K2.json     # rebuild from the cached deltas
-  POLICY=$LR/outputs/training/scarcity_study/q2/checkpoints/last/pretrained_model bash $S/planar_calibrate.sh s1 2 > "$SM/calibrate_k2.log" 2>&1; RC=$?
+  POLICY=$PCDAGGER_OUTPUTS/training/scarcity_study/q2/checkpoints/last/pretrained_model bash $S/planar_calibrate.sh s1 2 > "$SM/calibrate_k2.log" 2>&1; RC=$?
   D=$(sched_diff $A/noise_schedule_pooled_s1_K2.json $S/analysis/noise_schedule_pooled_s1_K2.json); [ "$D" = 0 ] || RC=$((RC+100))
   check $RC "analysis planar_calibrate.sh s1 K=2 from cached deltas (pooled max|diff| vs shipped = $D)"
   rm -f $A/sigma_deltas_s1q1_dag1.npz $A/noise_schedule_pooled_s1_K1.json $A/noise_schedule_sigma_alpha_s1_K1.json
-  POLICY=$LR/outputs/training/scarcity_study/q1/checkpoints/last/pretrained_model bash $S/planar_calibrate.sh s1 1 > "$SM/calibrate_k1.log" 2>&1; RC=$?
+  POLICY=$PCDAGGER_OUTPUTS/training/scarcity_study/q1/checkpoints/last/pretrained_model bash $S/planar_calibrate.sh s1 1 > "$SM/calibrate_k1.log" 2>&1; RC=$?
   [ -f $A/sigma_deltas_s1q1_dag1.npz ] || RC=$((RC+100))
   check $RC "analysis planar_calibrate.sh s1 K=1 re-measured with q1 (pooled max|diff| vs shipped = $(sched_diff $A/noise_schedule_pooled_s1_K1.json $S/analysis/noise_schedule_pooled_s1_K1.json), rows are O(10-30), stochastic)"
   PFX=lever_d100_03dagcap_r84_diff; cd $LR

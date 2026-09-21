@@ -21,16 +21,15 @@ import numpy as np
 import pandas as pd
 import torch
 
-sys.path.insert(0, "/home/jennyw2/code/lerobot/src")
+sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "src"))
 from safetensors.torch import load_file
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.processor import PolicyProcessorPipeline
 
-S = os.environ.get("TABLES_REPRO_DIR", "/home/jennyw2/code/lerobot/my_scripts/paper_plots/tables_repro")
-CKPT = "/home/jennyw2/code/lerobot/outputs/training/diffusion_planar_3joint_12_delta_stateng/checkpoints/last/pretrained_model"
-LINEAGE = "/home/jennyw2/code/lerobot/outputs/training/diffusion_planar_3joint_12_delta_stateng_03dag_ft_dag{K}/checkpoints/last/pretrained_model"
+S = os.environ.get("TABLES_REPRO_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CKPT = os.environ.get("PCDAGGER_OUTPUTS", os.path.expanduser("~/code/lerobot/outputs")) + "/training/diffusion_planar_3joint_12_delta_stateng/checkpoints/last/pretrained_model"
 FLOOR, CAP = 0.5**2, 3 * 8**2
 fps = 30
 TAG = sys.argv[1]  # s1 | s2
@@ -74,7 +73,7 @@ def sample_round(RD, RATIO, KD, STRIDE):
         sigma_eff_norm = float(np.sqrt((1 - abar) / abar))
     epi = np.array(ds.hf_dataset["episode_index"])
     fri = np.array(ds.hf_dataset["frame_index"])
-    root = os.path.expanduser(f"~/.cache/huggingface/lerobot/JennyWWW/planar_12_{LINEAGE_TAG}_diff_r_dag{RD}")
+    root = os.path.join(os.environ.get("LEROBOT_CACHE_DIR", os.path.expanduser("~/.cache/huggingface/lerobot/JennyWWW")), f"planar_12_{LINEAGE_TAG}_diff_r_dag{RD}")
     di = pd.concat([pd.read_parquet(f) for f in glob.glob(root + "/data/**/*.parquet", recursive=True)])
     deltas_all, meds = {}, {}
     with torch.no_grad():

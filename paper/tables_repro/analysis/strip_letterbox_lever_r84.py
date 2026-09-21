@@ -45,7 +45,7 @@ if __name__ == "__main__":
         n = sum(p.map(do_file, files))
     print(f"rewrote {len(files)} files, {n} frames", flush=True)
     # validate before swapping
-    sys.path.insert(0, "/home/jennyw2/code/lerobot/src")
+    sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "src"))
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     ds = LeRobotDataset("JennyWWW/splatsim_approach_lever_13_smooth_r84_tmp")

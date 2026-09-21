@@ -15,14 +15,14 @@ import numpy as np
 import pandas as pd
 import torch
 
-sys.path.insert(0, "/home/jennyw2/code/lerobot/src")
+sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "src"))
 from safetensors.torch import load_file
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.processor import PolicyProcessorPipeline
 
-S = os.environ.get("TABLES_REPRO_DIR", "/home/jennyw2/code/lerobot/my_scripts/paper_plots/tables_repro")
+S = os.environ.get("TABLES_REPRO_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TAG, CK, SHORT = sys.argv[1], sys.argv[2], sys.argv[3]
 REPO = f"JennyWWW/{SHORT}"
 OUT = f"{S}/analysis/sigma_deltas_lever_{TAG}.npz"

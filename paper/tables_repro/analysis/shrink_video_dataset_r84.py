@@ -60,7 +60,7 @@ for k, v in vids.items():
     v["info"]["video.height"] = RES
     v["info"]["video.width"] = RES
 json.dump(info, open(f"{ROOT}/meta/info.json", "w"), indent=4)
-sys.path.insert(0, "/home/jennyw2/code/lerobot/src")
+sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "src"))
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 ds = LeRobotDataset(

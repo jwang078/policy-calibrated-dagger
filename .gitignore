@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+*.log
+*.out
+*.aux
+# figure-folder caches: regenerable from paper/tables_repro/analysis (schedules, sigma deltas) or by the plot scripts
+paper/**/*.npz
+paper/**/noise_schedule_*.json
+paper/**/fig_data*.json
+paper/**/cands/
+paper/fig1_teaser_lever/video/
+paper/tables_repro/table_full_benchmark.tex
+paper/tables_repro/analysis/table_lever.tex
+# the per-figure input snapshots (paper/figdata.py) ARE committed: negate the file patterns above for that folder
+!paper/data/
+!paper/data/*
+!paper/dart_chunks_src47/*.npz

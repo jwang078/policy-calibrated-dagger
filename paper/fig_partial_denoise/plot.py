@@ -37,7 +37,7 @@ OUT = os.environ.get(
     "OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "fig_partial_denoise.png")
 )
 # ─────────────────────────────────────────────────────────────────────────────
-LR = os.path.expanduser("~/code/lerobot")
+LR = os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot"))
 sys.path.insert(0, f"{LR}/src")
 sys.path.insert(0, f"{LR}/my_scripts")
 os.chdir(LR)

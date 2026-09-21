@@ -4,7 +4,7 @@ import sys
 
 import numpy as np
 
-S = os.environ.get("TABLES_REPRO_DIR", "/home/jennyw2/code/lerobot/my_scripts/paper_plots/tables_repro")
+S = os.environ.get("TABLES_REPRO_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SFX, LIN, K = sys.argv[1], sys.argv[2], int(sys.argv[3])
 W = 8.0
 prof_all = {}

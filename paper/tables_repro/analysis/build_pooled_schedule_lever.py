@@ -18,9 +18,9 @@ import sys
 
 import numpy as np
 
-S = os.environ.get("TABLES_REPRO_DIR", "/home/jennyw2/code/lerobot/my_scripts/paper_plots/tables_repro")
+S = os.environ.get("TABLES_REPRO_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 K, W = int(sys.argv[1]), float(sys.argv[2])
-INT_PREFIX = os.environ.get("INT_PREFIX", "lever_d100_03dagcap_cam_diff")
+INT_PREFIX = os.environ.get("INT_PREFIX", "lever_d100_03dagcap_r84_diff")
 TAGPFX = os.environ.get(
     "TAGPFX", ""
 )  # e.g. TAGPFX=r84_ -> sigma_deltas_lever_r84_q1_dag1.npz, noise_schedule_pooled_lever_r84_K1.json

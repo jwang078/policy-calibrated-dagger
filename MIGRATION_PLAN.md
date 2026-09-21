@@ -123,12 +123,17 @@ Everything else in the 19.5k lines is paper code and moves.
 Green means `paper/tables_repro/smoke_test.sh` 13/13 and `paper/make_figures.sh` bit-identical, run from
 the *new* location.
 
-1. **Scaffold** this repo: `pyproject.toml`, `pcdagger/__init__.py`, `scripts/`, `paper/`. Move
+1. **DONE 2026-09-21 — Scaffold** this repo: `pyproject.toml`, `pcdagger/__init__.py`, `scripts/`, `paper/`. Move
    `my_scripts/paper_plots` → `paper/` and `gridworld_dagger_sim` → `sandbox/` with `git mv`-style history
    (`git filter-repo --subdirectory-filter my_scripts/paper_plots` into a branch, then merge with
    `--allow-unrelated-histories`, so `git log` still shows the figure history). Fix the handful of absolute
    paths (`~/code/lerobot/outputs`, `~/code/SplatSim`) into two env vars with defaults:
    `PCDAGGER_OUTPUTS`, `SPLATSIM_ROOT`. Smoke + figures green from the new path. *Half a day.*
+   Done: `paper/` and `sandbox/` carry their fork history (13 commits merged); `pcdagger/paths.{py,sh}`
+   hold the four locations; every hard-coded `~/code/...` in `paper/` now reads them. Lesson: the fork's
+   `paper_plots/.gitignore` had never actually tracked `paper_plots/data/` (a `!data/**` negation under a
+   `*.npz` rule does not re-include), so the snapshots were rebuilt from the sources here and the root
+   `.gitignore` negates the directory explicitly.
 2. **SplatSim plugin.** Create `lerobot_env_splatsim` inside SplatSim from the fork's `SplatSimEnv`;
    delete that class from the fork; `lerobot-eval --env.type=splatsim` still works because the plugin
    registers it. Move `teleop_recording.py`, `sim_seeding.py`, `robots/splatsim_lerobot` into SplatSim.

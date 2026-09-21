@@ -1,0 +1,1092 @@
+#!/usr/bin/env bash
+
+# Sweep wrapper for dagger_orchestrate.sh. Two modes:
+#
+#   SINGLE-RATIO MODE  (--sweep_blends="..."):
+#       Invoke the orchestrator once per ratio listed in --sweep_blends, with
+#       each iteration's --blends set to that single ratio.
+#
+#   COMBINATION MODE   (--combination_pool="..." --sweep_combinations_of=K):
+#       Enumerate every K-combination from --combination_pool and invoke the
+#       orchestrator once per combination with --blends set to the full
+#       K-tuple. K=1 is equivalent to SINGLE-RATIO mode over the pool.
+#
+# Common to both: the orchestrator's BLENDS_TAG derivation (b<NNN>_<NNN>_…,
+# sorted descending) auto-disambiguates lineage names across iterations,
+# so --run_tag stays constant across the sweep. Each iteration is
+# independent and resumable. Cached per-ratio blend datasets from previous
+# sweep iterations (or single-ratio reruns) are reused automatically by the
+# orchestrator's step-2 resume detection.
+#
+# Usage:
+#   bash my_scripts/dagger_orchestrate_sweep.sh <mode flags> <orchestrator flags>
+#
+# Mode flags (pick exactly one mode):
+#   --sweep_blends=LIST
+#       SINGLE-RATIO. Space-separated single ratios; one orchestrator
+#       invocation per ratio. Quote to keep it one shell word.
+#         e.g. --sweep_blends="0.9 0.8 0.7 0.6 0.5 0.4 0.3 0.2 0.1"
+#
+#   --combination_pool=LIST --sweep_combinations_of=K[,K2,...]
+#       COMBINATION. Enumerate every K-combination from the pool; one
+#       orchestrator invocation per combination.
+#         e.g. --combination_pool="0.1 0.3 0.5 0.7 0.9" --sweep_combinations_of=2
+#       produces C(5,2)=10 invocations: pairs [0.1,0.3], [0.1,0.5], … [0.7,0.9].
+#       K=1 → behaves like --sweep_blends over the pool. K must satisfy 1≤K≤N.
+#
+#       MULTI-K LISTS: --sweep_combinations_of accepts a comma- OR space-
+#       separated list of K values (e.g. =1,2 or "1 2 3"), in which case
+#       the wrapper validates each K independently (length checks per K),
+#       then concatenates all C(N,Kᵢ) iterations into one sweep — same
+#       --run_tag, blends_tag auto-disambiguates the lineages
+#       (rerun_v1_b010 vs rerun_v1_b090_050 don't collide).
+#         e.g. --sweep_combinations_of=1,2 over pool of 5 →
+#              C(5,1)+C(5,2) = 5+10 = 15 iterations in one invocation.
+#
+#   SOURCE-ONLY MODE (no blend spec at all):
+#       With --auto_create_source and NEITHER --sweep_blends NOR a
+#       (non-empty) --combination_pool — an explicit --combination_pool=''
+#       and/or --sweep_combinations_of=0 spell the same intent — the sweep
+#       runs ONLY the auto-create-source step: interventions + per-round
+#       finetunes for the source lineage, ZERO blend iterations. Use this
+#       to run the plain (no-blend) DAgger loop through the sweep interface,
+#       e.g. under dagger_orchestrate_repeat.sh for no-blend repeat studies.
+#
+# Common options:
+#   --continue_on_error     Keep sweeping past failed iterations (default:
+#                           abort on first failure).
+#   --dry-run               Pass --dry-run to each orchestrator invocation
+#                           (the wrapper still iterates over all combinations).
+#   --auto_create_source    Before iterating, run dagger_orchestrate.sh once
+#                           in NON-rerun mode to create the source lineage
+#                           that --rerun_blends_from points at. Strips
+#                           --rerun_blends_from and replaces --run_tag with
+#                           the source's tag; everything else (--num_rounds,
+#                           --intervention_n_episodes, --intervention_extra_args,
+#                           --finetune_*, etc.) is forwarded. Always passes
+#                           --resume to the create step so a fully-complete
+#                           source exits 0 quickly; partial source resumes;
+#                           missing source is created from scratch.
+#
+#                           ORDER: with --final_mode=scratch, the source's
+#                           post-loop from-scratch train is DEFERRED — the
+#                           create step runs with --final_mode=finetune (no
+#                           post-loop phase) and the sweep re-invokes the
+#                           orchestrator with --final_mode=scratch after the
+#                           last blend iteration, so the sequence is always
+#                           interventions → blends → final scratch.
+#
+#                           Requires
+#                           --rerun_blends_from=TAG (no `:BLENDS_TAG` form —
+#                           sources with their own blends would need a
+#                           separate spec we don't yet support).
+#
+#                           CONVENIENCE: when this flag is on, the wrapper
+#                           auto-suffixes the rerun's --run_tag with the
+#                           string set by --auto_rerun_tag_suffix (default
+#                           "_rr") IF either (a) --run_tag is omitted, OR
+#                           (b) --run_tag equals --rerun_blends_from. So:
+#                             --rerun_blends_from=30ep   (--run_tag omitted)
+#                                 → source's run_tag=30ep, rerun's=30ep_rr
+#                             --run_tag=30ep --rerun_blends_from=30ep
+#                                 → same as above (collision auto-resolved)
+#                             --run_tag=my_v2 --rerun_blends_from=30ep
+#                                 → explicit; no auto-suffix
+#   --retrain_round0        (requires --auto_create_source) Forwarded to the
+#                           source-create orchestrator call ONLY: forces the
+#                           round-0 base training to run from scratch even if
+#                           its checkpoint already exists on disk (the old
+#                           training dir is rm -rf'd first; with --dry-run the
+#                           rm and the train_sweep.sh command are only
+#                           printed — handy for recovering the exact round-0
+#                           training command). Never forwarded to the
+#                           per-iteration rerun invocations. One-shot flag:
+#                           drop it after the base is rebuilt.
+#   --separate_blend_lineage[=true|false]
+#                           (passthrough to dagger_orchestrate.sh; listed here
+#                           because the wrapper changes two behaviors for it)
+#                           Each blend iteration gets its OWN DAgger loop:
+#                           it records its own interventions every round from
+#                           its own previous-round blend-finetuned policy and
+#                           finetunes from its own _ft_dag(r-1), instead of
+#                           reusing the source lineage's interventions and
+#                           branching off source's policies. --rerun_blends_from
+#                           then names the BASELINE lineage for comparison only
+#                           (and is still what --auto_create_source builds).
+#                           Wrapper-side effects:
+#                             * no `_rr` run_tag auto-suffix — the blends_tag
+#                               already separates the lineages, and here it
+#                               appears in the dataset names too;
+#                             * the combination-mode length pre-flight probes
+#                               the `_nc` blend name (derived from THIS
+#                               iteration's prefix in this mode), so long
+#                               lineages are rejected before anything runs.
+#                           NOTE: every iteration now records interventions,
+#                           so a K-way sweep costs K× the recording time of
+#                           the equivalent rerun sweep.
+#   --auto_rerun_tag_suffix=NAME
+#                           Suffix used by the auto-disambiguation above.
+#                           Default "_rr". Has no effect when --run_tag is
+#                           explicitly set to something different from the
+#                           source's tag.
+#
+# Orchestrator passthrough:
+#   Every flag not listed above is forwarded VERBATIM to each
+#   dagger_orchestrate.sh invocation — including --num_workers=N, which sets
+#   the DataLoader worker count for every training in every lineage the sweep
+#   produces (round-0 base, per-round scratch, per-round finetune + `_nc`
+#   sibling, post-loop final scratch). The orchestrator defaults it to 16;
+#   lerobot's own default of 4 leaves a many-core CPU idle and stalls the GPU
+#   on batch assembly. Recording / blending / merge steps have no DataLoader,
+#   so the flag does not affect them.
+#   Likewise --video_backend=NAME, which the orchestrator defaults to
+#   torchcodec and emits as --dataset.video_backend into every training. It
+#   matters most for RESUMED/finetuned rounds: a train_config.json written
+#   while torchcodec was unloadable pins `pyav`, and without this flag every
+#   later round in the lineage would inherit that pin.
+#   RRT path-scoring tuning rides --intervention_extra_args like the other
+#   SA-config fields, e.g.
+#   --policy.shared_autonomy_config.rrt_path_score_joint_arc_weight=0.03
+#   (joint-arc regularizer on the path score, m/rad; small values
+#   ~0.02-0.05 break near-goal EE-arc ties toward fast-to-execute
+#   candidates; 0 = off).
+#
+# Pre-flight name length validation (COMBINATION mode only):
+#   The wrapper predicts the merged-dataset name for every combination
+#   (`<HF_USER>/<BASE_DATASET_SHORT>_<a|r>_dag<N>_m` and, if --skip_alias_step
+#   is NOT set, the alias dataset too). If ANY combination's name would
+#   exceed HuggingFace's 56-char repo-name limit, the wrapper PRINTS the
+#   full per-combination table and EXITS BEFORE any orchestrator runs.
+#   Shorten --run_tag or --dag_short_override and retry.
+#
+# Example (rerun-blends with combinations of 2):
+#   bash my_scripts/dagger_orchestrate_sweep.sh \
+#       --combination_pool="0.1 0.3 0.5 0.7 0.9" --sweep_combinations_of=2 \
+#       --base_short=approach_lever_11_biasend_5path_grip0 \
+#       --initial_policy_path=outputs/training/diffusion_approach_lever_11_biasend_5path_delta_basewrist \
+#       --model=diff --action_format=rel \
+#       --intermediate_mode=finetune --final_mode=scratch \
+#       --target_intervention_volume=3 \
+#       --finetune_steps=1000 --finetune_eval_freq=1000 --finetune_save_freq=1000 \
+#       --env_external_port=6001 --skip_alias_step \
+#       --dag_short_override=lever_grip0 --run_tag=rerun_v1 \
+#       --rerun_blends_from=d5jvm \
+#       --blend_extra_args='--blend_mode=every_step' \
+#       --resume
+#
+# Resulting lineages for that example (10 finetune rounds + 1 from-scratch each):
+#   diffusion_..._rerun_v1_b030_010   (pair [0.1, 0.3])
+#   diffusion_..._rerun_v1_b050_010   (pair [0.1, 0.5])
+#   diffusion_..._rerun_v1_b050_030   (pair [0.3, 0.5])
+#   … etc, 10 total.
+
+set -euo pipefail
+
+SWEEP_BLENDS=""
+COMBINATION_POOL=""
+SWEEP_COMBINATIONS_OF=""
+CONTINUE_ON_ERROR=false
+AUTO_CREATE_SOURCE=false
+AUTO_RERUN_TAG_SUFFIX="_rr"   # appended to source's run_tag when sweep tag is missing or collides
+# --retrain_round0: forwarded ONLY to the --auto_create_source orchestrator
+# call (round 0 lives in the source lineage; rerun iterations never train it
+# and the orchestrator rejects the flag in rerun mode). Kept out of
+# ORCHESTRATOR_ARGS so per-iteration invocations don't each wipe + retrain
+# the shared base. One-shot: drop it once the base is rebuilt, or every sweep
+# invocation retrains round 0 again.
+RETRAIN_ROUND0=false
+# When --interleave_rounds is set, the sweep does ROUND-FIRST iteration
+# instead of ITERATION-FIRST: for r in 1..NUM_ROUNDS, for each iteration,
+# call dagger_orchestrate.sh with --num_rounds=$r. Combined with the
+# orchestrator's existing resume detection, each per-round call only does
+# work for round r (earlier rounds are skip-detected, later rounds aren't
+# requested). Useful for "see early-round results across all iterations
+# before committing compute to later rounds" + helps surface late-round
+# regressions in one iteration before others have over-trained.
+INTERLEAVE_ROUNDS=false
+ORCHESTRATOR_ARGS=()
+
+# Capture the wrapper's argv before parsing so the per-iteration orchestrator
+# invocation can record it into the dagger sidecar (alongside its own argv).
+# This lets dagger_detect_dataset_anomalies.py (and any other reverse-lookup
+# tool) reconstruct the EXACT sweep-level command used to spawn the lineage,
+# not just the orchestrator-level command. JSON-encoded so the orchestrator
+# can pass it through to the sidecar without shell-quoting headaches.
+# NOT exported here — the env var is set INLINE on each per-iteration orchestrator
+# invocation (see the inner sweep loop below). Inline-only avoids tagging the
+# --auto_create_source preamble's orchestrator call (which builds the SOURCE
+# lineage independent of this sweep) with this sweep's argv.
+SWEEP_ARGV_JSON_FOR_SIDECAR="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@")"
+
+for arg in "$@"; do
+    case "$arg" in
+        --sweep_blends=*)            SWEEP_BLENDS="${arg#*=}" ;;
+        --combination_pool=*)        COMBINATION_POOL="${arg#*=}" ;;
+        --sweep_combinations_of=*)   SWEEP_COMBINATIONS_OF="${arg#*=}" ;;
+        --continue_on_error)         CONTINUE_ON_ERROR=true ;;
+        --auto_create_source)        AUTO_CREATE_SOURCE=true ;;
+        --retrain_round0)            RETRAIN_ROUND0=true ;;
+        --auto_rerun_tag_suffix=*)   AUTO_RERUN_TAG_SUFFIX="${arg#*=}" ;;
+        --interleave_rounds)         INTERLEAVE_ROUNDS=true ;;
+        --blends=*)
+            echo "ERROR: don't pass --blends to the sweep wrapper; use --sweep_blends or --combination_pool instead." >&2
+            echo "  The wrapper splits the sweep spec into individual --blends invocations." >&2
+            exit 1
+            ;;
+        -h|--help)
+            sed -n '1,/^set -euo pipefail/p' "$0" | grep '^#' | sed 's/^# \?//'
+            exit 0
+            ;;
+        *) ORCHESTRATOR_ARGS+=( "$arg" ) ;;
+    esac
+done
+
+# --separate_blend_lineage detection. The flag itself is a plain passthrough
+# (it stays in ORCHESTRATOR_ARGS and reaches every per-iteration orchestrator
+# call); the wrapper only needs to KNOW about it for two reasons:
+#   * skip the `_rr` run_tag auto-suffix — a separate blend lineage is not a
+#     rerun of the source, and its blends_tag already keeps its artifacts from
+#     colliding with the source's, so the extra suffix is just noise in every
+#     dataset/policy name (and costs chars against the 56-char limit);
+#   * tell the combination-mode length validator to probe the `_nc` blend
+#     name, which in this mode is derived from THIS iteration's
+#     BASE_DATASET_SHORT (blends_tag included) rather than the source's prefix.
+SEPARATE_BLEND_LINEAGE=false
+for a in "${ORCHESTRATOR_ARGS[@]}"; do
+    case "$a" in
+        --separate_blend_lineage)        SEPARATE_BLEND_LINEAGE=true ;;
+        --separate_blend_lineage=*)      SEPARATE_BLEND_LINEAGE="${a#*=}" ;;
+    esac
+done
+case "$SEPARATE_BLEND_LINEAGE" in
+    true|false) ;;
+    *) echo "ERROR: --separate_blend_lineage must be true or false (got '$SEPARATE_BLEND_LINEAGE')." >&2; exit 1 ;;
+esac
+
+# --dart_noise (base-DART, train-time state noise on the intervention repos —
+# see dagger_orchestrate.sh) changes every finetune but creates NO blend
+# datasets, so a dart-noise study is a legitimate sweep with ZERO blend
+# ratios: one no-blend rerun iteration per invocation. Detected here so the
+# mode logic below can (a) not collapse into SOURCE-ONLY mode and (b) seed a
+# single empty combination when no blend spec is given.
+DART_IN_ARGS=""
+for a in "${ORCHESTRATOR_ARGS[@]}"; do
+    [[ "$a" == --dart_noise=* ]] && DART_IN_ARGS="${a#*=}"
+done
+
+# Mode selection + mutual-exclusion validation.
+#
+# SOURCE-ONLY mode: with --auto_create_source and NO blend spec at all —
+# --sweep_blends absent and --combination_pool empty/absent (an explicit
+# --sweep_combinations_of=0 is accepted as the same intent) — the sweep runs
+# ONLY the source-create step: interventions + per-round finetunes, zero
+# blend iterations. Pairs with dagger_orchestrate_repeat.sh for repeat
+# studies of the plain (no-blend) DAgger lineage.
+SOURCE_ONLY=false
+_POOL_STRIPPED="${COMBINATION_POOL//[ ,]/}"
+if [[ "$AUTO_CREATE_SOURCE" == "true" && -z "$SWEEP_BLENDS" && -z "$_POOL_STRIPPED" \
+      && -z "$DART_IN_ARGS" \
+      && ( -z "$SWEEP_COMBINATIONS_OF" || "$SWEEP_COMBINATIONS_OF" == "0" ) ]]; then
+    SOURCE_ONLY=true
+    COMBINATION_POOL=""
+    SWEEP_COMBINATIONS_OF=""
+fi
+# Dart-noise-only runs accept the same "empty pool + combinations_of=0"
+# spelling; normalize it so the pool/K set-together check below doesn't trip.
+if [[ -n "$DART_IN_ARGS" && -z "$_POOL_STRIPPED" \
+      && ( -z "$SWEEP_COMBINATIONS_OF" || "$SWEEP_COMBINATIONS_OF" == "0" ) ]]; then
+    COMBINATION_POOL=""
+    SWEEP_COMBINATIONS_OF=""
+fi
+if [[ "$SOURCE_ONLY" != "true" && ( -n "$COMBINATION_POOL" || -n "$SWEEP_COMBINATIONS_OF" ) ]]; then
+    if [[ -z "$COMBINATION_POOL" || -z "$SWEEP_COMBINATIONS_OF" ]]; then
+        echo "ERROR: --combination_pool and --sweep_combinations_of must be set TOGETHER." >&2
+        echo "  Got --combination_pool='$COMBINATION_POOL', --sweep_combinations_of='$SWEEP_COMBINATIONS_OF'." >&2
+        exit 1
+    fi
+    if [[ -n "$SWEEP_BLENDS" ]]; then
+        echo "ERROR: --sweep_blends is mutually exclusive with --combination_pool / --sweep_combinations_of." >&2
+        echo "  Pick one mode per invocation." >&2
+        exit 1
+    fi
+fi
+
+# --retrain_round0 only reaches the orchestrator through the source-create
+# preamble; without --auto_create_source the sweep would silently drop it.
+if [[ "$RETRAIN_ROUND0" == "true" && "$AUTO_CREATE_SOURCE" != "true" ]]; then
+    echo "ERROR: --retrain_round0 requires --auto_create_source (round 0 is trained by the" >&2
+    echo "  source-create step; per-iteration rerun invocations never train round 0)." >&2
+    echo "  To retrain the base without a sweep, invoke dagger_orchestrate.sh directly with" >&2
+    echo "  the source's --run_tag + --retrain_round0." >&2
+    exit 1
+fi
+
+if [[ "$SOURCE_ONLY" != "true" && -z "$SWEEP_BLENDS" && -z "$COMBINATION_POOL" && -z "$DART_IN_ARGS" ]]; then
+    echo "ERROR: must specify EITHER --sweep_blends='RATIO_LIST' OR --combination_pool + --sweep_combinations_of." >&2
+    echo "  Examples:" >&2
+    echo "    --sweep_blends='0.9 0.8 0.7'" >&2
+    echo "    --combination_pool='0.1 0.3 0.5 0.7 0.9' --sweep_combinations_of=2" >&2
+    echo "  Or pass --auto_create_source with NO blend spec for SOURCE-ONLY mode (no blend iterations)." >&2
+    exit 1
+fi
+
+# Default --target_intervention_volume to (max_K + 1) when the user didn't set
+# it, where max_K is the largest sweep combination size ("K" in
+# combinations_of=K) — 1 for --sweep_blends mode (each iteration has a single
+# ratio). This aligns per-round DAgger MASS across all sweep iterations AND
+# any --auto_create_source lineage (which has no blends):
+#   * Per-iteration (n_blends = K): raw_mult = max(1, TIV - K) = 1, blend_mult = 1
+#     → K+1 sub-datasets each with weight 1 → total DAgger mass ≡ (K+1) × raw
+#   * Source lineage (n_blends = 0):  raw_mult = TIV = K+1, no blends
+#     → single sub-dataset with weight K+1 → total DAgger mass ≡ (K+1) × raw
+# Both hit the same total per-batch DAgger mass at natural_share, so cross-
+# combination and source-vs-rerun comparisons stay apples-to-apples without
+# the user having to compute TIV by hand. Only injects if the user didn't
+# already pass --target_intervention_volume (explicit user value wins).
+_USER_SET_TIV=false
+for _a in "${ORCHESTRATOR_ARGS[@]}"; do
+    if [[ "$_a" == --target_intervention_volume=* ]]; then
+        _USER_SET_TIV=true
+        break
+    fi
+done
+if [[ "$_USER_SET_TIV" != "true" ]]; then
+    # Determine max K. Combination mode: parse SWEEP_COMBINATIONS_OF (accepts
+    # single value OR comma/space-separated list, mirroring the parser at
+    # line ~295 — kept lightweight here so we don't need to hoist the fuller
+    # validator up). --sweep_blends mode: each iteration is a single ratio, so
+    # K_eff = 1. Non-positive-int entries are ignored here; the fuller
+    # validator later will error clearly if the input is truly malformed.
+    _MAX_K=0
+    if [[ -n "$SWEEP_COMBINATIONS_OF" ]]; then
+        IFS=', ' read -ra _K_TMP <<< "$SWEEP_COMBINATIONS_OF"
+        for _k in "${_K_TMP[@]}"; do
+            if [[ "$_k" =~ ^[0-9]+$ ]] && (( _k > _MAX_K )); then
+                _MAX_K="$_k"
+            fi
+        done
+    fi
+    if (( _MAX_K < 1 )); then
+        _MAX_K=1   # --sweep_blends mode, or SWEEP_COMBINATIONS_OF parse fell through
+    fi
+    _DEFAULT_TIV=$(( _MAX_K + 1 ))
+    ORCHESTRATOR_ARGS+=( "--target_intervention_volume=$_DEFAULT_TIV" )
+    echo "[sweep] --target_intervention_volume not set; defaulting to max_K+1 = $_DEFAULT_TIV" \
+         "(K = ${SWEEP_COMBINATIONS_OF:-1 (--sweep_blends mode)})."
+    echo "[sweep]   Effect: per-round DAgger MASS ≡ $_DEFAULT_TIV × raw intervention across all iterations" \
+         "(and any --auto_create_source source lineage) — apples-to-apples."
+    echo "[sweep]   Pass --target_intervention_volume=N to override."
+fi
+
+# Auto-disambiguate rerun's --run_tag from source's tag. The orchestrator
+# requires `--run_tag != --rerun_blends_from` (to keep the new lineage from
+# clobbering the source on disk). For the convenience case where the user
+# either (a) omits --run_tag entirely or (b) reuses the same value for both,
+# auto-suffix the rerun's run_tag with $AUTO_RERUN_TAG_SUFFIX so the user
+# doesn't have to think about "they must differ" — one tag input, two
+# distinct lineage families on disk.
+# When user provides a distinct --run_tag, we leave it alone (explicit > magic).
+# Runs before the length check (Python helper) so dataset-name predictions
+# reflect the final tag the orchestrator will actually receive.
+if [[ "$AUTO_CREATE_SOURCE" == "true" ]]; then
+    _CUR_RUN_TAG=""
+    _CUR_RERUN_FROM=""
+    for a in "${ORCHESTRATOR_ARGS[@]}"; do
+        case "$a" in
+            --run_tag=*)            _CUR_RUN_TAG="${a#*=}" ;;
+            --rerun_blends_from=*)  _CUR_RERUN_FROM="${a#*=}" ;;
+        esac
+    done
+    if [[ -z "$_CUR_RERUN_FROM" ]]; then
+        echo "ERROR: --auto_create_source requires --rerun_blends_from=TAG to also be set." >&2
+        exit 1
+    fi
+    # Parse source's run_tag out of --rerun_blends_from=TAG[:BLENDS_TAG].
+    _SRC_RUN_TAG="${_CUR_RERUN_FROM%%:*}"
+    if [[ "$SEPARATE_BLEND_LINEAGE" == "true" ]]; then
+        # Separate blend lineage: no `_rr` suffix. The iteration's blends_tag
+        # (b050, b090_080, ...) is what separates it from the source lineage,
+        # in BOTH the policy dirs and — unlike rerun mode — the dataset names.
+        # The orchestrator re-validates that the two lineages can't collide.
+        if [[ -n "$_CUR_RUN_TAG" && "$_CUR_RUN_TAG" != "$_SRC_RUN_TAG" ]]; then
+            echo "[auto_create_source] --separate_blend_lineage: keeping explicit --run_tag='$_CUR_RUN_TAG'."
+        else
+            if [[ -z "$_CUR_RUN_TAG" ]]; then
+                _filtered=()
+                for a in "${ORCHESTRATOR_ARGS[@]}"; do
+                    case "$a" in
+                        --run_tag=*) continue ;;
+                        *) _filtered+=( "$a" ) ;;
+                    esac
+                done
+                ORCHESTRATOR_ARGS=( "${_filtered[@]}" "--run_tag=$_SRC_RUN_TAG" )
+            fi
+            echo "[auto_create_source] --separate_blend_lineage: using run_tag='$_SRC_RUN_TAG' (no '$AUTO_RERUN_TAG_SUFFIX' suffix;" \
+                 "the blends_tag disambiguates this lineage from the source)."
+        fi
+    elif [[ -z "$_CUR_RUN_TAG" || "$_CUR_RUN_TAG" == "$_SRC_RUN_TAG" ]]; then
+        _NEW_RUN_TAG="${_SRC_RUN_TAG}${AUTO_RERUN_TAG_SUFFIX}"
+        if [[ "$_NEW_RUN_TAG" == "$_SRC_RUN_TAG" ]]; then
+            echo "ERROR: --auto_rerun_tag_suffix is empty; auto-disambiguation would still collide." >&2
+            exit 1
+        fi
+        _filtered=()
+        for a in "${ORCHESTRATOR_ARGS[@]}"; do
+            case "$a" in
+                --run_tag=*) continue ;;
+                *) _filtered+=( "$a" ) ;;
+            esac
+        done
+        ORCHESTRATOR_ARGS=( "${_filtered[@]}" "--run_tag=$_NEW_RUN_TAG" )
+        if [[ -z "$_CUR_RUN_TAG" ]]; then
+            echo "[auto_create_source] --run_tag not provided; using rerun_tag='$_NEW_RUN_TAG' (= source_tag + '$AUTO_RERUN_TAG_SUFFIX')."
+        else
+            echo "[auto_create_source] --run_tag collided with --rerun_blends_from='$_SRC_RUN_TAG'; using rerun_tag='$_NEW_RUN_TAG' (= source_tag + '$AUTO_RERUN_TAG_SUFFIX')."
+        fi
+    fi
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ORCH="$SCRIPT_DIR/dagger_orchestrate.sh"
+if [[ ! -f "$ORCH" ]]; then
+    echo "ERROR: dagger_orchestrate.sh not found at $ORCH" >&2
+    exit 1
+fi
+
+# Build the iteration list. Each entry is a single --blends argument value
+# (one ratio for single-ratio mode, a space-separated K-tuple for combo mode).
+RATIO_LISTS_ARR=()
+
+if [[ "$SOURCE_ONLY" == "true" ]]; then
+    echo "[source_only] no blend spec given; running ONLY the auto-create-source step (0 blend iterations)."
+
+elif [[ -n "$COMBINATION_POOL" ]]; then
+    # COMBINATION mode. Hand off to a Python helper that (per K value):
+    #   (1) enumerates C(N, K) combinations from the pool,
+    #   (2) replicates dagger_orchestrate.sh's BASE_DATASET_SHORT derivation
+    #       (stem + run_tag + model_tag + method_tag + blends_tag) for each
+    #       combination,
+    #   (3) checks every predicted longest derived dataset name against the
+    #       56-char HF limit (merged and, when --skip_alias_step is NOT set,
+    #       alias too — alias is longer for diffusion lineages),
+    #   (4) prints the per-combination table to stderr, and
+    #   (5) on stdout, emits one combination per line if and only if ALL
+    #       combinations fit. If ANY would overflow, exits non-zero before
+    #       any orchestrator runs.
+    # The helper inspects ORCHESTRATOR_ARGS by name (--base_short, --run_tag,
+    # --model, etc.) to keep its derivation in lock-step with the orchestrator
+    # without re-parsing every flag.
+    #
+    # --sweep_combinations_of accepts a single K (e.g. "2") OR a comma /
+    # space-separated list of K values (e.g. "1,2" or "1 2 3"). For each K
+    # we run the helper independently; if ANY K has any overflow, we abort
+    # before any orchestrator runs. Combos across all K values are concatenated
+    # into a single RATIO_LISTS_ARR for the iteration loop below.
+    HF_USER="${HF_USER:-JennyWWW}"
+    IFS=', ' read -ra SWEEP_COMBO_K_LIST <<< "$SWEEP_COMBINATIONS_OF"
+    _k_filtered=()
+    for k in "${SWEEP_COMBO_K_LIST[@]}"; do
+        [[ -n "$k" ]] && _k_filtered+=( "$k" )
+    done
+    SWEEP_COMBO_K_LIST=( "${_k_filtered[@]}" )
+    if (( ${#SWEEP_COMBO_K_LIST[@]} == 0 )); then
+        echo "ERROR: --sweep_combinations_of parsed to an empty list. Got: '$SWEEP_COMBINATIONS_OF'" >&2
+        exit 1
+    fi
+    for k in "${SWEEP_COMBO_K_LIST[@]}"; do
+        if ! [[ "$k" =~ ^[0-9]+$ ]] || (( k < 1 )); then
+            echo "ERROR: --sweep_combinations_of value '$k' must be a positive integer." >&2
+            echo "  Use a single value (e.g. =2) or a list (e.g. =1,2 or '1 2 3')." >&2
+            exit 1
+        fi
+    done
+
+    # PYTHONPATH=$SCRIPT_DIR so the inline helper can `import dagger_naming`
+    # (the canonical naming module — keeps this length-check in lock-step
+    # with the orchestrator's actual name derivation).
+    for SWEEP_K_VAL in "${SWEEP_COMBO_K_LIST[@]}"; do
+    # dagger_naming's blend_tag_for_ratio reads DAG_BLEND_RUN_TAG — export it
+    # so the length predictions below match the orchestrator's real names.
+    for _a in "${ORCHESTRATOR_ARGS[@]}"; do
+        [[ "$_a" == --blend_run_tag=* ]] && export DAG_BLEND_RUN_TAG="${_a#*=}"
+    done
+    COMBO_OUTPUT=$(PYTHONPATH="$SCRIPT_DIR" python3 - "$COMBINATION_POOL" "$SWEEP_K_VAL" "$HF_USER" "${ORCHESTRATOR_ARGS[@]}" <<'PY' || exit $?
+import sys
+from itertools import combinations
+
+from dagger_naming import (
+    derive_base_dataset_short,
+    derive_base_policy_name,
+    format_blends_tag,
+    merged_repo,
+    alias_repo,
+    nocoll_short,
+)
+
+pool_str = sys.argv[1]
+k = int(sys.argv[2])
+hf_user = sys.argv[3]
+orch_args = sys.argv[4:]
+
+
+def _blends_tag_with_additive(combo):
+    """format_blends_tag + the orchestrator's --blend_data_fraction suffix.
+
+    Mirrors the orchestrator's BLENDS_TAG derivation: an additive blend
+    allocation appends `a<NNN>` (B=0.1 -> a010) so the prediction stays in
+    lock-step with the real names.
+    """
+    tag = format_blends_tag(list(combo))
+    for a in orch_args:
+        if a.startswith("--blend_data_fraction="):
+            v = a.split("=", 1)[1]
+            if v:
+                tag += f"a{round(float(v) * 100):03d}"
+    return tag
+
+def get_flag(name, default=None):
+    pfx = f"--{name}="
+    for a in orch_args:
+        if a.startswith(pfx):
+            return a[len(pfx):]
+    return default
+
+def has_bool_flag(name):
+    return f"--{name}" in orch_args
+
+# Pull every orchestrator flag that affects BASE_DATASET_SHORT.
+base_short = get_flag("base_short") or ""
+base_repo_id = get_flag("base_repo_id") or ""
+dag_short_override = get_flag("dag_short_override") or ""
+run_tag = get_flag("run_tag") or ""
+model = get_flag("model") or "pi"
+intervention_method = get_flag("intervention_method") or "rrt"
+action_format = get_flag("action_format") or "rel"
+num_rounds_str = get_flag("num_rounds") or ""
+skip_alias = has_bool_flag("skip_alias_step")
+strip_splatsim = not has_bool_flag("no_strip_splatsim_prefix")   # default true
+filter_collisions = has_bool_flag("filter_blend_collisions")
+# In rerun mode the blend (and therefore the `_nc` sibling) name uses
+# the SOURCE lineage's prefix, not the current sweep iteration's base_short.
+# Source datasets are read-only and were length-validated when they were
+# originally created, so skip the nocoll length probe to avoid false-
+# positive overflows.
+# --separate_blend_lineage turns the data reuse OFF: the lineage records its own
+# interventions and names every blend/_nc dataset from its OWN prefix, so
+# the nocoll length probe below applies exactly as it does to a fresh-recording
+# sweep. Accept both the bare flag and the =true/=false spelling.
+separate_blend_lineage = has_bool_flag("separate_blend_lineage") or (
+    (get_flag("separate_blend_lineage") or "false").lower() == "true"
+)
+rerun_mode = (
+    bool(get_flag("rerun_blends_from")) or bool(get_flag("reuse_intervention_from"))
+) and not separate_blend_lineage
+
+if not (base_short or base_repo_id):
+    print("ERROR: --base_short or --base_repo_id required for combination length validation.", file=sys.stderr)
+    sys.exit(1)
+
+# Mirror dagger_orchestrate.sh's BASE_DATASET_STEM derivation.
+if base_repo_id:
+    stem = base_repo_id.split("/", 1)[1] if "/" in base_repo_id else base_repo_id
+else:
+    stem = base_short
+if strip_splatsim and stem.startswith("splatsim_"):
+    stem = stem[len("splatsim_"):]
+if dag_short_override:
+    stem = dag_short_override
+
+MODEL_TAGS  = {"pi": "", "diff": "diff", "act": "act"}
+METHOD_TAGS = {"rrt": "", "oracle_goal": "og"}
+if model not in MODEL_TAGS:
+    print(f"ERROR: unknown --model='{model}' (expected pi/diff/act).", file=sys.stderr); sys.exit(1)
+if intervention_method not in METHOD_TAGS:
+    print(f"ERROR: unknown --intervention_method='{intervention_method}'.", file=sys.stderr); sys.exit(1)
+if action_format == "rel":
+    action_infix = "r"
+elif action_format == "abs":
+    action_infix = "a"
+else:
+    print(f"ERROR: unknown --action_format='{action_format}'.", file=sys.stderr); sys.exit(1)
+model_tag  = MODEL_TAGS[model]
+method_tag = METHOD_TAGS[intervention_method]
+
+# Conservative default for the length check. The orchestrator's own pre-flight
+# does the final authoritative check at the actual NUM_ROUNDS; this is just an
+# early-warning gate. dag<N> width is fixed at 2 chars for N=10..99, so any
+# NUM_ROUNDS in that range gives identical predicted lengths.
+num_rounds = int(num_rounds_str) if num_rounds_str else 10
+
+# Derive BASE_POLICY_STEM the same way dagger_orchestrate.sh does (see
+# dagger_orchestrate.sh:1336-1347). Used to predict the longest `_nc` sibling
+# policy name when --filter_blend_collisions is on. Only the basename of
+# --initial_policy_path matters; the orchestrator strips trailing
+# /pretrained_model and /checkpoints/<step>/ segments before basename.
+import os as _os
+import posixpath as _pp
+def _strip_ckpt_suffix(path: str) -> str:
+    p = path.rstrip("/")
+    if p.endswith("/pretrained_model"):
+        p = p[: -len("/pretrained_model")]
+    # Drop the trailing /checkpoints/<seg> if present.
+    parts = p.split("/")
+    if len(parts) >= 2 and parts[-2] == "checkpoints":
+        p = "/".join(parts[:-2])
+    return p
+
+initial_policy_path = get_flag("initial_policy_path") or ""
+if initial_policy_path:
+    base_policy_stem = _os.path.basename(_strip_ckpt_suffix(initial_policy_path))
+else:
+    base_policy_stem = ""  # without it we can't predict nc names; skip the probe
+
+# Parse the pool. 0.0 is rejected (orchestrator silently drops it → empty
+# --blends — likely a typo). 1.0 is KEPT: when it's the only ratio in a
+# combination, the orchestrator enters PURE_POLICY_MODE and trains on the
+# base dataset only (matched-compute baseline, no DAgger data). When 1.0
+# is mixed with other ratios in a combination (e.g. {0.5, 1.0}), it's a
+# regular blend that produces an extra _blend100 sub-dataset alongside.
+pool = []
+for r_str in pool_str.replace(",", " ").replace("[", " ").replace("]", " ").split():
+    r = float(r_str)
+    if r == 0.0:
+        print("ERROR: --combination_pool contains 0.0 (orchestrator rejects 0.0).", file=sys.stderr); sys.exit(1)
+    pool.append(r)
+
+if k <= 0:
+    print(f"ERROR: --sweep_combinations_of={k} must be >= 1.", file=sys.stderr); sys.exit(1)
+if k > len(pool):
+    print(f"ERROR: --sweep_combinations_of={k} exceeds pool size {len(pool)}.", file=sys.stderr); sys.exit(1)
+
+combos = list(combinations(pool, k))
+
+def predicted_longest(combo):
+    """Predict longest derived dataset name for a given combination.
+
+    Uses dagger_naming's canonical helpers so this stays in lock-step with
+    the orchestrator's actual derivation."""
+    blends_tag = _blends_tag_with_additive(combo)
+    base_dataset_short = derive_base_dataset_short(
+        stem, run_tag=run_tag, model_tag=model_tag, method_tag=method_tag, blends_tag=blends_tag
+    )
+    candidates = [merged_repo(hf_user, base_dataset_short, action_infix, num_rounds)]
+    if not skip_alias:
+        # Note: in non-rerun mode SOURCE_INT_SHORT_PREFIX == BASE_DATASET_SHORT,
+        # so the alias name is derived from base_dataset_short. In rerun mode
+        # the alias step is typically skipped (--skip_alias_step) so this
+        # branch is only exercised for fresh-recording sweeps anyway.
+        candidates.append(
+            alias_repo(hf_user, base_dataset_short, action_infix, num_rounds, model, action_format)
+        )
+    if filter_collisions and not rerun_mode:
+        # Fresh-recording sweep: the `_nc` blend uses the sweep iteration's
+        # BASE_DATASET_SHORT as the source prefix, so it's worth probing for
+        # overflows that the bare blend name wouldn't trigger. Any ratio in the
+        # combo works — all blend ratios produce the same name length.
+        # In rerun mode this name uses the SOURCE lineage's prefix instead,
+        # which was validated at source-creation time → skip.
+        any_ratio = combo[0]
+        nc_short = nocoll_short(base_dataset_short, action_infix, num_rounds, any_ratio)
+        candidates.append(f"{hf_user}/{nc_short}")
+    return max(candidates, key=len)
+
+
+def predicted_longest_nc_policy(combo):
+    """Predict longest collision-filtered sibling policy name (= nocoll
+    training-dir basename) for a combination. Format:
+        ${BASE_POLICY_NAME}_ft_dag${num_rounds}_nc
+    where BASE_POLICY_NAME = derive_base_policy_name(stem, run_tag, ...).
+    Returns None when --filter_blend_collisions is off or we lack the
+    initial-policy basename needed to predict it.
+    """
+    if not filter_collisions:
+        return None
+    if not base_policy_stem:
+        return None
+    blends_tag = _blends_tag_with_additive(combo)
+    base_policy_name = derive_base_policy_name(
+        base_policy_stem, run_tag=run_tag, model_tag=model_tag,
+        method_tag=method_tag, blends_tag=blends_tag,
+    )
+    return f"{base_policy_name}_ft_dag{num_rounds}_nc"
+
+# Per-combination table + overflow detection.
+print(f"Combination-mode sweep: C({len(pool)}, {k}) = {len(combos)} combination(s)", file=sys.stderr)
+print(f"  Pool: {pool}", file=sys.stderr)
+print(f"  K (combination size): {k}", file=sys.stderr)
+print(f"  Length check uses NUM_ROUNDS=dag{num_rounds} (orchestrator does authoritative check at pre-flight)", file=sys.stderr)
+print(file=sys.stderr)
+print(f"  {'combination':<28}  {'predicted longest derived dataset':<60}  {'len':>4}  status", file=sys.stderr)
+print(f"  {'-'*28}  {'-'*60}  ----  ------", file=sys.stderr)
+
+overflows = []
+combo_lines = []
+for combo in combos:
+    longest = predicted_longest(combo)
+    overflows_flag = len(longest) > 56
+    combo_str = " ".join(f"{r:g}" for r in combo)
+    if overflows_flag:
+        overflows.append(combo_str)
+    print(f"  [{combo_str}]".ljust(30) + f"  {longest:<60}  {len(longest):>4}  " + ("OVERFLOW" if overflows_flag else "ok"), file=sys.stderr)
+    combo_lines.append(combo_str)
+
+if overflows:
+    print(file=sys.stderr)
+    print(f"ERROR: {len(overflows)} of {len(combos)} combinations would exceed HuggingFace's 56-char repo-name limit.", file=sys.stderr)
+    print("  No orchestrator runs were started. To proceed, shorten one of:", file=sys.stderr)
+    print(f"    --run_tag (currently '{run_tag}', {len(run_tag)} chars)", file=sys.stderr)
+    if dag_short_override:
+        print(f"    --dag_short_override (currently '{dag_short_override}', {len(dag_short_override)} chars)", file=sys.stderr)
+    else:
+        print(f"    add --dag_short_override=<SHORTER> (current stem '{stem}', {len(stem)} chars)", file=sys.stderr)
+    print(f"  Or reduce --sweep_combinations_of from {k} (fewer ratios per combination → shorter blends_tag).", file=sys.stderr)
+    if separate_blend_lineage:
+        print("  Note: --separate_blend_lineage puts the blends_tag into the intervention/blend/_nc", file=sys.stderr)
+        print("  dataset names too (they are this lineage's own artifacts, not the source's), which is", file=sys.stderr)
+        print("  typically 5-10 chars longer than the same sweep in rerun mode.", file=sys.stderr)
+    sys.exit(2)
+
+# Second table: collision-filtered sibling policy name (step 6b output, the
+# `_nc`-suffixed training-dir basename = --policy.repo_id). Limit is wandb's
+# 128-char run-name cap (HF Hub's 96 is only a constraint when push_to_hub=true;
+# the orchestrator's own pre-flight will catch that case). Only printed when
+# --filter_blend_collisions is on AND we could derive base_policy_stem
+# (requires --initial_policy_path).
+NC_POLICY_LIMIT = 128
+nc_rows = []
+for combo in combos:
+    nc_name = predicted_longest_nc_policy(combo)
+    if nc_name is not None:
+        nc_rows.append((combo, nc_name))
+
+if nc_rows:
+    # Use a wider name column (130) since _nc policy names are inherently
+    # longer than dataset names (BASE_POLICY_NAME + `_ft_dag10_nc` ≈ 80-120
+    # chars). 130 leaves a few chars of right padding above the limit so the
+    # `len` column stays aligned.
+    NC_COL = 130
+    print(file=sys.stderr)
+    print(f"  {'combination':<28}  {'predicted longest _nc policy name (step 6b)':<{NC_COL}}  {'len':>4}  status", file=sys.stderr)
+    print(f"  {'-'*28}  {'-'*NC_COL}  ----  ------", file=sys.stderr)
+    nc_overflows = []
+    for combo, nc_name in nc_rows:
+        combo_str = " ".join(f"{r:g}" for r in combo)
+        nc_overflow_flag = len(nc_name) > NC_POLICY_LIMIT
+        if nc_overflow_flag:
+            nc_overflows.append(combo_str)
+        print(f"  [{combo_str}]".ljust(30) + f"  {nc_name:<{NC_COL}}  {len(nc_name):>4}  " + ("OVERFLOW" if nc_overflow_flag else "ok"), file=sys.stderr)
+    if nc_overflows:
+        print(file=sys.stderr)
+        print(f"ERROR: {len(nc_overflows)} of {len(nc_rows)} combinations would exceed wandb's {NC_POLICY_LIMIT}-char run-name limit for the step-6b nocoll sibling policy.", file=sys.stderr)
+        print("  Shorten the lineage somewhere upstream (--run_tag, --dag_short_override) or drop --filter_blend_collisions.", file=sys.stderr)
+        sys.exit(2)
+elif filter_collisions and not base_policy_stem:
+    print(file=sys.stderr)
+    print("  Note: --filter_blend_collisions is on but --initial_policy_path was not provided;", file=sys.stderr)
+    print("  cannot predict the step-6b `_nc` policy name length here. The orchestrator's own", file=sys.stderr)
+    print("  pre-flight will validate against the 128-char wandb cap.", file=sys.stderr)
+
+# stdout: one combination per line, space-separated ratios. Consumed by the
+# bash caller into RATIO_LISTS_ARR.
+for line in combo_lines:
+    print(line)
+PY
+)
+    helper_rc=$?
+    if (( helper_rc != 0 )); then
+        # The Python helper already streamed the diagnostic table + error reason to stderr.
+        exit "$helper_rc"
+    fi
+    # Append this K's combos to the cumulative iteration list.
+    while IFS= read -r _line; do
+        [[ -n "$_line" ]] && RATIO_LISTS_ARR+=( "$_line" )
+    done <<< "$COMBO_OUTPUT"
+    done   # for SWEEP_K_VAL
+
+elif [[ -n "$DART_IN_ARGS" && -z "$SWEEP_BLENDS" ]]; then
+    # DART-NOISE-ONLY mode: one no-blend rerun iteration. The orchestrator
+    # receives --blends= (empty) + the forwarded --dart_noise; its dn<sigma>
+    # tag lands in the blends-tag slot, so the iteration builds the
+    # <source>_rr_dn<sigma> lineage off the source's interventions.
+    RATIO_LISTS_ARR=( "" )
+    echo "[dart_noise] no blend spec; running ONE no-blend rerun iteration with --dart_noise=$DART_IN_ARGS."
+
+else
+    # SINGLE-RATIO mode. Parse the list (allow brackets/commas for ergonomics).
+    _clean=$(echo "$SWEEP_BLENDS" | tr ',[]' '   ')
+    # shellcheck disable=SC2206  # intentional word-split
+    RATIO_LISTS_ARR=( $_clean )
+    if (( ${#RATIO_LISTS_ARR[@]} == 0 )); then
+        echo "ERROR: --sweep_blends parsed to an empty list. Got: '$SWEEP_BLENDS'" >&2
+        exit 1
+    fi
+fi
+
+total=${#RATIO_LISTS_ARR[@]}
+if [[ "$SOURCE_ONLY" == "true" ]]; then
+    echo "[source_only] starting source-create (interventions + finetunes; no blends)."
+elif [[ -n "$COMBINATION_POOL" ]]; then
+    echo
+    echo "All $total combination(s) fit within the 56-char limit. Starting sweep."
+else
+    echo "Sweep over $total ratio(s): ${RATIO_LISTS_ARR[*]}"
+fi
+
+# Build the outer round-loop list. When --interleave_rounds, each value of $r
+# is appended to every orchestrator invocation as `--num_rounds=$r`, so all
+# iterations do round $r, then $r+1, etc. The orchestrator's existing resume
+# detection skip-finishes prior rounds, so per-round calls only do new work
+# for round $r. Without the flag, the loop runs ONCE with no override and
+# the orchestrator follows the user's original --num_rounds for each iter
+# in full sequence (= the historical behavior).
+if [[ "$INTERLEAVE_ROUNDS" == "true" ]]; then
+    INTERLEAVE_NUM_ROUNDS=""
+    for a in "${ORCHESTRATOR_ARGS[@]}"; do
+        case "$a" in
+            --num_rounds=*) INTERLEAVE_NUM_ROUNDS="${a#*=}" ;;
+        esac
+    done
+    if [[ -z "$INTERLEAVE_NUM_ROUNDS" ]]; then
+        echo "ERROR: --interleave_rounds requires an explicit --num_rounds=N." >&2
+        echo "  The sweep needs to know how many rounds to iterate; auto-detection happens" >&2
+        echo "  inside dagger_orchestrate.sh after invocation, which is too late for this wrapper." >&2
+        exit 1
+    fi
+    ROUND_VALUES=()
+    for r in $(seq 1 "$INTERLEAVE_NUM_ROUNDS"); do
+        ROUND_VALUES+=( "$r" )
+    done
+    # Pre-flight: without --resume, the orchestrator's "is the lineage already
+    # complete?" detection prompts interactively at every invocation. With
+    # --interleave_rounds that's NUM_ROUNDS × iterations prompts — way too
+    # many. Warn + confirm rather than silently dropping the user into a
+    # prompt swamp.
+    RESUME_SET=false
+    for a in "${ORCHESTRATOR_ARGS[@]}"; do
+        if [[ "$a" == "--resume" ]]; then
+            RESUME_SET=true
+            break
+        fi
+    done
+    if [[ "$RESUME_SET" != "true" ]]; then
+        _expected_prompts=$(( INTERLEAVE_NUM_ROUNDS * total ))
+        if [[ "$AUTO_CREATE_SOURCE" == "true" ]]; then
+            _expected_prompts=$(( _expected_prompts + INTERLEAVE_NUM_ROUNDS ))
+        fi
+        echo "WARNING: --resume is not set so the orchestrator will pause for"
+        echo "  '[Y/n/restart-from-scratch]' confirmation at every invocation."
+        echo "  With --interleave_rounds=true, that's ~${_expected_prompts} prompts"
+        echo "  across the sweep (NUM_ROUNDS=${INTERLEAVE_NUM_ROUNDS} × ${total} iteration(s)"
+        if [[ "$AUTO_CREATE_SOURCE" == "true" ]]; then
+            echo "   + ${INTERLEAVE_NUM_ROUNDS} source-create call(s) since --auto_create_source)."
+        else
+            echo "   no --auto_create_source so source step skipped)."
+        fi
+        echo "  Add --resume to skip these prompts entirely (recommended)."
+        echo
+        read -r -p "Continue WITHOUT --resume? (y/N) " _confirm
+        if [[ "$_confirm" != "y" && "$_confirm" != "Y" ]]; then
+            echo "Aborted. Re-run with --resume to proceed non-interactively."
+            exit 1
+        fi
+    fi
+    echo "[interleave_rounds] outer loop over rounds 1..${INTERLEAVE_NUM_ROUNDS};"
+    echo "  for each round r: auto-create source (if enabled) + all ${total} iteration(s), each capped at --num_rounds=\$r."
+    echo
+else
+    # Sentinel single-iteration so the per-round block runs exactly once.
+    ROUND_VALUES=( "" )
+fi
+
+for ROUND in "${ROUND_VALUES[@]}"; do
+if [[ -n "$ROUND" ]]; then
+    ROUND_ARGS=( "--num_rounds=$ROUND" )
+    echo "════════════════════════════════════════════════════════════════════════════════"
+    echo "[interleave_rounds] OUTER ROUND $ROUND / $INTERLEAVE_NUM_ROUNDS"
+    echo "════════════════════════════════════════════════════════════════════════════════"
+else
+    ROUND_ARGS=()
+fi
+
+# Optional source-create step. Always invoked with --resume so the orchestrator
+# is responsible for "is it already done?" detection; if complete, it exits 0
+# in seconds. The sweep iterations below assume the source exists; this step
+# guarantees that. In interleave mode, ROUND_ARGS appends --num_rounds=$ROUND
+# so the source is built ONE round at a time too.
+if [[ "$AUTO_CREATE_SOURCE" == "true" ]]; then
+    REVERSE_FROM=""
+    for a in "${ORCHESTRATOR_ARGS[@]}"; do
+        case "$a" in
+            --rerun_blends_from=*) REVERSE_FROM="${a#*=}" ;;
+        esac
+    done
+    if [[ -z "$REVERSE_FROM" ]]; then
+        echo "ERROR: --auto_create_source requires --rerun_blends_from=TAG to also be set." >&2
+        echo "  We need the source's run_tag to know which lineage to create." >&2
+        exit 1
+    fi
+    if [[ "$REVERSE_FROM" == *:* ]]; then
+        echo "ERROR: --auto_create_source doesn't support --rerun_blends_from=TAG:BLENDS_TAG yet." >&2
+        echo "  Sources with their own blends would need a separate spec we don't have." >&2
+        echo "  Got --rerun_blends_from='$REVERSE_FROM'." >&2
+        exit 1
+    fi
+    SOURCE_RUN_TAG="$REVERSE_FROM"
+    # Build CREATE_ARGS = ORCHESTRATOR_ARGS minus --rerun_blends_from and minus
+    # --run_tag (we replace it with source's tag), then append the source tag
+    # and --resume. Any --blends caller had in ORCHESTRATOR_ARGS will also be
+    # stripped (defensive — caller shouldn't pass --blends to the wrapper, but
+    # belt-and-suspenders since the rerun's iteration tag has its own --blends).
+    # Ordering: the source's post-loop final-scratch train must come AFTER
+    # every blend iteration (interventions → blends → final scratch), so this
+    # create step suppresses it with --final_mode=finetune (= no post-loop
+    # phase) and the sweep re-invokes the orchestrator with the original
+    # --final_mode once the iteration loop is done. Deferral only applies when
+    # the original modes would run the post-loop at all — final=scratch AND
+    # intermediate!=scratch (mirrors do_final_scratch() in the orchestrator).
+    ORIG_FINAL_MODE="scratch"; ORIG_INTERMEDIATE_MODE="finetune"  # orchestrator defaults
+    for a in "${ORCHESTRATOR_ARGS[@]}"; do
+        case "$a" in
+            --final_mode=*)        ORIG_FINAL_MODE="${a#*=}" ;;
+            --intermediate_mode=*) ORIG_INTERMEDIATE_MODE="${a#*=}" ;;
+        esac
+    done
+    DEFER_SOURCE_FINAL_SCRATCH=false
+    [[ "$ORIG_FINAL_MODE" == "scratch" && "$ORIG_INTERMEDIATE_MODE" != "scratch" ]] \
+        && DEFER_SOURCE_FINAL_SCRATCH=true
+    CREATE_ARGS=()
+    for a in "${ORCHESTRATOR_ARGS[@]}"; do
+        case "$a" in
+            --rerun_blends_from=*|--run_tag=*|--blends=*|--final_mode=*) continue ;;
+            # Base-DART noise belongs to the RERUN lineage's finetunes only;
+            # forwarding it would fork a spurious <source>_dn<sigma> source
+            # lineage (new interventions and all) instead of reusing the
+            # plain source.
+            --dart_noise=*|--dart_raw_mix=*) continue ;;
+            # The source lineage IS the baseline; the flag only has meaning for
+            # a blend iteration that would otherwise reuse the source's data.
+            --separate_blend_lineage|--separate_blend_lineage=*) continue ;;
+            # --intermediate_mode=none is rerun-iteration-only (skip per-round
+            # training, post-loop base-finetune does the training). The SOURCE
+            # lineage can't use it: it isn't in rerun mode, and it needs its
+            # per-round policies to record each round's interventions. Map it
+            # back to the plain finetune loop for the create step.
+            --intermediate_mode=none) CREATE_ARGS+=( "--intermediate_mode=finetune" ) ;;
+            *) CREATE_ARGS+=( "$a" ) ;;
+        esac
+    done
+    CREATE_ARGS+=( "--run_tag=$SOURCE_RUN_TAG" --resume )
+    if [[ "$DEFER_SOURCE_FINAL_SCRATCH" == "true" ]]; then
+        CREATE_ARGS+=( "--final_mode=finetune" )
+    else
+        CREATE_ARGS+=( "--final_mode=$ORIG_FINAL_MODE" )
+    fi
+    [[ "$RETRAIN_ROUND0" == "true" ]] && CREATE_ARGS+=( --retrain_round0 )
+
+    echo
+    echo "════════════════════════════════════════════════════════════════════════════════"
+    echo "Auto-create source lineage (--auto_create_source): run_tag='$SOURCE_RUN_TAG'"
+    if [[ "$DEFER_SOURCE_FINAL_SCRATCH" == "true" ]]; then
+        echo "  (source post-loop final-scratch DEFERRED until after all blend iterations)"
+    fi
+    echo "  Invoking:"
+    echo "    bash $ORCH ${CREATE_ARGS[*]}"
+    echo "  (Idempotent: if the source is already fully complete, this exits 0 in seconds.)"
+    echo "════════════════════════════════════════════════════════════════════════════════"
+    # Pass the sweep-level invocation so the SOURCE lineage's per-round sidecars
+    # (including round 1) record `sweep_invocation` too. The source is created by
+    # calling the orchestrator DIRECTLY here, so without this its rounds'
+    # config.json would have sweep_invocation: null (only the rerun iterations
+    # below carried it). This puts the full, reproducible sweep command right
+    # next to round 1's dagger sidecar.
+    if ! DAGGER_SWEEP_INVOCATION_ARGV_JSON="$SWEEP_ARGV_JSON_FOR_SIDECAR" \
+         DAGGER_SWEEP_INVOCATION_WRAPPER="my_scripts/dagger_orchestrate_sweep.sh" \
+         bash "$ORCH" "${CREATE_ARGS[@]}" "${ROUND_ARGS[@]}"; then
+        echo "Auto-create source step FAILED. Aborting sweep before any blend iteration." >&2
+        exit 1
+    fi
+    echo "Auto-create source step complete; proceeding with sweep."
+    echo
+fi
+if [[ "$SOURCE_ONLY" != "true" ]]; then
+    echo "Each iteration invokes:"
+    echo "  bash $ORCH --blends=<combo> ${ORCHESTRATOR_ARGS[*]}"
+    echo
+fi
+
+n_succ=0
+n_fail=0
+failures=()
+sweep_start=$(date +%s)
+for i in "${!RATIO_LISTS_ARR[@]}"; do
+    combo="${RATIO_LISTS_ARR[$i]}"
+    # Infer K from the combo (number of space-separated ratios). Lets a
+    # multi-K sweep label each iteration with its blend count without
+    # needing a parallel K-array.
+    iter_k=$(echo "$combo" | wc -w | tr -d ' ')
+    iter_start=$(date +%s)
+    echo "════════════════════════════════════════════════════════════════════════════════"
+    echo "Sweep iteration $((i + 1)) / $total: K=$iter_k --blends=\"$combo\""
+    echo "  (elapsed sweep time so far: $(( iter_start - sweep_start ))s)"
+    echo "════════════════════════════════════════════════════════════════════════════════"
+    # DAGGER_SWEEP_INVOCATION_* tells the orchestrator's write_dagger_config_sidecar
+    # to include `sweep_invocation: {argv, wrapper}` in the per-round sidecar so
+    # downstream tools (dagger_detect_dataset_anomalies, etc.) can recover the
+    # full sweep-level command, not just this iteration's orchestrator-level one.
+    if DAGGER_SWEEP_INVOCATION_ARGV_JSON="$SWEEP_ARGV_JSON_FOR_SIDECAR" \
+       DAGGER_SWEEP_INVOCATION_WRAPPER="my_scripts/dagger_orchestrate_sweep.sh" \
+       bash "$ORCH" --blends="$combo" "${ORCHESTRATOR_ARGS[@]}" "${ROUND_ARGS[@]}"; then
+        n_succ=$((n_succ + 1))
+        echo "Sweep iteration --blends=\"$combo\" SUCCEEDED ($(( $(date +%s) - iter_start ))s)."
+    else
+        n_fail=$((n_fail + 1))
+        failures+=( "$combo" )
+        echo "Sweep iteration --blends=\"$combo\" FAILED ($(( $(date +%s) - iter_start ))s)."
+        if [[ "$CONTINUE_ON_ERROR" != "true" ]]; then
+            echo "Aborting sweep. Pass --continue_on_error to keep going past failures."
+            break 2  # break out of BOTH the iteration loop AND the outer round loop
+        fi
+    fi
+    echo
+done
+
+done   # for ROUND in "${ROUND_VALUES[@]}" — outer interleave-rounds loop
+
+# Deferred source final-scratch: runs AFTER every blend iteration so the
+# ordering is interventions → blends → from-scratch train. CREATE_ARGS
+# persists from the source-create step above; swap its suppressing
+# --final_mode=finetune back to scratch and let the orchestrator's resume
+# detection jump straight to the post-loop phase. Skipped when iterations
+# failed — the command to run manually is printed instead.
+if [[ "$AUTO_CREATE_SOURCE" == "true" && "${DEFER_SOURCE_FINAL_SCRATCH:-false}" == "true" ]]; then
+    FINAL_CREATE_ARGS=()
+    for a in "${CREATE_ARGS[@]}"; do
+        [[ "$a" == --final_mode=* ]] && continue
+        FINAL_CREATE_ARGS+=( "$a" )
+    done
+    FINAL_CREATE_ARGS+=( "--final_mode=scratch" )
+    if (( n_fail == 0 )); then
+        echo "════════════════════════════════════════════════════════════════════════════════"
+        echo "Deferred source final-scratch (run_tag='$SOURCE_RUN_TAG'):"
+        echo "  bash $ORCH ${FINAL_CREATE_ARGS[*]}"
+        echo "════════════════════════════════════════════════════════════════════════════════"
+        if ! DAGGER_SWEEP_INVOCATION_ARGV_JSON="$SWEEP_ARGV_JSON_FOR_SIDECAR" \
+             DAGGER_SWEEP_INVOCATION_WRAPPER="my_scripts/dagger_orchestrate_sweep.sh" \
+             bash "$ORCH" "${FINAL_CREATE_ARGS[@]}"; then
+            n_fail=$((n_fail + 1))
+            failures+=( "source-final-scratch" )
+            echo "Deferred source final-scratch FAILED." >&2
+        fi
+    else
+        echo "Skipping deferred source final-scratch ($n_fail failed iteration(s))."
+        echo "  Run it manually once fixed:"
+        echo "    bash $ORCH ${FINAL_CREATE_ARGS[*]}"
+    fi
+fi
+
+echo "════════════════════════════════════════════════════════════════════════════════"
+echo "Sweep complete: $n_succ succeeded, $n_fail failed (total wall time: $(( $(date +%s) - sweep_start ))s)."
+if (( n_fail > 0 )); then
+    echo "Failures at: ${failures[*]}"
+    exit 1
+fi

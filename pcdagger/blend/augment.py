@@ -1,0 +1,2212 @@
+r"""Dataset augmentation via closed-loop blended-policy rollouts.
+
+Loads source episodes from an intervention-style LeRobot dataset, replays each
+one through ``SharedAutonomyPolicyWrapper`` at one or more blend ratios in
+closed loop against splatsim, and writes the resulting (observation, action)
+trajectories to a target LeRobotDataset. Each output episode is tagged with
+``source_episode_idx``, ``blend_ratio``, and (when present) the source
+episode's ``source_scenario_idx`` so the augmented dataset can be merged
+with the original — or with arbitrary ratio subsets of it — for training.
+
+Per-output-episode rollout length matches the source episode length: every
+source-action timestep gets executed through the wrapper (with the source
+action stream as guidance) and the resulting (env_obs, action) pair is
+written to the target dataset.
+
+Argument names are aligned with visualize_shared_autonomy_sim.py so you can
+copy the same env / policy / guidance flags across both scripts.
+
+Example (single episode, mirrors the visualize command):
+
+    python my_scripts/augment_dataset_with_blending.py \\
+        --policy_path=outputs/training/.../checkpoints/006000/pretrained_model \\
+        --dataset_repo_id=JennyWWW/splatsim_..._rrt_pi05 \\
+        --target_dataset_repo_id=JennyWWW/splatsim_..._rrt_pi05_blended \\
+        --forward_flow_ratios='[0.0, 0.5, 1.0]' \\
+        --episode_index=305 \\
+        --blend_strategy=denoise --guidance_repr=absolute_pos --blend_interval_frac \\
+        --env_task=upright_small_engine_new --env_external_port=6001
+
+Example (bulk — all episodes 0–49):
+
+    python my_scripts/augment_dataset_with_blending.py \\
+        --policy_path=... --dataset_repo_id=... --target_dataset_repo_id=... \\
+        --forward_flow_ratios='[0.0, 0.5, 1.0]' \\
+        --episode_range='[0, 50]' \\
+        --env_task=upright_small_engine_new --env_external_port=6001
+"""
+
+# NOTE: do not add `from __future__ import annotations` — parser.wrap reads
+# the function's annotation at runtime to infer the draccus config class, and
+# stringified annotations break that lookup.
+
+import csv
+import faulthandler
+import itertools
+import json
+import logging
+import sys
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from pprint import pformat
+from typing import Any
+
+# Surface Python+C tracebacks for SIGSEGV / SIGABRT / SIGFPE / SIGILL /
+# SIGBUS — without this, native crashes from pybullet / CUDA / shared
+# memory / forkserver workers print only "Aborted (core dumped)" with no
+# context. The C frames in the traceback (libpython / libc / libcuda /
+# pybullet) usually point at the failing call.
+faulthandler.enable(all_threads=True)
+
+# matplotlib's default TkAgg backend initializes Tcl/Tk at first pyplot
+# import, which then crashes with "Tcl_AsyncDelete: async handler deleted by
+# the wrong thread" once splatsim's pybullet GUI thread is running. Force
+# the non-interactive Agg backend BEFORE any matplotlib import — our
+# sibling import below (visualize_shared_autonomy.py) does
+# `import matplotlib.pyplot as plt` at module load, which would otherwise
+# bake in TkAgg before visualize_shared_autonomy_sim's module-level Agg
+# call gets a chance to run.
+import matplotlib  # noqa: E402
+
+matplotlib.use("Agg")
+
+import gymnasium as gym  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import torch  # noqa: E402
+from tqdm import tqdm  # noqa: E402
+
+# Sibling-script imports. visualize_shared_autonomy_sim.py owns the env /
+# batch / seeding helpers we reuse.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+# Sibling-module imports. These previously came from
+# ``my_scripts.visualize_shared_autonomy_DEPRECATED`` (which only resolved by
+# accident as a side effect of the sim visualizer's sys.path manipulation);
+# they've been split into topic-focused library modules so this script doesn't
+# depend on a deprecated file. Bare module names (no ``my_scripts.`` prefix)
+# so they resolve when this script is invoked via
+# ``python my_scripts/augment_dataset_with_blending.py``.
+from lib_dataset_episode_io import (  # type: ignore[import-not-found]  # noqa: E402
+    find_parquet_files,
+    load_episode_frames,
+    load_task_description,
+)
+from lib_sa_policy_loading import (  # type: ignore[import-not-found]  # noqa: E402
+    apply_clip_sample_override,
+    load_wrapped_policy,
+)
+from lib_sa_rollout import (  # type: ignore[import-not-found]  # noqa: E402,F401
+    WorldMismatchError,
+    check_sim_strict_goal_tolerances,
+    progress_guidance_index,  # re-export kept for external importers
+    run_blended_rollout,
+    warn_if_sim_physics_unsynced,
+)
+
+from lerobot.configs import parser  # noqa: E402
+from lerobot.envs.factory import (  # noqa: E402
+    make_env,
+    make_env_config,
+    make_env_pre_post_processors,
+)
+from lerobot.policies.shared_autonomy_wrapper import (  # noqa: E402
+    BlendMode,
+    GuidanceBlendStrategy,
+    PolicyGuidanceRepresentation,
+)
+from lerobot.utils.import_utils import register_third_party_plugins  # noqa: E402
+from lerobot.utils.lerobot_dataset_utils import make_default_rename_map, resolve_dataset_dir  # noqa: E402
+from lerobot.utils.random_utils import set_seed  # noqa: E402
+from lerobot.utils.sim_seeding import set_env_benchmark_indices  # noqa: E402
+from lerobot.utils.utils import init_logging  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AugmentationConfig:
+    """CLI config for the blend-augmentation run (flag names shared with visualize_shared_autonomy_sim.py)."""
+
+    # ── Shared with visualize_shared_autonomy_sim.py ──────────────────────────
+    # Use the same flag names so commands are easy to copy between scripts.
+
+    # Source dataset (≡ visualize's --dataset_repo_id).
+    dataset_repo_id: str = ""
+    # Local override for the source parquet dir (≡ visualize's --dataset_dir).
+    dataset_dir: str | None = None
+
+    policy_path: str = ""
+
+    # Blend ratios (≡ visualize's --forward_flow_ratios). Each
+    # (source_episode × ratio) → one output episode in the target dataset.
+    # 0.0 = pure human guidance; 1.0 = pure policy.
+    forward_flow_ratios: list[float] = field(default_factory=lambda: [0.5])
+
+    # Episode selection — choose ONE of the two (mutually exclusive):
+    #   episode_index:   single int ("305"), inclusive range ("300-310"), or
+    #                    the literal "all" / "ALL" (every episode in the source
+    #                    dataset). Mirrors visualize_shared_autonomy_sim.py's
+    #                    --episode_index, with the "all" shorthand added so
+    #                    callers (e.g. dagger_orchestrate.sh) can be explicit
+    #                    about meaning "every episode" instead of relying on
+    #                    the field being unset.
+    #   episode_indices: explicit JSON list, e.g. '[3, 8, 23]'.
+    # If both are None, every episode is processed (same as --episode_index=all).
+    episode_index: str | None = None
+    episode_indices: list[int] | None = None
+
+    # ── Augment-specific ──────────────────────────────────────────────────────
+    target_dataset_repo_id: str = ""
+
+    # Wrapper config.
+    blend_mode: str = "once_per_chunk"  # "once_per_chunk" | "every_step"
+    blend_strategy: str = "denoise"  # "denoise" | "interpolate"
+    guidance_repr: str = "absolute_pos"  # "absolute_pos" | "delta"
+    # Chunk anchoring (in-loop inpainting; see lerobot/policies/common/chunk_anchor.py):
+    # anchor_prefix_steps pins the first k positions of each built chunk to
+    # guidance (seam continuity); anchor_suffix_steps pins the LAST M positions
+    # (rejoin-by-construction: every chunk plans a return to the demo corridor,
+    # bounding blend deviations per chunk instead of letting them compound).
+    # anchor_every_denoise_step=True (default) re-pins at every denoise step and
+    # clamps clean at the end (hard guarantee); False = one soft injection.
+    anchor_prefix_steps: int = 0
+    anchor_suffix_steps: int = 0
+    # Grow the suffix to cover the chunk's whole goal-hold tail near the demo
+    # end: effective suffix = max(anchor_suffix_steps, hold_tail - clock_lag).
+    # Closes the dawdle window between goal arrival and a short fixed suffix.
+    anchor_suffix_to_goal: bool = False
+    anchor_every_denoise_step: bool = True
+    # Guidance chunk = DART label track (dart_labels.chunk_labels at the
+    # current state/projection) instead of the raw demo window — rollout
+    # guidance then EQUALS the train-time supervision targets (same
+    # function, same clock): seam-continuous, timestep-corrected, and the
+    # blend distribution matches the label distribution by construction.
+    guidance_from_dart_labels: bool = False
+    # Recording against an unsynced sim (no --sync_physics_to_client) corrupts
+    # the achieved-motion data with chunk-boundary lurches; the blend script
+    # therefore REFUSES unless this override is set.
+    allow_unsynced_physics: bool = False
+    n_action_steps: int | None = None  # None ⇒ keep policy's default
+    # Interval between guidance re-blends, as a fraction of the executed chunk
+    # (n_action_steps), in [0, 1]: 1.0 = blend at chunk boundaries only
+    # (legacy --drain_chunk=true), 0.0 = re-blend every step (legacy false),
+    # fraction f = re-blend every ceil(f * n_action_steps) ticks (e.g. 0.5 →
+    # twice per chunk). Fractional values REQUIRE --blend_mode=every_step —
+    # once_per_chunk's drain path ignores mid-chunk guidance, so the extra
+    # blend ticks would silently do nothing (validated at startup). The CLI
+    # still accepts --drain_chunk as a deprecated alias, the bare flag
+    # (→ 1.0), and true/false spellings (→ 1.0/0.0).
+    blend_interval_frac: float = 1.0
+    # Pin ONE noise draw per episode ("common random numbers") and reuse it for
+    # every select_action call, instead of letting the wrapper draw fresh
+    # torch.randn each tick.
+    #
+    # This is the fix for `blend_mode=every_step` jitter. In every_step mode the
+    # wrapper re-runs a FULL denoising pass each tick and only action[0] of that
+    # fresh chunk is executed — so with independent noise per tick, consecutive
+    # executed actions are independent samples from the policy's action
+    # distribution. The guidance sets their MEAN, but the tick-to-tick DELTA is
+    # dominated by resampling noise rather than by the (smooth) trajectory,
+    # which reads as shaking even at low ratios where guidance dominates.
+    # Pinning the noise makes consecutive passes differ only because the
+    # observation/guidance moved — which is the intended "continuous steering"
+    # semantics of every_step.
+    #
+    # Irrelevant to once_per_chunk (one draw per chunk already), where enabling
+    # it just makes runs reproducible. Default False = unchanged behavior for
+    # existing blend datasets. Mirrors visualize_shared_autonomy_sim.py, which
+    # has always pinned a shared base_noise across ratios.
+    fixed_base_noise: bool = False
+    # Horizon headroom for blend rollouts: total_steps = source length x this.
+    # On-path-but-slow blends (pace < 1) were truncated at the source length
+    # and scored as "diverged" purely from running out of steps (2026-08-18:
+    # pace 0.76 x 155 steps -> ends 0.5 rad short on the demo path). 2.0 =
+    # let a lagging-but-faithful rollout run to the goal: at 1.3, ep27 r0.5
+    # reached demo cursor 180/192 on-path and was ratio-backed-off purely
+    # for pace (needed ~1.4x); slow on-path rollouts are exactly the good
+    # DART data and the labels are lag-proof (demo-clock resume). Strict-
+    # success truncation still ends converged episodes at their natural
+    # length, so the headroom only costs time on attempts the gate rejects
+    # anyway.
+    total_steps_multiplier: float = 2.0
+    # Convergence gate: accept a blend rollout only if it hit strict success
+    # OR its final commanded state lands within this many rad (arm-joint L2)
+    # of the demo's final action. Divergent mid-ratio rollouts are a noise-
+    # draw lottery (mode escape locked in by RTC hysteresis) and their
+    # frames are anti-corrective label noise — retry with a fresh draw up to
+    # blend_end_gap_retries times, then DROP the pair (unlike intervention
+    # chunks, failed blends are not expert data). <= 0 disables the gate.
+    # Gate threshold in units of the SOURCE DEMO'S median per-tick step
+    # (scale-free — same value works across episodes and environments; 8
+    # steps ~ 0.15 rad on the planar demos it was calibrated on).
+    # Loosened to a SANITY bound (was 8.0, the primary gate): with the goal
+    # taper active, endpoint distance conflates basin-following with the
+    # terminal contact creep that even pure guidance cannot push through —
+    # faithful follows (final cursor 121/124) were dropped over 0.19 rad
+    # last-mm gaps. The primary gate is now max_blend_end_lag_indices.
+    max_blend_end_gap_steps: float = 24.0
+    # PRIMARY convergence gate: the rollout's final projected demo index must
+    # be within this many indices of the demo end (after trims). Measures
+    # exactly what the gate exists for — did the rollout traverse the
+    # demonstration's basin to its end — independent of the goal taper and
+    # of terminal contact creep. Scale-free (demo-index units).
+    max_blend_end_lag_indices: int = 8
+    blend_end_gap_retries: int = 2
+    # After exhausting fresh-draw retries at a ratio, HALVE the ratio (down
+    # to two backoff levels, floor >0.1) and retry instead of dropping the
+    # pair: on hard DAgger scenarios the pure policy diverges, so mid/high
+    # ratios fail the gate systematically and coverage would otherwise skew
+    # toward easy episodes (measured 2026-08-19: eps 9/27 fail even ratio
+    # 0.1's gate at the requested ratio). The requested ratio stays the
+    # provenance key (blend_ratio); the achieved one is recorded as
+    # blend_ratio_effective episode metadata.
+    blend_ratio_backoff: bool = True
+    # DART-style relabeling: "executed" (default) stores the rollout's
+    # executed mixture action. "guidance" ALSO stores the executed action —
+    # the dataset stays an honest record of what ran — but adds a per-frame
+    # ``relabel_demo_index`` scalar: the continuous demo index of the state's
+    # projection onto the source demo's state polyline (monotone, windowed,
+    # advance-rate-capped cursor — jumps structurally impossible). Expert
+    # label CHUNKS are then synthesized where they are consumed (the
+    # DartChunkDataset train-time wrapper / visualize_dart_chunks) from the
+    # frame's own state + this index — see dart_labels.py. Per-frame stored
+    # labels were abandoned: training chunks overlap, so a single action
+    # column cannot encode a chunk that converges to the demo from its
+    # conditioning frame's offset. The correction-rate knob (scale-free, in
+    # demo med_step units) lives in dart_labels, not here.
+    relabel_actions: str = "executed"  # "executed" | "guidance"
+    # Seed a fresh torch.Generator for EVERY blend-path model call: the x_tsw
+    # guidance-noising draw, the denoiser's per-step scheduler variance
+    # (diffusion), the flow prior + anchor noise (PI0.5), and the anchor-chunk
+    # predict. Each call then consumes an IDENTICAL noise sequence, so
+    # consecutive every_step re-blends differ only through the (smoothly
+    # moving) observation — no fresh-sample shake — and rollouts are
+    # reproducible. Unlike --fixed_base_noise (which only pins the initial
+    # x_T draw, leaving the DDPM scheduler's per-step variance fresh), this
+    # pins the entire sampling chain. -1 disables (legacy global-RNG draws).
+    sample_seed: int = 42
+    # Independent blend rollouts per (source episode, ratio) — DART-style
+    # noise-ensemble sampling. Each sample k gets its own sample_seed salt and
+    # (when --fixed_base_noise) its own pinned base-noise draw, so the K
+    # blends explore K different deviations around the SAME intervention.
+    # K=1 (default) is the historical single-sample behavior, byte-identical
+    # seeds included. Every output episode records `blend_sample_idx` (and
+    # `blend_sample_seed`) next to `source_episode_idx`, so all K samples
+    # trace back to their intervention for visualization/merging.
+    samples_per_episode: int = 1
+    # Per-sample gaussian offset (demo med-step units, like dart_state_noise_std)
+    # added to the ARM joints of the seed/teleport state before each rollout —
+    # the perturbation happens at t=0 (a teleport, before any motion), so the
+    # excursion amplitude comes from the start offset instead of from tube
+    # width, and the return leg stays guidance-shaped at feasible speeds. Each
+    # sample_idx draws an independent offset (seeded from the sample's own
+    # seed base), so K samples start in K different directions around the
+    # intervention start. 0 disables (historical behavior). The seed obs
+    # history keeps the demo's handoff velocity; the world-match guard is
+    # unaffected (robot-derived env_state dims carry 10x slack).
+    start_state_noise_std: float = 0.0
+    # Measured onset library: JSON {source_ep: [[dq per arm joint], ...]} of
+    # RAW-radian start offsets (e.g. states from free-run probes = "the expert
+    # intervened a bit earlier/later"). Per attempt one entry is drawn
+    # (salted rng, same scheme as start_state_noise_std). Mutually exclusive
+    # with start_state_noise_std.
+    start_offsets_file: str = ""
+    # LAPSE measurement: per sample, guidance engages after tau ~ U{0..max}
+    # ticks of free policy rollout (0 = off). Generalizes the onset library:
+    # the free segment is generated in-rollout instead of pre-seeded.
+    guidance_delay_max_ticks: int = 0
+
+    # How many TRAILING environment_state dims are robot-derived (the planar
+    # oracle state ends with the 2-D EE). Only consulted when
+    # start_state_noise_std > 0: those dims are forced to the loose robot-dim
+    # tolerance in the world-match guard, since the deliberate start offset
+    # moves them even when the source handoff was at rest.
+    start_noise_env_state_ee_dims: int = 2
+    # RTC-style previous-chunk guidance (Real-Time Chunking; see
+    # SharedAutonomyConfig.rtc_* for full docs). Passes the previous blended
+    # chunk's UNEXECUTED remainder into each re-blend's denoise, which pulls
+    # the fresh chunk toward the mode already being executed — cross-tick
+    # consistency WITHOUT pinning the noise (an alternative/complement to
+    # --sample_seed / --fixed_base_noise for the every_step shake). Additive
+    # to the x_tsw ratio blend; diffusion inner policies only.
+    rtc_prev_chunk: bool = False
+    rtc_max_guidance_weight: float = 10.0
+    rtc_execution_horizon: int | None = None
+    rtc_inference_delay: int = 0
+    # Canon blend knobs (see hybrid-path-scoring notes, 2026-08-18):
+    resample_noise_per_reblend: bool = False
+    rtc_hard_prefix_xfade: int = 0
+    rtc_prefix_attention_schedule: str = "linear"  # linear | exp | zeros | ones
+    # DEBUG: override the checkpoint's DDPM/DDIM `clip_sample` (None = keep the
+    # trained value). clip_sample=True clamps the predicted clean action to
+    # ±clip_sample_range at EVERY denoising step — with out-of-distribution
+    # guidance (robot stuck, demo far ahead: encoded deltas can exceed the
+    # rel-stats range → |normalized| > 1) each step slams into that clamp,
+    # which is one suspected cause of blend-mode shaking. Setting false lets
+    # the denoiser express the OOD target un-clamped: if the stuck-shake turns
+    # into large smooth lurches, the clip-fight is confirmed; if unchanged,
+    # the clamp wasn't the mechanism. EVAL-MISMATCHED — debug only, don't
+    # train on datasets produced this way without understanding the tradeoff.
+    clip_sample: bool | None = None
+    # Show a translucent green "ghost" robot at the guidance target pose in
+    # the SA wrapper's pybullet window (needs the wrapper GUI, e.g.
+    # --keep_sa_gui at the orchestrator level). Purely visual — the ghost is
+    # collision-disabled and invisible to the RRT/shield collision world.
+    show_guidance_ghost: bool = False
+    # PROGRESS-AWARE guidance indexing. Default (False) indexes the demo by
+    # wall-clock tick: guidance = demo_actions[t:]. If the robot falls behind
+    # (contact, stall, blend detour), the demo marches on anyway and guidance
+    # runs unboundedly ahead — the "green ghost diverges and never comes back"
+    # failure. True re-indexes each tick by PROGRESS: find the demo step whose
+    # action (≈ demo state) is closest to the robot's CURRENT joints, searched
+    # in a forward window from the previous match (monotonic — never rewinds),
+    # and pass demo_actions[j*:]. A stuck robot then holds guidance at its
+    # current demo point (waits for the robot) instead of racing ahead, and a
+    # recovered robot re-converges to the demo where it actually is.
+    progress_guidance: bool = False
+    # Forward search window (demo steps) for the progress match. Bounds both
+    # compute and how far a single tick can jump ahead.
+    progress_guidance_window: int = 45
+    # Soft hold for the demo-pace clock (see lib_sa_rollout): advance rate
+    # while the robot lags in (lag_tol, hard_lag] demo indices. 0 = legacy
+    # hard hold (measured to cascade at small ratios: r=0.1 blends crawled
+    # at pace ~0.7 and came out 1.45x source length).
+    progress_guidance_soft_hold: float = 0.0
+    progress_guidance_hard_lag: int = 8
+    # Anneal the blend ratio to 0 over the last N demo indices (0 = off).
+    # DART validity: the noisy supervisor must still complete the task; a
+    # constant ratio leaves a r*(policy-expert) equilibrium offset at the
+    # goal that blocks strict success (episodes ballooned to 1.4-1.9x with
+    # slow near-goal hover). Guidance lands the rollout instead. Measured
+    # (r=0.1, round-0 policy): src4 102 -> 81 frames with success firing,
+    # src22 138 -> 129; combined with the progress-stall cut, src47
+    # 185 -> 124. Default 16 demo indices (scale-free).
+    blend_ratio_goal_taper: int = 16
+    # TUBE-REGULATED noise (see lib_sa_rollout): the requested ratio becomes
+    # a MAXIMUM — per tick the effective ratio anneals from full (state
+    # within blend_dev_full_below med_steps of the demo corridor) to 0 (at
+    # blend_dev_zero_above), so the CONTROLLED quantity is the coverage-tube
+    # radius and 'ratio r' means 'at most r, inside the declared tube'.
+    # Basin escapes get pulled back instead of retried/backed off; realized
+    # per-episode stats land in episode metadata (blend_ratio_effective_mean,
+    # blend_dev_steps_p50/p95). Scale-free knobs (med_step units).
+    blend_dev_regulation: bool = False
+    blend_dev_full_below: float = 3.0
+    blend_dev_zero_above: float = 8.0
+    # TUBE-BREACH accept gate: "how far past the declared tube may a rollout
+    # actually stray before we throw it away?" — 1.5 means reject any
+    # rollout (success included) whose realized corridor deviation (p95 over
+    # its ticks) exceeds 1.5x blend_tube_steps. Also arms the matching
+    # early abort inside the rollout loop (lib_sa_rollout abort_dev_steps).
+    # The tube re-blend constrains the PLANNED chunk only;
+    # execution compounding can still run past it (2026-08-21, ep 9 of the
+    # dag1 b050 set: dev p95 36 med-steps against a 16-step tube -> 0.75 rad
+    # offsets whose DART rejoins are physically impossible within a chunk).
+    # Rejected rollouts retry with a fresh draw and then drop, like the
+    # convergence gate. <= 0 (or blend_tube_steps == 0) disables.
+    max_tube_breach_ratio: float = 1.5
+    # Tube re-blend budget (predictive): if the blended chunk's max offset
+    # from the guidance fill exceeds this many guidance-median-steps, the
+    # blend is RE-RUN at a reduced ratio before anything executes (same
+    # seeds, smaller ratio) — the emitted chunk is always a genuine
+    # policy-blend product; the action distribution comes entirely from the
+    # policy blending. Replaces both action-space clipping and the failed
+    # state-feedback regulation. 0 disables.
+    blend_tube_steps: float = 8.0
+    # Post-success handling. The strict-tolerance sim can still terminate a
+    # blend rollout BEFORE the guidance runs out (the blended trajectory
+    # reaches the goal early). Historically the rollout then froze into hold
+    # mode — the terminal obs + a stay-put action duplicated until
+    # total_steps — so every early success injected a long block of
+    # stand-still (obs, action) pairs at the goal, teaching the policy to
+    # park. False (the default) TRUNCATES the episode at the success tick
+    # instead; if the truncated episode is shorter than --min_episode_length
+    # it is DROPPED entirely, mirroring how intervention recording drops
+    # short segments under --env.teleop_pad_short_episodes=false. True
+    # restores the legacy hold-padding (and the pad-to-min behavior for
+    # short source episodes). Dropped (source_ep, ratio) pairs are never
+    # written to the target, so a resumed run re-rolls (and re-drops) them.
+    pad_after_success: bool = False
+    # Minimum episode length for the pad_after_success=False drop check (and
+    # the legacy pad-to-min target). Mirrors teleop_min_episode_length
+    # (envs/configs.py) and filter_blend_collisions' min_episode_length.
+    min_episode_length: int = 60
+
+    # Start the replay at this source-episode frame instead of frame 0. The
+    # robot is teleported to the demo's pose at that frame (works over ZMQ —
+    # the SplatSim server dispatches teleport_joint_state), so guidance and
+    # robot stay aligned for nonzero starts. Episodes whose remaining length
+    # after start_frame can't fit n_obs_steps + 1 guidance frame are skipped
+    # with a warning. Applies to EVERY source episode of the run.
+    start_frame: int = 0
+
+    # Env config — must match the source dataset's image keys so the
+    # augmented dataset can be merged with the source for training.
+    env_task: str = "upright_small_engine_new"
+    env_robot_name: str = "robot_iphone_w_engine_new"
+    env_camera_names: list[str] = field(default_factory=lambda: ["base_rgb", "wrist_rgb"])
+    env_image_resize_modes: list[str] = field(default_factory=lambda: ["letterbox", "stretch"])
+    env_fps: int = 30
+    env_episode_length: int = 1_000_000  # very large; we don't truncate
+
+    # The benchmark dataset whose per-scenario object / robot poses are
+    # restored on each env.reset(). Each source episode in
+    # ``source_dataset_repo_id`` carries a ``source_scenario_idx`` that
+    # indexes into this dataset (the intervention recording stored only that
+    # pointer, not the per-episode geometry). Default matches the benchmark
+    # we record corrections against.
+    eval_benchmark_repo_id: str = "JennyWWW/eval_splatsim_approach_lever_benchmark_1000"
+
+    # SplatSim must run out-of-process — the wrapper's pybullet GUI client
+    # in this process can't coexist with an in-process env (pybullet refuses
+    # a second local GUI), and AsyncVectorEnv's dummy-env lifecycle hits the
+    # SplatSim Tk GUI's Tcl_AsyncDelete abort. Launch splatsim manually:
+    #
+    #     cd ~/code/SplatSim && \
+    #         python scripts/launch_nodes.py \
+    #             --robot sim_ur_pybullet_small_engine_new_interactive \
+    #             --robot_port 6001 \
+    #             --robot_name robot_iphone_w_engine_new \
+    #             --eval_benchmark_repo_id JennyWWW/eval_splatsim_approach_lever_benchmark_1000
+    #
+    # Then point this script at it via --env_external_port. The simulator
+    # stays up across runs; only the augmentation script restarts.
+    env_external_port: int = 6001
+    env_external_host: str = "127.0.0.1"
+
+    # The sim MUST run --strict_goal_tolerances (recording-grade success:
+    # planar 1 cm vs the loose 60 mm eval threshold). Loose sims terminate
+    # blend rollouts "close enough" to the goal and cut off exactly the
+    # near-goal state coverage the blends exist to capture — the orchestrator
+    # always launches its managed sim strict, and this script fails fast when
+    # the server reports it is not. Set true to bypass (debug only; a server
+    # that predates the strict_goal_tolerances env-config field only warns).
+    allow_loose_goal_tolerances: bool = False
+
+    # Frame schema for the new dataset. image_keys are derived as
+    # ``[f"{cam}_{mode}" for cam in env_camera_names for mode in env_image_resize_modes]``
+    # so the augmented dataset matches the intervention dataset's schema.
+    num_dofs: int = 6
+
+    # rename_map: {sim-side key → policy-side key}. None ⇒ default map
+    # (each ``{cam}_{first_mode}`` → ``{cam}``).
+    rename_map: dict[str, str] | None = None
+
+    # Where the per-episode CSV goes; the dataset itself goes to
+    # $HF_LEROBOT_HOME/{target_dataset_repo_id} via LeRobotDataset.create.
+    output_dir: str = "outputs/augment_dataset_with_blending"
+
+    # If True, push the finalized dataset to the Hub at the end (creates
+    # the repo if missing). False keeps it local-only.
+    push_to_hub: bool = False
+
+    device: str = "cuda"
+    seed: int = 0
+
+
+def _resolve_episode_selection(cfg: AugmentationConfig, available_eps: list[int]) -> list[int]:
+    """Resolve episode selection from --episode_index / --episode_indices.
+
+    ``--episode_index`` accepts:
+      * a single int ("305"),
+      * an inclusive range ("300-310" → episodes 300, 301, …, 310),
+      * the literal "all" (case-insensitive) → every available episode.
+    ``--episode_indices`` accepts an explicit JSON list ('[3, 8, 23]').
+    If neither is set, all available episodes are used (same as ``=all``).
+    """
+    if cfg.episode_index is not None and cfg.episode_indices is not None:
+        raise ValueError("Set at most one of --episode_index and --episode_indices.")
+
+    if cfg.episode_index is not None:
+        s = str(cfg.episode_index).strip()
+        if s.lower() == "all":
+            return sorted(available_eps)
+        if "-" in s:
+            parts = s.split("-", 1)
+            start, end = int(parts[0]), int(parts[1])
+            selected = list(range(start, end + 1))  # inclusive
+        else:
+            selected = [int(s)]
+    elif cfg.episode_indices is not None:
+        selected = [int(i) for i in cfg.episode_indices]
+    else:
+        return sorted(available_eps)
+
+    available_set = set(available_eps)
+    missing = [e for e in selected if e not in available_set]
+    if missing:
+        raise ValueError(
+            f"Selected episode(s) not present in source dataset: {missing[:10]}"
+            + (f" (and {len(missing) - 10} more)" if len(missing) > 10 else "")
+        )
+    return selected
+
+
+# ---------------------------------------------------------------------------
+# Frame construction
+# ---------------------------------------------------------------------------
+
+
+def _build_frame(
+    raw_obs: dict[str, Any],
+    gym_obs: dict[str, Any],
+    action: np.ndarray,
+    image_keys: list[str],
+    task: str,
+    env_state_dim: int = 0,
+) -> dict[str, Any]:
+    """Build a LeRobot frame from this step's env observations and action.
+
+    Mirrors ``TeleopRecordingWrapper._build_frame`` so the resulting dataset is
+    schema-compatible with intervention recordings — including
+    ``observation.environment_state`` when the source dataset declares it
+    (``env_state_dim > 0``). ``raw_obs`` is what the splatsim robot server
+    returns directly (has ``{cam}_{mode}`` image keys for every resize mode);
+    ``gym_obs`` is the post-_to_gym_obs form (used for agent_pos and
+    environment_state, since raw_obs doesn't put them under canonical names).
+    """
+    state = np.asarray(gym_obs["agent_pos"], dtype=np.float32).reshape(-1)
+    frame: dict[str, Any] = {
+        "observation.state": state,
+        "action": np.asarray(action, dtype=np.float32).reshape(-1),
+        "task": task,
+    }
+    if env_state_dim > 0:
+        env_state = gym_obs.get("environment_state")
+        if env_state is None:
+            raise RuntimeError(
+                f"Source dataset declares observation.environment_state "
+                f"(dim={env_state_dim}) but the env observation has no "
+                f"'environment_state' key (have: {list(gym_obs)}). The sim server "
+                f"is not publishing env_state — check env_state_dim wiring in "
+                f"make_env_config."
+            )
+        env_state = np.asarray(env_state, dtype=np.float32).reshape(-1)
+        if env_state.shape[0] != env_state_dim:
+            raise RuntimeError(
+                f"environment_state width mismatch: env published {env_state.shape[0]}, "
+                f"source dataset schema says {env_state_dim}."
+            )
+        frame["observation.environment_state"] = env_state
+    for key in image_keys:
+        img = raw_obs.get(key)
+        if img is None:
+            raise RuntimeError(
+                f"Image key '{key}' missing from raw_obs (have: {list(raw_obs)[:6]}…). "
+                f"Make sure --env_image_resize_modes covers every mode the source "
+                f"dataset used."
+            )
+        if isinstance(img, torch.Tensor):
+            img = img.cpu().numpy()
+        frame[f"observation.images.{key}"] = np.asarray(img, dtype=np.float32)
+    return frame
+
+
+def _get_raw_obs(vec_env: gym.vector.VectorEnv) -> dict[str, Any]:
+    """Pull raw_obs (with ``{cam}_{mode}`` image keys) from the single-env vec.
+
+    ``vec_env.call`` returns a tuple of length n_envs; we only ever use n=1.
+    """
+    raw = vec_env.call("get_observations")
+    if isinstance(raw, tuple | list):
+        return raw[0]
+    return raw  # type: ignore[return-value]
+
+
+def _unbatch_obs(env_obs: dict[str, Any]) -> dict[str, Any]:
+    """Strip the batch (n_envs=1) dim from a vec-env obs. Used for state lookup."""
+    out: dict[str, Any] = {}
+    for k, v in env_obs.items():
+        if k == "pixels" and isinstance(v, dict):
+            out[k] = {ck: cv[0] if hasattr(cv, "__len__") and len(cv) > 0 else cv for ck, cv in v.items()}
+        elif hasattr(v, "__len__") and not isinstance(v, str | bytes) and len(v) > 0:
+            out[k] = v[0]
+        else:
+            out[k] = v
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Closed-loop rollout
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RolloutResult:
+    """One blend rollout's captured frames plus bookkeeping counters."""
+
+    frames: list[dict[str, Any]]
+    n_steps: int  # frame count BEFORE any drop (kept for logging when frames=[])
+    success: bool = False
+    success_t: int | None = None
+    # True when pad_after_success=False and the (possibly success-truncated)
+    # rollout came in under min_episode_length: frames is emptied and the
+    # caller must skip saving this episode.
+    dropped_short: bool = False
+    mean_effective_ratio: float | None = None  # tick-mean of taper/tube-scaled ratio
+    dev_steps_p50: float | None = None  # realized corridor deviation, med_step units
+    dev_steps_p95: float | None = None
+    tube_breach: bool = False  # rollout aborted early: realized dev crossed the gate
+
+
+@torch.no_grad()
+def rollout_closed_loop_for_augmentation(
+    *,
+    wrapper,
+    obs_preprocessor,
+    vec_env: gym.vector.VectorEnv,
+    env_preprocessor,
+    env_postprocessor,
+    seed_joint_state: np.ndarray,
+    seed_joint_velocity: np.ndarray | None = None,
+    guidance_actions_raw: np.ndarray,
+    ratio: float,
+    blend_mode: BlendMode,
+    blend_interval_frac: float,
+    total_steps: int,
+    progress_guidance: bool = False,
+    progress_guidance_window: int = 45,
+    progress_guidance_soft_hold: float = 0.0,
+    progress_guidance_hard_lag: int = 8,
+    guidance_delay_steps: int = 0,
+    guidance_lapse_start: int = 0,
+    blend_ratio_goal_taper: int = 0,
+    guidance_from_dart_labels: bool = False,
+    blend_dev_regulation: bool = False,
+    blend_dev_full_below: float = 3.0,
+    blend_dev_zero_above: float = 8.0,
+    demo_states_raw: np.ndarray | None = None,
+    rename_map: dict[str, str],
+    image_keys: list[str],
+    task_description: str,
+    device: str,
+    playlist_pos: int | None = None,
+    env_state_dim: int = 0,
+    base_noise: torch.Tensor | None = None,
+    pad_after_success: bool = True,
+    min_episode_length: int = 60,
+    expected_env_state: np.ndarray | None = None,
+    env_state_static_mask: np.ndarray | None = None,
+    abort_dev_steps: float = 0.0,
+) -> RolloutResult:
+    """Run one closed-loop rollout and capture (raw_obs, action) per step.
+
+    Thin frame-capture adapter over :func:`lib_sa_rollout.run_blended_rollout`
+    — the SAME core the debug visualizer (``visualize_shared_autonomy_sim``)
+    drives, so whatever the visualizer validates is what this script records.
+    The only caller-specific parts are injected callbacks: ``on_step`` builds
+    a LeRobot frame from the pre-step raw obs, and ``on_success`` snapshots
+    the terminal raw obs for the post-success hold frames.
+
+    The scenario for this rollout is picked by the sim server's EVAL_BENCHMARK
+    counter walking whatever playlist was set via ``set_env_benchmark_indices``
+    (see ``run_augmentation`` — the playlist is installed once before the
+    outer loop and mirrors the source ``source_scenario_idx`` sequence).
+    ``playlist_pos`` pins the reset to that exact playlist slot via
+    ``benchmark_start_index`` instead of trusting the server counter's
+    position — GUI interactions (or the dropdown echo of a duplicate scenario
+    id) can move the counter between rollouts, silently replaying the wrong
+    scenario. ``None`` falls back to counter-order.
+    """
+    frames: list[dict[str, Any]] = []
+    terminal_raw_obs: dict | None = None
+
+    def _on_success(terminal_env_obs: dict) -> None:
+        # Snapshot terminal raw state BEFORE the next step() would reset.
+        nonlocal terminal_raw_obs
+        terminal_raw_obs = _get_raw_obs(vec_env)
+
+    def _on_step(t: int, env_obs: dict, action_1d: np.ndarray, is_hold: bool) -> None:
+        # Capture (s_t, a_t) — obs before the step, action we're about to send.
+        # Hold ticks reuse the frozen terminal obs (stepping after termination
+        # would trigger AutoresetMode.NEXT_STEP and pull in the next scene).
+        raw_obs = terminal_raw_obs if is_hold else _get_raw_obs(vec_env)
+        assert raw_obs is not None
+        frames.append(
+            _build_frame(
+                raw_obs=raw_obs,
+                gym_obs=_unbatch_obs(env_obs),
+                action=action_1d,
+                image_keys=image_keys,
+                task=task_description,
+                env_state_dim=env_state_dim,
+            )
+        )
+
+    result = run_blended_rollout(
+        wrapper=wrapper,
+        obs_preprocessor=obs_preprocessor,
+        vec_env=vec_env,
+        env_preprocessor=env_preprocessor,
+        env_postprocessor=env_postprocessor,
+        seed_joint_state=seed_joint_state,
+        seed_joint_velocity=seed_joint_velocity,
+        guidance_actions_raw=guidance_actions_raw,
+        ratio=ratio,
+        blend_mode=blend_mode,
+        blend_interval_frac=blend_interval_frac,
+        total_steps=total_steps,
+        rename_map=rename_map,
+        device=device,
+        task_description=task_description,
+        seed=None,
+        benchmark_start_index=playlist_pos,
+        base_noise=base_noise,
+        progress_guidance=progress_guidance,
+        progress_guidance_window=progress_guidance_window,
+        progress_guidance_soft_hold=progress_guidance_soft_hold,
+        progress_guidance_hard_lag=progress_guidance_hard_lag,
+        blend_ratio_goal_taper=blend_ratio_goal_taper,
+        guidance_delay_steps=guidance_delay_steps,
+        guidance_lapse_start=guidance_lapse_start,
+        guidance_from_dart_labels=guidance_from_dart_labels,
+        blend_dev_regulation=blend_dev_regulation,
+        blend_dev_full_below=blend_dev_full_below,
+        blend_dev_zero_above=blend_dev_zero_above,
+        demo_states_raw=demo_states_raw,
+        pad_after_success=pad_after_success,
+        expected_env_state=expected_env_state,
+        env_state_static_mask=env_state_static_mask,
+        abort_dev_steps=abort_dev_steps,
+        on_step=_on_step,
+        on_success=_on_success,
+        log=lambda msg: logger.info(msg),
+    )
+    # Per-frame collision flags from the live rollout (aligned 1:1 with the
+    # frames _on_step captured; later trims cut from the END so alignment of
+    # the surviving prefix is preserved).
+    if result.in_collision is not None:
+        for _fr, _c in zip(frames, result.in_collision):
+            _fr["frame_in_collision"] = np.array([float(_c)], dtype=np.float32)
+
+    # STATE-PAIRING ALIGNMENT (2026-08-27). The client loop records
+    # (pre-command obs, action) — but the source demos/interventions were
+    # recorded server-side as (post-command obs, action), and the PD servo
+    # carries a steady one-command tracking lag, so client-paired episodes
+    # come out one frame off: action[t] ~ state[t+2] here vs state[t+1] in
+    # every server-recorded dataset (measured: base/int best-k=1, all blend
+    # datasets best-k=2, residual 0.22-0.24 either way — a clean index
+    # shift, not settling noise). Re-pair each action with the NEXT frame's
+    # observation side (state, env_state, images, collision flag), matching
+    # the traj-gen recorder's post-command convention; the last frame loses
+    # its observation successor and is dropped. Hold frames reuse the frozen
+    # terminal obs, so the shift is the identity across the hold zone.
+    if len(frames) >= 2:
+        for _i in range(len(frames) - 1):
+            for _k, _v in frames[_i + 1].items():
+                if _k not in ("action", "task"):
+                    frames[_i][_k] = _v
+        frames.pop()
+
+    if not pad_after_success:
+        # No padding of any kind: the rollout was truncated at the success tick
+        # (or ran the full guidance length without succeeding). Episodes under
+        # min_episode_length are DROPPED — mirroring intervention recording's
+        # teleop_pad_short_episodes=false — instead of padded with stand-still
+        # frames.
+        n_real = len(frames)
+        if frames and n_real < min_episode_length:
+            return RolloutResult(
+                frames=[],
+                n_steps=n_real,
+                success=result.success,
+                success_t=result.success_t,
+                dropped_short=True,
+                tube_breach=result.tube_breach,
+            )
+        return RolloutResult(
+            frames=frames,
+            n_steps=n_real,
+            success=result.success,
+            success_t=result.success_t,
+            mean_effective_ratio=result.mean_effective_ratio,
+            dev_steps_p50=result.dev_steps_p50,
+            dev_steps_p95=result.dev_steps_p95,
+            tube_breach=result.tube_breach,
+        )
+
+    # Legacy pad path: pad to min_episode_length if the rollout was shorter
+    # (very short source episode — the post-success hold already fills to
+    # total_steps). IMPORTANT: use dict copies, not the same reference.
+    # dataset_writer.add_frame does frame.pop("task") which mutates the dict in
+    # place — sharing references would cause the second add_frame call to fail
+    # with "Missing features: {'task'}".
+    if frames and len(frames) < min_episode_length:
+        last_frame = frames[-1]
+        while len(frames) < min_episode_length:
+            frames.append(dict(last_frame))
+
+    return RolloutResult(
+        frames=frames,
+        n_steps=len(frames),
+        success=result.success,
+        success_t=result.success_t,
+        mean_effective_ratio=result.mean_effective_ratio,
+        dev_steps_p50=result.dev_steps_p50,
+        dev_steps_p95=result.dev_steps_p95,
+        tube_breach=result.tube_breach,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source-dataset helpers
+# ---------------------------------------------------------------------------
+
+
+def _existing_provenance_pairs(target_root: Path) -> Counter:
+    """Count of committed episodes per (source_episode_idx, blend_ratio).
+
+    Read from the target's per-episode metadata parquets. The blend loop skips
+    pairs in this set, making re-invocation IDEMPOTENT: a run that died between
+    dataset completion and the stats sidecar (or mid-blending) can be resumed
+    by simply re-running — previously the script re-blended EVERYTHING and
+    appended, silently duplicating every episode (observed: r_dag1_blend* at
+    2x, their _nocoll siblings at 3x, 2026-07-31).
+
+    Ratios are rounded to 6 decimals for the set membership so float noise in
+    parquet round-trips can't defeat the match. Episodes without provenance
+    columns (foreign/legacy data) are ignored — they never match, so the run
+    degrades to the old append behavior for them.
+    """
+    pairs: Counter = Counter()
+    for f in sorted((Path(target_root) / "meta" / "episodes").glob("chunk-*/*.parquet")):
+        try:
+            df = pd.read_parquet(f)
+        except Exception:
+            continue
+        if "source_episode_idx" not in df.columns or "blend_ratio" not in df.columns:
+            continue
+        for se, br in zip(df["source_episode_idx"], df["blend_ratio"]):
+            if pd.notna(se) and pd.notna(br):
+                pairs[(int(se), round(float(br), 6))] += 1
+    return pairs
+
+
+def _load_source_episodes_meta(source_dataset_dir: Path) -> pd.DataFrame:
+    """Read the source dataset's episodes parquet.
+
+    Lets us copy through any per-episode metadata (e.g.
+    ``source_scenario_idx``) into the augmented dataset's per-episode
+    metadata.
+    """
+    ep_files = sorted((source_dataset_dir / "meta" / "episodes").rglob("*.parquet"))
+    if not ep_files:
+        return pd.DataFrame()
+    return pd.concat([pd.read_parquet(f) for f in ep_files], ignore_index=True)
+
+
+def _episode_length(parquet_files: list[Path], episode_idx: int) -> int:
+    """Count frames in a source episode without loading them."""
+    n = 0
+    for pf in parquet_files:
+        df = pd.read_parquet(pf, columns=["episode_index"])
+        n += int((df["episode_index"] == episode_idx).sum())
+    return n
+
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+
+
+def _annotate_frames_with_demo_index(
+    frames: list[dict[str, Any]],
+    demo_states_raw: np.ndarray,
+    demo_actions_raw: np.ndarray,
+    n_arm: int,
+    index_window: int,
+    index_offset: int = 0,
+) -> None:
+    """Attach ``relabel_demo_index`` to each frame, in place.
+
+    The continuous demo index of each visited state's projection onto the
+    source demo's state polyline (dart_labels.project_states — the same
+    monotone/windowed/rate-capped cursor as the progress guidance). Actions
+    are left untouched; expert label chunks are synthesized at train/viz
+    time from (state, index) — see dart_labels.chunk_labels.
+
+    ``index_offset`` shifts the stored index onto the FULL source episode's
+    frame grid (the demo arrays here are the episode's tail from
+    ``n_obs_steps``), so every consumer can build geometry from the source
+    episode as-loaded, with no tail-offset bookkeeping.
+    """
+    from dart_labels import demo_geometry, project_states
+
+    geom = demo_geometry(demo_states_raw, demo_actions_raw, n_arm=n_arm)
+    states = np.stack([np.asarray(fr["observation.state"], dtype=np.float64) for fr in frames])
+    idxs = project_states(states, geom, index_window=index_window) + float(index_offset)
+    for t, (fr, di) in enumerate(zip(frames, idxs, strict=True)):
+        fr["relabel_demo_index"] = np.array([di], dtype=np.float32)
+        # Smoothed per-frame velocity (+-5 tick window): the label launch
+        # tangent. A 1-tick finite difference on a noisy blend path points
+        # anywhere; train time only loads 2 obs frames, so the smoothed
+        # estimate must be recorded. Window widened +-3 -> +-5 (2026-08-25):
+        # on anchored-blend rollouts (per-tick velocity noise/signal ~0.5)
+        # the +-3 estimate still carried 10-19% error vs the smoothed true
+        # velocity; +-5 halves it to 5-10% with negligible smearing (accel
+        # time constants are ~10+ ticks).
+        lo, hi = max(0, t - 5), min(len(states) - 1, t + 5)
+        fr["relabel_velocity"] = ((states[hi, :n_arm] - states[lo, :n_arm]) / max(1, hi - lo)).astype(
+            np.float32
+        )
+
+
+@dataclass
+class AugmentedEpisodeResult:
+    """Provenance row for one written (source episode, ratio) output episode."""
+
+    target_episode_idx: int
+    source_episode_idx: int
+    source_scenario_idx: int | None
+    blend_ratio: float
+    blend_sample_idx: int
+    n_frames: int
+    elapsed_s: float
+
+
+def run_augmentation(
+    cfg: AugmentationConfig,
+    *,
+    csv_path: Path | None = None,
+) -> list[AugmentedEpisodeResult]:
+    """Top-level loop.
+
+    Builds env+wrapper once, then per (source_ep, ratio) seeds, rolls out,
+    captures frames, and saves to the target dataset.
+    """
+    from splatsim.utils.lerobot_utils import (
+        build_lerobot_features,
+        create_lerobot_dataset,
+        finalize_lerobot_dataset,
+        load_lerobot_dataset,
+    )
+
+    # ── Resolve source dataset on disk ─────────────────────────────────────
+    # resolve_dataset_dir returns the `data/` subdirectory (used by
+    # find_parquet_files / load_episode_frames). The episodes-meta parquet
+    # lives at the dataset ROOT under `meta/episodes/`, so we need the parent.
+    source_data_dir = Path(resolve_dataset_dir(cfg.dataset_repo_id, cfg.dataset_dir))
+    if not source_data_dir.exists():
+        raise FileNotFoundError(f"Source data dir does not exist: {source_data_dir}")
+    source_root_dir = source_data_dir.parent
+    logger.info("Source dataset root: %s (data subdir: %s)", source_root_dir, source_data_dir)
+
+    source_episodes_meta = _load_source_episodes_meta(source_root_dir)
+    parquet_files = find_parquet_files(source_data_dir)
+    task_map = load_task_description(source_data_dir)
+
+    # ── Resolve which source episodes to process ───────────────────────────
+    if not source_episodes_meta.empty:
+        available_eps = sorted(int(i) for i in source_episodes_meta["episode_index"].tolist())
+    else:
+        # Fall back to scanning data parquets for unique episode_index.
+        seen: set[int] = set()
+        for pf in parquet_files:
+            df = pd.read_parquet(pf, columns=["episode_index"])
+            seen.update(int(i) for i in df["episode_index"].unique())
+        available_eps = sorted(seen)
+
+    episode_indices = _resolve_episode_selection(cfg, available_eps)
+    if not episode_indices:
+        raise ValueError("No source episodes selected.")
+    if cfg.samples_per_episode < 1:
+        raise ValueError(f"samples_per_episode must be >= 1 (got {cfg.samples_per_episode})")
+    logger.info(
+        "Will augment %d source episode(s) × %d ratio(s) × %d sample(s) = %d output episode(s)",
+        len(episode_indices),
+        len(cfg.forward_flow_ratios),
+        cfg.samples_per_episode,
+        len(episode_indices) * len(cfg.forward_flow_ratios) * cfg.samples_per_episode,
+    )
+
+    # ── Connect to externally-launched splatsim via ZMQ ───────────────────
+    # SplatSim must run out-of-process — see the AugmentationConfig docstring
+    # and the launch_nodes.py invocation it shows.
+    logger.info(
+        "Connecting to splatsim ZMQ server at %s:%d …",
+        cfg.env_external_host,
+        cfg.env_external_port,
+    )
+    # Read authoritative feature shapes from the source dataset's meta/info.json.
+    # `SplatSimEnv`'s state_dim / action_dim / env_state_dim default to UR5
+    # (7/7/0). If we don't override them, gymnasium's SyncVectorEnv pre-allocates
+    # its `out` buffer from the env's observation_space at those UR5 shapes, then
+    # env.reset() returns whatever the sim server ACTUALLY publishes (planar arm:
+    # state=(4,), env_state=(8,)) — `np.stack` compares out.shape to items[0]
+    # shape and raises "ValueError: Output array is the wrong shape" before the
+    # first tick. Reading from meta/info.json is authoritative because that JSON
+    # was written by the sim server itself when the source dataset was recorded,
+    # so its shapes MATCH what the sim will publish now. Alternative — trusting
+    # cfg.num_dofs + adding cfg.env_state_dim — would drift the two sources
+    # apart again. Same reasoning as the num_dofs/robot_name forwarding fix in
+    # load_wrapped_policy above: single source of truth for shapes = the source
+    # dataset itself.
+    _source_info_path = source_root_dir / "meta" / "info.json"
+    with open(_source_info_path) as _f:
+        _source_info = json.load(_f)
+    _source_feats = _source_info.get("features", {})
+    _state_shape = _source_feats.get("observation.state", {}).get("shape", [7])
+    _action_shape = _source_feats.get("action", {}).get("shape", [7])
+    _env_state_shape = _source_feats.get("observation.environment_state", {}).get("shape", [0])
+    source_state_dim = int(_state_shape[0]) if _state_shape else 7
+    source_action_dim = int(_action_shape[0]) if _action_shape else 7
+    source_env_state_dim = int(_env_state_shape[0]) if _env_state_shape else 0
+    # Same reasoning as the dims fix above — derive camera names + resize
+    # modes from the source dataset's `observation.images.{cam}_{mode}` keys,
+    # rather than the config's UR5-style defaults (which include a wrist
+    # camera that the planar env doesn't have — and searching for
+    # `wrist_rgb_letterbox` in the sim's obs dict raises RuntimeError inside
+    # `_build_frame`). Convention: dataset keys are
+    # `observation.images.{cam_with_underscores}_{resize_mode}` — split on
+    # the LAST underscore (resize modes are single tokens: letterbox / stretch).
+    _KNOWN_RESIZE_MODES = ("letterbox", "stretch")
+    _src_img_keys = sorted(k for k in _source_feats if k.startswith("observation.images."))
+    _cams_seen: list[str] = []
+    _modes_seen: list[str] = []
+    for _k in _src_img_keys:
+        _stem = _k[len("observation.images.") :]  # e.g. "base_rgb_letterbox"
+        _mode = next((m for m in _KNOWN_RESIZE_MODES if _stem.endswith("_" + m)), None)
+        if _mode is None:
+            # No known suffix — treat the whole thing as the camera name
+            # (e.g. a legacy dataset that didn't tag resize mode into the key).
+            _cam = _stem
+        else:
+            _cam = _stem[: -len("_" + _mode)]
+            if _mode not in _modes_seen:
+                _modes_seen.append(_mode)
+        if _cam not in _cams_seen:
+            _cams_seen.append(_cam)
+    source_camera_names = _cams_seen  # may be [] for state-only datasets
+    source_image_resize_modes = _modes_seen if _modes_seen else ["letterbox"]
+    logger.info(
+        "Source dataset feature shapes: state_dim=%d, action_dim=%d, env_state_dim=%d",
+        source_state_dim,
+        source_action_dim,
+        source_env_state_dim,
+    )
+    logger.info(
+        "Source dataset image keys: cameras=%s, resize_modes=%s",
+        source_camera_names,
+        source_image_resize_modes,
+    )
+    # Overwrite the CLI defaults with the derived values BEFORE any downstream
+    # consumer uses them (rename_map builder + `image_keys` frame-schema
+    # builder later in this function). Without this, those consumers still
+    # look for e.g. `wrist_rgb_letterbox` and blow up at `_build_frame` when
+    # the sim's obs dict is missing that key.
+    if list(cfg.env_camera_names) != source_camera_names:
+        logger.info(
+            "Overriding env_camera_names %s → %s (from source dataset)",
+            list(cfg.env_camera_names),
+            source_camera_names,
+        )
+        cfg.env_camera_names = source_camera_names
+    if list(cfg.env_image_resize_modes) != source_image_resize_modes:
+        logger.info(
+            "Overriding env_image_resize_modes %s → %s (from source dataset)",
+            list(cfg.env_image_resize_modes),
+            source_image_resize_modes,
+        )
+        cfg.env_image_resize_modes = source_image_resize_modes
+    env_cfg_obj = make_env_config(
+        "splatsim",
+        task=cfg.env_task,
+        robot_name=cfg.env_robot_name,
+        camera_names=cfg.env_camera_names,
+        image_resize_modes=cfg.env_image_resize_modes,
+        fps=cfg.env_fps,
+        episode_length=cfg.env_episode_length,
+        external_port=cfg.env_external_port,
+        external_host=cfg.env_external_host,
+        eval_benchmark_repo_id=cfg.eval_benchmark_repo_id,
+        eval_benchmark_subset=None,
+        include_oracle_info=False,
+        num_dofs=cfg.num_dofs,
+        state_dim=source_state_dim,
+        action_dim=source_action_dim,
+        env_state_dim=source_env_state_dim,
+    )
+    env_dict = make_env(env_cfg_obj, n_envs=1, use_async_envs=False)
+    vec_env = env_dict["splatsim"][0]
+    warn_if_sim_physics_unsynced(vec_env, log=logger.info, required=not cfg.allow_unsynced_physics)
+    check_sim_strict_goal_tolerances(vec_env, required=not cfg.allow_loose_goal_tolerances, log=logger.info)
+
+    # ── Build wrapped policy (acquires its own pybullet GUI in parent) ────
+    logger.info("Loading wrapped policy from %s …", cfg.policy_path)
+    # `action_names_dataset_hint=cfg.dataset_repo_id` ensures the
+    # RelativeActionsProcessorStep's `action_names` gets backfilled from a
+    # dataset we KNOW is on disk (the blend source intervention dataset),
+    # rather than the policy's training dataset which may have been deleted
+    # by the orchestrator after training (e.g. per-round merged datasets).
+    # Without this, `exclude_joints=['gripper']` is silently ignored and the
+    # recorded blend gripper column leaks the gripper STATE into the action
+    # column — see _backfill_rel_step_action_names docstring.
+    wrapper, obs_preprocessor = load_wrapped_policy(
+        policy_path=cfg.policy_path,
+        device=cfg.device,
+        action_names_dataset_hint=cfg.dataset_repo_id,
+        # Pass the CLI-configured robot_name AND num_dofs through so the SA
+        # wrapper loads the CORRECT URDF and sizes its internal state to the
+        # CORRECT DoF count. Both fields default in load_wrapped_policy to
+        # UR5 assumptions (robot_iphone_w_engine_new, num_dofs=6); without
+        # forwarding, the wrapper's internal PyBullet loads a different
+        # robot or expects a different action-vector width than the sim
+        # server is publishing — observation vector shapes disagree and
+        # gymnasium's SyncVectorEnv.reset fails with "ValueError: Output
+        # array is the wrong shape" at np.stack. For planar_3joint this
+        # matters especially because the URDF has 6 MOVABLE joints (3 arm
+        # + 3 gripper), so `num_dofs` auto-inference from URDF gets 6, not
+        # 3. Same env_robot_name / num_dofs used above for make_env_config;
+        # single source of truth is cfg.env_robot_name / cfg.num_dofs.
+        robot_name=cfg.env_robot_name,
+        num_dofs=cfg.num_dofs,
+        # Ghost needs a visible pybullet window on the wrapper's client.
+        pb_gui=cfg.show_guidance_ghost,
+    )
+    apply_clip_sample_override(wrapper, cfg.clip_sample)
+
+    wrapper.show_guidance_ghost = cfg.show_guidance_ghost
+    wrapper.guidance_blend_strategy = GuidanceBlendStrategy(cfg.blend_strategy)
+    wrapper.policy_guidance_representation = PolicyGuidanceRepresentation(cfg.guidance_repr)
+    wrapper.anchor_prefix_steps = cfg.anchor_prefix_steps
+    wrapper.anchor_suffix_steps = cfg.anchor_suffix_steps
+    wrapper.anchor_suffix_to_goal = cfg.anchor_suffix_to_goal
+    wrapper.anchor_every_denoise_step = cfg.anchor_every_denoise_step
+    wrapper.rtc_prev_chunk_guidance = cfg.rtc_prev_chunk
+    wrapper.rtc_max_guidance_weight = cfg.rtc_max_guidance_weight
+    wrapper.rtc_execution_horizon = cfg.rtc_execution_horizon
+    wrapper.rtc_inference_delay = cfg.rtc_inference_delay
+    wrapper.resample_noise_per_reblend = cfg.resample_noise_per_reblend
+    wrapper.rtc_hard_prefix_xfade = cfg.rtc_hard_prefix_xfade
+    wrapper.blend_tube_steps = cfg.blend_tube_steps
+    wrapper.rtc_prefix_attention_schedule = cfg.rtc_prefix_attention_schedule
+    if cfg.rtc_prev_chunk:
+        # Set post-init, so re-run the wrapper's init-time policy-type check.
+        if getattr(wrapper.inner_policy.config, "type", None) != "diffusion":
+            raise SystemExit("--rtc_prev_chunk requires a diffusion inner policy.")
+        logger.info(
+            "RTC prev-chunk guidance ON (max_gw=%.1f, exec_horizon=%s, delay=%d, schedule=%s).",
+            cfg.rtc_max_guidance_weight,
+            cfg.rtc_execution_horizon,
+            cfg.rtc_inference_delay,
+            cfg.rtc_prefix_attention_schedule,
+        )
+    if cfg.n_action_steps is not None:
+        prev = wrapper.config.n_action_steps
+        wrapper.config.n_action_steps = cfg.n_action_steps
+        logger.info("Overrode n_action_steps: %d → %d", prev, cfg.n_action_steps)
+    blend_mode_enum = BlendMode(cfg.blend_mode)
+    if not 0.0 <= cfg.blend_interval_frac <= 1.0:
+        raise ValueError(f"--blend_interval_frac must be in [0, 1], got {cfg.blend_interval_frac}")
+    if 0.0 < cfg.blend_interval_frac < 1.0 and blend_mode_enum != BlendMode.EVERY_STEP:
+        raise ValueError(
+            f"Fractional --blend_interval_frac={cfg.blend_interval_frac} requires "
+            "--blend_mode=every_step: once_per_chunk drains the cached blended chunk even on "
+            "ticks that carry guidance, so the requested mid-chunk re-blends would silently "
+            f"never happen (got --blend_mode={cfg.blend_mode})."
+        )
+    if cfg.sample_seed >= 0:
+        wrapper.sample_seed = cfg.sample_seed
+        logger.info(
+            "Per-call sample generator enabled (sample_seed=%d): every blend-path model call "
+            "uses identical noise, so every_step re-blends stay temporally coherent.",
+            cfg.sample_seed,
+        )
+    if cfg.relabel_actions not in ("executed", "guidance"):
+        raise ValueError(f"--relabel_actions must be 'executed' or 'guidance', got {cfg.relabel_actions!r}")
+    if blend_mode_enum == BlendMode.EVERY_STEP and not cfg.fixed_base_noise and cfg.sample_seed < 0:
+        logger.warning(
+            "blend_mode=every_step WITHOUT --fixed_base_noise and WITH --sample_seed=-1: the "
+            "wrapper re-runs a full denoising pass with a FRESH torch.randn every tick, and "
+            "only action[0] of that chunk is executed — so consecutive executed actions are "
+            "INDEPENDENT samples and the recorded trajectory will shake (worse at higher "
+            "ratios, where more of x_tsw is noise). Use the default --sample_seed to pin the "
+            "entire sampling chain per call, --fixed_base_noise=true to pin one x_T draw per "
+            "episode, or blend_mode=once_per_chunk (one denoising pass per n_action_steps=%s "
+            "ticks).",
+            getattr(wrapper.config, "n_action_steps", "?"),
+        )
+    wrapper.blend_mode = blend_mode_enum
+
+    # Release the CPU copy of model weights that may linger after .to("cuda").
+    # The safetensors file is mmap'd during from_pretrained; the OS caches those
+    # pages (up to ~6 GiB for PI0.5) and can force other pages to swap out.
+    # Explicit GC + CUDA cache flush reclaims that headroom before the rollout loop.
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Now that the policy config is loaded, build the env-side processors.
+    env_pre, env_post = make_env_pre_post_processors(env_cfg_obj, wrapper.config)
+
+    rename_map = cfg.rename_map or make_default_rename_map(
+        cfg.env_camera_names, cfg.env_image_resize_modes[0]
+    )
+    logger.info("rename_map: %s", rename_map)
+
+    # ── Build target dataset (matches source's full schema) ────────────────
+    image_keys = [f"{cam}_{mode}" for cam in cfg.env_camera_names for mode in cfg.env_image_resize_modes]
+    # The schema this run will write: derived from the SOURCE dataset's dims
+    # (state / action / env_state / image keys), so blends stay
+    # schema-compatible with the intervention they were blended from. In
+    # particular env_state_dim>0 declares observation.environment_state —
+    # required downstream when training mixes blends with env-state datasets
+    # (multi_source_feature_intersection would otherwise silently drop the
+    # feature from EVERY source and an env-state-conditioned policy gets
+    # neither images nor env_state).
+    expected_features = build_lerobot_features(
+        image_keys,
+        cfg.num_dofs,
+        state_dim=source_state_dim,
+        env_state_dim=source_env_state_dim,
+    )
+    # Guidance relabeling adds the per-frame projection index used by the
+    # train-time DART chunk synthesis (see dart_labels.py). Declaring it in
+    # expected_features makes the resume-schema check refuse pre-relabel
+    # targets instead of failing mid-write.
+    extra_features: dict[str, dict] = {}
+    # Per-frame collision flag from the LIVE blend rollout — lets collision
+    # filtering happen at train time (loader-side window) instead of a
+    # destructive replay filter producing _nc/_tfc copies. Declared for BOTH
+    # label modes: the frame writer attaches it unconditionally, and gating
+    # the declaration on guidance-relabel made executed-label runs die with
+    # "Extra features: {'frame_in_collision'}" at the first add_frame
+    # (2026-08-27, first blend_labels=executed run since the flag landed).
+    extra_features["frame_in_collision"] = {"dtype": "float32", "shape": (1,), "names": None}
+    if cfg.relabel_actions == "guidance":
+        extra_features["relabel_demo_index"] = {"dtype": "float32", "shape": (1,), "names": None}
+        extra_features["relabel_velocity"] = {
+            "dtype": "float32",
+            "shape": (cfg.num_dofs,),
+            "names": None,
+        }
+    expected_features = {**expected_features, **extra_features}
+    existing = load_lerobot_dataset(cfg.target_dataset_repo_id)
+    if existing is not None:
+        _existing_feats = existing.meta.features
+        _mismatches = []
+        for _key, _spec in expected_features.items():
+            if _key not in _existing_feats:
+                _mismatches.append(f"missing feature '{_key}' (expected shape {tuple(_spec['shape'])})")
+            elif tuple(_existing_feats[_key]["shape"]) != tuple(_spec["shape"]):
+                _mismatches.append(
+                    f"feature '{_key}' has shape {tuple(_existing_feats[_key]['shape'])}, "
+                    f"expected {tuple(_spec['shape'])}"
+                )
+        if _mismatches:
+            raise RuntimeError(
+                f"Target dataset {cfg.target_dataset_repo_id} already exists on disk but its "
+                f"schema does not match what this run would write (source "
+                f"{cfg.dataset_repo_id}: state_dim={source_state_dim}, "
+                f"env_state_dim={source_env_state_dim}):\n  - "
+                + "\n  - ".join(_mismatches)
+                + f"\nIt is stale (e.g. created before the source gained these features). "
+                f"Refusing to append. Delete it and re-run:\n"
+                f"  rm -rf {existing.root}"
+            )
+        logger.warning(
+            "Target dataset %s already exists locally — resuming into it (schema verified "
+            "compatible). Episodes whose (source_episode_idx, blend_ratio) provenance is "
+            "already present will be SKIPPED (idempotent resume); only missing pairs are "
+            "blended. Delete the directory if you want a fresh dataset.",
+            cfg.target_dataset_repo_id,
+        )
+        target_ds = existing
+    else:
+        target_ds = create_lerobot_dataset(
+            cfg.target_dataset_repo_id,
+            fps=cfg.env_fps,
+            image_keys=image_keys,
+            num_dofs=cfg.num_dofs,
+            state_dim=source_state_dim,
+            env_state_dim=source_env_state_dim,
+            extra_features=extra_features or None,
+        )
+
+    # Idempotent-resume skip set (empty for a freshly created target).
+    _done_pairs = _existing_provenance_pairs(target_ds.root)
+    if _done_pairs:
+        logger.info(
+            "[resume] target already contains %d (source_ep, ratio) pair(s); they will be skipped.",
+            len(_done_pairs),
+        )
+
+    # ── Per-source-episode CSV writer ──────────────────────────────────────
+    csv_writer = None
+    csv_file = None
+    if csv_path is not None:
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        # File spans the whole rollout; closed in the outer finally.
+        csv_file = open(csv_path, "w", newline="")  # noqa: SIM115
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(
+            [
+                "target_episode_idx",
+                "source_episode_idx",
+                "source_scenario_idx",
+                "blend_ratio",
+                "blend_sample_idx",
+                "n_frames",
+                "elapsed_s",
+            ]
+        )
+        csv_file.flush()
+
+    results: list[AugmentedEpisodeResult] = []
+    n_dropped = 0
+    target_ep_idx = int(target_ds.meta.total_episodes)
+
+    def _resolve_source_scenario_idx(source_ep: int) -> int:
+        """Look up the scenario the source episode was originally recorded in.
+
+        Reads ``source_scenario_idx`` from the source dataset's per-episode
+        metadata (written by RRT/oracle intervention recording); falls back
+        to ``source_ep`` itself when absent (identity assumption for plain
+        training datasets — logged as a warning).
+        """
+        if not source_episodes_meta.empty and "source_scenario_idx" in source_episodes_meta.columns:
+            row = source_episodes_meta.loc[
+                source_episodes_meta["episode_index"] == source_ep, "source_scenario_idx"
+            ]
+            if not row.empty and pd.notna(row.iloc[0]):
+                return int(row.iloc[0])
+        logger.warning(
+            "Source episode %d has no source_scenario_idx in metadata; "
+            "falling back to episode_index=%d as the scenario id. Make "
+            "sure --eval_benchmark_repo_id scenario %d matches this "
+            "episode's scene geometry.",
+            source_ep,
+            source_ep,
+            source_ep,
+        )
+        return source_ep
+
+    # Pre-scan episodes to (a) filter out ones with 0 frames (skipped in the
+    # rollout loop below) and (b) resolve source_scenario_idx up front. The
+    # RESULTING list ordering IS the playlist: for each surviving source_ep,
+    # we play its scenario once per ratio in cfg.forward_flow_ratios. This is
+    # the same order the outer loop below iterates in, so the sim's counter
+    # walks the playlist in perfect sync with our source_ep × ratio iteration.
+    _valid_source_eps: list[int] = []
+    _playlist: list[int] = []
+    for source_ep in episode_indices:
+        if _episode_length(parquet_files, source_ep) <= 0:
+            logger.warning("Source episode %d has 0 frames; skipping (excluded from playlist too)", source_ep)
+            continue
+        _valid_source_eps.append(source_ep)
+        _scen_idx = _resolve_source_scenario_idx(source_ep)
+        for _ in cfg.forward_flow_ratios:
+            for _ in range(cfg.samples_per_episode):
+                _playlist.append(_scen_idx)
+    logger.info(
+        "Installing sim EVAL_BENCHMARK playlist: %d entries (%d source_eps × %d ratios × %d samples). First 20: %s",
+        len(_playlist),
+        len(_valid_source_eps),
+        len(cfg.forward_flow_ratios),
+        cfg.samples_per_episode,
+        _playlist[:20],
+    )
+    # ORDER + DUPLICATES preserved end-to-end (see set_env_benchmark_indices
+    # + server-side set_eval_benchmark_indices docstrings). Each rollout's
+    # env.reset() then just advances the sim's internal counter one slot;
+    # no per-reset scenario arg needed downstream.
+    set_env_benchmark_indices(vec_env, _playlist)
+
+    # Walks _playlist in lockstep with the (source_ep × ratio) loop below.
+    # Passed to each rollout as benchmark_start_index so every reset lands on
+    # ITS slot even if the server counter drifted (e.g. GUI dropdown echo).
+    _playlist_pos = 0
+
+    try:
+        for source_ep in tqdm(_valid_source_eps, desc="source episodes", leave=True):
+            ep_length = _episode_length(parquet_files, source_ep)
+            # Load enough frames to cover the full episode (n_obs_steps obs +
+            # ep_length-n_obs_steps guidance). We only need actions+state+task
+            # here; images come from the live env.
+            n_obs_steps = wrapper.config.n_obs_steps
+            # --start_frame slices the replay window mid-episode. The robot is
+            # TELEPORTED to the demo's pose at that frame by the shared rollout
+            # core (works for ZMQ SplatSim servers too — the server dispatches
+            # teleport_joint_state), so guidance and robot stay aligned from
+            # tick 0 even for nonzero starts.
+            s0 = int(cfg.start_frame)
+            if s0 < 0 or s0 + n_obs_steps + 1 > ep_length:
+                logger.warning(
+                    "Source ep %d: start_frame=%d leaves no guidance frames "
+                    "(ep_length=%d, n_obs_steps=%d); skipping episode.",
+                    source_ep,
+                    s0,
+                    ep_length,
+                    n_obs_steps,
+                )
+                continue
+            frames_df = load_episode_frames(
+                source_data_dir, source_ep, frame_index=s0, n_frames=ep_length - s0
+            )
+            seed_joint_state = np.asarray(frames_df.iloc[n_obs_steps - 1]["action"], dtype=np.float32)
+            # Handoff velocity at the seed frame (rad/s, 3-frame FD like the
+            # intervention recorder's lookback restore): the source episode
+            # began with the policy's carried velocity, so the blend rollout
+            # must seed the sim AND the policy's obs history moving the same
+            # way — a rest seed lurches at its first command (0.67 rad/s
+            # first-step vs the source's 0.24-0.30) and conditions the policy
+            # on an at-rest history the source never had.
+            seed_joint_velocity = None
+            if "observation.state" in frames_df.columns and len(frames_df) > n_obs_steps + 2:
+                _s_lo = np.asarray(frames_df.iloc[n_obs_steps - 1]["observation.state"], dtype=np.float32)
+                _s_hi = np.asarray(frames_df.iloc[n_obs_steps + 2]["observation.state"], dtype=np.float32)
+                seed_joint_velocity = (_s_hi - _s_lo) / 3.0 * float(cfg.env_fps)
+            _expected_env_state = None
+            _env_state_static_mask = None
+            if "observation.environment_state" in frames_df.columns:
+                _expected_env_state = np.asarray(
+                    frames_df.iloc[n_obs_steps]["observation.environment_state"], dtype=np.float64
+                )
+                # Which env_state dims are SCENARIO dims (block/obstacles —
+                # static over the episode's opening frames) vs robot-derived
+                # dims (the planar oracle state ends with the EE, which moves
+                # whenever the handoff was mid-motion)? The world-match guard
+                # holds static dims to the strict tolerance but only a loose
+                # one on moving dims — comparing the seeded EE (from the
+                # commanded action at n_obs-1) against the achieved state at
+                # n_obs measures the source robot's own tracking error, which
+                # false-positived as a "world mismatch" at fast handoffs
+                # (2026-08-21: 4.1 cm EE lag, world byte-identical).
+                _es_head = np.stack(
+                    [
+                        np.asarray(r["observation.environment_state"], dtype=np.float64)
+                        for _, r in frames_df.iloc[: n_obs_steps + 6].iterrows()
+                    ]
+                )
+                _env_state_static_mask = np.ptp(_es_head, axis=0) < 0.005
+                # The ptp heuristic classifies robot-derived dims as SCENARIO
+                # dims whenever the handoff was at rest (EE static over the
+                # opening frames) — fine normally, but --start_state_noise_std
+                # deliberately displaces the seeded EE, so those dims must get
+                # the loose robot-dim tolerance or ~30% of samples (exactly
+                # the at-rest handoffs) are dropped as false world mismatches
+                # (observed 2026-08-31: sn4 r1 lost 72/240 slots, deltas
+                # 0.02-0.09 all on the trailing EE dims; k5/wide runs with no
+                # start noise dropped zero).
+                if (
+                    cfg.start_state_noise_std > 0 or cfg.start_offsets_file
+                ) and cfg.start_noise_env_state_ee_dims > 0:
+                    _env_state_static_mask[-int(cfg.start_noise_env_state_ee_dims) :] = False
+            guidance_actions_raw = np.stack(
+                [
+                    np.asarray(row["action"], dtype=np.float32)
+                    for _, row in frames_df.iloc[n_obs_steps:].iterrows()
+                ]
+            )
+            total_steps = int(round(guidance_actions_raw.shape[0] * max(1.0, cfg.total_steps_multiplier)))
+            # Demo STATES on the same index grid as guidance_actions_raw:
+            # demo_states_raw[k] = the state at the time raw[k] should execute.
+            # Used by progress-aware guidance to match the robot's CURRENT
+            # state — matching against ACTIONS would be off by one (action[k]'s
+            # target ≈ state[k+1]): the matched action's target would be the
+            # robot's current pose, i.e. guidance would command "stay put" and
+            # the robot would permanently crawl behind the demo.
+            demo_states_raw = None
+            if cfg.progress_guidance and "observation.state" in frames_df.columns:
+                demo_states_raw = np.stack(
+                    [
+                        np.asarray(row["observation.state"], dtype=np.float32)
+                        for _, row in frames_df.iloc[n_obs_steps:].iterrows()
+                    ]
+                )
+
+            task_idx = int(frames_df.iloc[0].get("task_index", 1))
+            task_description = (task_map.get(task_idx) if task_map else None) or cfg.env_task
+
+            source_scenario_idx = _resolve_source_scenario_idx(source_ep)
+            logger.info(
+                "Source ep %d → scenario %d, total_steps=%d",
+                source_ep,
+                source_scenario_idx,
+                total_steps,
+            )
+
+            # Per-episode sample seed: every model call WITHIN an episode uses
+            # the identical noise sequence (smooth, coherent every_step
+            # re-blends) while episodes get DIFFERENT seeds (dataset keeps
+            # sample diversity across episodes instead of locking the whole
+            # run to one noise realization).
+            if cfg.sample_seed >= 0:
+                wrapper.sample_seed = cfg.sample_seed + int(source_ep)
+
+            # One pinned noise draw per (source_ep, ratio) rollout when
+            # --fixed_base_noise is set: constant WITHIN the episode (kills the
+            # per-tick resampling jitter that makes every_step shake) but
+            # independent ACROSS episodes/ratios (so the dataset keeps sample
+            # diversity). Shape mirrors visualize_shared_autonomy_sim.py.
+            _base_noise = None
+            if cfg.fixed_base_noise:
+                if getattr(wrapper.config, "max_action_dim", None) is not None:
+                    _noise_shape = (1, wrapper.config.chunk_size, wrapper.config.max_action_dim)
+                else:
+                    _adim = wrapper.config.output_features["action"].shape[0]
+                    _noise_shape = (1, wrapper.config.horizon, _adim)
+                _base_noise = torch.randn(_noise_shape, device=cfg.device)
+
+            for ratio, sample_idx in itertools.product(
+                cfg.forward_flow_ratios, range(cfg.samples_per_episode)
+            ):
+                # Resume semantics with K samples: the target holds COUNT
+                # episodes for this (source_ep, ratio); samples are written in
+                # sample_idx order, so indices < COUNT already exist.
+                if _done_pairs[(int(source_ep), round(float(ratio), 6))] > sample_idx:
+                    logger.info(
+                        "[resume] source_ep=%d ratio=%.2f sample=%d already in target — skipping.",
+                        source_ep,
+                        ratio,
+                        sample_idx,
+                    )
+                    # The playlist has one slot per (source_ep, ratio, sample);
+                    # keep position in lockstep even when skipping so later
+                    # rollouts still reset to THEIR scenario slot.
+                    _playlist_pos += 1
+                    continue
+                # Per-sample seed base: sample 0 reproduces the historical
+                # single-sample seeds exactly; samples k>=1 salt by 7919*k so
+                # the K blends draw K independent noise realizations.
+                _seed_base = (
+                    cfg.sample_seed + int(source_ep) + 7919 * sample_idx if cfg.sample_seed >= 0 else -1
+                )
+                if cfg.sample_seed >= 0:
+                    wrapper.sample_seed = _seed_base
+                _bn = _base_noise
+                if _bn is not None and sample_idx > 0:
+                    _bn = torch.randn_like(_base_noise)
+                t0 = time.time()
+                _n_arm = max(1, guidance_actions_raw.shape[1] - 1)
+                _demo_end = np.asarray(guidance_actions_raw[-1, :_n_arm], dtype=np.float64)
+                rollout = None
+                _end_gap = float("nan")
+                # Scale-free gate: threshold in demo med_step units.
+                _g_steps = np.linalg.norm(
+                    np.diff(guidance_actions_raw[:, :_n_arm].astype(np.float64), axis=0), axis=1
+                )
+                _med_step = float(np.median(_g_steps[_g_steps > 1e-9])) if (_g_steps > 1e-9).any() else 1e-3
+                _gap_gate = cfg.max_blend_end_gap_steps * _med_step
+                _seed_js = seed_joint_state
+                # Ratio ladder: requested ratio first, then halvings (backoff).
+                _ratio_ladder = [float(ratio)]
+                if cfg.blend_ratio_backoff:
+                    _r = float(ratio)
+                    while _r > 0.2 and len(_ratio_ladder) < 3:
+                        _r = round(_r / 2.0, 3)
+                        _ratio_ladder.append(_r)
+                ratio_eff = float(ratio)
+                _accepted = False
+                _world_mismatch = False
+                _attempt_no = 0
+                for ratio_eff in _ratio_ladder:
+                    for _attempt in range(1 + max(0, cfg.blend_end_gap_retries)):
+                        _attempt_no += 1
+                        if _attempt_no > 1:
+                            # Fresh draw for the retry: re-salt the seeded
+                            # stream and (when pinned) redraw the base noise.
+                            # The lottery is decided by the draw — same draw,
+                            # same outcome.
+                            if cfg.sample_seed >= 0:
+                                wrapper.sample_seed = _seed_base + 100_000 * _attempt_no
+                            if cfg.fixed_base_noise and _bn is not None:
+                                _bn = torch.randn_like(_bn)
+                        # DART-at-the-start: per-sample offset on the arm
+                        # joints of the seed/teleport state (demo med-step
+                        # units). Drawn PER ATTEMPT (salted by _attempt_no) so
+                        # a tube-breach retry gets a fresh start offset, not
+                        # just fresh policy noise — a doomed offset (e.g. one
+                        # seeded near an obstacle) would otherwise fail all
+                        # retries and drop the sample (lost ep 9's sample 5/5
+                        # on the hard wrap-around scenario, 2026-08-31).
+                        if cfg.start_state_noise_std > 0:
+                            _sn_rng = np.random.default_rng(
+                                (_seed_base if _seed_base >= 0 else int(source_ep))
+                                + 424243
+                                + 1_000_003 * _attempt_no
+                            )
+                            _off = _sn_rng.normal(0.0, cfg.start_state_noise_std * _med_step, size=_n_arm)
+                            _seed_js = np.asarray(seed_joint_state, dtype=np.float32).copy()
+                            _seed_js[:_n_arm] += _off.astype(np.float32)
+                        elif cfg.start_offsets_file:
+                            global _ONSET_LIB
+                            if "_ONSET_LIB" not in globals():
+                                import json as _json
+
+                                _ONSET_LIB = _json.load(open(cfg.start_offsets_file))
+                            _entries = _ONSET_LIB.get(str(int(source_ep)))
+                            if _entries:
+                                _sn_rng = np.random.default_rng(
+                                    (_seed_base if _seed_base >= 0 else int(source_ep))
+                                    + 424243
+                                    + 1_000_003 * _attempt_no
+                                )
+                                _off = np.asarray(
+                                    _entries[int(_sn_rng.integers(len(_entries)))],
+                                    dtype=np.float32,
+                                )[:_n_arm]
+                                _seed_js = np.asarray(seed_joint_state, dtype=np.float32).copy()
+                                _seed_js[:_n_arm] += _off
+
+                        _lapse_ticks = 0
+                        _lapse_start = 0
+                        if cfg.guidance_delay_max_ticks > 0:
+                            _lp_rng = np.random.default_rng(
+                                (_seed_base if _seed_base >= 0 else int(source_ep))
+                                + 777001
+                                + 1_000_003 * _attempt_no
+                            )
+                            _lapse_ticks = int(_lp_rng.integers(0, cfg.guidance_delay_max_ticks + 1))
+                            # lapse can begin ANYWHERE the guidance still has
+                            # runway: uniform over [0, total - tau - 20]
+                            _hi = max(1, int(total_steps) - _lapse_ticks - 20)
+                            _lapse_start = int(_lp_rng.integers(0, _hi))
+                        try:
+                            rollout = rollout_closed_loop_for_augmentation(
+                                wrapper=wrapper,
+                                obs_preprocessor=obs_preprocessor,
+                                vec_env=vec_env,
+                                env_preprocessor=env_pre,
+                                env_postprocessor=env_post,
+                                seed_joint_state=_seed_js,
+                                seed_joint_velocity=seed_joint_velocity,
+                                guidance_actions_raw=guidance_actions_raw,
+                                ratio=ratio_eff,
+                                blend_mode=blend_mode_enum,
+                                blend_interval_frac=cfg.blend_interval_frac,
+                                total_steps=total_steps,
+                                progress_guidance=cfg.progress_guidance,
+                                progress_guidance_window=cfg.progress_guidance_window,
+                                progress_guidance_soft_hold=cfg.progress_guidance_soft_hold,
+                                progress_guidance_hard_lag=cfg.progress_guidance_hard_lag,
+                                blend_ratio_goal_taper=cfg.blend_ratio_goal_taper,
+                                guidance_delay_steps=_lapse_ticks,
+                                guidance_lapse_start=_lapse_start,
+                                guidance_from_dart_labels=cfg.guidance_from_dart_labels,
+                                blend_dev_regulation=cfg.blend_dev_regulation,
+                                blend_dev_full_below=cfg.blend_dev_full_below,
+                                blend_dev_zero_above=cfg.blend_dev_zero_above,
+                                demo_states_raw=demo_states_raw,
+                                rename_map=rename_map,
+                                image_keys=image_keys,
+                                task_description=task_description,
+                                device=cfg.device,
+                                playlist_pos=_playlist_pos,
+                                env_state_dim=source_env_state_dim,
+                                base_noise=_bn,
+                                pad_after_success=cfg.pad_after_success,
+                                min_episode_length=cfg.min_episode_length,
+                                expected_env_state=_expected_env_state,
+                                env_state_static_mask=_env_state_static_mask,
+                                abort_dev_steps=(
+                                    cfg.max_tube_breach_ratio * cfg.blend_tube_steps
+                                    if cfg.max_tube_breach_ratio > 0 and cfg.blend_tube_steps > 0
+                                    else 0.0
+                                ),
+                            )
+                        except WorldMismatchError as _wme:
+                            # This source episode's world is unreproducible
+                            # (usually: the pre-intervention policy roll
+                            # displaced an object before the takeover, so the
+                            # episode never started from the pristine
+                            # scenario). Deterministic — retries cannot help.
+                            # Crash THIS episode loudly and keep the run.
+                            logger.warning(
+                                "source_ep=%d ratio=%.2f: DROPPING source episode — %s",
+                                source_ep,
+                                ratio,
+                                _wme,
+                            )
+                            _world_mismatch = True
+                            break
+                        if (
+                            cfg.max_tube_breach_ratio > 0
+                            and cfg.blend_tube_steps > 0
+                            and (
+                                rollout.tube_breach  # early abort — retry even if short/empty
+                                or (
+                                    rollout.frames
+                                    and not rollout.dropped_short
+                                    and rollout.dev_steps_p95 is not None
+                                    and rollout.dev_steps_p95
+                                    > cfg.max_tube_breach_ratio * cfg.blend_tube_steps
+                                )
+                            )
+                        ):
+                            logger.warning(
+                                "source_ep=%d ratio=%.2f (eff %.3f) attempt %d: TUBE BREACH%s — "
+                                "realized dev p95 %.1f med-steps, gate %.1f (%.2gx tube %g); "
+                                "execution compounding outran the planned-chunk re-blend — %s.",
+                                source_ep,
+                                ratio,
+                                ratio_eff,
+                                _attempt_no,
+                                " (aborted early)" if rollout.tube_breach else "",
+                                rollout.dev_steps_p95 if rollout.dev_steps_p95 is not None else float("nan"),
+                                cfg.max_tube_breach_ratio * cfg.blend_tube_steps,
+                                cfg.max_tube_breach_ratio,
+                                cfg.blend_tube_steps,
+                                "retrying with a fresh draw"
+                                if _attempt < cfg.blend_end_gap_retries
+                                else (
+                                    "backing off the ratio"
+                                    if ratio_eff != _ratio_ladder[-1]
+                                    else "dropping the pair"
+                                ),
+                            )
+                            continue
+                        if cfg.max_blend_end_gap_steps <= 0 or rollout.dropped_short or not rollout.frames:
+                            _accepted = True
+                            break
+                        if not rollout.success:
+                            # Trim the post-approach wander tail: past the
+                            # closest approach to the demo endpoint the
+                            # guidance is exhausted (cursor pinned at the
+                            # end) and the policy component just wanders —
+                            # measured 2026-08-19: doubling the budget made
+                            # ep27 r0.5's FINAL gap worse (0.195 -> 0.390)
+                            # while its closest approach was unchanged. Gate
+                            # on the closest approach; overtime drift never
+                            # rescues a rollout and only poisons the tail.
+                            _states = np.stack(
+                                [
+                                    np.asarray(f["observation.state"][:_n_arm], dtype=np.float64)
+                                    for f in rollout.frames
+                                ]
+                            )
+                            _t_star = int(np.argmin(np.linalg.norm(_states - _demo_end[None], axis=1)))
+                            # Progress-stall cut: hovering at the goal without
+                            # strict success (e.g. a last-mm contact push
+                            # creeping at near-zero speed) piles up slow
+                            # near-goal frames — measured 90 ticks covering
+                            # the demo's final 10% on src47 r0.1. Cut where
+                            # the projected demo index first comes within
+                            # 2.0 idx of its final value (+10 settle ticks).
+                            from dart_labels import demo_geometry as _dg, project_states as _ps
+
+                            _idxs = _ps(
+                                _states,
+                                _dg(demo_states_raw, guidance_actions_raw, n_arm=_n_arm),
+                                index_window=cfg.progress_guidance_window,
+                            )
+                            _stall = int(np.argmax(_idxs >= _idxs[-1] - 2.0)) + 10
+                            _t_star = min(_t_star, _stall)
+                            if cfg.min_episode_length <= _t_star + 1 < len(rollout.frames):
+                                logger.info(
+                                    "source_ep=%d ratio=%.3f: trimmed %d post-approach wander "
+                                    "tick(s) (closest approach at t=%d/%d).",
+                                    source_ep,
+                                    ratio_eff,
+                                    len(rollout.frames) - _t_star - 1,
+                                    _t_star,
+                                    len(rollout.frames),
+                                )
+                                del rollout.frames[_t_star + 1 :]
+                        if rollout.success:
+                            _accepted = True
+                            break
+                        _last = np.asarray(rollout.frames[-1]["observation.state"][:_n_arm], dtype=np.float64)
+                        _end_gap = float(np.linalg.norm(_last - _demo_end))
+                        # _idxs was computed by the stall-cut block above
+                        # (always reached on the non-success path).
+                        _final_lag = float(len(guidance_actions_raw) - 1) - float(
+                            _idxs[len(rollout.frames) - 1]
+                        )
+                        if _final_lag <= cfg.max_blend_end_lag_indices and _end_gap <= _gap_gate:
+                            _accepted = True
+                            break
+                        logger.warning(
+                            "source_ep=%d ratio=%.2f (eff %.3f) attempt %d: rollout did not "
+                            "converge (success=False, final progress lag %.1f idx vs gate %d; "
+                            "end_gap=%.3f vs sanity %.3f) — %s.",
+                            source_ep,
+                            ratio,
+                            ratio_eff,
+                            _attempt_no,
+                            _final_lag,
+                            cfg.max_blend_end_lag_indices,
+                            _end_gap,
+                            _gap_gate,
+                            "retrying with a fresh draw"
+                            if _attempt < cfg.blend_end_gap_retries
+                            else (
+                                "backing off the ratio"
+                                if ratio_eff != _ratio_ladder[-1]
+                                else "dropping the pair"
+                            ),
+                        )
+                    if _accepted or _world_mismatch:
+                        break
+                if not _accepted:
+                    n_dropped += 1
+                    rollout = None
+                    gc.collect()
+                    _playlist_pos += 1
+                    if cfg.sample_seed >= 0:
+                        wrapper.sample_seed = cfg.sample_seed + int(source_ep)
+                    continue
+                if ratio_eff != float(ratio):
+                    logger.info(
+                        "source_ep=%d: accepted at backed-off ratio %.3f (requested %.2f).",
+                        source_ep,
+                        ratio_eff,
+                        ratio,
+                    )
+                if cfg.sample_seed >= 0:
+                    wrapper.sample_seed = cfg.sample_seed + int(source_ep)
+                _playlist_pos += 1
+
+                if rollout.dropped_short:
+                    n_dropped += 1
+                    logger.warning(
+                        "DROPPED source_ep=%d ratio=%.2f: rollout %s at %d frames "
+                        "< min_episode_length=%d (pad_after_success=false). Not saved to "
+                        "the target — a resumed run will re-roll (and re-drop) this pair.",
+                        source_ep,
+                        ratio,
+                        (
+                            f"succeeded at t={rollout.success_t + 1}"
+                            if rollout.success and rollout.success_t is not None
+                            else "ended"
+                        ),
+                        rollout.n_steps,
+                        cfg.min_episode_length,
+                    )
+                    del rollout
+                    gc.collect()
+                    continue
+
+                if rollout.frames:
+                    # Terminal-dwell trim (ALL accepted rollouts, success
+                    # included — success bypasses the gate trims, so a
+                    # rollout that reaches the goal and then sits parked
+                    # waiting for strict success records 20-50 frozen ticks;
+                    # measured on blend010 eps 0-2: 11-27% frozen frames,
+                    # all in the last quarter, with re-blend-boundary
+                    # micro-twitches). Two combined scale-free criteria, cut
+                    # at whichever fires earlier:
+                    #   * net motion: last tick whose 5-tick net displacement
+                    #     exceeds 1 med_step (filters oscillating twitches);
+                    #   * progress plateau: first tick within 2 demo indices
+                    #     of the final projected index (+10 settle ticks).
+                    # Offline validation: frozen fraction 11/27/15% -> 5/7/6%.
+                    from dart_labels import demo_geometry as _dgeom, project_states as _pstates
+
+                    _sd = np.stack(
+                        [
+                            np.asarray(f["observation.state"][:_n_arm], dtype=np.float64)
+                            for f in rollout.frames
+                        ]
+                    )
+                    _idxs2 = _pstates(
+                        _sd,
+                        _dgeom(demo_states_raw, guidance_actions_raw, n_arm=_n_arm),
+                        index_window=cfg.progress_guidance_window,
+                    )
+                    _W = 5
+                    _disp = np.linalg.norm(_sd[_W:] - _sd[:-_W], axis=1)
+                    _moving = np.where(_disp > _med_step)[0]
+                    _keep_motion = (int(_moving.max()) + _W + 3) if len(_moving) else len(_sd)
+                    _keep_idx = int(np.argmax(_idxs2 >= _idxs2[-1] - 2.0)) + 10
+                    _keep = max(int(cfg.min_episode_length), min(_keep_motion, _keep_idx))
+                    if _keep < len(rollout.frames):
+                        logger.info(
+                            "source_ep=%d ratio=%.3f: trimmed %d terminal-dwell tick(s) "
+                            "(motion cut %d, progress-plateau cut %d).",
+                            source_ep,
+                            ratio_eff,
+                            len(rollout.frames) - _keep,
+                            _keep_motion,
+                            _keep_idx,
+                        )
+                        del rollout.frames[_keep:]
+
+                if cfg.relabel_actions == "guidance" and rollout.frames:
+                    if demo_states_raw is None:
+                        raise ValueError(
+                            "--relabel_actions=guidance requires the source dataset to "
+                            "carry observation.state (the demo polyline)."
+                        )
+                    _annotate_frames_with_demo_index(
+                        rollout.frames,
+                        demo_states_raw,
+                        guidance_actions_raw,
+                        n_arm=_n_arm,
+                        index_window=cfg.progress_guidance_window,
+                        index_offset=n_obs_steps,
+                    )
+
+                # Commit one episode per (source_ep, ratio) pair.
+                # Pass a copy of each frame — dataset_writer.add_frame does
+                # frame.pop("task") which mutates the dict in place. Copying
+                # here is defensive against shared references (e.g. padding).
+                n_frames = len(rollout.frames)
+                for frame in rollout.frames:
+                    target_ds.add_frame(dict(frame))
+                _mean_r_eff = rollout.mean_effective_ratio
+                _dev_p50, _dev_p95 = rollout.dev_steps_p50, rollout.dev_steps_p95
+                del rollout  # free image buffers before video encoding in save_episode
+                gc.collect()
+                episode_metadata: dict[str, Any] = {
+                    "source_episode_idx": int(source_ep),
+                    "source_dataset_repo_id": str(cfg.dataset_repo_id),
+                    "blend_ratio": float(ratio),
+                    "blend_ratio_effective": float(ratio_eff),
+                    # Which of the K DART noise samples of this intervention
+                    # this episode is (samples_per_episode>1) + the seed that
+                    # drew it — keeps every sample traceable to its source
+                    # intervention for viz/merging/debug.
+                    "blend_sample_idx": int(sample_idx),
+                    "blend_sample_seed": int(_seed_base),
+                }
+                # ALWAYS present (NaN when unmeasured): a conditional key makes
+                # ragged metadata columns when an episode ends before any
+                # regulated tick (e.g. terminated inside a guidance lapse) —
+                # pyarrow batch flush then fails on column length mismatch.
+                episode_metadata["blend_ratio_effective_mean"] = (
+                    float(_mean_r_eff) if _mean_r_eff is not None else float("nan")
+                )
+                episode_metadata["blend_dev_steps_p50"] = (
+                    float(_dev_p50) if _dev_p50 is not None else float("nan")
+                )
+                episode_metadata["blend_dev_steps_p95"] = (
+                    float(_dev_p95) if _dev_p95 is not None else float("nan")
+                )
+                if source_scenario_idx is not None:
+                    episode_metadata["source_scenario_idx"] = int(source_scenario_idx)
+                target_ds.save_episode(episode_metadata=episode_metadata)
+
+                elapsed = time.time() - t0
+                result = AugmentedEpisodeResult(
+                    target_episode_idx=target_ep_idx,
+                    source_episode_idx=int(source_ep),
+                    source_scenario_idx=source_scenario_idx,
+                    blend_ratio=float(ratio),
+                    blend_sample_idx=int(sample_idx),
+                    n_frames=n_frames,
+                    elapsed_s=elapsed,
+                )
+                results.append(result)
+                logger.info(
+                    "Saved target ep %d ← source_ep=%d, ratio=%.2f, sample=%d, frames=%d (%.1fs).",
+                    target_ep_idx,
+                    source_ep,
+                    ratio,
+                    sample_idx,
+                    n_frames,
+                    elapsed,
+                )
+                if csv_writer is not None and csv_file is not None:
+                    csv_writer.writerow(
+                        [
+                            target_ep_idx,
+                            int(source_ep),
+                            source_scenario_idx if source_scenario_idx is not None else "",
+                            f"{float(ratio):.4f}",
+                            int(sample_idx),
+                            n_frames,
+                            f"{elapsed:.2f}",
+                        ]
+                    )
+                    csv_file.flush()
+                target_ep_idx += 1
+    finally:
+        if csv_file is not None:
+            csv_file.close()
+        try:
+            vec_env.close()
+        except Exception:
+            logger.exception("vec_env.close() raised — ignoring during shutdown.")
+
+    finalize_lerobot_dataset(target_ds)
+
+    if n_dropped:
+        logger.warning(
+            "%d (source_ep, ratio) pair(s) dropped for length < %d "
+            "(pad_after_success=false); %d episode(s) saved.",
+            n_dropped,
+            cfg.min_episode_length,
+            len(results),
+        )
+
+    # Write a README / dataset card so the augmentation provenance is visible
+    # on the HuggingFace dataset page when push_to_hub=True.
+    _write_dataset_readme(cfg, results, n_dropped=n_dropped)
+
+    if cfg.push_to_hub:
+        logger.info("Pushing %s to Hub …", cfg.target_dataset_repo_id)
+        target_ds.push_to_hub()
+    return results
+
+
+def _write_dataset_readme(
+    cfg: AugmentationConfig, results: list["AugmentedEpisodeResult"], *, n_dropped: int = 0
+) -> None:
+    """Write a README.md dataset card into the target dataset directory.
+
+    HuggingFace renders this as the dataset page description. When push_to_hub=True
+    the file is uploaded automatically.
+    """
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    dataset_root = HF_LEROBOT_HOME / cfg.target_dataset_repo_id
+    if not dataset_root.exists():
+        logger.warning("Dataset root %s not found; skipping README write.", dataset_root)
+        return
+
+    n_episodes = len(results)
+    n_source = len({r.source_episode_idx for r in results})
+    ratios_str = ", ".join(f"`{r}`" for r in sorted({r.blend_ratio for r in results}))
+
+    # Resolve which source episodes were processed.
+    ep_idx = cfg.episode_index
+    if ep_idx is not None and "-" in str(ep_idx):
+        ep_desc = f"episodes `{ep_idx}` (range)"
+    elif ep_idx is not None:
+        ep_desc = f"episode `{ep_idx}`"
+    elif cfg.episode_indices is not None:
+        ep_desc = f"episodes `{cfg.episode_indices}`"
+    else:
+        ep_desc = f"all episodes ({n_source} total)"
+
+    readme = f"""\
+---
+tags:
+  - lerobot
+  - splatsim
+  - shared-autonomy
+  - augmented
+---
+
+# {cfg.target_dataset_repo_id.split("/")[-1]}
+
+Augmented dataset generated by `augment_dataset_with_blending.py`.
+
+## Source dataset
+`{cfg.dataset_repo_id}` — {ep_desc}
+
+## Policy used for blending
+```
+{cfg.policy_path}
+```
+
+## Augmentation parameters
+| Parameter | Value |
+|---|---|
+| `forward_flow_ratios` | {cfg.forward_flow_ratios} |
+| `blend_strategy` | `{cfg.blend_strategy}` |
+| `guidance_repr` | `{cfg.guidance_repr}` |
+| `blend_interval_frac` | `{cfg.blend_interval_frac}` |
+| `blend_mode` | `{cfg.blend_mode}` |
+| `anchor_prefix_steps` | `{cfg.anchor_prefix_steps}` |
+| `anchor_suffix_steps` | `{cfg.anchor_suffix_steps}` |
+| `anchor_suffix_to_goal` | `{cfg.anchor_suffix_to_goal}` |
+| `anchor_every_denoise_step` | `{cfg.anchor_every_denoise_step}` |
+| `guidance_from_dart_labels` | `{cfg.guidance_from_dart_labels}` |
+| `samples_per_episode` | `{cfg.samples_per_episode}` |
+| `start_state_noise_std` | `{cfg.start_state_noise_std}` |
+| `n_action_steps` | `{cfg.n_action_steps}` |
+| `pad_after_success` | `{cfg.pad_after_success}` |
+| `min_episode_length` | `{cfg.min_episode_length}` |
+
+## Environment
+| Parameter | Value |
+|---|---|
+| `env_task` | `{cfg.env_task}` |
+| `env_robot_name` | `{cfg.env_robot_name}` |
+| `env_camera_names` | `{cfg.env_camera_names}` |
+| `env_image_resize_modes` | `{cfg.env_image_resize_modes}` |
+| `eval_benchmark_repo_id` | `{cfg.eval_benchmark_repo_id}` |
+
+## Output
+- **{n_episodes} output episode(s)** from {n_source} source episode(s) × {len(cfg.forward_flow_ratios)} ratio(s) ({ratios_str})
+{f"- **{n_dropped} pair(s) dropped** — shorter than `min_episode_length={cfg.min_episode_length}` after success-truncation (`pad_after_success=false`)" if n_dropped else ""}
+"""
+
+    readme_path = dataset_root / "README.md"
+    readme_path.write_text(readme, encoding="utf-8")
+    logger.info("Wrote dataset README → %s", readme_path)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+@parser.wrap()
+def augment_main(cfg: AugmentationConfig):
+    """Parsed-config entry point (see module docstring for examples)."""
+    logging.info("Augmentation config:\n%s", pformat(cfg.__dict__))
+
+    if not cfg.dataset_repo_id:
+        raise ValueError("--dataset_repo_id is required.")
+    if not cfg.target_dataset_repo_id:
+        raise ValueError("--target_dataset_repo_id is required.")
+    if not cfg.policy_path:
+        raise ValueError("--policy_path is required.")
+    if not cfg.forward_flow_ratios:
+        raise ValueError("--ratios must contain at least one float.")
+
+    set_seed(cfg.seed)
+
+    output_dir = Path(cfg.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "augmentation_per_episode.csv"
+    logging.info("Per-episode CSV: %s", csv_path)
+
+    results = run_augmentation(cfg, csv_path=csv_path)
+
+    logging.info(
+        "Done. %d episode(s) saved across %d source × %d ratios. CSV: %s",
+        len(results),
+        len({r.source_episode_idx for r in results}),
+        len({r.blend_ratio for r in results}),
+        csv_path,
+    )
+
+
+def main():
+    """CLI entry point."""
+    init_logging()
+    register_third_party_plugins()
+
+    # Draccus treats bool fields as requiring a value (--flag=true). Keep the
+    # bare-flag CLI: --push_to_hub → --push_to_hub=true. --blend_interval_frac
+    # is a float blend cadence (--drain_chunk is its deprecated alias): the
+    # bare flag maps to 1.0 (legacy true = blend once per chunk) and
+    # true/false spellings map to 1.0/0.0 for back-compat with existing
+    # callers (e.g. --blend_extra_args='--drain_chunk=false').
+    def _map_arg(arg: str) -> str:
+        if arg == "--push_to_hub":
+            return "--push_to_hub=true"
+        for flag in ("--blend_interval_frac", "--drain_chunk"):
+            if arg == flag:
+                return "--blend_interval_frac=1.0"
+            if arg.startswith(flag + "="):
+                val = arg.split("=", 1)[1].strip().lower()
+                if val in ("true", "yes"):
+                    val = "1.0"
+                elif val in ("false", "no"):
+                    val = "0.0"
+                return f"--blend_interval_frac={val}"
+        return arg
+
+    sys.argv = [_map_arg(arg) for arg in sys.argv]
+    augment_main()
+
+
+if __name__ == "__main__":
+    main()

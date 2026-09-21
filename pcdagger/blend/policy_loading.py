@@ -15,9 +15,9 @@ from types import SimpleNamespace
 from lerobot.configs.shared_autonomy import SharedAutonomyConfig
 from lerobot.policies.factory import (
     _reconnect_relative_absolute_steps,
-    _wrap_with_shared_autonomy,
     get_policy_class,
 )
+from pcdagger.lerobot_glue.policy import _wrap_with_shared_autonomy
 from pcdagger.blend.wrapper import (
     GuidanceBlendStrategy,
     PolicyGuidanceRepresentation,

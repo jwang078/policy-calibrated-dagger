@@ -139,9 +139,7 @@ for K in range(1, NK + 1):
     lo = min(m - (se or 0) for m, se, _ in col)
     hi = max(m + (se or 0) for m, se, _ in col)
     ranges[K] = (lo, hi)
-COLOR_SCOPE = os.environ.get(
-    "COLOR_SCOPE", "global"
-)  # "global": one shade scale for the whole table; "column": per DAgger round
+COLOR_SCOPE = os.environ.get("COLOR_SCOPE", "column")  # "column" (the paper): each K column spans its own light-to-dark range; "global": one scale for the whole table
 if COLOR_SCOPE == "global":
     glo = min(v[0] for v in ranges.values())
     ghi = max(v[1] for v in ranges.values())

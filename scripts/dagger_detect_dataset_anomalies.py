@@ -205,7 +205,7 @@ import pandas as pd
 # don't duplicate the `<prefix>_<a|r>_dag<N>` regex here. We import
 # parse_dataset_short for forward parsing and reuse its ParsedDatasetName.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dagger_naming import parse_dataset_short  # noqa: E402
+from pcdagger.dagger.naming import parse_dataset_short  # noqa: E402
 
 # Trailing suffix detector — used purely for display (e.g. distinguishing
 # `_dag1` from `_dag1_old` in the per-lineage summary) since parse_dataset_short
@@ -244,7 +244,7 @@ def _parsed_intervention(name: str):
     if not m:
         return None
     # Build a ParsedDatasetName via the canonical dataclass (same fields).
-    from dagger_naming import ParsedDatasetName
+    from pcdagger.dagger.naming import ParsedDatasetName
 
     return ParsedDatasetName(
         kind="intervention",

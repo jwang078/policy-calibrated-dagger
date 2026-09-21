@@ -17,7 +17,7 @@
 #   * let train_sweep spawn it in-process (task `planar_3joint` is registered in
 #     splatsim/gym_env.py).
 # Relative-action training also needs the stats sidecar: run
-#   my_scripts/compute_relative_stats.sh for DATASET_REPO first.
+#   $PCDAGGER_ROOT/scripts/compute_relative_stats.sh for DATASET_REPO first.
 
 ENV_TASK="planar_3joint"                      # lerobot --env.task + splatsim register_env key
 ROBOT_VARIANT="sim_pybullet_planar_interactive"  # launch_nodes.py --robot (dagger server launch)
@@ -29,9 +29,9 @@ CAMERAS="base"                                # base_rgb only (no wrist camera)
 # Datasets store it, so image-only (default) OR image+oracle
 # (--include_env_state_obs=true) OR oracle-only (--cameras=state) all train from
 # the SAME dataset. Historical widths that require retrofit before mixing:
-#   6  — pre-EE:   retrofit via my_scripts/append_ee_to_env_state.py
+#   6  — pre-EE:   retrofit via $PCDAGGER_ROOT/scripts/append_ee_to_env_state.py
 #   11 — link-dist era (2026-07-29/30 only): strip back via
-#        my_scripts/strip_link_obstacle_dists_from_env_state.py (the per-link
+#        $PCDAGGER_ROOT/scripts/strip_link_obstacle_dists_from_env_state.py (the per-link
 #        min-obstacle-distance suffix was retired 2026-07-30).
 ENV_STATE_DIM=8
 DATASET_REPO="JennyWWW/planar_3joint"

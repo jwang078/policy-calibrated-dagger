@@ -48,14 +48,14 @@ fi
 # ---- 1. record round K
 if [ ! -f "$LR/outputs/dataset_stats/$DAGK/stats_rel64.json" ]; then
   if [ $K -ge 2 ]; then   # the resume must plan to start at round K step 1 (recording), else abort loudly
-    bash my_scripts/dagger_orchestrate.sh "${ORCH[@]}" --dry-run > "$OUT_TRAIN/lever_r${RES}_orchestrator_r${K}_dryrun.log" 2>&1
+    bash "$PCDAGGER_ROOT/scripts/"dagger_orchestrate.sh "${ORCH[@]}" --dry-run > "$OUT_TRAIN/lever_r${RES}_orchestrator_r${K}_dryrun.log" 2>&1
     grep -q "next is round $K, step 1" "$OUT_TRAIN/lever_r${RES}_orchestrator_r${K}_dryrun.log" || { log "orchestrator would not start at round $K step 1 — see the dry-run log"; exit 1; }
   fi
   log "orchestrator: recording round $K with $(basename $(dirname $(dirname $(dirname $COLLECTOR))))"
   if [ $K = 1 ]; then
-    bash my_scripts/dagger_orchestrate.sh "${ORCH[@]}" > "$OUT_TRAIN/lever_r${RES}_orchestrator_r${K}.log" 2>&1; log "orchestrator rc=$?"
+    bash "$PCDAGGER_ROOT/scripts/"dagger_orchestrate.sh "${ORCH[@]}" > "$OUT_TRAIN/lever_r${RES}_orchestrator_r${K}.log" 2>&1; log "orchestrator rc=$?"
   else
-    setsid bash my_scripts/dagger_orchestrate.sh "${ORCH[@]}" > "$OUT_TRAIN/lever_r${RES}_orchestrator_r${K}.log" 2>&1 & OPID=$!
+    setsid bash "$PCDAGGER_ROOT/scripts/"dagger_orchestrate.sh "${ORCH[@]}" > "$OUT_TRAIN/lever_r${RES}_orchestrator_r${K}.log" 2>&1 & OPID=$!
     until [ -f "$LR/outputs/dataset_stats/$DAGK/stats_rel64.json" ] || ! kill -0 $OPID 2>/dev/null; do sleep 20; done
     sleep 15; kill -- -$OPID 2>/dev/null; sleep 5; kill -9 -- -$OPID 2>/dev/null
     rm -rf "${FT_DIR}$K/checkpoints"   # its lineage-style fine-tune is not wanted (HG rK is trained from base below)
@@ -74,7 +74,7 @@ blend_lane() {  # PORT ratios...
   local SIM; SIM=$(start_lever_node $PORT --strict_goal_tolerances); wait_port $PORT || return 1
   local R TAG TGT; for R in "$@"; do TAG=$($PY -c "print(f'{int(round(float($R)*100)):03d}')"); TGT=JennyWWW/${DAGK}_blend$TAG
     [ -d "$HF/${DAGK}_blend$TAG/data" ] && { log "$TGT exists"; continue; }; log "blend r=$R on $PORT -> $TGT"
-    nice -n 10 $PY my_scripts/augment_dataset_with_blending.py --dataset_repo_id=JennyWWW/$DAGK --target_dataset_repo_id="$TGT" --policy_path="$COLLECTOR" \
+    nice -n 10 $PY $PCDAGGER_ROOT/scripts/augment_dataset_with_blending.py --dataset_repo_id=JennyWWW/$DAGK --target_dataset_repo_id="$TGT" --policy_path="$COLLECTOR" \
       "--forward_flow_ratios=[$R]" "--episode_indices=$EPS" --samples_per_episode=1 --relabel_actions=guidance --env_external_port=$PORT --env_external_host=127.0.0.1 \
       --env_task=upright_small_engine_new --env_robot_name=robot_iphone_w_engine_curtain --num_dofs=6 --eval_benchmark_repo_id=$LEVER_BENCH \
       --blend_strategy=denoise --guidance_repr=absolute_pos --blend_mode=every_step --blend_interval_frac=0.5 --fixed_base_noise=true --resample_noise_per_reblend=false --clip_sample=false --sample_seed=42 \

@@ -25,7 +25,7 @@ import torch
 from torch import Tensor
 
 from lerobot.configs.last_mile import DetectBackend, LastMileConfig
-from lerobot.policies.last_mile.joint_history import JointHistoryBuffer
+from pcdagger.extras.last_mile.joint_history import JointHistoryBuffer
 
 logger = logging.getLogger(__name__)
 

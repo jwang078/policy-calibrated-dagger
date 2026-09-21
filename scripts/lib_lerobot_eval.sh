@@ -3,8 +3,8 @@
 #
 # This file is meant to be `source`'d, not executed directly. It defines
 # functions (prefixed `lle_*`) used by:
-#   * my_scripts/run_all_evals.sh           — eval every checkpoint in a folder
-#   * my_scripts/dagger_reeval_lineage.sh   — re-eval a DAgger lineage's rounds
+#   * $PCDAGGER_ROOT/scripts/run_all_evals.sh           — eval every checkpoint in a folder
+#   * $PCDAGGER_ROOT/scripts/dagger_reeval_lineage.sh   — re-eval a DAgger lineage's rounds
 #                                             at a new --env.episode_length
 # Keeping these in one place avoids drift between the two callers and
 # means future eval-invocation scripts can compose them.
@@ -19,6 +19,7 @@
 #
 # All helpers tolerate missing files / fields by returning sensible defaults
 # matching what run_all_evals.sh used to hard-code in-place.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../pcdagger/paths.sh"   # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR
 
 # Guard against double-sourcing (harmless but noisy).
 if [[ -n "${_LIB_LEROBOT_EVAL_LOADED:-}" ]]; then

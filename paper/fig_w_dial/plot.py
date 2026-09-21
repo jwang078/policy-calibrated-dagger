@@ -30,9 +30,7 @@ import pandas as pd
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
-
-sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "my_scripts"))
-from lib_sa_rollout import progress_guidance_index
+from pcdagger.blend.rollout import progress_guidance_index
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))

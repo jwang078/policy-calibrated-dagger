@@ -239,7 +239,7 @@ def render_dart_sim_video(
     """
     import imageio.v2 as imageio
     import pybullet as pb
-    from dart_labels import _interp_rows
+    from pcdagger.dart.relabel import _interp_rows
 
     cid = pb.connect(pb.DIRECT)
     try:

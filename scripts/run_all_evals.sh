@@ -1,4 +1,5 @@
 #!/bin/bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../pcdagger/paths.sh"   # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR
 
 # Script to run lerobot-eval on all policy checkpoints, in eval-benchmark
 # mode against a fixed pre-recorded scenario set so different runs and
@@ -164,7 +165,7 @@ if [ "$DRY_RUN" = true ]; then
     echo ""
 fi
 
-OUTPUTS_DIR="/home/jennyw2/code/lerobot/outputs"
+OUTPUTS_DIR="$LEROBOT_ROOT/outputs"
 TIMESTAMP=$(date +"%Y-%m-%d-%H%M%S")
 EVAL_OUTPUT_DIR="$OUTPUTS_DIR/eval_output/$TIMESTAMP"
 EXP_PATTERNS=("$OUTPUTS_DIR"/training/diffusion_approach_lever_* "$OUTPUTS_DIR"/training/pi05_approach_lever_* "$OUTPUTS_DIR"/training/act_approach_lever_*)
@@ -584,5 +585,5 @@ echo "========================================"
 if [ "$DRY_RUN" = false ]; then
     echo ""
     echo "Generating evaluation summary..."
-    python3 /home/jennyw2/code/lerobot/my_scripts/summarize_evals.py "$EVAL_OUTPUT_DIR"
+    python3 $LEROBOT_ROOT/$PCDAGGER_ROOT/scripts/summarize_evals.py "$EVAL_OUTPUT_DIR"
 fi

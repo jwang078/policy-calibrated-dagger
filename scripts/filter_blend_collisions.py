@@ -83,7 +83,7 @@ if str(_HERE) not in sys.path:
 # prefix here — that only works when the lerobot repo root itself is on
 # sys.path (e.g. during ``pytest``), and the orchestrator launches this via
 # ``python /…/my_scripts/filter_blend_collisions.py`` without that.
-from lib_dataset_episode_io import (  # type: ignore[import-not-found]  # noqa: E402
+from pcdagger.datasets.episode_io import (  # type: ignore[import-not-found]  # noqa: E402
     find_parquet_files,
     load_episode_frames,
 )
@@ -93,8 +93,8 @@ from lerobot.datasets.video_utils import decode_video_frames  # noqa: E402
 from lerobot.envs.factory import make_env, make_env_config  # noqa: E402
 from lerobot.utils.constants import DEFAULT_FEATURES  # noqa: E402
 from lerobot.utils.import_utils import register_third_party_plugins  # noqa: E402
-from lerobot.utils.lerobot_dataset_utils import resolve_dataset_dir  # noqa: E402
-from lerobot.utils.sim_seeding import seed_splatsim_env_to_state, set_env_benchmark_indices  # noqa: E402
+from pcdagger.datasets.dataset_dirs import resolve_dataset_dir  # noqa: E402
+from lerobot_env_splatsim.seeding import seed_splatsim_env_to_state, set_env_benchmark_indices  # noqa: E402
 from lerobot.utils.utils import init_logging  # noqa: E402
 
 # DEFAULT_FEATURES (timestamp, frame_index, episode_index, index, task_index)

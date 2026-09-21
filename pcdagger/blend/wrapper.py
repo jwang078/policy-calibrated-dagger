@@ -59,19 +59,19 @@ from torch import Tensor, nn
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.shared_autonomy import FutureChunkConfig, PreJumpLookbackConfig
-from lerobot.policies.guidance import GuidanceCallCtx
-from lerobot.policies.guidance.observation_teleop_source import ObservationTeleopGuidanceSource
-from lerobot.policies.guidance.oracle_goal_source import OracleGoalGuidanceSource
-from lerobot.policies.guidance.rrt_source import RRTGuidanceSource
-from lerobot.policies.guidance.views import _RRTBackCompatView
+from pcdagger.blend.guidance import GuidanceCallCtx
+from pcdagger.blend.guidance.observation_teleop_source import ObservationTeleopGuidanceSource
+from pcdagger.blend.guidance.oracle_goal_source import OracleGoalGuidanceSource
+from pcdagger.blend.guidance.rrt_source import RRTGuidanceSource
+from pcdagger.blend.guidance.views import _RRTBackCompatView
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.rrt_to_goal import RRTMode
-from lerobot.policies.teleop_recording import FrameSource
+from pcdagger.blend.guidance.rrt_to_goal import RRTMode
+from lerobot_env_splatsim.recording import FrameSource
 from lerobot.processor import AbsoluteActionsProcessorStep, PolicyProcessorPipeline, to_relative_actions
 from lerobot.utils.constants import ACTION
 
 if TYPE_CHECKING:
-    from lerobot.policies.teleop_recording import TeleopRecordingContext
+    from lerobot_env_splatsim.recording import TeleopRecordingContext
 
 logger = logging.getLogger(__name__)
 
@@ -681,7 +681,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             self._load_static_obstacles()
 
         if show_slider:
-            from lerobot.policies.shared_autonomy_gui import launch_ratio_slider
+            from pcdagger.blend.gui import launch_ratio_slider
 
             launch_ratio_slider(self)
 
@@ -1046,7 +1046,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         (``use_relative_actions`` / ``relative_exclude_joints``).
         """
         # Lazy import — keep optional dependency surface contained.
-        from lerobot.policies.rrt_to_goal import check_chunk_collision
+        from pcdagger.blend.guidance.rrt_to_goal import check_chunk_collision
 
         # Peek without consuming. Returns None if no chunk cached yet
         # (e.g., very first tick before select_action populated the queue).
@@ -1293,7 +1293,7 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
         `wrapper._rrt.planner`, etc. all read/write the underlying
         `RRTGuidanceSource.state` (which is the same `RRTRuntimeState` dataclass
         that used to live directly on the wrapper). See
-        `lerobot.policies.guidance.views._RRTBackCompatView` for the proxy
+        `pcdagger.blend.guidance.views._RRTBackCompatView` for the proxy
         implementation.
         """
         return _RRTBackCompatView(self._rrt_source)

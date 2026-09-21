@@ -26,7 +26,7 @@
 # when present, falling back to the training wandb log if not.
 #
 # Usage:
-#   bash my_scripts/dagger_reeval_lineage.sh \
+#   bash $PCDAGGER_ROOT/scripts/dagger_reeval_lineage.sh \
 #       [<training_dir_path> ...] \
 #       [--filter d5jvm_g0_03dag] \
 #       --episode_length=800 \
@@ -123,7 +123,7 @@
 #                                 the round's train_config.json env.task →
 #                                 the resolved env profile's ENV_TASK →
 #                                 upright_small_engine_new).
-#   --env_profile=NAME            Env profile (my_scripts/env_profiles/NAME.sh)
+#   --env_profile=NAME            Env profile ($PCDAGGER_ROOT/scripts/env_profiles/NAME.sh)
 #                                 for the sim launch + defaults (task, sim
 #                                 robot variant, render mode, benchmark).
 #                                 Default: auto-resolved from the positional
@@ -157,6 +157,7 @@
 #      DEFAULT behavior — opt out with --no_prefer_reeval to force the
 #      legacy wandb-log scrape.
 #   2. Wandb output.log's "Suite overall aggregated" line (fallback).
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../pcdagger/paths.sh"   # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR
 
 set -euo pipefail
 
@@ -215,7 +216,7 @@ DRY_RUN=false
 FORCE_RERUN=false
 EVAL_BENCHMARK_REPO_ID_OVERRIDE=""
 TASK_OVERRIDE=""
-# Env profile (my_scripts/env_profiles/<name>.sh). Empty = auto-resolve from
+# Env profile ($PCDAGGER_ROOT/scripts/env_profiles/<name>.sh). Empty = auto-resolve from
 # the first positional train dir's dagger sidecar (`--env_profile=` in the
 # orchestrator argv). Sourcing the profile supplies ENV_TASK, ROBOT_VARIANT
 # (launch_nodes --robot), ROBOT_NAME, RENDER_MODE and the env's benchmark —
@@ -1145,7 +1146,7 @@ print('[' + ','.join(str(i) for i in sorted(random.sample(range(int(sys.argv[3])
             # it's persisted even if the eval crashes partway. dagger_progress.sh
             # reads this to annotate rows with what the reeval changed vs the
             # original training-time eval; users read it to reproduce the reeval
-            # exactly (`bash my_scripts/dagger_reeval_lineage.sh <argv...>`).
+            # exactly (`bash $PCDAGGER_ROOT/scripts/dagger_reeval_lineage.sh <argv...>`).
             REEVAL_CONFIG_JSON="$reeval_dir/reeval_config.json"
             if [[ "$DRY_RUN" != "true" ]]; then
                 python3 - "$REEVAL_CONFIG_JSON" "$_round_reeval_tag" \
@@ -1296,7 +1297,7 @@ fi
 # the user gave us — positional paths get echoed back verbatim (progress
 # also accepts them), --filter substrings pass through as-is.
 if (( ${#FILTERS[@]} > 0 )); then
-    echo "Run \`bash my_scripts/dagger_progress.sh --filter ${FILTERS[*]}\` — the chart prefers reeval results by default; rows sourced from a reeval are tagged with \`*<reeval_tag>\` in the eval_step column. Pass --no_prefer_reeval to force the legacy wandb-log scrape."
+    echo "Run \`bash $PCDAGGER_ROOT/scripts/dagger_progress.sh --filter ${FILTERS[*]}\` — the chart prefers reeval results by default; rows sourced from a reeval are tagged with \`*<reeval_tag>\` in the eval_step column. Pass --no_prefer_reeval to force the legacy wandb-log scrape."
 else
     echo "Chart these results with dagger_progress.sh (it prefers reeval results by default). Rows sourced from a reeval are tagged with \`*<reeval_tag>\` in the eval_step column; pass --no_prefer_reeval to force the legacy wandb-log scrape."
 fi

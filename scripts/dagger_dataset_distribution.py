@@ -44,7 +44,7 @@ from pathlib import Path
 
 # dagger_naming sits next to this script.
 sys.path.insert(0, str(Path(__file__).parent))
-import dagger_naming as dn  # noqa: E402
+from pcdagger.dagger import naming as dn  # noqa: E402
 
 _ROUND_DAG_RE = re.compile(r"_(?:ft_)?dag(\d+)(?:_|$)")
 

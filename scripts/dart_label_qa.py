@@ -35,7 +35,7 @@ import sys
 
 import numpy as np
 import pandas as pd
-from dart_labels import chunk_labels, chunk_ok, demo_geometry, project_states
+from pcdagger.dart.relabel import chunk_labels, chunk_ok, demo_geometry, project_states
 
 FPS = 30.0
 

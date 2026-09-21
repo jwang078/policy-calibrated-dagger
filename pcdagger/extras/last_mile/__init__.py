@@ -12,7 +12,7 @@ backends (currently ``BlendToGoalBiasHelper``). Stall / RRT / alt-policy
 backends are added in subsequent refactor steps.
 """
 
-from lerobot.policies.last_mile.detectors import (
+from pcdagger.extras.last_mile.detectors import (
     Detector,
     DetectorState,
     DetectorVerdict,
@@ -21,7 +21,7 @@ from lerobot.policies.last_mile.detectors import (
     StallDetector,
     build_detector,
 )
-from lerobot.policies.last_mile.helpers import (
+from pcdagger.extras.last_mile.helpers import (
     BlendToGoalBiasHelper,
     Helper,
     HelperOutput,
@@ -29,8 +29,8 @@ from lerobot.policies.last_mile.helpers import (
     SwapToAltPolicyHelper,
     build_helper,
 )
-from lerobot.policies.last_mile.joint_history import JointHistoryBuffer
-from lerobot.policies.last_mile.wrapper import RAW_STATE_KEY, LastMileWrapper
+from pcdagger.extras.last_mile.joint_history import JointHistoryBuffer
+from pcdagger.extras.last_mile.wrapper import RAW_STATE_KEY, LastMileWrapper
 
 __all__ = [
     "BlendToGoalBiasHelper",

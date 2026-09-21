@@ -15,7 +15,7 @@ package, and concrete sources import back into `rrt_to_goal.py` — putting
 both on the package's top-level import chain would deadlock loading.
 """
 
-from lerobot.policies.guidance.base import (
+from pcdagger.blend.guidance.base import (
     GuidanceCallCtx,
     GuidanceMode,
     GuidanceSource,

@@ -29,13 +29,13 @@ import numpy as np
 import pybullet as p
 import torch
 
-from lerobot.policies.guidance.base import (
+from pcdagger.blend.guidance.base import (
     GuidanceCallCtx,
     GuidanceMode,
     GuidanceStepResult,
     IntegrationMode,
 )
-from lerobot.policies.rrt_to_goal import (
+from pcdagger.blend.guidance.rrt_to_goal import (
     PathSelectionStrategy,
     RRTPlanningError,
     RRTRuntimeState,
@@ -44,7 +44,7 @@ from lerobot.policies.rrt_to_goal import (
 )
 
 if TYPE_CHECKING:
-    from lerobot.policies.shared_autonomy_wrapper import SharedAutonomyPolicyWrapper
+    from pcdagger.blend.wrapper import SharedAutonomyPolicyWrapper
 
 logger = logging.getLogger(__name__)
 
@@ -482,7 +482,7 @@ class RRTGuidanceSource:
           2. chunk exhausted → tell the wrapper to finish (auto-pause + cancel).
           3. normal step → emit next waypoint.
         """
-        from lerobot.policies.teleop_recording import FrameSource
+        from lerobot_env_splatsim.recording import FrameSource
 
         st = self.state
         wrapper = self._wrapper
@@ -1229,7 +1229,7 @@ class RRTGuidanceSource:
                         # The rewound state is MOVING again — the recorder's
                         # leading-frame trim exists to hide from-rest
                         # artifacts that no longer exist.
-                        from lerobot.policies.teleop_recording import TeleopRecordingContext
+                        from lerobot_env_splatsim.recording import TeleopRecordingContext
 
                         TeleopRecordingContext.get_instance().rrt_extra_leading_trim = 0
                     # Rewind the inner policy's obs history along with the

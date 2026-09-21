@@ -30,17 +30,17 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from lerobot.policies.guidance.base import (
+from pcdagger.blend.guidance.base import (
     GuidanceCallCtx,
     GuidanceMode,
     GuidanceSourceState,
     GuidanceStepResult,
     IntegrationMode,
 )
-from lerobot.policies.rrt_to_goal import extract_task_goal
+from pcdagger.blend.guidance.rrt_to_goal import extract_task_goal
 
 if TYPE_CHECKING:
-    from lerobot.policies.shared_autonomy_wrapper import SharedAutonomyPolicyWrapper
+    from pcdagger.blend.wrapper import SharedAutonomyPolicyWrapper
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +225,7 @@ class OracleGoalGuidanceSource:
             st.target_steps = None
 
     def next_action(self, ctx: GuidanceCallCtx) -> GuidanceStepResult:
-        from lerobot.policies.teleop_recording import FrameSource
+        from lerobot_env_splatsim.recording import FrameSource
 
         st = self.state
         wrapper = self._wrapper

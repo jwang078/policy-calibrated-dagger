@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../pcdagger/paths.sh"   # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR
 set -euo pipefail
 # train_sweep.sh
 #
@@ -7,7 +8,7 @@ set -euo pipefail
 # augment_ratios_sweep.sh.
 #
 # Usage:
-#   bash my_scripts/train_sweep.sh [OPTIONS]
+#   bash $PCDAGGER_ROOT/scripts/train_sweep.sh [OPTIONS]
 #
 # All options have defaults (see USER CONFIG below).
 #
@@ -61,13 +62,13 @@ set -euo pipefail
 #   --dry-run               Print commands without executing
 #
 # Example:
-#   bash my_scripts/train_sweep.sh \
+#   bash $PCDAGGER_ROOT/scripts/train_sweep.sh \
 #       --dataset_repo=JennyWWW/splatsim_approach_lever_11_50failsrrtpi05 \
 #       --ratio_sweep \
 #       --ratios="0.2 0.4 0.6 0.8 1.0"
 
 # ── USER CONFIG (defaults) ────────────────────────────────────────────────────
-# Env profile: `--env_profile=NAME` sources my_scripts/env_profiles/NAME.sh,
+# Env profile: `--env_profile=NAME` sources $PCDAGGER_ROOT/scripts/env_profiles/NAME.sh,
 # which sets the env-specific values below (ENV_TASK, ROBOT_NAME, NUM_DOFS,
 # CAMERAS, DATASET_REPO, EVAL_BENCHMARK_REPO_ID) in ONE place so swapping
 # environments (small_engine <-> planar <-> ...) is a single flag. Precedence:
@@ -399,7 +400,7 @@ DATASET_SHORT="${DATASET_SHORT#splatsim_}"
 # the chunk size they were computed against (stats_rel{N}.json) — the policy
 # type doesn't matter, only the chunk over which action deltas are computed.
 # run_job picks the right one based on each policy's chunk_size.
-STATS_DIR=~/code/lerobot/outputs/dataset_stats/${DATASET_SHORT}
+STATS_DIR=$LEROBOT_ROOT/outputs/dataset_stats/${DATASET_SHORT}
 
 # Resolve the chunk size used to construct the relative-action stats sidecar
 # path (stats_rel${chunk}.json). This MUST equal the policy's TRAINING horizon
@@ -468,7 +469,7 @@ if [[ "$USE_RELATIVE_ACTIONS" == true ]]; then
         f="${STATS_DIR}/stats_rel${chunk}.json"
         if [[ ! -f "$f" ]]; then
             echo "ERROR: USE_RELATIVE_ACTIONS=true but stats file not found: $f" >&2
-            echo "Run my_scripts/compute_relative_stats.sh first." >&2
+            echo "Run $PCDAGGER_ROOT/scripts/compute_relative_stats.sh first." >&2
             exit 1
         fi
     fi
@@ -1007,11 +1008,11 @@ print(Path(os.environ.get('HF_LEROBOT_HOME', Path.home()/'.cache/huggingface/ler
 
         # Step 1: create the merged dataset
         if [[ "$DRY_RUN" == false ]]; then
-            python my_scripts/merge_augmented_datasets_for_training.py \
+            python $PCDAGGER_ROOT/scripts/merge_augmented_datasets_for_training.py \
                 --base "$_BASE_DATASET_REPO" \
                 --ratios "${_CUMULATIVE_RATIOS[@]}"
         else
-            echo "[DRY-RUN] python my_scripts/merge_augmented_datasets_for_training.py \\"
+            echo "[DRY-RUN] python $PCDAGGER_ROOT/scripts/merge_augmented_datasets_for_training.py \\"
             echo "    --base $_BASE_DATASET_REPO --ratios ${_CUMULATIVE_RATIOS[*]}"
         fi
 

@@ -382,7 +382,7 @@ class SwapToAltPolicyHelper:
     def begin(self, ctx: dict | None, wrapper) -> None:
         if self._was_triggered_this_episode:
             return
-        from lerobot.policies.last_mile.policy_swap import (
+        from pcdagger.extras.last_mile.policy_swap import (
             cache_state_dict_to_cpu,
             load_policy_from_path,
             unload_policy_inplace,
@@ -484,7 +484,7 @@ class SwapToAltPolicyHelper:
             self._cached_alt_raw = None
             return
 
-        from lerobot.policies.last_mile.policy_swap import (
+        from pcdagger.extras.last_mile.policy_swap import (
             load_policy_from_path,
             restore_policy_from_state,
         )

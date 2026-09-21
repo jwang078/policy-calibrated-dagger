@@ -53,7 +53,7 @@ from sklearn.neighbors import NearestNeighbors  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dagger_diagnose_lineage import CACHE, OUT_DIR, find_config_for_dataset  # noqa: E402
-from dagger_naming import parse_dataset_short  # noqa: E402
+from pcdagger.dagger.naming import parse_dataset_short  # noqa: E402
 from plot_state_deltas import load_state_episodes  # noqa: E402
 
 GRIPPER_DIM = -1

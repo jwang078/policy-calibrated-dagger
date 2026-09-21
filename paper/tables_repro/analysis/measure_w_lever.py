@@ -14,9 +14,7 @@ import sys
 import numpy as np
 import pandas as pd
 from scipy.optimize import curve_fit
-
-sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "my_scripts"))
-from lib_sa_rollout import progress_guidance_index
+from pcdagger.blend.rollout import progress_guidance_index
 
 ROUNDS = [int(x) for x in (sys.argv[1] if len(sys.argv) > 1 else "1,2").split(",")]
 TAGS = ["010", "020", "030", "050", "075", "090"]

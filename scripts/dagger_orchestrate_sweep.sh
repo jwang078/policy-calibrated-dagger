@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../pcdagger/paths.sh"   # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR
 
 # Sweep wrapper for dagger_orchestrate.sh. Two modes:
 #
@@ -19,7 +20,7 @@
 # orchestrator's step-2 resume detection.
 #
 # Usage:
-#   bash my_scripts/dagger_orchestrate_sweep.sh <mode flags> <orchestrator flags>
+#   bash $PCDAGGER_ROOT/scripts/dagger_orchestrate_sweep.sh <mode flags> <orchestrator flags>
 #
 # Mode flags (pick exactly one mode):
 #   --sweep_blends=LIST
@@ -160,7 +161,7 @@
 #   Shorten --run_tag or --dag_short_override and retry.
 #
 # Example (rerun-blends with combinations of 2):
-#   bash my_scripts/dagger_orchestrate_sweep.sh \
+#   bash $PCDAGGER_ROOT/scripts/dagger_orchestrate_sweep.sh \
 #       --combination_pool="0.1 0.3 0.5 0.7 0.9" --sweep_combinations_of=2 \
 #       --base_short=approach_lever_11_biasend_5path_grip0 \
 #       --initial_policy_path=outputs/training/diffusion_approach_lever_11_biasend_5path_delta_basewrist \
@@ -1000,7 +1001,7 @@ if [[ "$AUTO_CREATE_SOURCE" == "true" ]]; then
     # below carried it). This puts the full, reproducible sweep command right
     # next to round 1's dagger sidecar.
     if ! DAGGER_SWEEP_INVOCATION_ARGV_JSON="$SWEEP_ARGV_JSON_FOR_SIDECAR" \
-         DAGGER_SWEEP_INVOCATION_WRAPPER="my_scripts/dagger_orchestrate_sweep.sh" \
+         DAGGER_SWEEP_INVOCATION_WRAPPER="$PCDAGGER_ROOT/scripts/dagger_orchestrate_sweep.sh" \
          bash "$ORCH" "${CREATE_ARGS[@]}" "${ROUND_ARGS[@]}"; then
         echo "Auto-create source step FAILED. Aborting sweep before any blend iteration." >&2
         exit 1
@@ -1034,7 +1035,7 @@ for i in "${!RATIO_LISTS_ARR[@]}"; do
     # downstream tools (dagger_detect_dataset_anomalies, etc.) can recover the
     # full sweep-level command, not just this iteration's orchestrator-level one.
     if DAGGER_SWEEP_INVOCATION_ARGV_JSON="$SWEEP_ARGV_JSON_FOR_SIDECAR" \
-       DAGGER_SWEEP_INVOCATION_WRAPPER="my_scripts/dagger_orchestrate_sweep.sh" \
+       DAGGER_SWEEP_INVOCATION_WRAPPER="$PCDAGGER_ROOT/scripts/dagger_orchestrate_sweep.sh" \
        bash "$ORCH" --blends="$combo" "${ORCHESTRATOR_ARGS[@]}" "${ROUND_ARGS[@]}"; then
         n_succ=$((n_succ + 1))
         echo "Sweep iteration --blends=\"$combo\" SUCCEEDED ($(( $(date +%s) - iter_start ))s)."
@@ -1071,7 +1072,7 @@ if [[ "$AUTO_CREATE_SOURCE" == "true" && "${DEFER_SOURCE_FINAL_SCRATCH:-false}" 
         echo "  bash $ORCH ${FINAL_CREATE_ARGS[*]}"
         echo "════════════════════════════════════════════════════════════════════════════════"
         if ! DAGGER_SWEEP_INVOCATION_ARGV_JSON="$SWEEP_ARGV_JSON_FOR_SIDECAR" \
-             DAGGER_SWEEP_INVOCATION_WRAPPER="my_scripts/dagger_orchestrate_sweep.sh" \
+             DAGGER_SWEEP_INVOCATION_WRAPPER="$PCDAGGER_ROOT/scripts/dagger_orchestrate_sweep.sh" \
              bash "$ORCH" "${FINAL_CREATE_ARGS[@]}"; then
             n_fail=$((n_fail + 1))
             failures+=( "source-final-scratch" )

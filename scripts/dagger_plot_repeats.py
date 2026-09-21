@@ -48,7 +48,7 @@ import numpy as np
 from matplotlib.ticker import MaxNLocator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dagger_naming import lineage_of, parse_round_variant  # noqa: E402
+from pcdagger.dagger.naming import lineage_of, parse_round_variant  # noqa: E402
 from dagger_plot import (  # noqa: E402
     DEFAULT_OUT_DIR,
     TRAINING_ROOT,

@@ -21,7 +21,7 @@
 : "${DGR_KNOWN_MODEL_PREFIXES:=diffusion pi05 act}"
 
 DGR_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DGR_LEROBOT_ROOT="$(cd "$DGR_LIB_DIR/.." && pwd)"
+DGR_LEROBOT_ROOT="${LEROBOT_ROOT:?LEROBOT_ROOT is set by pcdagger/paths.sh}"
 DGR_TRAINING_ROOT_DEFAULT="$DGR_LEROBOT_ROOT/outputs/training"
 
 # dgr_normalize_train_dir <path> [training_root]

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../pcdagger/paths.sh"   # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR
 set -euo pipefail
 
 # Computes relative-action normalization stats for each policy's chunk size and saves
@@ -8,7 +9,7 @@ set -euo pipefail
 # Run this once per dataset before training with USE_RELATIVE_ACTIONS=true in train_sweep.sh.
 #
 # Usage:
-#   bash my_scripts/compute_relative_stats.sh [OPTIONS]
+#   bash $PCDAGGER_ROOT/scripts/compute_relative_stats.sh [OPTIONS]
 #
 # Options:
 #   --dataset_repo=ID      Full dataset repo id, e.g.
@@ -75,7 +76,7 @@ DATASET_SHORT="${DATASET_REPO#*/}"
 DATASET_SHORT="${DATASET_SHORT#splatsim_}"
 DATASET_CACHE=~/.cache/huggingface/lerobot/${DATASET_REPO}
 STATS_JSON="${DATASET_CACHE}/meta/stats.json"
-STATS_DIR=~/code/lerobot/outputs/dataset_stats/${DATASET_SHORT}
+STATS_DIR=$LEROBOT_ROOT/outputs/dataset_stats/${DATASET_SHORT}
 
 echo "Dataset : $DATASET_REPO"
 echo "Stats dir: $STATS_DIR"

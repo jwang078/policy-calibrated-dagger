@@ -13,9 +13,9 @@
 #                                         on our port so the run can continue
 #
 # Mirrors the orchestrator's own sim lifecycle in
-# my_scripts/dagger_orchestrate.sh:1774-1911 (~80 lines). Callers set the
+# $PCDAGGER_ROOT/scripts/dagger_orchestrate.sh:1774-1911 (~80 lines). Callers set the
 # following globals before invoking splat_start_sim:
-#   SPLATSIM_ROOT          absolute path to SplatSim repo (default: ~/code/SplatSim)
+#   SPLATSIM_ROOT          absolute path to SplatSim repo (default: $SPLATSIM_ROOT)
 #   ENV_EXTERNAL_PORT      TCP port for the sim to bind (default: 6001)
 #   ENV_EXTERNAL_HOST      hostname (default: 127.0.0.1)
 #   SPLATSIM_ROBOT         --robot arg (default: sim_ur_pybullet_small_engine_new_interactive)
@@ -39,6 +39,7 @@
 #   splat_start_sim
 #   ... run lerobot-eval against --env.external_port=$ENV_EXTERNAL_PORT ...
 #   # trap handles cleanup; explicit splat_stop_sim works too
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../pcdagger/paths.sh"   # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR
 
 # Guard against double-sourcing.
 if [[ -n "${_LIB_SPLATSIM_MANAGE_LOADED:-}" ]]; then
@@ -47,7 +48,7 @@ fi
 _LIB_SPLATSIM_MANAGE_LOADED=1
 
 # Defaults — callers can override before splat_start_sim runs.
-: "${SPLATSIM_ROOT:=$HOME/code/SplatSim}"
+: "${SPLATSIM_ROOT:=$SPLATSIM_ROOT}"
 : "${ENV_EXTERNAL_PORT:=6001}"
 : "${ENV_EXTERNAL_HOST:=127.0.0.1}"
 : "${SPLATSIM_ROBOT:=sim_ur_pybullet_small_engine_new_interactive}"

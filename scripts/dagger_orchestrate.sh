@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../pcdagger/paths.sh"   # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR
 set -euo pipefail
 # dagger_orchestrate.sh
 #
@@ -15,14 +16,14 @@ set -euo pipefail
 #   * Requires a SHARED EXTERNAL SplatSim ZMQ server running at --env_external_port
 #     BEFORE this script is invoked. GPU memory can't host multiple SplatSim
 #     instances plus training simultaneously. Launch with e.g.:
-#       cd ~/code/SplatSim && python -u scripts/launch_nodes.py \
+#       cd $SPLATSIM_ROOT && python -u scripts/launch_nodes.py \
 #         --robot sim_ur_pybullet_small_engine_new_interactive \
 #         --robot_port 6001 --robot_name robot_iphone_w_engine_new \
 #         --eval_benchmark_repo_id JennyWWW/eval_splatsim_approach_lever_benchmark_1000
 #     Keep that running for the whole orchestration.
 #
 # Usage:
-#   bash my_scripts/dagger_orchestrate.sh --base_short=STR --num_rounds=N [OPTIONS]
+#   bash $PCDAGGER_ROOT/scripts/dagger_orchestrate.sh --base_short=STR --num_rounds=N [OPTIONS]
 #
 # Required:
 #   --base_short=STR              Base dataset short name. The full repo id is
@@ -675,7 +676,7 @@ set -euo pipefail
 #                                 step-1 intervention recording and step-6
 #                                 training alike. No effect without --headless
 #                                 (the slider defaults on).
-#   --splatsim_root=PATH          Root of the SplatSim repo (default $HOME/code/SplatSim).
+#   --splatsim_root=PATH          Root of the SplatSim repo (default $SPLATSIM_ROOT).
 #                                 launch_nodes.py is run from this dir.
 #   --splatsim_robot=NAME         --robot arg for launch_nodes.py
 #                                 (default sim_ur_pybullet_small_engine_new_interactive).
@@ -686,7 +687,7 @@ set -euo pipefail
 #   --dry-run                     Print every command instead of executing.
 #
 # Example:
-#   bash my_scripts/dagger_orchestrate.sh \
+#   bash $PCDAGGER_ROOT/scripts/dagger_orchestrate.sh \
 #       --base_short=approach_lever_7_lowres_5path \
 #       --num_rounds=3 \
 #       --initial_policy_path=outputs/training/pi05_approach_lever_7_lowres_5path_delta_basewrist \
@@ -978,7 +979,7 @@ RETRAIN_ROUND0=false
 RESUME=false
 # --cleanup_only: when combined with --force_restart, deletes all lineage
 # artifacts and exits 0 without starting a fresh run. Designed to be called
-# by my_scripts/dagger_cleanup_lineage.sh, which derives the orchestrator
+# by $PCDAGGER_ROOT/scripts/dagger_cleanup_lineage.sh, which derives the orchestrator
 # flags from a training-dir path. Has no effect without --force_restart.
 CLEANUP_ONLY=false
 # --also_delete_blends: opt-in flag for --force_restart. In rerun-blends
@@ -1096,7 +1097,7 @@ SPLAT_SHADOWS=false
 # Opt out with --no_sync_physics_to_client if you need the legacy async
 # behavior (e.g. reproducing an old dataset exactly).
 SYNC_PHYSICS=true
-SPLATSIM_ROOT="$HOME/code/SplatSim"
+SPLATSIM_ROOT="$SPLATSIM_ROOT"
 SPLATSIM_ROBOT="sim_ur_pybullet_small_engine_new_interactive"
 # Empty by default — the sim launch script (`launch_nodes.py`) will fall
 # back to the SplatSim server class's `DEFAULT_ROBOT_NAME` (e.g.
@@ -1106,7 +1107,7 @@ SPLATSIM_ROBOT="sim_ur_pybullet_small_engine_new_interactive"
 # of truth for the env's canonical splat/URDF identifier.
 SPLATSIM_ROBOT_NAME=""
 # ── Env profile ──────────────────────────────────────────────────────────────
-# `--env_profile=NAME` sources my_scripts/env_profiles/NAME.sh, setting every
+# `--env_profile=NAME` sources $PCDAGGER_ROOT/scripts/env_profiles/NAME.sh, setting every
 # env-specific value (ENV_TASK, ROBOT_VARIANT/ROBOT_NAME, NUM_DOFS, CAMERAS,
 # EVAL_BENCHMARK_REPO_ID) in ONE place so swapping environments is a single flag,
 # forwarded verbatim through dagger_orchestrate_sweep.sh. The SAME profile is
@@ -1122,12 +1123,12 @@ DRY_RUN=false
 
 # Path constants.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LEROBOT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+: "${LEROBOT_ROOT:?LEROBOT_ROOT is set by pcdagger/paths.sh (the lerobot checkout; this script no longer lives inside it)}"
 LEROBOT_CACHE="$HOME/.cache/huggingface/lerobot"
 STATS_BASE="$LEROBOT_ROOT/outputs/dataset_stats"
 
 # Thin shim around the canonical naming module so forward-direction naming
-# (config → name) lives in ONE place — `my_scripts/dagger_naming.py` — and
+# (config → name) lives in ONE place — `$PCDAGGER_ROOT/scripts/dagger_naming.py` — and
 # can't drift between the bash orchestrator and the Python viz scripts. See
 # the module docstring for available subcommands.
 _py_dagger_name() {
@@ -2698,7 +2699,7 @@ validate_repo_name() {
 
 # Write a per-round dagger config sidecar to <train_dir>/dagger/config.json.
 # Logs the orchestrator invocation, computed naming, and (in rerun mode) the
-# source-lineage pointers — primary mechanism by which my_scripts/dagger_plot.py
+# source-lineage pointers — primary mechanism by which $PCDAGGER_ROOT/scripts/dagger_plot.py
 # auto-pairs rerun lineages with their source for the overlay comparison plots.
 # Called once at the top of each round; re-writes idempotently on resume so the
 # latest invocation's values win.
@@ -2961,7 +2962,7 @@ PY
 # is unchanged.
 # Per-round name helpers — all delegated to the canonical naming module via
 # _py_dagger_name. Forward derivation (config → name) lives in
-# my_scripts/dagger_naming.py so the bash orchestrator and downstream Python
+# $PCDAGGER_ROOT/scripts/dagger_naming.py so the bash orchestrator and downstream Python
 # viz scripts share one source of truth.
 int_short_for_round()    { _py_dagger_name int_short    --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1"; }
 int_repo_for_round()     { _py_dagger_name int_repo     --hf_user="$HF_USER" --prefix="$SOURCE_INT_SHORT_PREFIX" --infix="$ACTION_INFIX" --round="$1"; }
@@ -4019,7 +4020,7 @@ if [[ "$USE_WEIGHTED_SAMPLING" == "true" ]]; then
         for _c in "${_conflicting[@]}"; do echo "    $_c" >&2; done
         echo "  Resolve by either:" >&2
         echo "    (1) starting a weighted-mode lineage under a different --run_tag, OR" >&2
-        echo "    (2) running my_scripts/dagger_cleanup_lineage.sh first." >&2
+        echo "    (2) running $PCDAGGER_ROOT/scripts/dagger_cleanup_lineage.sh first." >&2
         exit 1
     fi
     echo "  ✓ no prior merge-mode artifacts; safe to run in weighted mode."
@@ -4050,7 +4051,7 @@ print('true' if v else 'false')
         echo "  Resolve by either:" >&2
         echo "    (1) passing --use_weighted_sampling to stay in weighted mode, OR" >&2
         echo "    (2) starting a merge-mode lineage under a different --run_tag, OR" >&2
-        echo "    (3) running my_scripts/dagger_cleanup_lineage.sh first." >&2
+        echo "    (3) running $PCDAGGER_ROOT/scripts/dagger_cleanup_lineage.sh first." >&2
         exit 1
     fi
     echo "  ✓ no prior weighted-mode artifacts; safe to run in merge mode."
@@ -5327,7 +5328,7 @@ if (( EFFECTIVE_START_ROUND == 1 )); then
             echo "    (a) Use the existing partial checkpoint AS THE BASE (accept its current step count):" >&2
             echo "        --initial_policy_path=$BASE_TRAINING_DIR" >&2
             echo "    (b) Resume base training to the configured target first, then rerun this sweep:" >&2
-            echo "        bash my_scripts/resume_training.sh $BASE_TRAINING_DIR/checkpoints/last/pretrained_model \\" >&2
+            echo "        bash $PCDAGGER_ROOT/scripts/resume_training.sh $BASE_TRAINING_DIR/checkpoints/last/pretrained_model \\" >&2
             echo "            --steps=${_cfg_target:-<target-steps>}" >&2
             echo "    (c) Nuke and retrain from zero:" >&2
             echo "        rm -rf $BASE_TRAINING_DIR   # then rerun the sweep" >&2

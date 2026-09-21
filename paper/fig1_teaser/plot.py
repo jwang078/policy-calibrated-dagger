@@ -44,14 +44,12 @@ if not os.path.exists(SCHED_PATH):  # the schedules live in tables_repro/analysi
     SCHED_PATH = os.path.join(os.path.dirname(SCRATCH), "tables_repro", "analysis", SCHEDULE)
 STATES_JSON = os.path.join(SCRATCH, "servo_states_ep24_f61.json")  # saved anchor + draws
 # ─────────────────────────────────────────────────────────────────────────────
-
-sys.path.append(os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "my_scripts"))
 sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "src"))
-import dart_sim_video as dsv  # noqa: E402
+from pcdagger.viz import dart_sim_video as dsv  # noqa: E402
 import matplotlib  # noqa: E402
 import pybullet as pb  # noqa: E402
 
-from lerobot.datasets.dart_relabel import chunk_labels, demo_geometry  # noqa: E402
+from pcdagger.dart.relabel import chunk_labels, demo_geometry  # noqa: E402
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402

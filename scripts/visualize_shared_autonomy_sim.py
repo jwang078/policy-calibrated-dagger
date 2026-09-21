@@ -138,27 +138,27 @@ if str(_REPO_ROOT) not in sys.path:
 # topic-focused library modules so this script doesn't depend on a deprecated
 # file. Bare module names (no ``my_scripts.`` prefix) so they resolve when
 # this script is invoked directly via ``python my_scripts/…``.
-from lib_dataset_episode_io import (  # type: ignore[import-not-found]  # noqa: E402
+from pcdagger.datasets.episode_io import (  # type: ignore[import-not-found]  # noqa: E402
     find_parquet_files,
     get_available_episodes,
     load_episode_frames,
     load_episodes_meta,
     load_task_description,
 )
-from lib_ee_kinematics import (  # type: ignore[import-not-found]  # noqa: E402
+from pcdagger.viz.ee_kinematics import (  # type: ignore[import-not-found]  # noqa: E402
     absolute_positions_to_ee_deltas,
     compute_ee_from_states,
     compute_ee_trajectories,
 )
-from lib_sa_plotting import (  # type: ignore[import-not-found]  # noqa: E402
+from pcdagger.viz.sa_plotting import (  # type: ignore[import-not-found]  # noqa: E402
     plot_ee_trajectories_3d,
     plot_joint_angles,
 )
-from lib_sa_policy_loading import (  # type: ignore[import-not-found]  # noqa: E402
+from pcdagger.blend.policy_loading import (  # type: ignore[import-not-found]  # noqa: E402
     apply_clip_sample_override,
     load_wrapped_policy,
 )
-from lib_sa_rollout import (  # type: ignore[import-not-found]  # noqa: E402,F401
+from pcdagger.blend.rollout import (  # type: ignore[import-not-found]  # noqa: E402,F401
     # THE shared rollout core — the sweep's blend script executes the same
     # code. _build_sim_batch/_run_filler_phase/progress_guidance_index are
     # re-exported here for back-compat importers.
@@ -173,12 +173,12 @@ from lib_sa_rollout import (  # type: ignore[import-not-found]  # noqa: E402,F40
 
 from lerobot.envs import close_envs  # noqa: E402
 from lerobot.envs.factory import make_env, make_env_config, make_env_pre_post_processors  # noqa: E402
-from lerobot.policies.shared_autonomy_wrapper import (  # noqa: E402
+from pcdagger.blend.wrapper import (  # noqa: E402
     BlendMode,
     GuidanceBlendStrategy,
     PolicyGuidanceRepresentation,
 )
-from lerobot.utils.lerobot_dataset_utils import make_default_rename_map, resolve_dataset_dir  # noqa: E402
+from pcdagger.datasets.dataset_dirs import make_default_rename_map, resolve_dataset_dir  # noqa: E402
 
 # ── sim-server launch hint ────────────────────────────────────────────────────
 

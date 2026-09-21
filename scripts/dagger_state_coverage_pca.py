@@ -55,7 +55,7 @@ import numpy as np
 
 # Share the canonical naming module with the orchestrator + dagger_plot.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dagger_naming import (  # noqa: E402
+from pcdagger.dagger.naming import (  # noqa: E402
     enumerate_blend_paths_on_disk,
     find_sidecar_by_prefix,
     int_cache_path,

@@ -47,7 +47,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from dart_labels import DemoGeometry, _interp_rows, chunk_labels, chunk_ok, demo_geometry, project_states
+from pcdagger.dart.relabel import DemoGeometry, _interp_rows, chunk_labels, chunk_ok, demo_geometry, project_states
 
 # ── figure text (EDIT ME — mirrors paper_plots/dart_chunks_src47/plot.py) ──
 TEXT = {
@@ -400,7 +400,7 @@ def _sim_video(args, S, idxs, geom, res, env, png_out: str, title: str) -> None:
     (``chunk_ok``), plus the worst-deviation served anchor — the same one the
     figure's zoom panel details — so the video and the plot tell one story.
     """
-    from dart_sim_video import render_dart_sim_video
+    from pcdagger.viz.dart_sim_video import render_dart_sim_video
 
     anchors, chunks, oks, colors = res["anchors"], res["chunks"], res["oks"], res["colors"]
     served = [t for t in anchors if oks.get(t, True)] or anchors
@@ -537,7 +537,7 @@ def main() -> None:
     n = args.num_arm_joints
     jac_fn = None
     if args.cartesian_gain:
-        from dart_sim_video import make_planar_jacobian
+        from pcdagger.viz.dart_sim_video import make_planar_jacobian
 
         jac_fn = make_planar_jacobian()
 

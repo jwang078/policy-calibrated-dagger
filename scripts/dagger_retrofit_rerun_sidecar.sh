@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../pcdagger/paths.sh"   # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR
 
 # Retroactively write a minimal dagger/config.json sidecar into each existing
 # training dir of a rerun-blends lineage that predates the orchestrator's
@@ -6,7 +7,7 @@
 # rerun lineage with its source for the per-metric overlay comparison plots.
 #
 # Usage:
-#   bash my_scripts/dagger_retrofit_rerun_sidecar.sh \
+#   bash $PCDAGGER_ROOT/scripts/dagger_retrofit_rerun_sidecar.sh \
 #       --rerun_policy_basename=BASENAME \
 #       --source_policy_basename=BASENAME \
 #       --source_run_tag=TAG \
@@ -62,7 +63,7 @@ if [[ -z "$RERUN_POLICY_BASENAME" || -z "$SOURCE_POLICY_BASENAME" || -z "$SOURCE
     exit 1
 fi
 
-LEROBOT_ROOT="${LEROBOT_ROOT:-$HOME/code/lerobot}"
+: "${LEROBOT_ROOT:?LEROBOT_ROOT is set by pcdagger/paths.sh}"
 
 dirs=$( { ls -d "$LEROBOT_ROOT/outputs/training/${RERUN_POLICY_BASENAME}"_dag[0-9]*    2>/dev/null; \
           ls -d "$LEROBOT_ROOT/outputs/training/${RERUN_POLICY_BASENAME}"_ft_dag[0-9]* 2>/dev/null; \

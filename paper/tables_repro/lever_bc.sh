@@ -14,10 +14,10 @@ if [ ! -d "$HF/splatsim_approach_lever_13_smooth_r${RES}/meta" ]; then
   log "dropping letterbox image columns"; $PY $S/analysis/strip_letterbox_lever_r${RES}.py || exit 1
 fi
 [ -f outputs/dataset_stats/approach_lever_13_smooth_r${RES}/stats_rel64.json ] || \
-  bash my_scripts/compute_relative_stats.sh --dataset_repo=JennyWWW/splatsim_approach_lever_13_smooth_r${RES} --chunk_sizes=64
+  bash "$PCDAGGER_ROOT/scripts/"compute_relative_stats.sh --dataset_repo=JennyWWW/splatsim_approach_lever_13_smooth_r${RES} --chunk_sizes=64
 if [ ! -d "$LEVER_BASE/checkpoints/last" ]; then
   log "BC $LEVER_BASE_NAME: $BC_STEPS steps"
-  bash my_scripts/train_sweep.sh --model=diffusion --env_profile=small_engine \
+  bash "$PCDAGGER_ROOT/scripts/"train_sweep.sh --model=diffusion --env_profile=small_engine \
     --dataset_repo=JennyWWW/splatsim_approach_lever_13_smooth_r${RES} --cameras=basewrist \
     --run_name=$LEVER_BASE_NAME --num_workers=$LEVER_WORKERS \
     --extra_args="--policy.input_features={\"observation.images.base_rgb\":{\"type\":\"VISUAL\",\"shape\":[3,$RES,$RES]},\"observation.images.wrist_rgb\":{\"type\":\"VISUAL\",\"shape\":[3,$RES,$RES]},\"observation.state\":{\"type\":\"STATE\",\"shape\":[7]}} --policy.resize_shape=[$RES,$RES] --policy.crop_ratio=1.0 --policy.down_dims=[128,256,512] --dataset.observation_noise_std={\"observation.state\":0.01,\"observation.environment_state\":0.005} --seed=0 --policy.normalize_env_state=true --steps=$BC_STEPS --save_freq=25000 --env_eval_freq=0 --wandb.enable=false" \

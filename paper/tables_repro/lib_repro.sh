@@ -57,7 +57,7 @@ planar_ensure_stats() {  # LINEAGE_TAG K
   local TAG=$1 K=$2 i
   for i in $(seq 1 $K); do
     [ -f "$LR/outputs/dataset_stats/planar_12_${TAG}_diff_r_dag$i/stats_rel64.json" ] || \
-      (cd "$LR" && bash my_scripts/compute_relative_stats.sh --dataset_repo=JennyWWW/planar_12_${TAG}_diff_r_dag$i --chunk_sizes=64)
+      (cd "$LR" && bash "$PCDAGGER_ROOT/scripts/"compute_relative_stats.sh --dataset_repo=JennyWWW/planar_12_${TAG}_diff_r_dag$i --chunk_sizes=64)
   done
 }
 
@@ -110,7 +110,7 @@ train_from_base() {
   if [ -d "$DIR/checkpoints/$CK/pretrained_model" ]; then log "$JOB exists ($CK), skip"; return 0; fi
   rm -rf "$DIR"; mkdir -p "$(dirname "$DIR")"; log "training $JOB -> $DIR"
   local DRYARG=(); [ "$DRY" = 1 ] && DRYARG=(--dry-run)
-  (cd "$LR" && bash my_scripts/resume_training.sh "$BASE/checkpoints/last/pretrained_model" "$@" --steps="$STEPS" \
+  (cd "$LR" && bash "$PCDAGGER_ROOT/scripts/"resume_training.sh "$BASE/checkpoints/last/pretrained_model" "$@" --steps="$STEPS" \
      --output_dir="$DIR" --job_name="$JOB" --policy.repo_id="$JOB" --policy.push_to_hub=false "${DRYARG[@]}") > "$DIR.log" 2>&1
   local RC=$?; [ "$DRY" = 1 ] && { grep -A1 '^Command:' "$DIR.log" | tail -1; return $RC; }
   [ -d "$DIR/checkpoints/$CK/pretrained_model" ] || { log "$JOB FAILED (rc=$RC, no checkpoint $CK) — see $DIR.log"; return 1; }

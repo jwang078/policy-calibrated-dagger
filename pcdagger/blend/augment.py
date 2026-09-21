@@ -18,7 +18,7 @@ copy the same env / policy / guidance flags across both scripts.
 
 Example (single episode, mirrors the visualize command):
 
-    python my_scripts/augment_dataset_with_blending.py \\
+    python scripts/augment_dataset_with_blending.py \\
         --policy_path=outputs/training/.../checkpoints/006000/pretrained_model \\
         --dataset_repo_id=JennyWWW/splatsim_..._rrt_pi05 \\
         --target_dataset_repo_id=JennyWWW/splatsim_..._rrt_pi05_blended \\
@@ -29,7 +29,7 @@ Example (single episode, mirrors the visualize command):
 
 Example (bulk — all episodes 0–49):
 
-    python my_scripts/augment_dataset_with_blending.py \\
+    python scripts/augment_dataset_with_blending.py \\
         --policy_path=... --dataset_repo_id=... --target_dataset_repo_id=... \\
         --forward_flow_ratios='[0.0, 0.5, 1.0]' \\
         --episode_range='[0, 50]' \\
@@ -78,29 +78,17 @@ import pandas as pd  # noqa: E402
 import torch  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
-# Sibling-script imports. visualize_shared_autonomy_sim.py owns the env /
-# batch / seeding helpers we reuse.
-_HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
-
-# Sibling-module imports. These previously came from
-# ``my_scripts.visualize_shared_autonomy_DEPRECATED`` (which only resolved by
-# accident as a side effect of the sim visualizer's sys.path manipulation);
-# they've been split into topic-focused library modules so this script doesn't
-# depend on a deprecated file. Bare module names (no ``my_scripts.`` prefix)
-# so they resolve when this script is invoked via
-# ``python my_scripts/augment_dataset_with_blending.py``.
-from lib_dataset_episode_io import (  # type: ignore[import-not-found]  # noqa: E402
+# Library modules of the package (they used to be sibling files under my_scripts/).
+from pcdagger.datasets.episode_io import (  # type: ignore[import-not-found]  # noqa: E402
     find_parquet_files,
     load_episode_frames,
     load_task_description,
 )
-from lib_sa_policy_loading import (  # type: ignore[import-not-found]  # noqa: E402
+from pcdagger.blend.policy_loading import (  # type: ignore[import-not-found]  # noqa: E402
     apply_clip_sample_override,
     load_wrapped_policy,
 )
-from lib_sa_rollout import (  # type: ignore[import-not-found]  # noqa: E402,F401
+from pcdagger.blend.rollout import (  # type: ignore[import-not-found]  # noqa: E402,F401
     WorldMismatchError,
     check_sim_strict_goal_tolerances,
     progress_guidance_index,  # re-export kept for external importers
@@ -114,15 +102,15 @@ from lerobot.envs.factory import (  # noqa: E402
     make_env_config,
     make_env_pre_post_processors,
 )
-from lerobot.policies.shared_autonomy_wrapper import (  # noqa: E402
+from pcdagger.blend.wrapper import (  # noqa: E402
     BlendMode,
     GuidanceBlendStrategy,
     PolicyGuidanceRepresentation,
 )
 from lerobot.utils.import_utils import register_third_party_plugins  # noqa: E402
-from lerobot.utils.lerobot_dataset_utils import make_default_rename_map, resolve_dataset_dir  # noqa: E402
+from pcdagger.datasets.dataset_dirs import make_default_rename_map, resolve_dataset_dir  # noqa: E402
 from lerobot.utils.random_utils import set_seed  # noqa: E402
-from lerobot.utils.sim_seeding import set_env_benchmark_indices  # noqa: E402
+from lerobot_env_splatsim.seeding import set_env_benchmark_indices  # noqa: E402
 from lerobot.utils.utils import init_logging  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -940,7 +928,7 @@ def _annotate_frames_with_demo_index(
     ``n_obs_steps``), so every consumer can build geometry from the source
     episode as-loaded, with no tail-offset bookkeeping.
     """
-    from dart_labels import demo_geometry, project_states
+    from pcdagger.dart.relabel import demo_geometry, project_states
 
     geom = demo_geometry(demo_states_raw, demo_actions_raw, n_arm=n_arm)
     states = np.stack([np.asarray(fr["observation.state"], dtype=np.float64) for fr in frames])
@@ -1795,7 +1783,7 @@ def run_augmentation(
                             # the demo's final 10% on src47 r0.1. Cut where
                             # the projected demo index first comes within
                             # 2.0 idx of its final value (+10 settle ticks).
-                            from dart_labels import demo_geometry as _dg, project_states as _ps
+                            from pcdagger.dart.relabel import demo_geometry as _dg, project_states as _ps
 
                             _idxs = _ps(
                                 _states,
@@ -1903,7 +1891,7 @@ def run_augmentation(
                     #   * progress plateau: first tick within 2 demo indices
                     #     of the final projected index (+10 settle ticks).
                     # Offline validation: frozen fraction 11/27/15% -> 5/7/6%.
-                    from dart_labels import demo_geometry as _dgeom, project_states as _pstates
+                    from pcdagger.dart.relabel import demo_geometry as _dgeom, project_states as _pstates
 
                     _sd = np.stack(
                         [

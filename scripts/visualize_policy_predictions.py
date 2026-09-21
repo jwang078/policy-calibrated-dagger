@@ -48,7 +48,7 @@ from lerobot.policies.factory import _reconnect_relative_absolute_steps, get_pol
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
-from lerobot.utils.lerobot_dataset_utils import resolve_dataset_dir
+from pcdagger.datasets.dataset_dirs import resolve_dataset_dir
 
 JOINT_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"]
 

@@ -7,7 +7,7 @@
 # merged (via merge_augmented_datasets_for_training.py) without disk duplication.
 #
 # Usage:
-#   ./my_scripts/augment_ratios_sweep.sh [OPTIONS]
+#   ./$PCDAGGER_ROOT/scripts/augment_ratios_sweep.sh [OPTIONS]
 #
 # All options have defaults (see USER CONFIG below).  Pass --flag=value to
 # override any of them without editing the file.
@@ -34,14 +34,14 @@
 #   --push                  Push output datasets to HuggingFace Hub
 #
 # Example (DAgger no-op merge):
-#   bash my_scripts/augment_ratios_sweep.sh \
+#   bash $PCDAGGER_ROOT/scripts/augment_ratios_sweep.sh \
 #       --dataset_short=approach_lever_7_lowres_5path_dag1 \
 #       --ratios="0.0"
 #   →  creates JennyWWW/splatsim_approach_lever_7_lowres_5path_dag1_pirel00 as
 #      a hardlink alias of the source dataset, no SplatSim required.
 #
 # Example (full blending sweep):
-#   bash my_scripts/augment_ratios_sweep.sh \
+#   bash $PCDAGGER_ROOT/scripts/augment_ratios_sweep.sh \
 #       --dataset_short=approach_lever_11_50failsrrtpi05 \
 #       --policy_path=outputs/training/pi05_.../checkpoints/006000/pretrained_model \
 #       --ratios="0.2 0.4 0.6 0.8 1.0" \
@@ -52,6 +52,7 @@
 #   ratio=0.0 (no-op):  JennyWWW/${SOURCE_SHORT}_${MODEL}${ACTION_FORMAT}00
 #   ratio>0:            JennyWWW/${SOURCE_SHORT}_${MODEL}${ACTION_FORMAT}${BLEND_TAG}${NN}
 #                       where BLEND_TAG is "den" (denoise) or "lerp" (interpolate)
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../pcdagger/paths.sh"   # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR
 
 set -euo pipefail
 
@@ -180,7 +181,7 @@ for RATIO in "${RATIOS[@]}"; do
     PUSH_FLAG=""
     [[ "$PUSH_TO_HUB" == true ]] && PUSH_FLAG="--push_to_hub"
 
-    run python my_scripts/augment_dataset_with_blending.py \
+    run python $PCDAGGER_ROOT/scripts/augment_dataset_with_blending.py \
         --policy_path="${POLICY_PATH}" \
         --dataset_repo_id="${SOURCE_DATASET}" \
         --target_dataset_repo_id="${TARGET_DATASET}" \

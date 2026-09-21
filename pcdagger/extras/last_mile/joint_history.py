@@ -14,7 +14,7 @@ Used immediately by ``StallDetector`` (the "no-progress over N steps" trigger).
 Also a future migration target for:
 * ``SharedAutonomyPolicyWrapper._actual_q_history`` (deque) — pre-jump
   lookback for RRT q_start.
-* ``InterventionController``'s stall trigger in lerobot.scripts.intervention_controller.
+* ``InterventionController``'s stall trigger in pcdagger.dagger.intervention.
 
 Both of those currently work fine; the migration is a separate refactor
 (not in this commit).

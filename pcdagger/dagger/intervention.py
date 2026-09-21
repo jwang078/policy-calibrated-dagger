@@ -50,12 +50,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from lerobot.configs.intervention import InterventionConfig
-from lerobot.policies.last_mile.detectors import EEDistanceProgressTracker
-from lerobot.policies.rrt_to_goal import RRTMode
+from pcdagger.extras.last_mile.detectors import EEDistanceProgressTracker
+from pcdagger.blend.guidance.rrt_to_goal import RRTMode
 
 if TYPE_CHECKING:
-    from lerobot.policies.shared_autonomy_wrapper import SharedAutonomyPolicyWrapper
-    from lerobot.policies.teleop_recording import TeleopRecordingContext
+    from pcdagger.blend.wrapper import SharedAutonomyPolicyWrapper
+    from lerobot_env_splatsim.recording import TeleopRecordingContext
 
 logger = logging.getLogger(__name__)
 
@@ -458,7 +458,7 @@ class InterventionController:
             effective_reason in {"time stall", "no_progress", "no_progress_ori", "drift_stall", "joint_stall"}
             and not use_no_lookback
         ):
-            from lerobot.policies.teleop_recording import TeleopRecordingContext
+            from lerobot_env_splatsim.recording import TeleopRecordingContext
 
             n_obs_steps = int(getattr(self.wrapper.inner_policy.config, "n_obs_steps", 1))
             TeleopRecordingContext.get_instance().rrt_extra_leading_trim = max(0, n_obs_steps - 1)

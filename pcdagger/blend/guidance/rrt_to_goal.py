@@ -32,7 +32,7 @@ comparisons valid across the repo boundary.
 
 from __future__ import annotations
 
-from lerobot.policies.guidance.base import GuidanceMode
+from pcdagger.blend.guidance.base import GuidanceMode
 
 RRTMode = GuidanceMode
 

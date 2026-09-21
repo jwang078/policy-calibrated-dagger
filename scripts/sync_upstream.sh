@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Rebase this fork onto upstream/main, with the guardrails learned the hard way.
 #
-#   ./my_scripts/sync_upstream.sh            # rebase main onto upstream/main
-#   ./my_scripts/sync_upstream.sh --check    # report divergence only, change nothing
+#   ./$PCDAGGER_ROOT/scripts/sync_upstream.sh            # rebase main onto upstream/main
+#   ./$PCDAGGER_ROOT/scripts/sync_upstream.sh --check    # report divergence only, change nothing
 #
 # WHY THIS EXISTS
 #   A plain `git pull --rebase upstream main` replays EVERY fork commit. With ~80
@@ -22,6 +22,7 @@
 #   * TrainPipelineConfig field renames are absorbed by
 #     `_migrate_legacy_renamed_fields` in src/lerobot/configs/train.py — add an entry
 #     there instead of hand-editing saved train_config.json files.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../pcdagger/paths.sh"   # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -83,7 +84,7 @@ cat <<'MSG'
 
 == VERIFY (auto-merged files can still be broken) ==
 MSG
-git grep -n '^<<<<<<< \|^>>>>>>> ' -- 'src/**' 'my_scripts/**' && { echo "  conflict markers left!"; exit 1; } || echo "  no conflict markers"
+git grep -n '^<<<<<<< \|^>>>>>>> ' -- 'src/**' '$PCDAGGER_ROOT/scripts/**' && { echo "  conflict markers left!"; exit 1; } || echo "  no conflict markers"
 python -c "
 import lerobot, lerobot.scripts.lerobot_train, lerobot.scripts.lerobot_eval
 import lerobot.datasets.factory, lerobot.policies.factory, lerobot.envs.factory

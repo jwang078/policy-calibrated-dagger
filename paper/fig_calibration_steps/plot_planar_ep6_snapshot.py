@@ -58,7 +58,7 @@ SCHED_JSON = (
 sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "src"))
 import matplotlib  # noqa: E402
 
-from lerobot.datasets.dart_relabel import chunk_labels, demo_geometry  # noqa: E402
+from pcdagger.dart.relabel import chunk_labels, demo_geometry  # noqa: E402
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -78,8 +78,7 @@ T = np.arange(len(expert))
 
 # blend episode index: source episodes were collected every-2nd -> ep//2
 BLEND_EP = EPISODE // 2
-sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "my_scripts"))
-from lib_sa_rollout import progress_guidance_index  # noqa: E402
+from pcdagger.blend.rollout import progress_guidance_index  # noqa: E402
 
 _D3 = St[:, :3]
 _dm = np.linalg.norm(np.diff(_D3, axis=0), axis=1)

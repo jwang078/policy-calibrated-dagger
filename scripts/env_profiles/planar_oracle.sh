@@ -23,8 +23,8 @@ NUM_DOFS=3                # action = 4, state = 4 (joints + gripper)
 ENV_STATE_DIM=8          # 3 objects × (x,z) + gripper EE (x,z). The 3 per-link
                          # min-obstacle-distance dims were retired 2026-07-30.
                          # Retrofit paths for older recordings:
-                         #   6  → 8:  my_scripts/append_ee_to_env_state.py
-                         #   11 → 8:  my_scripts/strip_link_obstacle_dists_from_env_state.py
+                         #   6  → 8:  $PCDAGGER_ROOT/scripts/append_ee_to_env_state.py
+                         #   11 → 8:  $PCDAGGER_ROOT/scripts/strip_link_obstacle_dists_from_env_state.py
 CAMERAS="state"          # state-only: no image features
 DATASET_REPO="JennyWWW/planar_3joint_oracle"
 EVAL_BENCHMARK_REPO_ID="JennyWWW/planar_3joint_oracle"

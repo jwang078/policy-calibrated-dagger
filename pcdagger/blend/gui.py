@@ -6,7 +6,7 @@ import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from lerobot.policies.shared_autonomy_wrapper import SharedAutonomyPolicyWrapper
+    from pcdagger.blend.wrapper import SharedAutonomyPolicyWrapper
 
 
 def launch_ratio_slider(wrapper: SharedAutonomyPolicyWrapper) -> None:
@@ -146,7 +146,7 @@ def launch_ratio_slider(wrapper: SharedAutonomyPolicyWrapper) -> None:
 
         # --- RRT to Goal toggle ---
         # Single button: first click plans + executes; click again while busy cancels.
-        from lerobot.policies.rrt_to_goal import RRTMode
+        from pcdagger.blend.guidance.rrt_to_goal import RRTMode
 
         rrt_btn = tk.Button(
             root,
@@ -175,7 +175,7 @@ def launch_ratio_slider(wrapper: SharedAutonomyPolicyWrapper) -> None:
         _poll_rrt()
 
         # --- Teleop recording status ---
-        from lerobot.policies.teleop_recording import TeleopRecordingContext
+        from lerobot_env_splatsim.recording import TeleopRecordingContext
 
         ctx = TeleopRecordingContext.get_instance()
 

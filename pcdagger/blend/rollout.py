@@ -32,9 +32,9 @@ import numpy as np
 import torch
 
 from lerobot.envs.utils import preprocess_observation
-from lerobot.policies.shared_autonomy_wrapper import BlendMode
+from pcdagger.blend.wrapper import BlendMode
 from lerobot.utils.constants import ACTION
-from lerobot.utils.sim_seeding import seed_splatsim_env_to_state
+from lerobot_env_splatsim.seeding import seed_splatsim_env_to_state
 
 # ── collision flag extraction ─────────────────────────────────────────────────
 
@@ -582,7 +582,7 @@ def run_blended_rollout(
     if guidance_from_dart_labels:
         if not progress_guidance:
             raise ValueError("guidance_from_dart_labels requires progress_guidance=True")
-        from dart_labels import (
+        from pcdagger.dart.relabel import (
             _interp_rows as _dart_interp_rows,
             chunk_labels as _dart_chunk_labels,
             demo_geometry as _dart_demo_geometry,

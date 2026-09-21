@@ -81,7 +81,7 @@ from dagger_detect_dataset_anomalies import (  # noqa: E402
     load_action_delta_stats,
     scan_dataset,
 )
-from dagger_naming import parse_dataset_short  # noqa: E402
+from pcdagger.dagger.naming import parse_dataset_short  # noqa: E402
 from dagger_plot import scan_round  # noqa: E402
 
 CACHE = Path.home() / ".cache" / "huggingface" / "lerobot"

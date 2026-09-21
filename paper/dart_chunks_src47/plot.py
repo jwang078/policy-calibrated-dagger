@@ -10,7 +10,7 @@ Regenerate:  python plot.py            (writes PNG next to this script)
 
 All titles / axis labels / legends are in the TEXT block below — tune freely.
 The label-chunk synthesis (demo clock + rate-limited offset closure with C1
-ease-out merge) is inlined verbatim from lerobot.datasets.dart_relabel so
+ease-out merge) is inlined verbatim from pcdagger.dart.relabel so
 this file has no repo dependencies.
 """
 

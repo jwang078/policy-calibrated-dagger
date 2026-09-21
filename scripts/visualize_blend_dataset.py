@@ -32,7 +32,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dart_labels import demo_geometry  # noqa: E402
+from pcdagger.dart.relabel import demo_geometry  # noqa: E402
 
 
 def _root(repo_id: str) -> str:

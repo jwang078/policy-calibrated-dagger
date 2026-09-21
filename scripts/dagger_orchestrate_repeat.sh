@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../pcdagger/paths.sh"   # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR
 
 # Repeat wrapper around dagger_orchestrate_sweep.sh: run the SAME sweep N
 # times with identical hyperparameters, so per-round success rate can be
 # reported as mean ± std across repetitions. Plot the result with
-#   python my_scripts/dagger_plot_repeats.py --rep_tag=<TAG> --model=<MODEL>
+#   python $PCDAGGER_ROOT/scripts/dagger_plot_repeats.py --rep_tag=<TAG> --model=<MODEL>
 #
 # Usage:
-#   bash my_scripts/dagger_orchestrate_repeat.sh --repeats=10 <every sweep flag>
+#   bash $PCDAGGER_ROOT/scripts/dagger_orchestrate_repeat.sh --repeats=10 <every sweep flag>
 #
 # Flags consumed HERE (everything else forwards verbatim to the sweep):
 #   --repeats=N                  Number of repetitions (required, >= 1).
@@ -195,7 +196,7 @@ print(json.dumps([f"--repeats={sys.argv[1]}"] + sys.argv[2:]))
 PY
 )
 export DAGGER_REPEAT_INVOCATION_ARGV_JSON
-export DAGGER_REPEAT_INVOCATION_WRAPPER="my_scripts/dagger_orchestrate_repeat.sh"
+export DAGGER_REPEAT_INVOCATION_WRAPPER="$PCDAGGER_ROOT/scripts/dagger_orchestrate_repeat.sh"
 
 echo "Repeat study: tag '$BASE_TAG', repetitions $REPEAT_FROM..$REPEATS (rep 1 = bare tag, rep k = '${BASE_TAG}<k>')"
 echo "  Per-rep seed variation: $REPEAT_VARY_SEEDS"
@@ -240,7 +241,7 @@ fi
 echo "════════════════════════════════════════════════════════════════════════════════"
 echo "Repeat study complete: $n_succ succeeded, $n_fail failed (total: $(( $(date +%s) - study_start ))s)."
 echo "Plot mean ± std across reps with:"
-echo "  python my_scripts/dagger_plot_repeats.py --rep_tag=$BASE_TAG"
+echo "  python $PCDAGGER_ROOT/scripts/dagger_plot_repeats.py --rep_tag=$BASE_TAG"
 if (( n_fail > 0 )); then
     echo "Failures at reps: ${failures[*]}"
     exit 1

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../pcdagger/paths.sh"   # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR
 
 # Clean up a DAgger lineage's artifacts (training dirs, datasets, alias
 # datasets, merged datasets, stats sidecars, blend datasets) given any one
@@ -24,7 +25,7 @@
 #                about (e.g. --finetune_steps).
 #
 # Usage:
-#   bash my_scripts/dagger_cleanup_lineage.sh <training_dir_path> \
+#   bash $PCDAGGER_ROOT/scripts/dagger_cleanup_lineage.sh <training_dir_path> \
 #       [--dry-run] [-y|--yes] [--detect_siblings] \
 #       [--delete_episodes='[N1,N2,...]'] [--skip_dataset_edit]
 #
@@ -217,11 +218,11 @@
 #               that single confirm.
 #
 # Examples:
-#   bash my_scripts/dagger_cleanup_lineage.sh \
+#   bash $PCDAGGER_ROOT/scripts/dagger_cleanup_lineage.sh \
 #       outputs/training/diffusion_..._rerun_v1_b090_ft_dag4
 #
 #   # Wipe an entire K=1 sweep family in one go:
-#   bash my_scripts/dagger_cleanup_lineage.sh \
+#   bash $PCDAGGER_ROOT/scripts/dagger_cleanup_lineage.sh \
 #       outputs/training/diffusion_..._rerun_v1_b010_ft_dag1 \
 #       --detect_siblings
 
@@ -370,7 +371,7 @@ print(json.dumps(clean))
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LEROBOT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+: "${LEROBOT_ROOT:?LEROBOT_ROOT is set by pcdagger/paths.sh (the lerobot checkout; this script no longer lives inside it)}"
 # shellcheck source=lib_dagger_lineage.sh
 source "$SCRIPT_DIR/lib_dagger_lineage.sh"
 
@@ -1556,7 +1557,7 @@ print((cf.get('action_format') or 'rel').lower())
         echo "    1. lerobot-edit-dataset --repo_id $INT_REPO_ID \\"
         echo "         --operation.type delete_episodes \\"
         echo "         --operation.episode_indices '$DELETE_EPISODES'"
-        echo "    2. bash my_scripts/compute_relative_stats.sh --dataset_repo=$INT_REPO_ID"
+        echo "    2. bash $PCDAGGER_ROOT/scripts/compute_relative_stats.sh --dataset_repo=$INT_REPO_ID"
     fi
     n_train="${#NUKE_TRAIN_DIRS[@]}"
     n_blends="${#NUKE_BLENDS[@]}"
@@ -1616,7 +1617,7 @@ print((cf.get('action_format') or 'rel').lower())
     echo "[delete_episodes] Deleted $total_rm downstream item(s)."
     echo
     echo "[delete_episodes] DONE. Next steps:"
-    echo "  1. Verify with: python3 my_scripts/dagger_detect_dataset_anomalies.py \\"
+    echo "  1. Verify with: python3 $PCDAGGER_ROOT/scripts/dagger_detect_dataset_anomalies.py \\"
     echo "       --dataset_root $INT_DATASET_PATH --no_expand_to_lineage"
     echo "  2. Re-run the orchestrator (or sweep wrapper) with --resume to retrain"
     echo "     rounds ${TARGET_ROUND}..${NUM_ROUNDS} against the cleaned dataset."

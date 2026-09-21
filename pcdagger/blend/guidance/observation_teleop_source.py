@@ -49,7 +49,7 @@ from scipy.spatial.transform import Rotation
 from torch import Tensor
 
 from lerobot.policies.common.chunk_anchor import ChunkAnchor
-from lerobot.policies.guidance.base import (
+from pcdagger.blend.guidance.base import (
     GuidanceCallCtx,
     GuidanceMode,
     GuidanceSourceState,
@@ -58,7 +58,7 @@ from lerobot.policies.guidance.base import (
 )
 
 if TYPE_CHECKING:
-    from lerobot.policies.shared_autonomy_wrapper import SharedAutonomyPolicyWrapper
+    from pcdagger.blend.wrapper import SharedAutonomyPolicyWrapper
 
 logger = logging.getLogger(__name__)
 
@@ -195,7 +195,7 @@ class ObservationTeleopGuidanceSource:
           (c) drain path: existing blended chunk + (no guidance OR ONCE_PER_CHUNK)
           (d) (re)build the blended chunk and emit the first step
         """
-        from lerobot.policies.shared_autonomy_wrapper import (
+        from pcdagger.blend.wrapper import (
             BlendMode,
             FrameSource,
             PolicyGuidanceRepresentation,
@@ -305,7 +305,7 @@ class ObservationTeleopGuidanceSource:
         validates about indexing/anchoring/inputs is guaranteed to hold for
         the black-box denoise path too.
         """
-        from lerobot.policies.shared_autonomy_wrapper import (
+        from pcdagger.blend.wrapper import (
             BlendMode,
             FrameSource,
             GuidanceBlendStrategy,

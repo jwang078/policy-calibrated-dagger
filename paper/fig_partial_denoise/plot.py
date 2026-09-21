@@ -41,7 +41,7 @@ LR = os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot"))
 sys.path.insert(0, f"{LR}/src")
 sys.path.insert(0, f"{LR}/my_scripts")
 os.chdir(LR)
-import dart_sim_video as dsv
+from pcdagger.viz import dart_sim_video as dsv
 import matplotlib
 import pybullet as pb
 from safetensors.torch import load_file

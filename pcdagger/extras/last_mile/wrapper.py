@@ -40,13 +40,13 @@ from torch import Tensor, nn
 
 from lerobot.configs.last_mile import LastMileConfig
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.policies.last_mile.detectors import (
+from pcdagger.extras.last_mile.detectors import (
     Detector,
     DetectorState,
     DetectorVerdict,
     build_detector,
 )
-from lerobot.policies.last_mile.helpers import Helper, HelperOutput, build_helper
+from pcdagger.extras.last_mile.helpers import Helper, HelperOutput, build_helper
 from lerobot.policies.pretrained import PreTrainedPolicy
 
 logger = logging.getLogger(__name__)

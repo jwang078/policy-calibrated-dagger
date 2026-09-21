@@ -18,13 +18,13 @@ from lerobot.policies.factory import (
     _wrap_with_shared_autonomy,
     get_policy_class,
 )
-from lerobot.policies.shared_autonomy_wrapper import (
+from pcdagger.blend.wrapper import (
     GuidanceBlendStrategy,
     PolicyGuidanceRepresentation,
 )
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import POLICY_PREPROCESSOR_DEFAULT_NAME
-from lerobot.utils.lerobot_dataset_utils import resolve_dataset_dir
+from pcdagger.datasets.dataset_dirs import resolve_dataset_dir
 
 
 def load_wrapped_policy(

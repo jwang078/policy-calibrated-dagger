@@ -35,7 +35,7 @@ import matplotlib.pyplot as plt
 # they're now shared with the orchestrator + viz scripts via dagger_naming.py
 # so forward / inverse mappings can't drift.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dagger_naming import (  # noqa: E402
+from pcdagger.dagger.naming import (  # noqa: E402
     ROUND_SUFFIX_RE,
     base_lineage_of,
     lineage_of,

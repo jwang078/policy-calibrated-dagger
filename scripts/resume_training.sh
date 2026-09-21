@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../pcdagger/paths.sh"   # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR
 set -euo pipefail
 # resume_training.sh
 #
@@ -7,7 +8,7 @@ set -euo pipefail
 # checkpoint's train_config.json so you only specify what you want to OVERRIDE.
 #
 # Usage:
-#   bash my_scripts/resume_training.sh <checkpoint_path> [OPTIONS]
+#   bash $PCDAGGER_ROOT/scripts/resume_training.sh <checkpoint_path> [OPTIONS]
 #
 # checkpoint_path is auto-resolved from any of:
 #   - A train_config.json file directly
@@ -69,15 +70,15 @@ set -euo pipefail
 #   --dry-run                  Print the command without executing.
 #
 # Example (basic, extend an existing run):
-#   bash my_scripts/resume_training.sh \
+#   bash $PCDAGGER_ROOT/scripts/resume_training.sh \
 #       outputs/training/pi05_approach_lever_11_biasend_5path_grip0_abs_basewrist \
 #       --steps=50000 --eval_freq=2000 --save_freq=2000
 #
 # Example (finetune on a new merged DAgger dataset into a NEW _ft training dir):
-#   bash my_scripts/resume_training.sh \
+#   bash $PCDAGGER_ROOT/scripts/resume_training.sh \
 #       outputs/training/pi05_xyz \
 #       --dataset.repo_id=JennyWWW/splatsim_xyz_dag1_merged \
-#       --dataset.stats_path=~/code/lerobot/outputs/dataset_stats/xyz_dag1_merged/stats_rel50.json \
+#       --dataset.stats_path=$LEROBOT_ROOT/outputs/dataset_stats/xyz_dag1_merged/stats_rel50.json \
 #       --policy.repo_id=pi05_xyz_dag1_merged_ft_delta_basewrist \
 #       --output_dir=outputs/training/pi05_xyz_dag1_merged_ft_delta_basewrist \
 #       --job_name=pi05_xyz_dag1_merged_ft_delta_basewrist \

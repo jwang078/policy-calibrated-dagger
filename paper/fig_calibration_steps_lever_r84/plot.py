@@ -74,9 +74,8 @@ OUT = os.environ.get("OUT", os.path.join(HERE, "fig_calibration_steps_lever_r84.
 SRC_REPO = "lever_d100_03dagcap_r84_diff_r_dag1"
 NARM = 6
 sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "src"))
-sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "my_scripts"))
-from lerobot.datasets.dart_relabel import demo_geometry, chunk_labels  # noqa
-from lib_sa_rollout import progress_guidance_index  # noqa
+from pcdagger.dart.relabel import demo_geometry, chunk_labels  # noqa
+from pcdagger.blend.rollout import progress_guidance_index  # noqa
 import matplotlib
 
 matplotlib.use("Agg")

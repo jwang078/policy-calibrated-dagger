@@ -39,9 +39,9 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from dart_labels import chunk_labels, demo_geometry  # noqa: E402
-from lib_sa_policy_loading import apply_clip_sample_override, load_wrapped_policy  # noqa: E402
-from lib_sa_rollout import _build_sim_batch  # noqa: E402
+from pcdagger.dart.relabel import chunk_labels, demo_geometry  # noqa: E402
+from pcdagger.blend.policy_loading import apply_clip_sample_override, load_wrapped_policy  # noqa: E402
+from pcdagger.blend.rollout import _build_sim_batch  # noqa: E402
 
 
 def _load_episodes(repo_id: str) -> dict[int, dict]:
@@ -203,7 +203,7 @@ def main() -> None:
         device=args.device,
     )
     apply_clip_sample_override(wrapper, False)
-    from lerobot.policies.shared_autonomy_wrapper import BlendMode, GuidanceBlendStrategy
+    from pcdagger.blend.wrapper import BlendMode, GuidanceBlendStrategy
 
     wrapper.guidance_blend_strategy = GuidanceBlendStrategy.DENOISE
     wrapper.blend_mode = BlendMode.EVERY_STEP

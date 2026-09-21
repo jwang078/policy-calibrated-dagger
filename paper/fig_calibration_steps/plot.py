@@ -111,9 +111,8 @@ else:
     SCALE_JSON = os.path.join(HERE, "dart_scale_s1_K3.json")
 IU = [(i, j) for i in range(NARM) for j in range(i, NARM)]
 sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "src"))
-sys.path.insert(0, os.path.join(os.environ.get("LEROBOT_ROOT", os.path.expanduser("~/code/lerobot")), "my_scripts"))
-from lerobot.datasets.dart_relabel import demo_geometry, chunk_labels  # noqa
-from lib_sa_rollout import progress_guidance_index  # noqa
+from pcdagger.dart.relabel import demo_geometry, chunk_labels  # noqa
+from pcdagger.blend.rollout import progress_guidance_index  # noqa
 import matplotlib
 
 matplotlib.use("Agg")

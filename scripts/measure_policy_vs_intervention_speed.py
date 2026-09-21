@@ -56,8 +56,8 @@ for p in (str(_HERE), str(_REPO_ROOT)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from dagger_naming import _argv_get_flag, parse_dataset_short  # type: ignore[import-not-found]  # noqa: E402
-from lib_dataset_episode_io import (  # type: ignore[import-not-found]  # noqa: E402
+from pcdagger.dagger.naming import _argv_get_flag, parse_dataset_short  # type: ignore[import-not-found]  # noqa: E402
+from pcdagger.datasets.episode_io import (  # type: ignore[import-not-found]  # noqa: E402
     find_parquet_files,
     load_episodes_meta,
 )
@@ -66,7 +66,7 @@ from visualize_intervention_episode import (  # type: ignore[import-not-found]  
     _resolve_interventions_dir,
 )
 
-from lerobot.utils.lerobot_dataset_utils import resolve_dataset_dir  # noqa: E402
+from pcdagger.datasets.dataset_dirs import resolve_dataset_dir  # noqa: E402
 
 # Hybrid-mode no-lookback trigger reasons — keep in sync with
 # InterventionController._collision_trigger_reasons.

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../pcdagger/paths.sh"   # LEROBOT_ROOT, SPLATSIM_ROOT, PCDAGGER_ROOT, PCDAGGER_OUTPUTS, LEROBOT_CACHE_DIR
 
 # Summarize DAgger progress: scans `outputs/training/${MODEL_PREFIX}_*[_ft]_dag*/`
 # and prints, FOR EACH discovered DAgger lineage, a one-row-per-round table
@@ -12,7 +13,7 @@
 # (`..._dag{N}`) round dirs from the same lineage are folded into one table.
 #
 # Usage:
-#   bash my_scripts/dagger_progress.sh [OPTIONS]
+#   bash $PCDAGGER_ROOT/scripts/dagger_progress.sh [OPTIONS]
 #
 # Options:
 #   --base_short=STR    Lineage filter: restrict to a single lineage built from
@@ -731,7 +732,7 @@ print_table() {
         echo "DAgger progress for: ${MODEL_PREFIX}_${lineage}{,[_ft]_dag*}"
     fi
     # Surface the plot path (whether it currently exists or not, so users can
-    # ctrl-click as soon as `python my_scripts/dagger_plot.py` is run).
+    # ctrl-click as soon as `python $PCDAGGER_ROOT/scripts/dagger_plot.py` is run).
     # (skipped for base-only lineages — dagger_plot.py has nothing to plot
     # from a single round-0 point.)
     local plot_path="${HOME}/code/lerobot/outputs/dagger/dagger_progress_${MODEL_PREFIX}_${lineage}.png"
@@ -739,7 +740,7 @@ print_table() {
         if [[ -f "$plot_path" ]]; then
             echo "Plot: $plot_path"
         else
-            echo "Plot: $plot_path  (not generated yet — run: python my_scripts/dagger_plot.py)"
+            echo "Plot: $plot_path  (not generated yet — run: python $PCDAGGER_ROOT/scripts/dagger_plot.py)"
         fi
     fi
     # Read once per lineage; print_row picks it up via dynamic scope.

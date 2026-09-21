@@ -233,7 +233,7 @@ for t in range(0, len(D), BAND_EVERY):
     mu = pts.mean(0)
     cov = np.cov(pts.T)
     band.append({"t": t, "mu": mu.tolist(), "cov": cov.tolist()})
-from lerobot.datasets.dart_relabel import chunk_labels, demo_geometry
+from pcdagger.dart.relabel import chunk_labels, demo_geometry
 
 geom = demo_geometry(St, Ac, 6)
 rr = np.random.default_rng(ARC_SEED)

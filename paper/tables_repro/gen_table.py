@@ -30,7 +30,10 @@ DIRS = {
     "s4": "scarcity_study_s4",
     "s5": "scarcity_study_s5",
 }
-T = "/home/jennyw2/code/lerobot/outputs/training"
+# OUTPUTS_ROOT lets the generator run against an archive copy (archive_tables.sh); default = this machine
+_R = os.environ.get("OUTPUTS_ROOT", "/home/jennyw2/code/lerobot/outputs")
+T = f"{_R}/training"
+E = f"{_R}/eval300"
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "table_full_benchmark.tex")
 
 C_LO = (0xF0, 0xF3, 0xF5)  # off-white      = lowest mean in the column
@@ -53,8 +56,11 @@ def outc(p):
     return np.array([float(x) for x in m.group(1).split(",")])
 
 
+FALLBACKS = []  # cells served by the 100-episode inline eval instead of a 300-episode eval300 run
+
+
 def vec(sd, arm):
-    p = f"/home/jennyw2/code/lerobot/outputs/eval300/{DIRS[sd]}/{arm}/eval_info.json"
+    p = f"{E}/{DIRS[sd]}/{arm}/eval_info.json"
     try:
         s = np.array(json.load(open(p))["per_task"][0]["metrics"]["successes"], dtype=float)
         if len(s) == 300:
@@ -63,6 +69,8 @@ def vec(sd, arm):
         pass
     try:
         v = outc(f"{T}/{DIRS[sd]}/{arm}.log")
+        if len(v) == 100:
+            FALLBACKS.append(f"{DIRS[sd]}/{arm}")
         return v if len(v) == 100 else None
     except Exception:
         return None
@@ -86,7 +94,7 @@ def cl_cell(K):
     """Closed-loop pooled arm (single lineage): mean and SE over 300-ep evals with seeds 0,1,2."""
     vals = []
     for suf in ["", "_e1", "_e2"]:
-        p = f"/home/jennyw2/code/lerobot/outputs/eval300/scarcity_study_cl/q{K}_dnpoolcl{suf}/eval_info.json"
+        p = f"{E}/scarcity_study_cl/q{K}_dnpoolcl{suf}/eval_info.json"
         try:
             s = np.array(json.load(open(p))["per_task"][0]["metrics"]["successes"], dtype=float)
             if len(s) == 300:
@@ -108,7 +116,7 @@ def bc_value():
         try:
             s = np.array(
                 json.load(
-                    open(f"/home/jennyw2/code/lerobot/outputs/eval300/base/bc175k{suf}/eval_info.json")
+                    open(f"{E}/base/bc175k{suf}/eval_info.json")
                 )["per_task"][0]["metrics"]["successes"],
                 dtype=float,
             )
@@ -204,5 +212,7 @@ lines += [
 ]
 open(OUT, "w").write("\n".join(lines) + "\n")
 print(f"wrote {OUT}  (BC {bc:.1f} over {bc_n} eval seeds)")
+if FALLBACKS:
+    print(f"WARNING: {len(FALLBACKS)} cell(s) used the 100-episode inline eval, no 300-episode run found: {FALLBACKS}")
 for K in range(1, NK + 1):
     print(f"  K{K}: color range [{ranges[K][0]:.1f}, {ranges[K][1]:.1f}]")

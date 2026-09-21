@@ -9,7 +9,8 @@ import re
 
 import numpy as np
 
-E = "/home/jennyw2/code/lerobot/outputs/eval300/lever_cam"
+_R = os.environ.get("OUTPUTS_ROOT", "/home/jennyw2/code/lerobot/outputs")  # archive_tables.sh points this at the archive
+E = f"{_R}/eval300/lever_cam"
 
 
 def succ(d):
@@ -21,7 +22,7 @@ def succ(d):
 
 # ---- collect: name -> (round, arm, train_seed, eval_seed, succ)
 cells = {}  # (K, arm) -> {train_seed: [succ per eval seed]}
-inline_hg1 = "/home/jennyw2/code/lerobot/outputs/training/diffusion_approach_lever_13_smooth_r84_delta_basewrist_d100_03dagcap_r84_ft_dag1/eval/eval_info_step_095000.json"
+inline_hg1 = f"{_R}/training/diffusion_approach_lever_13_smooth_r84_delta_basewrist_d100_03dagcap_r84_ft_dag1/eval/eval_info_step_095000.json"
 for d in sorted(glob.glob(f"{E}/r84_*_20k*")):
     m = re.match(r"r84_(hg|cal)(\d)_20k(?:_s(\d))?(?:_e(\d))?$", os.path.basename(d))
     if not m:

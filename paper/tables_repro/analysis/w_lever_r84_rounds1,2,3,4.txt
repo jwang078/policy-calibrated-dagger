@@ -1,0 +1,28 @@
+pybullet build time: Dec  4 2025 15:17:40
+dag1 r=0.10: stable=16 escaped=0 rej_start=5 rej_short=0 RMS=6.00 med  (median 5.85, p95 8.80)
+dag1 r=0.20: stable=10 escaped=6 rej_start=5 rej_short=0 RMS=7.12 med  (median 6.27, p95 10.04)
+dag1 r=0.30: stable=8 escaped=8 rej_start=5 rej_short=0 RMS=7.82 med  (median 6.65, p95 11.51)
+dag1 r=0.50: stable=7 escaped=9 rej_start=5 rej_short=0 RMS=9.14 med  (median 9.45, p95 12.31)
+dag1 r=0.75: stable=4 escaped=12 rej_start=5 rej_short=0 RMS=7.29 med  (median 6.25, p95 10.58)
+dag1 r=0.90: stable=3 escaped=13 rej_start=5 rej_short=0 RMS=7.90 med  (median 7.07, p95 10.67)
+dag2 r=0.10: stable=23 escaped=0 rej_start=3 rej_short=0 RMS=4.68 med  (median 4.39, p95 6.12)
+dag2 r=0.20: stable=22 escaped=1 rej_start=3 rej_short=0 RMS=6.99 med  (median 6.99, p95 9.78)
+dag2 r=0.30: stable=19 escaped=4 rej_start=3 rej_short=0 RMS=8.49 med  (median 8.84, p95 11.94)
+dag2 r=0.50: stable=13 escaped=10 rej_start=3 rej_short=0 RMS=7.33 med  (median 7.58, p95 9.37)
+dag2 r=0.75: stable=9 escaped=14 rej_start=3 rej_short=0 RMS=6.65 med  (median 5.55, p95 9.23)
+dag2 r=0.90: stable=7 escaped=16 rej_start=3 rej_short=0 RMS=8.14 med  (median 9.07, p95 11.34)
+dag3 r=0.10: stable=13 escaped=0 rej_start=5 rej_short=0 RMS=4.58 med  (median 3.60, p95 7.66)
+dag3 r=0.20: stable=13 escaped=0 rej_start=5 rej_short=0 RMS=6.36 med  (median 5.95, p95 9.31)
+dag3 r=0.30: stable=13 escaped=0 rej_start=5 rej_short=0 RMS=7.64 med  (median 6.59, p95 11.29)
+dag3 r=0.50: stable=13 escaped=0 rej_start=5 rej_short=0 RMS=7.07 med  (median 5.97, p95 11.39)
+dag3 r=0.75: stable=10 escaped=3 rej_start=5 rej_short=0 RMS=8.49 med  (median 8.13, p95 11.82)
+dag3 r=0.90: stable=5 escaped=8 rej_start=5 rej_short=0 RMS=9.26 med  (median 8.79, p95 11.62)
+dag4 r=0.10: stable=16 escaped=0 rej_start=5 rej_short=0 RMS=4.64 med  (median 3.83, p95 7.22)
+dag4 r=0.20: stable=15 escaped=1 rej_start=5 rej_short=0 RMS=6.60 med  (median 5.98, p95 9.46)
+dag4 r=0.30: stable=13 escaped=3 rej_start=5 rej_short=0 RMS=8.10 med  (median 8.77, p95 11.03)
+dag4 r=0.50: stable=7 escaped=9 rej_start=5 rej_short=0 RMS=7.11 med  (median 6.77, p95 10.49)
+dag4 r=0.75: stable=4 escaped=12 rej_start=5 rej_short=0 RMS=7.23 med  (median 6.54, p95 9.78)
+dag4 r=0.90: stable=6 escaped=10 rej_start=5 rej_short=0 RMS=8.99 med  (median 9.53, p95 10.21)
+
+dial fit over 24 cells: W = 8.06 (±0.20), R = 0.021, RMSE 0.71
+bootstrap 95% CI for W: [7.66, 8.48]

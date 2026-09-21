@@ -1,0 +1,13 @@
+# figure-folder caches and scratch: regenerable from tables_repro/analysis (schedules, sigma deltas) or by the plot scripts
+*.npz
+noise_schedule_*.json
+fig_data*.json
+*.aux
+*.log
+*.out
+cands/
+__pycache__/
+# the per-figure input snapshots (figdata.py) ARE committed
+!data/**
+!dart_chunks_src47/*.npz
+fig1_teaser_lever/video/

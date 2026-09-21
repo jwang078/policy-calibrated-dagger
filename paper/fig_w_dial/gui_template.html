@@ -1,0 +1,164 @@
+<title>W Dial Styler</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{--bg:#f4f5f7;--panel:#ffffff;--ink:#1c2128;--muted:#5d6672;--line:#d9dde3;--accent:#2a5f9e;--accent-ink:#ffffff;--code:#eef1f5}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#171a1f;--panel:#1f242b;--ink:#e6e9ee;--muted:#9aa4b1;--line:#343b45;--accent:#6aa5e6;--accent-ink:#0f1318;--code:#262c35}}
+:root[data-theme="dark"]{--bg:#171a1f;--panel:#1f242b;--ink:#e6e9ee;--muted:#9aa4b1;--line:#343b45;--accent:#6aa5e6;--accent-ink:#0f1318;--code:#262c35}
+body{background:var(--bg);color:var(--ink);font-family:"IBM Plex Sans",system-ui,sans-serif;font-size:14px;padding-inline:16px;padding-block:14px}
+h1{font-size:17px;font-weight:600;margin:0 0 10px}
+.wrap{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:16px}
+@media (max-width:900px){.wrap{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px}
+.chart{position:sticky;top:10px}
+svg{width:100%;height:auto;background:#fff;border-radius:4px;display:block}
+fieldset{border:1px solid var(--line);border-radius:6px;margin:0 0 10px;padding:8px 10px}
+legend{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);padding:0 4px}
+.row{display:flex;gap:8px;align-items:center;margin:5px 0;flex-wrap:wrap}
+.row label{flex:0 0 96px;color:var(--muted);font-size:12.5px}
+.row input[type=text],.row select{flex:1 1 120px;min-width:0;font:inherit;font-size:13px;padding:4px 6px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--ink)}
+.row input[type=range]{flex:1 1 100px}
+.row input[type=color]{width:34px;height:26px;padding:0;border:1px solid var(--line);border-radius:4px;background:none}
+.row .num{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--muted);width:44px;text-align:right}
+.chk{display:flex;align-items:center;gap:6px;font-size:13px}
+.lg{display:grid;grid-template-columns:auto 1fr;gap:6px 8px;align-items:center}
+button{font:inherit;font-size:13px;padding:6px 12px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-ink);border-radius:5px;cursor:pointer}
+button.ghost{background:none;color:var(--accent)}
+pre{background:var(--code);border-radius:6px;padding:10px;font:12px/1.45 "IBM Plex Mono",monospace;overflow-x:auto;max-height:260px;white-space:pre}
+.hint{font-size:12px;color:var(--muted);margin:4px 0 0}
+</style>
+<h1>W dial — planar, 5 rounds × 13 ratios</h1>
+<div class="wrap">
+  <div class="panel chart"><div class="row" style="margin:0 0 6px"><label>preview zoom</label><input type="range" id="zoom" min="1" max="2.5" step="0.05" value="1"><span class="num" id="zoomv">1.00</span></div><div id="scroller" style="overflow:auto"><svg id="svg" viewBox="0 0 700 520" xmlns="http://www.w3.org/2000/svg"></svg></div>
+    <p class="hint">Drag the W annotation on the plot to place it. Placeholders: {W} {Wlo} {Whi} {R} {rd} (optionally {W:.2f}). Wrap math in $…$ — it renders here via MathJax and in the PNG via matplotlib mathtext (use \mathrm{} not \text{}). Preview zoom only enlarges the preview (not in CONFIG). Copy the CONFIG block into <code>plot.py</code> (paper_plots/fig_w_dial) and re-run for the PNG.</p></div>
+  <div class="panel" id="ctl"></div>
+</div>
+<script id="data" type="application/json">__DATA__</script>
+<script>window.MathJax = {startup: {typeset: false}, svg: {fontCache: 'none'}};</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg.js"></script>
+<script>
+const D = JSON.parse(document.getElementById('data').textContent);
+const C = JSON.parse(JSON.stringify(D.config));
+C.legend_show_each = {};
+const fmt = (s, extra={}) => s.replace(/\{(W|Wlo|Whi|R|rd)(?::\.(\d)f)?\}/g, (m,k,d)=>{const v={W:D.W,Wlo:D.W_lo,Whi:D.W_hi,R:D.R,...extra}[k]; return d!==undefined? Number(v).toFixed(+d): (typeof v==='number'? String(+v.toFixed(3)):String(v));});
+// python-ish default precision for {W} without spec: 1 decimal for W-like, 2 for R
+const svg = document.getElementById('svg');
+const NS='http://www.w3.org/2000/svg';
+// matplotlib geometry: 7x5.2in figure at 100 dpi (savefig scales x1.5); axes box from tight_layout
+const PX=100/72, Wd=700, Ht=520;
+const M={l:64.7,r:17.0,t:39.1,b:61.0};   // axes box (tight_layout); t becomes 103.6 with the top g axis
+// DDPM squaredcos_cap_v2 schedule (T=100): g(beta) = 1 - alphabar[k_sw]
+const T_=100, _ab=t=>Math.cos((t+0.008)/1.008*Math.PI/2)**2;
+const ALPHABAR=[];{let acc=1;for(let i=0;i<T_;i++){const b=Math.min(1-_ab((i+1)/T_)/_ab(i/T_),0.999);acc*=1-b;ALPHABAR.push(acc);}}
+const gOfBeta=b=>{const k=b*(T_-1),i=Math.min(Math.floor(k),T_-2),f=k-i;return 1-((1-f)*ALPHABAR[i]+f*ALPHABAR[i+1]);};
+const betaOfG=g=>{let lo=0,hi=1;for(let n=0;n<40;n++){const m=(lo+hi)/2;(gOfBeta(m)<g)?lo=m:hi=m;}return (lo+hi)/2;};
+for(const [k,v] of Object.entries({title_size:10.5,label_size:10.5,tick_size:9.5,legend_size:8,top_axis_g:true,top_axis_label:'noise-variance fraction g(β) = 1 − ᾱ$_{k_{sw}}$',top_axis_ticks:[0.01,0.05,0.1,0.2,0.4,0.6,0.8,0.95]})) if(C[k]==null) C[k]=v;
+const F={};
+function fonts(){F.tick=C.tick_size*PX;F.label=C.label_size*PX;F.title=C.title_size*PX;F.legend=C.legend_size*PX;}
+const R_CELL=Math.sqrt(70/Math.PI)*PX, R_EPS=Math.sqrt(9/Math.PI)*PX, R_LG=3.25*PX, R_LGS=2*PX, LW=1.8*PX;
+const ymax = Math.max(D.W*1.18, D.W_hi*1.08, Math.max(...D.eps.map(e=>e[2]), ...D.cells.filter(c=>c.rms!==null).map(c=>c.rms))*1.08);
+const X=r=>M.l+(r+0.02)/1.04*(Wd-M.l-M.r), Y=v=>Ht-M.b-(v/ymax)*(Ht-M.t-M.b);
+function el(n,a,txt){const e=document.createElementNS(NS,n);for(const k in a)e.setAttribute(k,a[k]);if(txt!=null)e.textContent=txt;return e;}
+// text node that renders $...$ segments through MathJax (mirrors matplotlib mathtext).
+// a: {x,y,'font-size',fill,'text-anchor','dominant-baseline',transform,...}
+function textOrTex(a, s){
+  if(!s.includes('$') || !window.MathJax || !MathJax.tex2svg) return el('text', a, s);
+  const parts = s.split('$'); // even = text, odd = math
+  const tex = parts.map((p,i)=> i%2 ? p : (p ? '\\text{'+p.replace(/([\\{}$&#^_%])/g,'\\$1')+'}' : '')).join('');
+  let node; try { node = MathJax.tex2svg(tex, {display:false}).querySelector('svg'); } catch(e){ return el('text', a, s); }
+  const fs = +a['font-size'] || 14, exPx = fs*0.5;   // 1ex ≈ 0.5em
+  const w = parseFloat(node.getAttribute('width'))*exPx, h = parseFloat(node.getAttribute('height'))*exPx;
+  node.setAttribute('width', w); node.setAttribute('height', h);
+  const anchor = a['text-anchor']||'start', base = a['dominant-baseline']||'auto';
+  const dx = anchor==='middle' ? -w/2 : anchor==='end' ? -w : 0;
+  const va = parseFloat((node.style.verticalAlign||'0ex'))*exPx;   // baseline offset from bottom
+  const dy = base==='hanging' ? 0 : base==='middle' ? -h/2 : -(h + va);
+  node.setAttribute('x', (+a.x)+dx); node.setAttribute('y', (+a.y)+dy);
+  node.querySelectorAll('[fill="currentColor"], g[fill]').forEach(g=>g.setAttribute('fill', a.fill||'#222'));
+  node.setAttribute('fill', a.fill||'#222'); node.style.color = a.fill||'#222';
+  if(a.transform){ const g=el('g',{transform:a.transform}); g.appendChild(node); return g; }
+  for(const k of ['id','cursor']) if(a[k]) node.setAttribute(k,a[k]);
+  return node;
+}
+let jit=null;
+function jitter(){if(jit)return jit;let s=1;const rnd=()=>{s=(s*16807)%2147483647;return s/2147483647-0.5;};jit=D.eps.map(()=>rnd()*0.024);return jit;}
+function draw(){
+  fonts(); M.t = C.top_axis_g ? 103.6 : 39.1; svg.innerHTML='';
+  // grid + axes
+  const yt=[];for(let v=0;v<=ymax;v+=2)yt.push(v);
+  yt.forEach(v=>{svg.appendChild(el('line',{x1:M.l,x2:Wd-M.r,y1:Y(v),y2:Y(v),stroke:'#dddddd','stroke-width':1}));
+    svg.appendChild(el('text',{x:M.l-6,y:Y(v)+F.tick*0.35,'text-anchor':'end','font-size':F.tick,fill:'#222'},v));});
+  [0,0.2,0.4,0.6,0.8,1.0].forEach(r=>{svg.appendChild(el('text',{x:X(r),y:Ht-M.b+F.tick+6,'text-anchor':'middle','font-size':F.tick,fill:'#222'},r.toFixed(1)));
+    svg.appendChild(el('line',{x1:X(r),x2:X(r),y1:Ht-M.b,y2:Ht-M.b+3.5*PX*0.8,stroke:'#222'}));});
+  svg.appendChild(el('line',{x1:M.l,x2:Wd-M.r,y1:Ht-M.b,y2:Ht-M.b,stroke:'#222'}));
+  svg.appendChild(el('line',{x1:M.l,x2:M.l,y1:M.t,y2:Ht-M.b,stroke:'#222'}));
+  svg.appendChild(textOrTex({x:(M.l+Wd-M.r)/2,y:Ht-10,'text-anchor':'middle','font-size':F.label,fill:'#111'},C.xlabel));
+  svg.appendChild(textOrTex({x:16,y:(M.t+Ht-M.b)/2,'text-anchor':'middle','font-size':F.label,fill:'#111',transform:`rotate(-90 16 ${(M.t+Ht-M.b)/2})`},C.ylabel));
+  if(C.top_axis_g){
+    svg.appendChild(el('line',{x1:M.l,x2:Wd-M.r,y1:M.t,y2:M.t,stroke:'#222'}));
+    (C.top_axis_ticks||[]).filter(g=>g>0&&g<1).forEach(g=>{const x=X(betaOfG(g));svg.appendChild(el('line',{x1:x,x2:x,y1:M.t,y2:M.t-3.5*PX*0.8,stroke:'#222'}));
+      svg.appendChild(el('text',{x,y:M.t-3.5*PX*0.8-4,'text-anchor':'middle','font-size':F.tick-PX,fill:'#222'},String(g)));});
+    svg.appendChild(textOrTex({x:(M.l+Wd-M.r)/2,y:M.t-3.5*PX*0.8-4-(F.tick-PX)-6,'text-anchor':'middle','font-size':F.label-PX,fill:'#111'},C.top_axis_label));
+    svg.appendChild(textOrTex({x:(M.l+Wd-M.r)/2,y:M.t-22*PX-3.5*PX*0.8,'text-anchor':'middle','font-size':F.title,fill:'#111'},C.title));
+  } else {
+    svg.appendChild(textOrTex({x:(M.l+Wd-M.r)/2,y:M.t-9,'text-anchor':'middle','font-size':F.title,fill:'#111'},C.title));
+  }
+  if(C.show_ci) svg.appendChild(el('rect',{x:M.l,y:Y(D.W_hi),width:Wd-M.l-M.r,height:Y(D.W_lo)-Y(D.W_hi),fill:C.ci_color,opacity:0.10}));
+  if(C.show_eps){const j=jitter();D.eps.forEach((e,i)=>svg.appendChild(el('circle',{cx:X(e[1]+j[i]),cy:Y(e[2]),r:R_EPS,fill:C.eps_color,opacity:0.16})));}
+  if(C.show_wline) svg.appendChild(el('line',{x1:M.l,x2:Wd-M.r,y1:Y(D.W),y2:Y(D.W),stroke:C.wline_color,'stroke-dasharray':`${5.2*PX} ${2.2*PX}`,'stroke-width':1.1*PX}));
+  svg.appendChild(el('path',{d:D.curve.map((p,i)=>(i?'L':'M')+X(p[0])+' '+Y(p[1])).join(' '),fill:'none',stroke:C.fit_color,'stroke-width':LW}));
+  D.cells.forEach(c=>{if(c.rms==null)return;const x=X(c.r+(c.rd-3)*0.008),y=Y(c.rms);const col=C.round_colors[c.rd];
+    svg.appendChild(c.in_fit?el('circle',{cx:x,cy:y,r:R_CELL,fill:col,stroke:'#fff','stroke-width':1.0*PX}):el('circle',{cx:x,cy:y,r:R_CELL,fill:'none',stroke:col,'stroke-width':1.4*PX}));});
+  // annotation (draggable)
+  if(C.show_annot){const t=textOrTex({x:X(C.annot_x),y:Y(D.W+C.annot_y_offset)-(C.annot_va==='bottom'?0.22*C.annot_size*PX:0),'font-size':C.annot_size*PX,fill:C.annot_color,'text-anchor':{left:'start',center:'middle',right:'end'}[C.annot_ha],'dominant-baseline':{bottom:'auto',center:'middle',top:'hanging'}[C.annot_va],cursor:'move',id:'annot'},fmt(C.annot_text));svg.appendChild(t);
+    t.addEventListener('pointerdown',ev=>{ev.preventDefault();const mv=e2=>{const pt=svg.createSVGPoint();pt.x=e2.clientX;pt.y=e2.clientY;const p=pt.matrixTransform(svg.getScreenCTM().inverse());C.annot_x=+(((p.x-M.l)/(Wd-M.l-M.r)*1.04-0.02).toFixed(3));C.annot_y_offset=+(((Ht-M.b-p.y)/(Ht-M.t-M.b)*ymax-D.W).toFixed(2));draw();sync();};const up=()=>{window.removeEventListener('pointermove',mv);window.removeEventListener('pointerup',up);};window.addEventListener('pointermove',mv);window.addEventListener('pointerup',up);});}
+  // legend
+  const items=[];const L=C.legend;
+  if(L.rounds.show) [1,2,3,4,5].forEach(rd=>items.push({k:'dot',col:C.round_colors[rd],label:fmt(L.rounds.label,{rd})}));
+  if(L.excluded.show && D.cells.some(c=>!c.in_fit)) items.push({k:'hollow',col:'#666',label:fmt(L.excluded.label)});
+  if(L.eps.show && C.show_eps) items.push({k:'small',col:C.eps_color,label:fmt(L.eps.label)});
+  if(L.ci.show && C.show_ci) items.push({k:'rect',col:C.ci_color,label:fmt(L.ci.label)});
+  if(L.fit.show) items.push({k:'line',col:C.fit_color,label:fmt(L.fit.label)});
+  const ncol=C.legend_ncol, rows=Math.ceil(items.length/ncol), lh=F.legend*1.4;
+  const colw=Math.max(...items.map(it=>it.label.replace(/\$[^$]*\$/g,m=>m.slice(1,-1).replace(/\\[a-zA-Z]+|[{}]/g,'')).length))*F.legend*0.55+F.legend*3.2, lw=colw;
+  const locs={'lower right':[Wd-M.r-ncol*lw-6, Ht-M.b-rows*lh-6],'lower left':[M.l+8, Ht-M.b-rows*lh-6],'upper right':[Wd-M.r-ncol*lw-6, M.t+6],'upper left':[M.l+8, M.t+6],'center right':[Wd-M.r-ncol*lw-6,(M.t+Ht-M.b)/2-rows*lh/2]};
+  const [lx,ly]=locs[C.legend_loc]||locs['lower right'];
+  items.forEach((it,i)=>{const cx=lx+Math.floor(i/rows)*lw, cy=ly+(i%rows)*lh+lh*0.55;
+    if(it.k==='dot')svg.appendChild(el('circle',{cx:cx+8,cy,r:R_LG,fill:it.col,stroke:'#fff','stroke-width':1.0*PX}));
+    if(it.k==='hollow')svg.appendChild(el('circle',{cx:cx+8,cy,r:R_LG,fill:'none',stroke:it.col,'stroke-width':1.4*PX}));
+    if(it.k==='small')svg.appendChild(el('circle',{cx:cx+8,cy,r:R_LGS,fill:it.col,opacity:0.5}));
+    if(it.k==='rect')svg.appendChild(el('rect',{x:cx,y:cy-5,width:16,height:10,fill:it.col,opacity:0.15}));
+    if(it.k==='line')svg.appendChild(el('line',{x1:cx,x2:cx+16,y1:cy,y2:cy,stroke:it.col,'stroke-width':LW}));
+    svg.appendChild(textOrTex({x:cx+20,y:cy+F.legend*0.35,'font-size':F.legend,fill:'#222'},it.label));});
+}
+// ── controls ──
+const ctl=document.getElementById('ctl');
+function textRow(lbl,get,set){const r=document.createElement('div');r.className='row';r.innerHTML=`<label>${lbl}</label><input type="text">`;const i=r.querySelector('input');i.value=get();i.addEventListener('input',()=>{set(i.value);draw();sync();});return r;}
+function colorRow(lbl,get,set){const r=document.createElement('div');r.className='row';r.innerHTML=`<label>${lbl}</label><input type="color"><input type="text" style="flex:0 1 90px">`;const c=r.querySelector('[type=color]'),t=r.querySelector('[type=text]');c.value=get();t.value=get();c.addEventListener('input',()=>{set(c.value);t.value=c.value;draw();sync();});t.addEventListener('change',()=>{set(t.value);c.value=t.value;draw();sync();});return r;}
+function rangeRow(lbl,min,max,step,get,set){const r=document.createElement('div');r.className='row';r.innerHTML=`<label>${lbl}</label><input type="range" min="${min}" max="${max}" step="${step}"><span class="num"></span>`;const i=r.querySelector('input'),n=r.querySelector('.num');const upd=()=>{i.value=get();n.textContent=get();};upd();i.addEventListener('input',()=>{set(+i.value);n.textContent=i.value;draw();sync();});r.refresh=upd;return r;}
+function chk(lbl,get,set){const l=document.createElement('label');l.className='chk';const i=document.createElement('input');i.type='checkbox';i.checked=get();i.addEventListener('change',()=>{set(i.checked);draw();sync();});l.append(i,lbl);return l;}
+function selRow(lbl,opts,get,set){const r=document.createElement('div');r.className='row';r.innerHTML=`<label>${lbl}</label><select>${opts.map(o=>`<option>${o}</option>`).join('')}</select>`;const s=r.querySelector('select');s.value=get();s.addEventListener('change',()=>{set(s.value);draw();sync();});return r;}
+function fs(title,...kids){const f=document.createElement('fieldset');f.innerHTML=`<legend>${title}</legend>`;kids.forEach(k=>f.appendChild(k));return f;}
+const ax=rangeRow('x (ratio)',-0.02,1.0,0.005,()=>C.annot_x,v=>C.annot_x=v), ay=rangeRow('y offset',-4,6,0.05,()=>C.annot_y_offset,v=>C.annot_y_offset=v);
+ctl.append(
+  fs('Text', textRow('title',()=>C.title,v=>C.title=v), textRow('x label',()=>C.xlabel,v=>C.xlabel=v), textRow('y label',()=>C.ylabel,v=>C.ylabel=v)),
+  fs('W annotation', chk('show',()=>C.show_annot,v=>C.show_annot=v), textRow('text',()=>C.annot_text,v=>C.annot_text=v), ax, ay,
+     selRow('h-align',['left','center','right'],()=>C.annot_ha,v=>C.annot_ha=v), selRow('v-align',['bottom','center','top'],()=>C.annot_va,v=>C.annot_va=v),
+     rangeRow('font size',6,16,0.5,()=>C.annot_size,v=>C.annot_size=v), colorRow('color',()=>C.annot_color,v=>C.annot_color=v)),
+  fs('Font sizes (pt)', rangeRow('title',6,16,0.5,()=>C.title_size,v=>C.title_size=v), rangeRow('axis labels',6,16,0.5,()=>C.label_size,v=>C.label_size=v), rangeRow('ticks',6,14,0.5,()=>C.tick_size,v=>C.tick_size=v), rangeRow('legend',5,12,0.5,()=>C.legend_size,v=>C.legend_size=v)),
+  fs('Top axis (g)', chk('show g(β) axis on top',()=>C.top_axis_g,v=>C.top_axis_g=v), textRow('label',()=>C.top_axis_label,v=>C.top_axis_label=v),
+     textRow('ticks',()=>C.top_axis_ticks.join(', '),v=>C.top_axis_ticks=v.split(/[\s,]+/).map(Number).filter(x=>!isNaN(x)))),
+  fs('Layers', chk('W dashed line',()=>C.show_wline,v=>C.show_wline=v), chk('95% CI band',()=>C.show_ci,v=>C.show_ci=v), chk('per-episode dots',()=>C.show_eps,v=>C.show_eps=v)),
+  fs('Colors', colorRow('fit line',()=>C.fit_color,v=>C.fit_color=v), colorRow('W line',()=>C.wline_color,v=>C.wline_color=v), colorRow('CI band',()=>C.ci_color,v=>C.ci_color=v), colorRow('episodes',()=>C.eps_color,v=>C.eps_color=v),
+     ...[1,2,3,4,5].map(rd=>colorRow('round '+rd,()=>C.round_colors[rd],v=>C.round_colors[rd]=v))),
+  fs('Legend', selRow('location',['lower right','lower left','upper right','upper left','center right'],()=>C.legend_loc,v=>C.legend_loc=v),
+     selRow('columns',['1','2'],()=>String(C.legend_ncol),v=>C.legend_ncol=+v),
+     ...Object.keys(C.legend).map(k=>{const r=document.createElement('div');r.className='row';const c=chk('',()=>C.legend[k].show,v=>C.legend[k].show=v);const t=document.createElement('input');t.type='text';t.value=C.legend[k].label;t.addEventListener('input',()=>{C.legend[k].label=t.value;draw();sync();});r.append(c,t);return r;}))
+);
+const out=document.createElement('div');out.innerHTML=`<div class="row"><button id="copy">Copy CONFIG</button><button class="ghost" id="reset">Reset</button></div><pre id="cfg"></pre>`;ctl.appendChild(out);
+function pyRepr(v){if(typeof v==='string')return JSON.stringify(v);if(typeof v==='boolean')return v?'True':'False';if(typeof v==='number')return String(v);if(Array.isArray(v))return '['+v.map(pyRepr).join(', ')+']';return '{'+Object.entries(v).map(([k,x])=>`${/^\d+$/.test(k)?k:JSON.stringify(k)}: ${pyRepr(x)}`).join(', ')+'}';}
+function sync(){const c={...C};delete c.legend_show_each;const lines=Object.entries(c).map(([k,v])=>`    ${JSON.stringify(k)}: ${pyRepr(v)},`);document.getElementById('cfg').textContent='CONFIG = {\n'+lines.join('\n')+'\n}';ax.refresh();ay.refresh();}
+document.getElementById('copy').addEventListener('click',()=>{navigator.clipboard.writeText(document.getElementById('cfg').textContent).then(()=>{document.getElementById('copy').textContent='Copied';setTimeout(()=>document.getElementById('copy').textContent='Copy CONFIG',1200);});});
+document.getElementById('reset').addEventListener('click',()=>{Object.assign(C,JSON.parse(JSON.stringify(D.config)));ctl.querySelectorAll('input[type=text],select').forEach(()=>{});location.reload();});
+document.getElementById('zoom').addEventListener('input',e=>{const z=+e.target.value;svg.style.width=(z*100)+'%';document.getElementById('zoomv').textContent=z.toFixed(2);});
+(window.MathJax && MathJax.startup ? MathJax.startup.promise : Promise.resolve()).then(()=>{draw();sync();});
+</script>

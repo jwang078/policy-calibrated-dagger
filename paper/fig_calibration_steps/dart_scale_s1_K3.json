@@ -1,0 +1,13 @@
+{
+ "W_med": 8.0,
+ "tr_mean_med2": 78.6135001341628,
+ "scale": 0.8141095345045924,
+ "alpha_dart_per_step_med2": 64.0,
+ "note": "DART: Sigma^alpha = alpha/(T tr Sigma_hat) * Sigma_hat with alpha = T*W^2 (cumulative squared error); scale = alpha/(T tr Sigma_hat) = W^2 / mean_t tr(Sigma_hat_t); tr Sigma^alpha = W^2. W in median-step units.",
+ "rounds": [
+  1,
+  2,
+  3
+ ],
+ "n_episodes": 144
+}

@@ -11,7 +11,7 @@ observations, `tab:overall_success_splatsim`) of the Policy-Calibrated DAgger pa
   Table II generator. The exact noise schedules used by every calibrated arm are committed as one tarball:
   **run `bash analysis/unpack_schedules.sh` once after cloning.** The per-anchor deltas they were built from
   (`sigma_deltas_*.npz`, ~320 MB) are kept here on the machine, git-ignored.
-- `gen_table.py` — Table I LaTeX (`table1_tabular.tex` is its output); `analysis/lever_table.py` — Table II.
+- `gen_table.py` — Table I LaTeX, per-column colour scaling (`table1_tabular_all300.tex` is its output; `table1_tabular.tex` is the submitted version, see the audit note); `analysis/lever_table.py` — Table II.
 - `smoke_test.sh` — runs the scripts above in miniature (see the end).
 - `history/` — the scripts exactly as they ran during the paper crunch (gated chains, per-round one-offs,
   K=6 attempts). The clean scripts are rewrites of them with the same commands; keep the history for
@@ -75,7 +75,7 @@ Details:
   s5/q5_dnsig) had no 300-episode run when the table was generated; `gen_table.py` silently fell back to the
   100-episode inline eval from training. The generator now prints a WARNING naming any such cell. The three
   300-episode evals were run afterwards (see `outputs/eval300`), so a regeneration differs from the submitted
-  numbers only in those cells: pooled K=5 88.3±0.6 → 89.3±0.5 and per-step K=5 88.9±0.8 → 88.5±0.8 (`table1_tabular_all300.tex`;
+  numbers only in those cells (cell colours are scaled per column, `COLOR_SCOPE=column`, the paper's convention; `COLOR_SCOPE=global` gives one scale for the whole table): pooled K=5 88.3±0.6 → 89.3±0.5 and per-step K=5 88.9±0.8 → 88.5±0.8 (`table1_tabular_all300.tex`;
   `table1_tabular.tex` stays the submitted version, and the smoke test compares against it with the three
   fallback cells excluded).
 

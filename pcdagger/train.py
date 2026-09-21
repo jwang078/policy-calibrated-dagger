@@ -75,8 +75,8 @@ from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.policies.factory import (
     ProcessorConfigKwargs,
-    _reconnect_relative_absolute_steps,
 )
+from pcdagger.compat import peft_available, reconnect_relative_absolute_steps
 from pcdagger.lerobot_glue.policy import (
     _wrap_with_shared_autonomy,
     _wrap_with_temporal_ensemble,
@@ -84,7 +84,7 @@ from pcdagger.lerobot_glue.policy import (
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
-from lerobot.utils.import_utils import _peft_available, register_third_party_plugins, require_package
+from lerobot.utils.import_utils import register_third_party_plugins, require_package
 from lerobot.utils.io_utils import load_json
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -96,7 +96,7 @@ from lerobot.utils.utils import (
     inside_slurm,
 )
 
-if TYPE_CHECKING or _peft_available:
+if TYPE_CHECKING or peft_available():
     from peft import PeftModel
 else:
     PeftModel = None
@@ -681,9 +681,9 @@ def train(cfg: TrainPipelineConfig):
     sa_cfg = getattr(cfg.policy, "shared_autonomy_config", None)
     if sa_cfg is not None and sa_cfg.enabled:
         policy = _wrap_with_shared_autonomy(policy, cfg.policy)
-        _reconnect_relative_absolute_steps(preprocessor, policy.postprocessor, policy=policy)
+        reconnect_relative_absolute_steps(preprocessor, policy.postprocessor, policy=policy)
     else:
-        _reconnect_relative_absolute_steps(preprocessor, postprocessor, policy=policy)
+        reconnect_relative_absolute_steps(preprocessor, postprocessor, policy=policy)
 
     # ── Debug: surface the normalization stats the policy ACTUALLY uses ──
     # This is ground truth AFTER all the layering that decides normalization:

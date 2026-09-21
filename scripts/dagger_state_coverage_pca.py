@@ -637,9 +637,9 @@ def _load_policy_processor_steps(policy_path: Path, base_dataset_path: Path | No
     # after deserialization (the reference is not serializable). Without this,
     # `abs_step.relative_step` is None and the SA-wrapper-style gate fails to
     # trigger the rel-conversion path. lerobot_eval / training do the same.
-    from lerobot.policies.factory import _reconnect_relative_absolute_steps
+    from pcdagger.compat import reconnect_relative_absolute_steps
 
-    _reconnect_relative_absolute_steps(preprocessor, postprocessor)
+    reconnect_relative_absolute_steps(preprocessor, postprocessor)
 
     # Backfill RelativeActionsProcessorStep.action_names from the BASE
     # dataset's meta/info.json if it's missing.

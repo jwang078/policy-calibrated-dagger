@@ -17,9 +17,11 @@ dependencies = [
     "matplotlib",
     "torch",
     "pyarrow",
-    # The training / evaluation stack. Pinned to the jwang078 fork until the hooks it
-    # needs are upstream (see MIGRATION_PLAN.md, "What stays in the lerobot fork").
-    "lerobot @ git+https://github.com/jwang078/lerobot.git",
+    # The training / evaluation stack: the jwang078 fork, pinned to the tag that
+    # tests/test_dependency_contract.py and paper/tables_repro/smoke_test.sh were last run against.
+    # Move the pin after re-running `bash scripts/check_dependency_contract.sh` (see README, "Keeping up
+    # with lerobot and SplatSim"). What the fork carries: MIGRATION_PLAN.md, "What stays in the lerobot fork".
+    "lerobot @ git+https://github.com/jwang078/lerobot.git@pcdagger-compat-2026-09-21",
 ]
 
 [project.scripts]
@@ -31,7 +33,7 @@ pcdagger-eval = "pcdagger.dagger.eval:main"
 [project.optional-dependencies]
 # The two simulated tasks of the paper (planar reacher, engine lever) and the RRT oracle expert.
 splatsim = [
-    "splatsim @ git+https://github.com/jwang078/SplatSim.git",
+    "splatsim @ git+https://github.com/jwang078/SplatSim.git@pcdagger-compat-2026-09-21",
 ]
 dev = ["pytest", "ruff"]
 

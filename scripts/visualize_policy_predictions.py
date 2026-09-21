@@ -44,7 +44,8 @@ import pandas as pd
 import torch
 from PIL import Image
 
-from lerobot.policies.factory import _reconnect_relative_absolute_steps, get_policy_class
+from lerobot.policies.factory import get_policy_class
+from pcdagger.compat import reconnect_relative_absolute_steps
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
@@ -426,7 +427,7 @@ def main():
     # Wire absolute↔relative steps and attach the policy so the relative step only
     # refreshes its anchor state on chunk boundaries (matches lerobot-eval behavior).
     # No-op for absolute-action policies (preprocessor has no RelativeActionsProcessorStep).
-    _reconnect_relative_absolute_steps(preprocessor, postprocessor, policy=policy)
+    reconnect_relative_absolute_steps(preprocessor, postprocessor, policy=policy)
 
     is_relative = is_relative_action_policy(preprocessor)
     print(f"Policy action mode: {'relative' if is_relative else 'absolute'}")

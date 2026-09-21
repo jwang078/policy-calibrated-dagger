@@ -13,10 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from lerobot.configs.shared_autonomy import SharedAutonomyConfig
-from lerobot.policies.factory import (
-    _reconnect_relative_absolute_steps,
-    get_policy_class,
-)
+from lerobot.policies.factory import get_policy_class
+from pcdagger.compat import reconnect_relative_absolute_steps
 from pcdagger.lerobot_glue.policy import _wrap_with_shared_autonomy
 from pcdagger.blend.wrapper import (
     GuidanceBlendStrategy,
@@ -94,7 +92,7 @@ def load_wrapped_policy(
         pretrained_model_name_or_path=str(policy_path),
         config_filename=f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
     )
-    _reconnect_relative_absolute_steps(obs_preprocessor, wrapper.postprocessor, policy=wrapper)
+    reconnect_relative_absolute_steps(obs_preprocessor, wrapper.postprocessor, policy=wrapper)
     _backfill_rel_step_action_names(obs_preprocessor, policy_path, dataset_hint=action_names_dataset_hint)
 
     return wrapper, obs_preprocessor

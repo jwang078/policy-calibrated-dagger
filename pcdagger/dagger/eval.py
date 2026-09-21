@@ -90,9 +90,7 @@ from lerobot.envs import (
 from lerobot.envs.utils import NEW_ROLLOUT_OPTION
 from lerobot.lerobot_types import PolicyAction
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
-from lerobot.policies.factory import (
-    _reconnect_relative_absolute_steps,
-)
+from pcdagger.compat import peft_available, reconnect_relative_absolute_steps
 from pcdagger.lerobot_glue.policy import (
     _wrap_with_last_mile,
     _wrap_with_shared_autonomy,
@@ -101,7 +99,7 @@ from pcdagger.lerobot_glue.policy import (
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_IMAGES, OBS_STR, REWARD
 from lerobot.utils.device_utils import get_safe_torch_device
-from lerobot.utils.import_utils import _peft_available, register_third_party_plugins, require_package
+from lerobot.utils.import_utils import register_third_party_plugins, require_package
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import (
@@ -109,7 +107,7 @@ from lerobot.utils.utils import (
     inside_slurm,
 )
 
-if TYPE_CHECKING or _peft_available:
+if TYPE_CHECKING or peft_available():
     from peft import PeftModel
 else:
     PeftModel = None
@@ -793,7 +791,7 @@ def eval_policy(
         exc = ValueError(
             f"Policy of type 'PreTrainedPolicy' is expected, but type '{type(policy)}' was provided."
         )
-        if not _peft_available:
+        if not peft_available():
             raise exc
         require_package("peft", extra="peft")
         if not isinstance(policy, PeftModel):
@@ -1345,9 +1343,9 @@ def eval_main(cfg: EvalPipelineConfig):
     sa_cfg = getattr(cfg.policy, "shared_autonomy_config", None)
     if sa_cfg is not None and sa_cfg.enabled:
         policy = _wrap_with_shared_autonomy(policy, cfg.policy)
-        _reconnect_relative_absolute_steps(preprocessor, policy.postprocessor, policy=policy)
+        reconnect_relative_absolute_steps(preprocessor, policy.postprocessor, policy=policy)
     else:
-        _reconnect_relative_absolute_steps(preprocessor, postprocessor, policy=policy)
+        reconnect_relative_absolute_steps(preprocessor, postprocessor, policy=policy)
 
     # Outermost last-mile help wrapper. Applied AFTER TE+SA so it overrides
     # whatever final action the inner stack produces.

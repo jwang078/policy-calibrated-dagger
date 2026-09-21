@@ -41,7 +41,19 @@ import numpy as np
 # Robot / scene constants mirrored from
 # SplatSim/splatsim/robots/sim_robot_pybullet_planar.py (PlanarPybulletRobotServer).
 SPLATSIM_ROOT = os.path.expanduser("~/code/SplatSim")
-PLANAR_URDF = f"{SPLATSIM_ROOT}/splatsim/robot_definitions/urdf/planar_3joint.urdf"
+PLANAR_URDF = (
+    next(  # moved to data/assets in the 2026-09-18 SplatSim asset refactor; old path kept as a fallback
+        (
+            p
+            for p in (
+                f"{SPLATSIM_ROOT}/data/assets/planar_3joint/planar_3joint.urdf",
+                f"{SPLATSIM_ROOT}/splatsim/robot_definitions/urdf/planar_3joint.urdf",
+            )
+            if os.path.exists(p)
+        ),
+        f"{SPLATSIM_ROOT}/data/assets/planar_3joint/planar_3joint.urdf",
+    )
+)
 CAMERA_EYE = (0.0, -1.1, 0.2)
 CAMERA_TARGET = (0.0, 0.0, 0.2)
 CAMERA_FOV = 60.0

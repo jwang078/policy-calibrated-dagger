@@ -1824,7 +1824,15 @@ class SharedAutonomyPolicyWrapper(PreTrainedPolicy):
             # refreshes every tick and decodes committed chunk deltas against
             # the wrong (current) state. This is byte-for-byte lerobot_eval's
             # gating, where the inner policy itself is the attached authority.
-            if self.forward_flow_ratio >= 1.0:
+            # The same holds at ANY ratio while the obs-teleop source is idle (no
+            # guidance, nothing draining): select_action then returns the inner
+            # policy's own queued chunk verbatim, so the gate must follow that
+            # queue. Reporting 0 here instead (the source's empty pending count)
+            # refreshed the anchor every tick and decoded the committed t0-relative
+            # deltas against the moving state: a runaway in every intervention
+            # recording's policy phase (lever, ratio 0.4: BC crashed at ~30 steps
+            # instead of ~240; found 2026-09-22).
+            if self.forward_flow_ratio >= 1.0 or not self._obs_teleop_source.is_active():
                 inner_q = getattr(self.inner_policy, "_queues", None)
                 if isinstance(inner_q, dict) and ACTION in inner_q:
                     return inner_q[ACTION]

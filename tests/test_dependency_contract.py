@@ -142,6 +142,18 @@ def test_splatsim_helpers() -> None:
     assert callable(planner_kwargs_from_traj_config)
 
 
+def test_splatsim_robots_expose_tool_frame() -> None:
+    """The shared-autonomy wrapper plans in the frame named by ``wrist_camera_link_name``; both paper
+    robots must resolve it (it silently became None for the UR5 after the 2026-09-18 asset refactor,
+    which broke every lever intervention recording with "Link 'None' not found in URDF")."""
+    from splatsim.configs.env_config import SplatObjectConfig
+
+    for robot in ("planar_3joint", "robot_iphone_w_engine_curtain"):
+        cfg = SplatObjectConfig(name="robot", splat_name=robot)
+        assert cfg.wrist_camera_link_name, f"{robot}: wrist_camera_link_name is unset"
+        assert cfg.urdf_path
+
+
 def test_console_scripts_import() -> None:
     from pcdagger.dagger.eval import main as eval_main
     from pcdagger.train import main as train_main

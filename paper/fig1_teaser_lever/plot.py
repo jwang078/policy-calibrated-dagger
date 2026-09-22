@@ -23,9 +23,10 @@ from matplotlib.path import Path
 HERE = os.path.dirname(os.path.abspath(__file__))
 TAG = sys.argv[1] if len(sys.argv) > 1 else "dag1_ep9_t4"
 # video-still mode (make_video_assets.sh): no title, output at the background's exact pixel size,
-# and each overlay layer switchable: TITLE=0 BAND=0/1 ARCS=0/1 ANCHOR=0/1 OUT=<png>
+# and each overlay layer switchable: TITLE=0 BAND=0/1 PATH=0/1 ARCS=0/1 ANCHOR=0/1 OUT=<png>
 _on = lambda k, d="1": os.environ.get(k, d) == "1"  # noqa: E731
 SHOW_TITLE, SHOW_BAND, SHOW_ARCS = _on("TITLE"), _on("BAND"), _on("ARCS")
+SHOW_PATH = _on("PATH")  # the intervention path line; defaults on so BAND=0 PATH=1 gives the path alone
 SHOW_ANCHOR = os.environ.get("ANCHOR")  # None = CONFIG["show_anchor"]
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 CONFIG = {
@@ -108,7 +109,7 @@ ax.set_ylim(Y1, Y0)
 ax.axis("off")
 for k, a in CONFIG["band_strokes"] if SHOW_BAND else []:
     ax.add_patch(union_patch([ellipse(b["mu"], b["cov"], k) for b in BAND], CONFIG["col_band"], a, 2))
-if SHOW_BAND:
+if SHOW_PATH:
     ax.plot(
         P[:, 0], P[:, 1], "-", color=CONFIG["col_path"], lw=CONFIG["lw_path"], solid_capstyle="round", zorder=4
     )

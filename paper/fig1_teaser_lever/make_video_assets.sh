@@ -10,6 +10,7 @@ cd "$H"
 cp $F/f0000.png                                   $V/1_start_still.png
 cp $F/$(printf f%04d.png $T0)                     $V/3_anchor_still_clean.png
 TITLE=0 BAND=1 ARCS=0 ANCHOR=0 OUT=$V/4_anchor_still_band.png      $PY plot.py $TAG > /dev/null
+TITLE=0 BAND=0 PATH=1 ARCS=0 ANCHOR=0 OUT=$V/4b_anchor_still_path_only.png $PY plot.py $TAG > /dev/null
 TITLE=0 BAND=1 ARCS=1 ANCHOR=1 OUT=$V/5_anchor_still_band_arcs.png $PY plot.py $TAG > /dev/null
 # ---- clips ----
 enc() { $FF -y -loglevel error -framerate $2 -start_number $3 -i $F/f%04d.png -frames:v $4 -vf "pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p" -c:v libx264 -crf 16 "$1"; }

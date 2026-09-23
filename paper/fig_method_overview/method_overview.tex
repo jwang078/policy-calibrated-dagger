@@ -32,7 +32,7 @@
 % ================= Row 1: the DAgger loop =================
 \node[data, fill=cBase] (D0) at (0,0) {Base\\demos $\mathcal{D}_0$};
 \node[block, fill=cTrain!60, right=0.9cm of D0] (train) {Train / fine-tune\\policy $\pi_\theta$};
-\node[block, fill=cCollect!70, right=1.1cm of train, text width=4.9cm] (collect) {Roll out $\pi_\theta$ in simulation;\\expert takes over on\\predicted failure};
+\node[block, fill=cCollect!70, right=1.1cm of train, text width=4.9cm] (collect) {Roll out $\pi_\theta$;\\expert takes over on\\predicted failure};
 \node[data, fill=cCollect!45, right=0.9cm of collect] (Dk) {Interventions\\$\mathcal{D}_k$};
 \draw[flow] (D0) -- (train);
 \draw[flow] (train) -- (collect);
@@ -96,7 +96,7 @@
 \begin{scope}[on background layer]
   \node[region, draw=cCal!60, fill=cCal!6, fit={($(rowy)+(2.6,2.05)$) ($(rowy)+(3.0+3*\PW+3.9,-0.75)$)}] (calbox) {};
 \end{scope}
-\node[lab, text=cCal!70!black, anchor=south west] at ($(rowy)+(2.75,2.1)$) {\textbf{Policy calibration + augmentation} \quad offline, in simulation, no expert required};
+\node[lab, text=cCal!70!black, anchor=south west] at ($(rowy)+(2.75,2.1)$) {\textbf{Policy calibration + augmentation} \quad offline, no expert required};
 \foreach \i in {1,2,3}{\draw[flow, cCal!70!black] ($(rowy)+(3.0+\i*\PW-0.55,0.2)$) -- ($(rowy)+(3.0+\i*\PW-0.05,0.2)$);}
 \node[data, fill=cCal!22, right=0.6cm of calbox.east, yshift=0.3cm] (Dhat) {Calibrated\\recovery $\hat{\mathcal{D}}_k$};
 \draw[flow] (calbox.east |- Dhat) -- (Dhat);

@@ -33,7 +33,7 @@
 % ================= Row 1: the DAgger loop =================
 \node[data, fill=cBase] (D0) at (0,0) {Base\\demos $\mathcal{D}_0$};
 \node[block, fill=cTrain!60, right=0.9cm of D0] (train) {Train / fine-tune\\policy $\pi_\theta$};
-\node[block, fill=cCollect!70, right=1.1cm of train, text width=4.9cm] (collect) {Roll out $\pi_\theta$ in simulation;\\expert takes over on\\predicted failure};
+\node[block, fill=cCollect!70, right=1.1cm of train, text width=4.9cm] (collect) {Roll out $\pi_\theta$;\\expert takes over on\\predicted failure};
 \node[data, fill=cCollect!45, right=0.9cm of collect] (Dk) {Interventions\\$\mathcal{D}_k$};
 \draw[flow] (D0) -- (train);
 \draw[flow] (train) -- (collect);
@@ -45,7 +45,7 @@
 \begin{scope}[on background layer]
   \node[region, draw=cCal!60, fill=cCal!6, fit=(panels), inner sep=6pt] (calbox) {};
 \end{scope}
-\node[lab, text=cCal!70!black, anchor=south west] at ($(calbox.north west)+(0.15,0.02)$) {\textbf{Policy calibration + augmentation} \quad offline, in simulation, no expert required};
+\node[lab, text=cCal!70!black, anchor=south west] at ($(calbox.north west)+(0.15,0.02)$) {\textbf{Policy calibration + augmentation} \quad offline, no expert required};
 % pi_theta chips over the panels that query the policy (a) and (b)
 \node[chip] at ($(panels.north west)+(0.95,-1.05)$) {$\pi_\theta$};
 \node[chip] at ($(panels.north west)+(0.25*16.6cm+0.95cm,-1.05)$) {$\pi_\theta$};
